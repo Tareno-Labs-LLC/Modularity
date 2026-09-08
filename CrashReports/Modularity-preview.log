@@ -1,0 +1,8 @@
+[CrashReporter] Preview session started at 2026-03-01 04:30:59
+[DEBUG] Renderer backend: OpenGL
+[INFO] Opening sample crash reporter preview window.
+[WARN] This is mock data for UI iteration only.
+[ERROR] Example exception: Failed to resolve preview resource handle.
+[ERROR] Stack frame 0: Modularity::Preview::OpenCrashReporter()
+[ERROR] Stack frame 1: Modularity::Engine::Tick()
+[ERROR] Stack frame 2: main

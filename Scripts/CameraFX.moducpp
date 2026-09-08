@@ -1,0 +1,99 @@
+add ModuCPP;
+add ModuEngine;
+public class CameraFX : ModuNode {
+    [Header("Position / Rotation Shake")]
+    public bool shakeEnabled = false;
+    public bool smoothShake = true;
+    [Slider(0.0f, 2.0f)]  public float shakePositionAmount = 0.08f;
+    [Slider(0.0f, 12.0f)] public float shakeRotationAmount = 0.6f;
+    [Slider(0.1f, 40.0f)] public float shakeFrequency = 14.0f;
+
+    [Header("Wind Sway (Rotation)")]
+    public bool windEnabled = false;
+    [Slider(0.0f, 20.0f)] public float windRollAmount = 2.5f;
+    [Slider(0.0f, 20.0f)] public float windPitchAmount = 1.0f;
+    [Slider(0.0f, 20.0f)] public float windYawAmount = 1.5f;
+    [Slider(0.01f, 4.0f)] public float windFrequency = 0.6f;
+    [Slider(0.0f, 4.0f)]  public float windGustSpeed = 0.25f;
+
+    [Header("Idle Bob (Position)")]
+    public bool bobEnabled = false;
+    [Slider(0.0f, 1.0f)]  public float bobAmount = 0.05f;
+    [Slider(0.1f, 10.0f)] public float bobSpeed = 1.5f;
+
+    [Header("Global")]
+    [Slider(0.0f, 2.0f)]  public float masterIntensity = 1.0f;
+    [Slider(0.0f, 30.0f)] public float responseSpeed = 12.0f;
+
+    private float phase = 0.0f;
+    private vec3 appliedPos = vec3(0.0f);
+    private vec3 appliedRot = vec3(0.0f);
+    void Begin() {
+        phase = 0.0f;
+        appliedPos = vec3(0.0f);
+        appliedRot = vec3(0.0f);
+    }
+    void TickUpdate() {
+        if (dt <= 0.0f) return;
+        phase += dt;
+        bool active = shakeEnabled || windEnabled || bobEnabled;
+        if (!active && Math.Length(appliedPos) < 0.0001f && Math.Length(appliedRot) < 0.0001f) {
+            appliedPos = vec3(0.0f);
+            appliedRot = vec3(0.0f);
+            return;
+        }
+        vec3 posOffset = vec3(0.0f);
+        vec3 rotOffset = vec3(0.0f);
+        if (shakeEnabled) {
+            if (smoothShake) {
+                float ft = phase * shakeFrequency;
+                posOffset.x += SmoothNoise(ft, 1.7f) * shakePositionAmount;
+                posOffset.y += SmoothNoise(ft, 5.3f) * shakePositionAmount;
+                posOffset.z += SmoothNoise(ft, 9.1f) * shakePositionAmount;
+                rotOffset.x += SmoothNoise(ft, 13.7f) * shakeRotationAmount;
+                rotOffset.y += SmoothNoise(ft, 17.3f) * shakeRotationAmount;
+                rotOffset.z += SmoothNoise(ft, 21.9f) * shakeRotationAmount;
+            } else {
+                float step = Math.Floor(phase * shakeFrequency);
+                posOffset.x += Hash(step + 1.7f) * shakePositionAmount;
+                posOffset.y += Hash(step + 5.3f) * shakePositionAmount;
+                posOffset.z += Hash(step + 9.1f) * shakePositionAmount;
+                rotOffset.x += Hash(step + 13.7f) * shakeRotationAmount;
+                rotOffset.y += Hash(step + 17.3f) * shakeRotationAmount;
+                rotOffset.z += Hash(step + 21.9f) * shakeRotationAmount;
+            }
+        }
+        if (windEnabled) {
+            float wt = phase * windFrequency;
+            float gust = 0.65f + 0.35f * Math.Sin(phase * windGustSpeed);
+            rotOffset.z += SmoothNoise(wt, 31.0f) * windRollAmount * gust;
+            rotOffset.x += SmoothNoise(wt, 43.0f) * windPitchAmount * gust;
+            rotOffset.y += SmoothNoise(wt, 57.0f) * windYawAmount * gust;
+        }
+        if (bobEnabled) to posOffset.y += Math.Sin(phase * bobSpeed) * bobAmount;
+        posOffset = posOffset * masterIntensity;
+        rotOffset = rotOffset * masterIntensity;
+
+        // ease toward the new offset so flipping a toggle ramps instead of popping
+        float k = (responseSpeed <= 0.0f) ? 1.0f : Math.Clamp01(1.0f - Math.Exp(-responseSpeed * dt));
+        vec3 nextPos = appliedPos + (posOffset - appliedPos) * k;
+        vec3 nextRot = appliedRot + (rotOffset - appliedRot) * k;
+        vec3 pos = obj.Transform.position;
+        obj.Transform.position = (pos - appliedPos) + nextPos;
+        vec3 rot = obj.Transform.rotation;
+        obj.Transform.rotation = (rot - appliedRot) + nextRot;
+        appliedPos = nextPos;
+        appliedRot = nextRot;
+    }
+
+    // pseudo-random in [-1, 1]; stepped per shake tick for a hard, jittery feel
+    float Hash(float n) {
+        float s = Math.Sin(n * 127.1f) * 43758.5453f;
+        return (s - Math.Floor(s)) * 2.0f - 1.0f;
+    }
+
+    // layered sines for organic, continuous wander (smooth shake + wind)
+    float SmoothNoise(float t, float seed) {
+        return Math.Sin(t + seed) * 0.55f + Math.Sin(t * 2.27f + seed * 1.7f) * 0.30f + Math.Sin(t * 4.73f + seed * 2.9f) * 0.15f;
+    }
+}

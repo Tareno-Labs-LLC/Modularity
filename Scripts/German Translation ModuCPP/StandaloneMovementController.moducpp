@@ -1,0 +1,33 @@
+Nutze ModuCPP;
+Nutze ModuEngine;
+Nutze ModuInput;
+öffentlich klasse SpielerBewegung : ModuNode {
+    öffentlich SceneObj kamera;
+    öffentlich float gehTempo = 4.0f;
+    öffentlich float sprintTempo = 7.0f;
+    öffentlich float beschleunigung = 20.0f;
+    öffentlich float abbremsung = 25.0f;
+    öffentlich float bodenPrüfDistanz = 0.1f;
+    öffentlich float sprungKraft = 6.5f;
+    privat float vertikalTempo = 0.0f;
+    Nichts Beginnen() { Ensure.obj; Ensure.Rigidbody3D(obj); }
+    Nichts Tick() {
+        Vector2 bewegung = Input.WASDMovement();
+        Vector3 richtung = Movement.Direction(bewegung, kamera);
+        float tempo = Input.ButtonHeld("Sprint") ? sprintTempo : gehTempo;
+        bool amBoden = obj.Physics.IsGrounded(bodenPrüfDistanz);
+        obj.Rigidbody3D.Accelerate(
+            richtung,
+            tempo,
+            beschleunigung,
+            abbremsung
+        );
+        obj.Transform.Face(richtung);
+        Wenn (amBoden) {
+            vertikalTempo = 0.0f;
+            Wenn (Input.ButtonDown("Jump")) dann vertikalTempo = sprungKraft;
+        }
+        sonst dann vertikalTempo = obj.Rigidbody3D.VelocityY;
+        obj.Rigidbody3D.AddVelocityY(vertikalTempo);
+    }
+}

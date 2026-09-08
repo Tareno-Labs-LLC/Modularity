@@ -1,0 +1,297 @@
+add ModuCPP;
+add ModuEngine;
+add ModuInput;
+add ModuCPP.Experimental;
+#include "DialoguePortShared.h"
+using namespace DialoguePort;
+
+public enum InteractableType {Dialogue, ToggleObjects}
+
+SubScript InteractionOption
+{
+    public string optionName = "New Option";
+    public int interactionType = 0;
+    public string dialogueSystemRef;
+    public DialoguePort.DialogueLine[] dialogueLines;
+    public string[] dialogueItemsToEnableOnEnd;
+    public string[] dialogueItemsToDisableOnEnd;
+    public string[] itemsToEnable;
+    public string[] itemsToDisable;
+}
+
+public class InteractableObject : ModuNode
+{
+    [Header("Basics")]
+    public bool canInteract = true;
+    public bool oneTimeUse = false;
+    public bool interactOnKeyPress = true;
+    public bool requirePlayerInRange = false;
+    [Slider(0.0f, 100.0f)] public float interactDistance = 2.5f;
+    public bool debugRange = false;
+    [ObjectRef] public string playerRef;
+    public string selectionNameOverride;
+
+    [Header("Selection")]
+    public bool isSelected = false;
+    [ObjectList] public string[] selectedStateEnable;
+    [ObjectList] public string[] selectedStateDisable;
+
+    [Header("Interaction")]
+    public int selectedOptionIndex = 0;
+    public InteractionOption[] options;
+
+    private bool prevInteractDown = false;
+    private bool hasSelectionState = false;
+    private bool lastSelectionState = false;
+    private float lastRangeDistance = -1.0f;
+    private bool lastRangeInRange = false;
+    private bool lastRangeHasPlayer = false;
+    private vec3 lastPlayerWorldPos = vec3(0.0f);
+    private vec3 lastSelfWorldPos = vec3(0.0f);
+
+    inspector
+    {
+        Tabs {
+            Tab("Basics") {
+                AutoFields(canInteract, oneTimeUse, interactOnKeyPress, requirePlayerInRange,
+                           interactDistance, debugRange, playerRef, selectionNameOverride);
+                Run(DrawInteractNowButton());
+            }
+
+            Tab("Selection") {
+                AutoFields(isSelected, selectedStateEnable, selectedStateDisable);
+                Run(DrawSelectionNameInfo());
+            }
+
+            Tab("Options") {
+                AutoFields(selectedOptionIndex, options);
+            }
+
+            Tab("Runtime") {
+                Run(DrawRuntimeStatus());
+            }
+        }
+    }
+
+    void Begin()
+    {
+        if (!ctx.object) return;
+
+        ResetRuntimeState();
+        MigrateLegacyOptionsIfNeeded();
+        applySelectedState();
+    }
+
+    void TickUpdate()
+    {
+        if (!ctx.object) return;
+
+        SyncSelectedState();
+        isPlayerInRange();
+
+        if (!interactOnKeyPress || !ConsumeInteractPressed()) {
+            return;
+        }
+
+        interact();
+    }
+
+    void ResetRuntimeState()
+    {
+        prevInteractDown = false;
+        hasSelectionState = true;
+        lastSelectionState = isSelected;
+        lastRangeDistance = -1.0f;
+        lastRangeInRange = false;
+        lastRangeHasPlayer = false;
+        lastPlayerWorldPos = vec3(0.0f);
+        lastSelfWorldPos = ctx.object ? GetObjectReferencePosition(ctx, *ctx.object) : vec3(0.0f);
+    }
+
+    void MigrateLegacyOptionsIfNeeded()
+    {
+        if (!options.empty()) return;
+
+        string legacyBlob = ctx.GetSetting("optionsBlob", "");
+        if (legacyBlob.empty()) return;
+
+        options = DeserializeSubScriptArray<InteractionOption>(legacyBlob);
+        if (options.empty()) return;
+
+        ctx.SetSetting("options", SerializeSubScriptArray(options));
+        ctx.SetSetting("optionsBlob", "");
+        // ctx.SetSetting already marks dirty; no manual MarkDirty needed here.
+    }
+
+    void SyncSelectedState()
+    {
+        if (hasSelectionState && lastSelectionState == isSelected) {
+            return;
+        }
+        applySelectedState();
+        hasSelectionState = true;
+        lastSelectionState = isSelected;
+    }
+
+    bool ConsumeInteractPressed()
+    {
+        const bool interactDown = isInteractDown();
+        const bool interactPressed = interactDown && !prevInteractDown;
+        prevInteractDown = interactDown;
+        return interactPressed;
+    }
+
+    bool interact()
+    {
+        if (!canInteract || options.empty()) {
+            return false;
+        }
+
+        if (!isPlayerInRange()) {
+            if (requirePlayerInRange && debugRange) {
+                if (lastRangeHasPlayer) {
+                    char msg[256];
+                    std::snprintf(msg, sizeof(msg),
+                                  "InteractableObject: out of range (distance %.2f > %.2f).",
+                                  lastRangeDistance,
+                                  Math.Max(0.0f, interactDistance));
+                    ctx.AddConsoleMessage(msg, ConsoleMessageType::Info);
+                } else {
+                    ctx.AddConsoleMessage("InteractableObject: player reference is missing or unresolved for range check.",
+                                          ConsoleMessageType::Warning);
+                }
+            }
+            return false;
+        }
+
+        const int optionIndex = Math.Clamp(selectedOptionIndex, 0, (int)options.size() - 1);
+        selectedOptionIndex = optionIndex;
+        const InteractionOption option = options[optionIndex];
+
+        const bool executed = executeOption(option);
+        if (executed && oneTimeUse) {
+            canInteract = false;
+            ctx.SetSetting("canInteract", "0");
+        }
+
+        return executed;
+    }
+
+    bool executeOption(InteractionOption option)
+    {
+        if (option.interactionType == 0) {
+            return executeDialogueOption(option);
+        }
+
+        SetObjectsEnabledState(ctx, option.itemsToEnable, true);
+        SetObjectsEnabledState(ctx, option.itemsToDisable, false);
+        return true;
+    }
+
+    bool executeDialogueOption(InteractionOption option)
+    {
+        auto dialogueObject = ResolveObject(option.dialogueSystemRef);
+        if (!dialogueObject) {
+            ctx.AddConsoleMessage("InteractableObject: dialogue option is missing a valid DialogueSystem object reference.",
+                                  ConsoleMessageType::Warning);
+            return false;
+        }
+
+        const DialogueScriptTarget dialogueTarget = FindDialogueScriptTarget(ctx, dialogueObject);
+        if (!dialogueTarget.script || !dialogueTarget.object) {
+            ctx.AddConsoleMessage("InteractableObject: target DialogueSystem object has no DialogueSystem script in its hierarchy.",
+                                  ConsoleMessageType::Warning);
+            return false;
+        }
+
+        bool changed = false;
+        changed |= WriteScriptSetting(dialogueTarget.script, kInteractionRequestPending, "1");
+        changed |= WriteScriptSetting(dialogueTarget.script, kInteractionOverrideLines,
+                                    SerializeDialogueLines(option.dialogueLines));
+        changed |= WriteScriptSetting(dialogueTarget.script, kInteractionEndEnable,
+                                    SerializeObjectRefs(option.dialogueItemsToEnableOnEnd));
+        changed |= WriteScriptSetting(dialogueTarget.script, kInteractionEndDisable,
+                                    SerializeObjectRefs(option.dialogueItemsToDisableOnEnd));
+        changed |= WriteScriptSetting(dialogueTarget.script, kInteractionPlayerRef, playerRef);
+
+        const int currentSerial = ParseInt(GetScriptSetting(dialogueTarget.script, kInteractionRequestSerial, "0"), 0);
+        changed |= WriteScriptSetting(dialogueTarget.script, kInteractionRequestSerial, std::to_string(currentSerial + 1));
+        changed |= SetObjectEnabledState(ctx, dialogueTarget.object, true);
+
+        // WriteScriptSetting auto-dirties on change; SetObjectEnabledState dirties internally.
+        (void)changed;
+
+        return true;
+    }
+
+    void applySelectedState()
+    {
+        SetObjectsEnabledState(ctx, selectedStateEnable, isSelected);
+        SetObjectsEnabledState(ctx, selectedStateDisable, !isSelected);
+    }
+
+    bool isInteractDown()
+    {
+        return IsRuntimeKeyDown(GLFW_KEY_E, ImGuiKey_E);
+    }
+
+    bool isPlayerInRange()
+    {
+        if (!ctx.object) return false;
+
+        auto player = ResolveObject(playerRef);
+        if (!player) {
+            lastRangeHasPlayer = false;
+            lastRangeInRange = false;
+            lastRangeDistance = -1.0f;
+            lastSelfWorldPos = GetObjectReferencePosition(ctx, *ctx.object);
+            lastPlayerWorldPos = vec3(0.0f);
+            return !requirePlayerInRange;
+        }
+
+        const vec3 selfPos = GetObjectReferencePosition(ctx, *ctx.object);
+        const vec3 playerPos = GetObjectReferencePosition(ctx, *player);
+        const vec3 delta = playerPos - selfPos;
+        const float range = Math.Max(0.0f, interactDistance);
+        const float distanceSq = glm::dot(delta, delta);
+        const bool inRange = distanceSq <= (range * range);
+
+        lastRangeHasPlayer = true;
+        lastRangeInRange = inRange;
+        lastRangeDistance = std::sqrt(Math.Max(0.0f, distanceSq));
+        lastSelfWorldPos = selfPos;
+        lastPlayerWorldPos = playerPos;
+
+        return !requirePlayerInRange || inRange;
+    }
+
+    void DrawSelectionNameInfo()
+    {
+        ImGui::TextDisabled("Selection Name: %s", GetCurrentObjectName(ctx, "Interactable").c_str());
+    }
+
+    bool DrawInteractNowButton()
+    {
+        return ImGui::Button("Interact Now") && interact();
+    }
+
+    void DrawRuntimeStatus()
+    {
+        ImGui::Separator();
+        ImGui::TextUnformatted("Runtime");
+        ImGui::TextDisabled("Can Interact: %s", canInteract ? "Yes" : "No");
+        ImGui::TextDisabled("Options: %zu", options.size());
+        ImGui::TextDisabled("Selected Option: %d", selectedOptionIndex);
+        if (!requirePlayerInRange && !debugRange) return;
+        if (!lastRangeHasPlayer) {
+            ImGui::TextDisabled("Range: player not found");
+            return;
+        }
+
+        ImGui::TextDisabled("Range Distance: %.2f / %.2f", lastRangeDistance, Math.Max(0.0f, interactDistance));
+        ImGui::TextDisabled("In Range: %s", lastRangeInRange ? "Yes" : "No");
+        if (!debugRange) return;
+        ImGui::TextDisabled("Self Pos: (%.2f, %.2f, %.2f)", lastSelfWorldPos.x, lastSelfWorldPos.y, lastSelfWorldPos.z);
+        ImGui::TextDisabled("Player Pos: (%.2f, %.2f, %.2f)", lastPlayerWorldPos.x, lastPlayerWorldPos.y, lastPlayerWorldPos.z);
+    }
+}

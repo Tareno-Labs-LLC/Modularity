@@ -1,0 +1,12 @@
+execute_process(
+    COMMAND "@CMAKE_COMMAND@"
+            "-DSRC_ROOT=@CMAKE_SOURCE_DIR@"
+            "-DBUILD_ROOT=@CMAKE_BINARY_DIR@"
+            "-DDST_ROOT=${CMAKE_INSTALL_PREFIX}/@CMAKE_INSTALL_BINDIR@/Resources/ScriptSDK"
+            -P "@MODULARITY_SCRIPT_SDK_COPY_SCRIPT@"
+    RESULT_VARIABLE modu_script_sdk_result
+)
+
+if(NOT modu_script_sdk_result EQUAL 0)
+    message(FATAL_ERROR "Failed to install ScriptSDK.")
+endif()

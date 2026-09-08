@@ -1,0 +1,9 @@
+{
+	"language": {
+		"id": "english",
+		"displayName": "English",
+		"endonym": "English"
+	},
+	"_comment": "English is the canonical ModuCPP syntax: its tokens are the ones the lexer, parser and C++ backend actually use, so it has no aliases. Copy this file into a new language folder and fill in 'aliases' to add a syntax language without recompiling the engine. 'position' is \"keyword\" (default, never matches after '.', '::' or '->') or \"member\" (only matches there, for built-in API aliases). Set \"identifying\": false on spellings that are also plausible English identifiers so they translate but never vote in automatic source-language detection. Order matters: when translating INTO this language, the first alias listed for a canonical token is the spelling that gets written.",
+	"aliases": []
+}

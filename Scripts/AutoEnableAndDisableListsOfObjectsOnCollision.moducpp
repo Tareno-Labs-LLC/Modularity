@@ -1,0 +1,9 @@
+add ModuCPP;
+public class AutoEnableAndDisableListsOfObjectsOnCollision : ModuNode {
+    public SceneObj[] enable;
+    public SceneObj[] disable;
+    OnCollideEnter(Col other) {
+        each enable.state(true);
+        each disable.state(false);
+    }
+}

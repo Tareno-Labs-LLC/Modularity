@@ -1,0 +1,30 @@
+add ModuCPP;
+add ModuInput;
+
+// Tests: obj.UI.Order, obj.UI.SetFront(), obj.UI.SetBack(), sorting order
+// Attach this to multiple UI objects in the same canvas.
+// Press Space to cycle the attached object to the front, R to send it to the back.
+
+public class UILayeringTest : ModuNode
+{
+    public int baseOrder = 0;
+
+    void Begin()
+    {
+        obj.UI.Order = baseOrder;
+        AddLog("UILayeringTest: initial order = " + IntR(baseOrder), Type.Info);
+    }
+
+    void TickUpdate()
+    {
+        if (ModuInput.KeyDown("Space")) {
+            obj.UI.SetFront();
+            AddLog(ctx.ObjectName() + " moved to front (order=" + IntR(obj.UI.Order) + ")", Type.Info);
+        }
+
+        if (ModuInput.KeyDown("R")) {
+            obj.UI.SetBack();
+            AddLog(ctx.ObjectName() + " moved to back (order=" + IntR(obj.UI.Order) + ")", Type.Info);
+        }
+    }
+}

@@ -1,0 +1,13 @@
+add ModuCPP;
+add ModuInput;
+add ModuInput.XR;
+public class InputsTest : ModuNode {
+    public SceneObj[] enable;
+    public SceneObj[] disable;
+    void TickUpdate() {
+        if   (InputXR.Left.ButtonDown ("Trigger")) then each disable.state(true);
+   else if   (InputXR.Left.ButtonUp   ("Trigger")) then each enable.state(true);
+        if   (InputXR.Right.ButtonDown("Trigger")) then each disable.state(false);
+   else if   (InputXR.Right.ButtonUp  ("Trigger")) then each enable.state(false);
+    }
+}

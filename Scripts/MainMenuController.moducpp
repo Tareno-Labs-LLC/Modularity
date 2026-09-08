@@ -1,0 +1,141 @@
+add ModuCPP;
+add ModuEngine;
+add ModuInput;
+enum class MenuOrientation {Vertical, Horizontal}
+SubScript MenuAction {public SceneObj[] enable; public SceneObj[] disable;}
+public class MainMenuController : ModuNode {
+    public MenuOrientation orientation = MenuOrientation.Vertical;
+    [ObjectRef]  public SceneObj heart;
+    [ObjectList] public SceneObj[] menuItems;
+    [ObjectRef]  public SceneObj moveSound;
+    [ObjectRef]  public SceneObj selectSound;
+    public float        moveSpeed    = 0.3f;
+    public float        offset       = 20.0f;
+    public float        inputDelay   = 0.2f;
+    public float        initialDelay = 0.2f;
+    public MenuAction[] actions;
+    private int         currentIndex = 0;
+    private float       nextInputTime = 0.0f;
+    private float       startupDelayRemaining = 0.0f;
+    private float       elapsed = 0.0f;
+    private Vector2     lerpStart = Vector2(0.0f, 0.0f);
+    private Vector2     lerpEnd   = Vector2(0.0f, 0.0f);
+    private float       lerpT     = 1.0f;
+    private bool        initialized = false;
+    inspector {
+        Tabs {
+            Tab("Layout") {
+                Enum("Menu Orientation", orientation);
+                AutoFields(heart, menuItems);
+                Slider("Offset", offset, -500.0f, 500.0f);
+            }
+            Tab("Timing")  {AutoFields(moveSpeed, inputDelay, initialDelay);}
+            Tab("Audio")   {AutoFields(moveSound, selectSound);}
+            Tab("Actions") {AutoFields(actions);}
+            Tab("Runtime") {Run(DrawRuntimeStatus());}
+        }
+    }
+    void Begin() {
+        SyncActionsToMenuItems();
+        currentIndex = 0;
+        nextInputTime = 0.0f;
+        startupDelayRemaining = initialDelay;
+        elapsed = 0.0f;
+        initialized = false;
+        UpdateHeartPosition(1.0f);
+        initialized = true;
+    }
+    void TickUpdate() {
+        SyncActionsToMenuItems();
+        if (!initialized) {
+            currentIndex = 0;
+            nextInputTime = 0.0f;
+            startupDelayRemaining = initialDelay;
+            elapsed = 0.0f;
+            initialized = true;
+        }
+        int itemCount = menuItems.size();
+        if (itemCount <= 0) {UpdateHeartPosition(dt); return;}
+        currentIndex = Math.Clamp(currentIndex, 0, itemCount - 1);
+        elapsed = elapsed + dt;
+        startupDelayRemaining = Math.Max(0.0f, startupDelayRemaining - dt);
+        bool canMove = startupDelayRemaining <= 0.0f;
+        if (canMove && elapsed >= nextInputTime) {
+            int direction = ReadDirection();
+            if (direction != 0) {
+                currentIndex = currentIndex + direction;
+                if (currentIndex < 0)          then currentIndex = itemCount - 1;
+                if (currentIndex >= itemCount) then currentIndex = 0;
+                nextInputTime = elapsed + Math.Max(0.0f, inputDelay);
+                if (moveSound) then Audio.PlayOneShot(moveSound);
+            }
+            if (IsSubmitPressed()) {
+                ExecuteAction(currentIndex);
+                if (selectSound) then Audio.PlayOneShot(selectSound);
+                nextInputTime = elapsed + Math.Max(0.0f, inputDelay);
+            }
+        }
+        UpdateHeartPosition(dt);
+    }
+    int ReadDirection() {// Input
+        if (orientation == MenuOrientation.Vertical) {
+            if (Input.IsKeyDown(Key.S, Key.Down)) then return 1;
+            if (Input.IsKeyDown(Key.W, Key.Up))   then return -1; return 0;
+        }
+        if (Input.IsKeyDown(Key.D, Key.Right)) then return 1;
+        if (Input.IsKeyDown(Key.A, Key.Left))  then return -1; return 0;
+    }
+    bool IsSubmitPressed() {return Input.IsKeyDown(Key.Enter);}
+    void UpdateHeartPosition(float dt) {// Heart cursor
+        if (!heart || !heart.UI.Exists) return;
+        if (currentIndex < 0 || currentIndex >= menuItems.size()) return;
+        string targetRef = menuItems[currentIndex];
+        if (targetRef.empty() || !UIExists(targetRef)) return;
+        Vector2 targetPos = UIPosition(targetRef);
+        float itemHalfW  = Math.Max(0.0f, UISize(targetRef).x * 0.5f);
+        float itemHalfH  = Math.Max(0.0f, UISize(targetRef).y * 0.5f);
+        float heartHalfW = Math.Max(0.0f, heart.UI.Size.x * 0.5f);
+        float heartHalfH = Math.Max(0.0f, heart.UI.Size.y * 0.5f);
+        if (orientation == MenuOrientation.Vertical) then targetPos.x = targetPos.x - (itemHalfW + heartHalfW + offset);
+        else targetPos.y = targetPos.y - (itemHalfH + heartHalfH + offset);
+        if (!initialized) {
+            lerpStart = heart.UI.Position;
+            lerpEnd   = targetPos;
+            lerpT     = 1.0f;
+        }
+        if (Math.Distance(lerpEnd, targetPos) > 0.001f) {
+            lerpStart = heart.UI.Position;
+            lerpEnd   = targetPos;
+            lerpT     = 0.0f;
+        }
+        if (moveSpeed <= 0.0001f) then lerpT = 1.0f;
+        else if (lerpT < 1.0f)    then lerpT = Math.Min(1.0f, lerpT + dt / moveSpeed);
+
+        float oneMinusT = 1.0f - lerpT;
+        float easedT    = 1.0f - oneMinusT * oneMinusT * oneMinusT;
+        Vector2 newPos  = Math.Mix(lerpStart, lerpEnd, easedT);
+        if (Math.Distance(newPos, heart.UI.Position) > 0.001f) then heart.UI.Position = newPos;
+    }
+    void SyncActionsToMenuItems() {
+        if (actions.size() == menuItems.size()) return;
+        actions.resize(menuItems.size());
+    }
+    void ExecuteAction(int index) {
+        if (index < 0 || index >= actions.size()) {
+            AddLog("MainMenuController: no action assigned for current menu item.", Type.Warning); return;
+        }
+        MenuAction action = actions[index];
+        each obj in action.disable then obj.State(false); each obj in action.enable  then obj.State(true);
+    }
+    void DrawRuntimeStatus() {
+        UI.Separator();
+        UI.TextDisabled("Menu Items: " + IntR(menuItems.size()));
+        UI.TextDisabled("Actions: "    + IntR(actions.size()));
+        if(!initialized){UI.TextDisabled("State: idle"); return;}
+        UI.TextDisabled("Current Index: "           + IntR(currentIndex + 1));
+        UI.TextDisabled(initialized ? "Initialized: Yes" : "Initialized: No");
+        UI.TextDisabled("Startup Delay Remaining: " + FloatR(startupDelayRemaining, 2));
+        UI.TextDisabled("Next Input Time: "         + FloatR(nextInputTime, 2));
+        UI.TextDisabled("Elapsed: "                 + FloatR(elapsed, 2));
+    }
+}

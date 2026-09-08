@@ -1,0 +1,5 @@
+add ModuCPP;
+add ModuEngine;
+public class FPSDisplay : ModuNode {
+    void TickUpdate() to obj.UILabel = "FPS: " + IntR(ModuEngine.FPS);
+}

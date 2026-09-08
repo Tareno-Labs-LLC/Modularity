@@ -1,0 +1,13 @@
+{
+    "files.associations": {
+        "iostream": "cpp",
+        "sstream": "cpp"
+    },
+    "makefile.configureOnOpen": true,
+    "cmake.sourceDirectory": "${workspaceFolder}",
+    "C_Cpp.errorSquiggles": "disabled",
+    "git.detectSubmodules": true,
+    "git.autoRepositoryDetection": "subFolders",
+    "git.postCommitCommand": "push",
+    "moducpp.lsp.executable": "c:\\Users\\theja\\Code\\Modularity\\build\\release\\Modularity.exe"
+}

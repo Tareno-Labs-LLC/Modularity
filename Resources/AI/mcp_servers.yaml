@@ -1,0 +1,12 @@
+mcpServers:
+  - name: fs
+    command: node
+    args:
+      - ./Resources/AI/fs-mcp-launcher.js
+
+  - name: tavily
+    command: npx
+    args:
+      - -y
+      - mcp-remote
+      - "https://mcp.tavily.com/mcp/?tavilyApiKey=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"

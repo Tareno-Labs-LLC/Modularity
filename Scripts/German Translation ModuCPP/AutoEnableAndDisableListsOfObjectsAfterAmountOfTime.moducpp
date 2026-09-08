@@ -1,0 +1,13 @@
+Nutze ModuCPP;
+öffentlich klasse ZeitObjektSchalter : ModuNode {
+    öffentlich SceneObj[] an;
+    öffentlich SceneObj[] aus;
+    öffentlich float intervall = 1.0f;
+    privat float timer = 0.0f;
+    Nichts Start() zu timer.Starten(intervall);
+    Nichts Tick() {
+        Wenn (!timer.Bereit) Zurück;
+        für an.Zustand(true);
+        für aus.Zustand(false);
+    }
+}

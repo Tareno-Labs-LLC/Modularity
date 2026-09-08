@@ -1,0 +1,97 @@
+add ModuCPP;
+add ModuEngine;
+
+public class RigidbodyTest : ModuBehaviour {
+    void Script_OnInspector() {
+        auto& config = Config<RigidbodyTestConfig>();
+        bindConfig(ctx, config);
+        auto& state = State<RigidbodyTestState>();
+
+        ImGui::TextUnformatted("RigidbodyTest");
+        ImGui::Separator();
+
+        bool changed = false;
+        changed |= ImGui::Checkbox("Launch on Begin", &config.autoLaunch);
+        changed |= ImGui::Checkbox("Show Velocity Readback", &config.showVelocity);
+        changed |= ImGui::DragFloat3("Launch Velocity", &config.launchVelocity.x, 0.25f, -50.0f, 50.0f, "%.2f");
+        changed |= ImGui::DragFloat3("Teleport Offset", &config.teleportOffset.x, 0.1f, -10.0f, 10.0f, "%.2f");
+        if (changed) {
+            ctx.SaveAutoSettings();
+        }
+
+        if (ImGui::Button("Launch Now")) {
+            Launch(ctx, config, state);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Zero Velocity")) {
+            if (!ctx.SetRigidbodyVelocity(vec3(0.0f))) {
+                warnOnce(ctx, state.warnedMissingRb, "RigidbodyTest: zeroing velocity requires a Rigidbody");
+            }
+        }
+
+        if (ImGui::Button("Teleport Offset")) {
+            Teleport(ctx, config, state);
+        }
+
+        vec3 currentVelocity;
+        if (config.showVelocity && ctx.GetRigidbodyVelocity(currentVelocity)) {
+            ImGui::Text("Velocity: (%.2f, %.2f, %.2f)", currentVelocity.x, currentVelocity.y, currentVelocity.z);
+        } else if (config.showVelocity) {
+            ImGui::TextDisabled("Velocity readback requires a Rigidbody");
+        }
+
+        if (obj) {
+            ImGui::TextDisabled("Attached to: %s (id=%d)", obj->name.c_str(), obj->id);
+        }
+    }
+
+    void Begin() {
+        auto& config = Config<RigidbodyTestConfig>();
+        bindConfig(ctx, config);
+        auto& state = State<RigidbodyTestState>();
+        if (config.autoLaunch) {
+            Launch(ctx, config, state);
+        }
+    }
+}
+
+namespace {
+
+struct RigidbodyTestConfig {
+    bool autoLaunch = true;
+    vec3 launchVelocity = vec3(0.0f, 6.0f, 8.0f);
+    vec3 teleportOffset = vec3(0.0f, 1.0f, 0.0f);
+    bool showVelocity = true;
+};
+
+struct RigidbodyTestState {
+    bool warnedMissingRb = false;
+};
+
+void bindConfig(ScriptContext& ctx, RigidbodyTestConfig& config) {
+    BindSetting(ctx, "autoLaunch", config.autoLaunch);
+    BindSetting(ctx, "launchVelocity", config.launchVelocity);
+    BindSetting(ctx, "teleportOffset", config.teleportOffset);
+    BindSetting(ctx, "showVelocity", config.showVelocity);
+}
+
+void Launch(ScriptContext& ctx, const RigidbodyTestConfig& config, RigidbodyTestState& state) {
+    if (ctx.HasRigidbody()) {
+        ctx.SetRigidbodyVelocity(config.launchVelocity);
+        state.warnedMissingRb = false;
+    } else {
+        warnOnce(ctx, state.warnedMissingRb, "RigidbodyTest: attach a Rigidbody component");
+    }
+}
+
+void Teleport(ScriptContext& ctx, const RigidbodyTestConfig& config, RigidbodyTestState& state) {
+    if (!ctx.object) return;
+
+    const vec3 targetPos = ctx.object->position + config.teleportOffset;
+    const vec3 targetRot = ctx.object->rotation;
+    if (!ctx.TeleportRigidbody(targetPos, targetRot)) {
+        warnOnce(ctx, state.warnedMissingRb, "RigidbodyTest: teleport failed (needs Rigidbody)");
+    }
+}
+
+} // namespace

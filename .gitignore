@@ -1,0 +1,22 @@
+build/
+.cache/
+Images-thingy/
+svgimagesamples/
+compile_commands.json
+Scripts/Managed/bin/
+Scripts/Managed/obj/
+CrashReports/
+.vscode/
+.idea/
+.claude/
+
+# The vendored Windows FFmpeg ships avfilter-11.dll at 124 MB, over the 100 MB
+# body limit the LFS remote sits behind. Nothing in the engine links or ships
+# it (we link avformat/avcodec/avutil/swresample/swscale only), so it stays a
+# local-only file. Re-fetch it from the gyan.dev full build if you need ffplay.
+src/ThirdParty/FFMPEG-8.1.2/bin/avfilter-11.dll
+
+# git-lfs writes its hooks into a literal dev/null directory when the native
+# Windows binary resolves core.hooksPath=/dev/null as a relative path. They are
+# never executed from here; the real hooks live in .git/hooks.
+/dev/

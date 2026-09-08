@@ -1,0 +1,38 @@
+add ModuCPP;
+add ModuInput;
+mark CollisionNamespaceTest;
+//^--- This allows your namespace to be used by using 'add CollisionNamespaceTest' in another script.
+//     You can add another by calling the same 'Mark NamespaceNamehere' in another script to add it to the same group.
+
+public class CollisionTest : ModuNode {
+    public SceneObj[] enable;
+    public SceneObj[] disable;
+    public bool ShouldEnableAndDisable;
+
+    void Begin() to ShouldEnableAndDisable = true;
+
+    // NEW! - Collision values will allow you to check states of collision of itself,
+    // or as seen in col meaning collider, and other meaning the other object.
+    OnCollideEnter(Col other) {
+        if (ShouldEnableAndDisable) {
+            each enable.state(true);
+            each disable.state(false);
+        }
+    }
+
+    // by default, it's 2f, if You'd like it to be longer.
+    // Use 'OnCollideHold(Col other 3.5f) {' with your own number value.
+    OnCollideHold(Col other) {
+        if (ShouldEnableAndDisable) {
+            each enable.state(true);
+            each disable.state(true);
+        }
+    }
+
+    OnCollideExit(Col other) {
+        if (ShouldEnableAndDisable) {
+            each enable.state(false);
+            each disable.state(true);
+        }
+    }   
+}

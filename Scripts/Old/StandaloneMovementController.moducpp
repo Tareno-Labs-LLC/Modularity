@@ -1,0 +1,83 @@
+add ModuCPP;
+add ModuEngine;
+
+public class StandaloneMovementController : ModuBehaviour {
+    void Script_OnInspector() {
+        auto& config = Config<StandaloneMovementControllerConfig>();
+        bindConfig(ctx, config);
+        ctx.DrawStandaloneMovementInspector(config.settings, &config.showDebug);
+    }
+
+    void Begin() {
+        if (!obj) return;
+
+        auto& config = Config<StandaloneMovementControllerConfig>();
+        bindConfig(ctx, config);
+        auto& state = State<StandaloneMovementControllerState>();
+        resetStateFromObject(state, *obj);
+
+        if (config.settings.enforceCollider) {
+            EnsureCapsuleCollider(config.settings.capsuleTuning.x, config.settings.capsuleTuning.y);
+        }
+        if (config.settings.enforceRigidbody) {
+            EnsureRigidbody(true, false);
+        }
+    }
+
+    void TickUpdate() {
+        float dt = time.deltaTime;
+        if (!obj || dt <= 0.0f) return;
+
+        auto& config = Config<StandaloneMovementControllerConfig>();
+        bindConfig(ctx, config);
+        auto& state = State<StandaloneMovementControllerState>();
+        if (!state.initialized) {
+            resetStateFromObject(state, *obj);
+        }
+
+        ctx.TickStandaloneMovement(state.movement, config.settings, dt, &state.debug);
+    }
+}
+
+namespace {
+
+struct StandaloneMovementControllerConfig {
+    ScriptContext::StandaloneMovementSettings settings = {
+        glm::vec3(4.5f, 7.5f, 6.5f),
+        glm::vec3(0.12f, 200.0f, 0.0f),
+        glm::vec3(1.8f, 0.4f, 0.2f),
+        glm::vec3(-9.81f, 0.4f, 30.0f),
+        glm::vec3(24.0f, 8.0f, 16.0f),
+        glm::vec3(0.2f, 40.0f, 1.0f),
+        true,
+        false,
+        true,
+        true
+    };
+    bool showDebug = false;
+};
+
+struct StandaloneMovementControllerState {
+    ScriptContext::StandaloneMovementState movement;
+    ScriptContext::StandaloneMovementDebug debug;
+    bool initialized = false;
+};
+
+void resetStateFromObject(StandaloneMovementControllerState& state, const SceneObject& object) {
+    state.movement.pitch = object.rotation.x;
+    state.movement.yaw = object.rotation.y;
+    state.movement.verticalVelocity = 0.0f;
+    state.movement.localVelocity = glm::vec2(0.0f);
+    state.movement.slideVelocity = glm::vec3(0.0f);
+    state.movement.lastGroundHitPos = glm::vec3(0.0f);
+    state.movement.hasGroundSample = false;
+    state.debug = ScriptContext::StandaloneMovementDebug{};
+    state.initialized = true;
+}
+
+void bindConfig(ScriptContext& ctx, StandaloneMovementControllerConfig& config) {
+    ctx.BindStandaloneMovementSettings(config.settings);
+    BindSetting(ctx, "showDebug", config.showDebug);
+}
+
+} // namespace

@@ -1,0 +1,38 @@
+add ModuCPP;
+add ModuEngine;
+public class SampleInspector : ModuBehaviour {
+    public bool autoRotate = false;
+    public Vector3 spinSpeed = Vector3(0.0f, 45.0f, 0.0f);
+    public Vector3 offset = Vector3(0.0f, 1.0f, 0.0f);
+    public string targetName = "MyTarget";
+    void ApplyAutoRotate() {
+        if (!obj || !autoRotate) return;
+        float dt = time.deltaTime;
+        if (ctx.HasRigidbody() && !obj->rigidbody.isKinematic) {
+            if (ctx.SetRigidbodyAngularVelocity(glm::radians(spinSpeed))) return;
+        }
+        ctx.SetRotation(obj->rotation + spinSpeed * dt);
+    }
+
+    void Script_OnInspector() {
+        UI.Text("SampleInspector");
+        UI.Separator();
+        bool changed = false;
+        changed |= UI.Checkbox("Auto Rotate", &autoRotate);
+        changed |= UI.DragFloat3("Spin Speed (deg/s)", &spinSpeed.x, 1.0f, -360.0f, 360.0f, "%.2f");
+        changed |= UI.DragFloat3("Offset", &offset.x, 0.1f, -1000.0f, 1000.0f, "%.2f");
+        changed |= EditString("Target Name", targetName, 128, "targetName");
+        if (changed) { SaveAutoSettings(); }
+        if (obj) {
+            ImGui::TextDisabled("Attached to: %s (id=%d)", obj->name.c_str(), obj->id);
+            if (UI.Button("Apply Offset To Self")) SetPosition(obj->position + offset);
+        }
+        if (UI.Button("Nudge Target")) {
+            if (auto target = ResolveObject(targetName)) target->position += offset;
+        }
+    }
+    void Begin() {}
+    void Spec() to ApplyAutoRotate();
+    void TestEditor() to ApplyAutoRotate();
+    void TickUpdate() to ApplyAutoRotate();
+}

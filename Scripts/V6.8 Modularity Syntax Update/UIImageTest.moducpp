@@ -1,0 +1,42 @@
+add ModuCPP;
+add ModuEngine;
+add ModuInput;
+
+// Tests: obj.UI.IsImage(), obj.UI.Image.Tint, obj.UI.Alpha, obj.UI.Size,
+//        obj.UI.Visible, obj.UI.Position
+
+public class UIImageTest : ModuNode
+{
+    public float bobSpeed = 1.5f;
+    public float bobAmount = 20.0f;
+    public bool toggled = true;
+    float baseY = 0.0f;
+
+    void Begin()
+    {
+        if (!obj.UI.IsImage()) then AddLog("UIImageTest: object is not an Image!", Type.Warning);
+
+        baseY = obj.UI.Position.y;
+        obj.UI.Image.Tint = Color(1.0f, 1.0f, 1.0f, 1.0f);
+    }
+
+    void TickUpdate()
+    {
+        float offset = Sin(ModuEngine.Time * bobSpeed) * bobAmount;
+        obj.UI.Position = Vector2(obj.UI.Position.x, baseY + offset);
+
+        if (ModuInput.KeyDown("T")) {
+            toggled = !toggled;
+            obj.UI.Visible = toggled;
+        }
+
+        if (ModuInput.Key("LeftShift")) {
+            float scroll = ModuInput.ScrollDelta();
+            if (scroll != 0.0f) {
+                Vector2 sz = obj.UI.Size;
+                float delta = scroll * 5.0f;
+                obj.UI.Size = Vector2(sz.x + delta, sz.y + delta);
+            }
+        }
+    }
+}

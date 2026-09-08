@@ -1,0 +1,74 @@
+add ModuCPP;
+add ModuEngine;
+
+// Tests: obj.UI.Button.*, obj.UI.OnClick, obj.UI.OnHover, obj.UI.OnUnhover,
+//        obj.UI.OnPress, obj.UI.OnRelease, obj.UI.Color, obj.UI.Order
+// Demonstrates hover fade, press scale, and jiggle-on-release animations.
+
+public class UIButtonTest : ModuNode
+{
+    public int clickCount = 0;
+
+    private float hoverT = 0.0f;
+    private float scaleT = 1.0f;
+    private float jiggleT = 0.0f;
+    private bool isHovered = false;
+    private bool isPressed = false;
+
+    void Begin()
+    {
+        if (!obj.UI.IsButton()) then AddLog("UIButtonTest: object is not a Button!", Type.Warning);
+
+        obj.UI.OnHover(() => { isHovered = true; });
+        obj.UI.OnUnhover(() => { isHovered = false; });
+
+        obj.UI.OnPress(() => {
+            isPressed = true;
+        });
+
+        obj.UI.OnRelease(() => {
+            isPressed = false;
+            jiggleT = 1.0f;
+        });
+
+        obj.UI.OnClick(() => {
+            clickCount = clickCount + 1;
+            obj.UI.Button.Text = "Clicks: " + IntR(clickCount);
+            AddLog("Button clicked! Total: " + IntR(clickCount), Type.Info);
+        });
+
+        obj.UI.Button.Text = "Click Me!";
+        obj.UI.Order = 1;
+    }
+
+    void TickUpdate()
+    {
+        float dt = time.deltaTime;
+
+        // Hover color lerp
+        float hoverTarget = 0.0f;
+        if (isHovered) then hoverTarget = 1.0f;
+        hoverT = hoverT + (hoverTarget - hoverT) * Math.Min(1.0f, dt * 12.0f);
+
+        float r = 1.0f - hoverT * 0.4f;
+        float g = 1.0f - hoverT * 0.1f;
+        float b = 1.0f + hoverT * 0.15f;
+        obj.UI.Color = Color(r, g, b, 1.0f);
+
+        // Press scale squish
+        float scaleTarget = 1.0f;
+        if (isPressed) then scaleTarget = 0.92f;
+        scaleT = scaleT + (scaleTarget - scaleT) * Math.Min(1.0f, dt * 20.0f);
+
+        // Jiggle on release: decaying sine oscillation
+        float jiggle = 0.0f;
+        if (jiggleT > 0.0f) {
+            jiggleT = jiggleT - dt * 4.5f;
+            if (jiggleT < 0.0f) then jiggleT = 0.0f;
+            jiggle = std::sin(jiggleT * 18.0f) * jiggleT * 0.06f;
+        }
+
+        float finalScale = scaleT + jiggle;
+        obj.UI.Scale = Vector2(finalScale, finalScale);
+    }
+}

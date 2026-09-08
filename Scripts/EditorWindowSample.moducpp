@@ -1,0 +1,141 @@
+add ModuCPP;
+add ModuEngine;
+
+public class EditorWindowSample : ModuBehaviour
+{
+    void RenderEditorWindow()
+    {
+        auto& config = Config<EditorWindowSampleConfig>();
+        bindConfig(ctx, config);
+
+        bool changed = false;
+
+        ImGui::TextUnformatted("Editor Window Sample");
+        ImGui::Separator();
+
+        changed |= ImGui::Checkbox("Clamp FPS To 120", &config.clampFps);
+        changed |= ImGui::DragFloat("Move Step", &config.moveStep, 0.01f, 0.01f, 10.0f, "%.2f");
+        changed |= ImGui::DragFloat("Rotate Step", &config.rotateStep, 1.0f, 1.0f, 180.0f, "%.1f");
+        changed |= ImGui::DragFloat("Scale Step", &config.scaleStep, 0.01f, 0.01f, 2.0f, "%.2f");
+        changed |= EditString("Log Message", config.note, 128, "note");
+
+        if (changed)
+        {
+            config.moveStep = Clamp(config.moveStep, 0.01f, 10.0f);
+            config.rotateStep = Clamp(config.rotateStep, 1.0f, 180.0f);
+            config.scaleStep = Clamp(config.scaleStep, 0.01f, 2.0f);
+            ctx.SaveAutoSettings();
+        }
+
+        if (config.clampFps)
+        {
+            ctx.SetFPSCap(true, 120.0f);
+        }
+
+        if (ImGui::Button("Log To Console"))
+        {
+            ctx.AddConsoleMessage("EditorWindowSample: " + config.note);
+        }
+
+        ImGui::Separator();
+
+        if (!obj)
+        {
+            ImGui::TextDisabled("Select an object to use the transform tools.");
+            return;
+        }
+
+        SceneObject* selected = ctx.object;
+        ImGui::TextDisabled("Selected object: %s (id=%d)", selected->name.c_str(), selected->id);
+
+        vec3 position = selected->position;
+        if (ImGui::DragFloat3("Position", &position.x, config.moveStep, -10000.0f, 10000.0f, "%.2f"))
+        {
+            ctx.SetPosition(position);
+        }
+
+        vec3 rotation = selected->rotation;
+        if (ImGui::DragFloat3("Rotation", &rotation.x, config.rotateStep, -3600.0f, 3600.0f, "%.1f"))
+        {
+            ctx.SetRotation(rotation);
+        }
+
+        vec3 scale = selected->scale;
+        if (ImGui::DragFloat3("Scale", &scale.x, config.scaleStep, 0.01f, 1000.0f, "%.2f"))
+        {
+            scale.x = Max(scale.x, 0.01f);
+            scale.y = Max(scale.y, 0.01f);
+            scale.z = Max(scale.z, 0.01f);
+            ctx.SetScale(scale);
+        }
+
+        if (ImGui::Button("Nudge +Y"))
+        {
+            position = selected->position;
+            position.y += config.moveStep;
+            ctx.SetPosition(position);
+        }
+
+        ImGui::SameLine();
+        if (ImGui::Button("Rotate +Y"))
+        {
+            rotation = selected->rotation;
+            rotation.y += config.rotateStep;
+            ctx.SetRotation(rotation);
+        }
+
+        ImGui::SameLine();
+        if (ImGui::Button("Grow Uniform"))
+        {
+            scale = selected->scale + vec3(config.scaleStep);
+            scale.x = Max(scale.x, 0.01f);
+            scale.y = Max(scale.y, 0.01f);
+            scale.z = Max(scale.z, 0.01f);
+            ctx.SetScale(scale);
+        }
+
+        if (ImGui::Button("Reset Local Transform"))
+        {
+            ctx.SetPosition(vec3(0.0f));
+            ctx.SetRotation(vec3(0.0f));
+            ctx.SetScale(vec3(1.0f));
+        }
+    }
+
+    void ExitRenderEditorWindow() {}
+}
+
+namespace
+{
+
+struct EditorWindowSampleConfig
+{
+    bool clampFps = false;
+    float moveStep = 0.25f;
+    float rotateStep = 15.0f;
+    float scaleStep = 0.10f;
+    std::string note = "Hello from ModuCPP";
+};
+
+void bindConfig(ScriptContext& ctx, EditorWindowSampleConfig& config)
+{
+    BindSetting(ctx, "clampFps", config.clampFps);
+    BindSetting(ctx, "moveStep", config.moveStep);
+    BindSetting(ctx, "rotateStep", config.rotateStep);
+    BindSetting(ctx, "scaleStep", config.scaleStep);
+    BindSetting(ctx, "note", config.note);
+}
+
+float Clamp(float value, float minValue, float maxValue)
+{
+    if (value < minValue) return minValue;
+    if (value > maxValue) return maxValue;
+    return value;
+}
+
+float Max(float a, float b)
+{
+    return a > b ? a : b;
+}
+
+} // namespace

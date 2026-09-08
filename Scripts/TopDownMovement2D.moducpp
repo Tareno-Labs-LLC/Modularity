@@ -1,0 +1,400 @@
+add ModuCPP;
+add ModuInput;
+add ModuEngine;
+
+public enum FacingDirection {Down, Up, Right, Left, DownRight, DownLeft, UpRight, UpLeft}
+public enum IdleState {Standing, Sitting, AlmostAsleep, Sleeping}
+
+public class TopDownMovement2D : ModuNode
+{
+    [Header("Top Down Movement 2D")]
+    [Slider(0.0f, 50.0f)]  public float walkSpeed = 4.0f;
+    [Slider(0.0f, 80.0f)]  public float runSpeed = 7.0f;
+    [Slider(0.0f, 200.0f)] public float acceleration = 18.0f;
+    [Slider(0.0f, 200.0f)] public float drag = 8.0f;
+    [Slider(1.0f, 30.0f)]  public float animationFps = 10.0f;
+    [Slider(1.0f, 60.0f)]  public float runAnimationFps = 14.0f;
+    [Slider(0.01f, 10.0f)] public float movementThreshold = 0.15f;
+
+    [Header("Idle & Sleep Animation")]
+    [Slider(0.0f, 60.0f)]  public float sitIdleTime = 3.0f;
+    [Slider(0.0f, 120.0f)] public float almostAsleepTime = 8.0f;
+    [Slider(0.0f, 180.0f)] public float sleepIdleTime = 12.0f;
+    [Slider(0.02f, 2.0f)]  public float sitAnimationSpeed = 0.3f;
+    [Slider(0.02f, 2.0f)]  public float sleepAnimationSpeed = 0.5f;
+
+    public int[8] idleClips;
+    public int[8][4] walkClips;
+    public int[8][2] sitIdleClips;
+    public int[8] almostAsleepClips;
+    public int[8][2] sleepingIdleClips;
+
+    [SoundSet("Footsteps")]
+    private string[6] stepSounds;
+
+    private FacingDirection facing = FacingDirection.Down;
+    private IdleState idleState = IdleState.Standing;
+    private Vector2 lastFacingMotion = Vector2(0.0f, -1.0f);
+    private float animationTime = 0.0f;
+    private float idleTime = 0.0f;
+    private float idleAnimationTime = 0.0f;
+    private int lastWalkFrame = -1;
+    private int nextFootstepIndex = 0;
+
+    void Begin() to ResetAnimationState();
+
+    void TickUpdate()
+    {
+        if (dt <= 0.0f) return;
+        Vector2 move = input.WASDNormalized();
+        bool running = input.sprint();
+        float speed = running ? runSpeed : walkSpeed;
+        Vector2 targetVelocity = move * speed;
+        Vector2 actualVelocity = targetVelocity;
+        TryMove(targetVelocity, dt, ref actualVelocity);
+        Vector2 motion = move.Dot(move) > 0.000001f ? targetVelocity : actualVelocity;
+        TickAnimation(motion, dt, running);
+    }
+
+    void TryMove(Vector2 targetVelocity, float dt, ref Vector2 actualVelocity)
+    {
+        actualVelocity = targetVelocity;
+        TryMoveRigidbody2D(ctx, targetVelocity, acceleration, drag, dt, ref actualVelocity);
+    }
+
+    void TickAnimation(Vector2 motion, float dt, bool running)
+    {
+        if (motion.Dot(motion) > movementThreshold * movementThreshold)
+        {
+            ApplyWalkingAnimation(motion, dt, running);
+            return;
+        }
+
+        ApplyIdleAnimation(dt);
+    }
+
+    void ApplyWalkingAnimation(Vector2 motion, float dt, bool running)
+    {
+        facing = ResolveFacing(motion, facing);
+        lastFacingMotion = motion;
+        idleTime = 0.0f;
+        idleAnimationTime = 0.0f;
+        idleState = IdleState.Standing;
+        animationTime += dt;
+
+        float fps = Math.Max(1.0f, running ? runAnimationFps : animationFps);
+        int frame = (int)(animationTime * fps) % 4;
+        int clip = SelectWalkClip(frame, motion);
+        if (clip >= 0) sprite.SetClip(clip);
+
+        PlayFootstepsBetweenFrames(lastWalkFrame, frame);
+        lastWalkFrame = frame;
+    }
+
+    void ApplyIdleAnimation(float dt)
+    {
+        animationTime = 0.0f;
+        lastWalkFrame = -1;
+        idleTime += dt;
+
+        IdleState newState = ResolveIdleState(idleTime);
+        if (newState != idleState)
+        {
+            idleState = newState;
+            idleAnimationTime = 0.0f;
+        }
+
+        if (idleState == IdleState.Standing)
+        {
+            int standingClip = SelectIdleClip();
+            if (standingClip >= 0) sprite.SetClip(standingClip);
+            return;
+        }
+
+        idleAnimationTime += dt;
+        int frame = 0;
+        if (idleState != IdleState.AlmostAsleep)
+        {
+            float frameDuration = IdleFrameDuration(idleState);
+            frame = (int)(idleAnimationTime / frameDuration) % 2;
+        }
+        int clip = SelectIdleAnimationClip(idleState, frame);
+        if (clip >= 0) sprite.SetClip(clip);
+    }
+
+    IdleState ResolveIdleState(float elapsed)
+    {
+        if (elapsed >= Math.Max(0.0f, sleepIdleTime)) return IdleState.Sleeping;
+        if (elapsed >= Math.Max(0.0f, almostAsleepTime)) return IdleState.AlmostAsleep;
+        if (elapsed >= Math.Max(0.0f, sitIdleTime)) return IdleState.Sitting;
+        return IdleState.Standing;
+    }
+
+    float IdleFrameDuration(IdleState stage)
+    {
+        if (stage == IdleState.Sitting) return Math.Max(0.02f, sitAnimationSpeed);
+        return Math.Max(0.02f, sleepAnimationSpeed);
+    }
+
+    void PlayFootstepsBetweenFrames(int previousFrame, int currentFrame)
+    {
+        int probe = previousFrame >= 0 ? previousFrame : 3;
+        while (probe != currentFrame)
+        {
+            probe = (probe + 1) % 4;
+            if (probe == 0 || probe == 2) PlayRandomFootstep();
+        }
+    }
+
+    void PlayRandomFootstep()
+    {
+        int[6] validIndices;
+        int count = 0;
+        for (int i = 0; i < 6; i++)
+        {
+            if (!stepSounds[i].IsEmpty()) validIndices[count++] = i;
+        }
+
+        if (count == 0) return;
+        int selected = validIndices[nextFootstepIndex % count];
+        nextFootstepIndex = (nextFootstepIndex + 1) % count;
+        audio.PlayOneShot(stepSounds[selected]);
+    }
+
+    int SelectWalkClip(int frame, Vector2 motion)
+    {
+        int dir = FacingIndex(facing);
+        int candidate = walkClips[dir][Math.Clamp(frame, 0, 3)];
+        if (IsValidClip(candidate)) return candidate;
+
+        candidate = FirstValidWalkFrame(dir);
+        if (IsValidClip(candidate)) return candidate;
+
+        if (IsDiagonal(facing))
+        {
+            FacingDirection fallback = CardinalFallback(motion);
+            int fallbackDir = FacingIndex(fallback);
+            candidate = walkClips[fallbackDir][Math.Clamp(frame, 0, 3)];
+            if (IsValidClip(candidate)) return candidate;
+
+            candidate = FirstValidWalkFrame(fallbackDir);
+            if (IsValidClip(candidate)) return candidate;
+        }
+
+        return SelectIdleClip();
+    }
+
+    int SelectIdleClip()
+    {
+        int dir = FacingIndex(facing);
+        int candidate = idleClips[dir];
+        if (IsValidClip(candidate)) return candidate;
+
+        if (IsDiagonal(facing))
+        {
+            int fallbackDir = FacingIndex(CardinalFallback(lastFacingMotion));
+            candidate = idleClips[fallbackDir];
+            if (IsValidClip(candidate)) return candidate;
+        }
+
+        for (int i = 0; i < 8; i++)
+        {
+            if (IsValidClip(idleClips[i])) return idleClips[i];
+        }
+
+        return -1;
+    }
+
+    int SelectIdleAnimationClip(IdleState stage, int frame)
+    {
+        int clampedFrame = Math.Clamp(frame, 0, 3);
+        int dir = FacingIndex(facing);
+        int candidate = IdleAnimationClipAt(stage, dir, clampedFrame);
+        if (IsValidClip(candidate)) return candidate;
+
+        candidate = FirstValidIdleAnimationFrame(stage, dir);
+        if (IsValidClip(candidate)) return candidate;
+
+        if (IsDiagonal(facing))
+        {
+            int verticalDir = FacingIndex(VerticalFallback(facing));
+            candidate = IdleAnimationClipAt(stage, verticalDir, clampedFrame);
+            if (IsValidClip(candidate)) return candidate;
+            candidate = FirstValidIdleAnimationFrame(stage, verticalDir);
+            if (IsValidClip(candidate)) return candidate;
+
+            int horizontalDir = FacingIndex(HorizontalFallback(facing));
+            candidate = IdleAnimationClipAt(stage, horizontalDir, clampedFrame);
+            if (IsValidClip(candidate)) return candidate;
+            candidate = FirstValidIdleAnimationFrame(stage, horizontalDir);
+            if (IsValidClip(candidate)) return candidate;
+        }
+
+        for (int fallbackDir = 0; fallbackDir < 8; fallbackDir++)
+        {
+            candidate = FirstValidIdleAnimationFrame(stage, fallbackDir);
+            if (IsValidClip(candidate)) return candidate;
+        }
+
+        return SelectIdleClip();
+    }
+
+    int IdleAnimationClipAt(IdleState stage, int dir, int frame)
+    {
+        if (stage == IdleState.Sitting) return sitIdleClips[dir][frame];
+        if (stage == IdleState.AlmostAsleep) return almostAsleepClips[dir];
+        return sleepingIdleClips[dir][frame];
+    }
+
+    int FirstValidWalkFrame(int dir)
+    {
+        for (int frame = 0; frame < 4; frame++)
+        {
+            if (IsValidClip(walkClips[dir][frame])) return walkClips[dir][frame];
+        }
+
+        return -1;
+    }
+
+    int FirstValidIdleAnimationFrame(IdleState stage, int dir)
+    {
+        int frameCount = stage == IdleState.AlmostAsleep ? 1 : 2;
+        for (int frame = 0; frame < frameCount; frame++)
+        {
+            int candidate = IdleAnimationClipAt(stage, dir, frame);
+            if (IsValidClip(candidate)) return candidate;
+        }
+
+        return -1;
+    }
+
+    void ResetAnimationState()
+    {
+        facing = FacingDirection.Down;
+        idleState = IdleState.Standing;
+        lastFacingMotion = Vector2(0.0f, -1.0f);
+        animationTime = 0.0f;
+        idleTime = 0.0f;
+        idleAnimationTime = 0.0f;
+        lastWalkFrame = -1;
+        nextFootstepIndex = 0;
+    }
+
+    int FacingIndex(FacingDirection direction) to (int)direction;
+    bool IsValidClip(int clip) to clip >= 0 && clip < ctx.GetSpriteClipCount();
+
+    bool IsDiagonal(FacingDirection direction)
+    {
+        return direction == FacingDirection.DownRight ||
+               direction == FacingDirection.DownLeft ||
+               direction == FacingDirection.UpRight ||
+               direction == FacingDirection.UpLeft;
+    }
+
+    FacingDirection ResolveFacing(Vector2 motion, FacingDirection fallback)
+    {
+        if (motion.Dot(motion) <= 0.000001f) return fallback;
+
+        bool hasX = Math.Abs(motion.x) > 0.01f;
+        bool hasY = Math.Abs(motion.y) > 0.01f;
+        if (hasX && hasY)
+        {
+            if (motion.x > 0.0f && motion.y > 0.0f) return FacingDirection.UpRight;
+            if (motion.x > 0.0f && motion.y < 0.0f) return FacingDirection.DownRight;
+            if (motion.x < 0.0f && motion.y > 0.0f) return FacingDirection.UpLeft;
+            return FacingDirection.DownLeft;
+        }
+
+        if (hasX) return motion.x >= 0.0f ? FacingDirection.Right : FacingDirection.Left;
+        if (hasY) return motion.y >= 0.0f ? FacingDirection.Up : FacingDirection.Down;
+        return fallback;
+    }
+
+    FacingDirection CardinalFallback(Vector2 motion)
+    {
+        if (Math.Abs(motion.x) >= Math.Abs(motion.y))
+        {
+            return motion.x >= 0.0f ? FacingDirection.Right : FacingDirection.Left;
+        }
+
+        return motion.y >= 0.0f ? FacingDirection.Up : FacingDirection.Down;
+    }
+
+    FacingDirection VerticalFallback(FacingDirection direction)
+    {
+        if (direction == FacingDirection.DownRight || direction == FacingDirection.DownLeft) return FacingDirection.Down;
+        return FacingDirection.Up;
+    }
+
+    FacingDirection HorizontalFallback(FacingDirection direction)
+    {
+        if (direction == FacingDirection.DownRight || direction == FacingDirection.UpRight) return FacingDirection.Right;
+        return FacingDirection.Left;
+    }
+
+    string DirectionLabel(int direction)
+    {
+        if (direction == 0) return "Down";
+        if (direction == 1) return "Up";
+        if (direction == 2) return "Right";
+        if (direction == 3) return "Left";
+        if (direction == 4) return "Down Right";
+        if (direction == 5) return "Down Left";
+        if (direction == 6) return "Up Right";
+        return "Up Left";
+    }
+
+    bool DrawAnimationClipGrid()
+    {
+        int clipCount = ctx.GetSpriteClipCount();
+        if (clipCount <= 0)
+        {
+            ModuGUI::TextDisabled("Enable Sprite Sheet clips on this object to assign animation frames.");
+            return false;
+        }
+
+        bool changed = false;
+        ModuGUI::TextDisabled("%d sprite clips available.", clipCount);
+        for (int dir = 0; dir < 8; dir++)
+        {
+            string direction = DirectionLabel(dir);
+            if (!ModuGUI::SubsectionFoldout(direction.c_str())) continue;
+
+            changed |= EditClipSelector(("Standing Idle##idle_" + std::to_string(dir)).c_str(), idleClips[dir]);
+            ModuGUI::TextDisabled("Walking");
+            for (int frame = 0; frame < 4; frame++)
+            {
+                changed |= EditClipSelector(("Walk " + std::to_string(frame + 1) + "##walk_" + std::to_string(dir)).c_str(), walkClips[dir][frame]);
+            }
+
+            ModuGUI::TextDisabled("Sitting");
+            for (int frame = 0; frame < 2; frame++)
+            {
+                changed |= EditClipSelector(("Sit " + std::to_string(frame + 1) + "##sit_" + std::to_string(dir)).c_str(), sitIdleClips[dir][frame]);
+            }
+
+            ModuGUI::TextDisabled("Almost Asleep");
+            changed |= EditClipSelector(("Almost Asleep##almost_" + std::to_string(dir)).c_str(), almostAsleepClips[dir]);
+
+            ModuGUI::TextDisabled("Sleeping");
+            for (int frame = 0; frame < 2; frame++)
+            {
+                changed |= EditClipSelector(("Sleeping " + std::to_string(frame + 1) + "##sleeping_" + std::to_string(dir)).c_str(), sleepingIdleClips[dir][frame]);
+            }
+
+            ModuGUI::TreePop();
+        }
+
+        return changed;
+    }
+
+    inspector
+    {
+        AutoFields(walkSpeed, runSpeed, acceleration, drag, animationFps, runAnimationFps, movementThreshold);
+        AutoFields(sitIdleTime, almostAsleepTime, sleepIdleTime, sitAnimationSpeed, sleepAnimationSpeed);
+        Separator();
+        Run(changed |= DrawAnimationClipGrid());
+        Separator();
+        SoundSet("Footsteps", stepSounds);
+    }
+}

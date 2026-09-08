@@ -1,0 +1,16 @@
+add ModuCPP;
+add ModuCPP.Experimental;
+
+public class TestScript : ModuNode
+{
+    public int TimerTimeThingy;
+    public SceneObj TestEnableObject;
+    void Begin()
+    {
+        timer.Start(TimerTimeThingy);
+        if(timer.Ready)
+        {
+            TimerTimeThingy.state(true);
+        }
+    }
+}

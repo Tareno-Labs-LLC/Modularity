@@ -1,0 +1,14 @@
+
+# Line endings are pinned per script type instead of being left to each clone's
+# core.autocrlf. Both failure modes are real and have bitten this repo:
+#   - a .bat checked out with LF makes cmd's `goto`/`call :label` scanner miss
+#     labels that are plainly in the file ("cannot find the batch label").
+#   - a .sh checked out with CRLF makes the kernel read the shebang as
+#     "/usr/bin/env bash\r" and fail with "bad interpreter".
+# On a Windows clone with autocrlf=true, git wants to hand build.sh CRLF, which
+# is the second case. These rules make the checkout correct either way.
+*.sh   text eol=lf
+*.bash text eol=lf
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf

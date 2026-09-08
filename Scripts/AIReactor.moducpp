@@ -1,0 +1,35 @@
+add ModuCPP;
+add ModuEngine;
+public class AIReactor : ModuNode {
+    public int SpawnID;
+    public SceneObj player;
+    [Header("AI Navigation Action Values.")]
+    public bool attacked = false;
+    public bool playerTooClose = false;
+    public int playerNear = 16;
+    public int playerFar = 48;
+    public int approach = 10;
+    void TickUpdate() {
+        if (!ensure.player) then AddLog("There ain't no Player assigned, PLEASE assign me!", Type.Warning); & return;
+        else if (!IEnum.IsRunning(RunTask))IEnum.StartSpawn(RunTask(), SpawnID);
+    }
+    IEnum RunTask() {
+        struct ModuEvent(awaitAny) {
+            attacked       = self.attacked(),
+            playerNear     = self.playerNear(16),
+            playerFar      = self.playerFar(48),
+            approach       = self.approachPlayer(8, 2),
+            playerTooClose = self.playerNear(2),
+            fire           = timer.Start(1.0f)
+        };
+        if result == "attacked" then hurt(result.damage);
+        if result == "playerNear" || (result == "attacked" && result.damageSource == "player") {
+            if result == "playerFar" then return;
+            if result == "approach" {
+                if result == "fire" then spawnProjectile(self, self.getPosition(), player.getPosition(), 8.0f);
+                elseif result == "attacked" then hurt(result.damage);
+                elseif result == "playerTooClose" then return;
+            }
+        }
+    }
+}

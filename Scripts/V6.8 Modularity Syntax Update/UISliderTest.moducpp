@@ -1,0 +1,26 @@
+add ModuCPP;
+
+// Tests: obj.UI.Slider.Value, obj.UI.Slider.Min, obj.UI.Slider.Max,
+//        obj.UI.OnValueChanged, obj.UI.Slider.Label, color override fields
+
+public class UISliderTest : ModuNode
+{
+    public float lastValue = 0.0f;
+
+    void Begin()
+    {
+        if (!obj.UI.IsSlider()) then AddLog("UISliderTest: object is not a Slider!", Type.Warning);
+
+        obj.UI.Slider.Min = 0.0f;
+        obj.UI.Slider.Max = 100.0f;
+        obj.UI.Slider.Value = 50.0f;
+        obj.UI.Slider.Label = "Volume";
+
+        obj.UI.OnValueChanged((float v) => {
+            lastValue = v;
+            float t = v / 100.0f;
+            obj.UI.Color = Color(t, 1.0f - t, 0.2f, 1.0f);
+            AddLog("Slider: " + FloatR(v, 1), Type.Info);
+        });
+    }
+}

@@ -1,0 +1,111 @@
+
+================================
+     Native Windows Build
+================================
+
+[INFO] Creating fresh build directory...
+[INFO] Configuring with CMake (Visual Studio 18 2026)...
+-- Selecting Windows SDK version 10.0.26100.0 to target Windows 10.0.26200.
+-- Modularity C++ API default: C++26 (/std:c++latest)
+-- Compiler cache enabled, but neither ccache nor sccache was found.
+-- Experimental Vulkan backend enabled.
+-- Including Win32 support
+-- Windows FFmpeg runtime DLLs: C:/Users/jkl22/Downloads/ffmpeg-8.1.1-full_build-shared/ffmpeg-8.1.1-full_build-shared/bin/avformat-62.dll;C:/Users/jkl22/Downloads/ffmpeg-8.1.1-full_build-shared/ffmpeg-8.1.1-full_build-shared/bin/avcodec-62.dll;C:/Users/jkl22/Downloads/ffmpeg-8.1.1-full_build-shared/ffmpeg-8.1.1-full_build-shared/bin/avutil-60.dll;C:/Users/jkl22/Downloads/ffmpeg-8.1.1-full_build-shared/ffmpeg-8.1.1-full_build-shared/bin/swresample-6.dll;C:/Users/jkl22/Downloads/ffmpeg-8.1.1-full_build-shared/ffmpeg-8.1.1-full_build-shared/bin/swscale-9.dll
+-- Windows FFmpeg runtime DLL directories: C:/Users/jkl22/Downloads/ffmpeg-8.1.1-full_build-shared/ffmpeg-8.1.1-full_build-shared/bin
+-- Shared libraries disabled
+-- compiling zlib from sources
+-- VRML disabled
+-- tinyusdz disabled
+-- Enabled importer formats: AMF 3DS AC ASE ASSBIN B3D BVH COLLADA DXF CSM HMP IRRMESH IQM IRR LWO LWS MD2 MD3 MD5 MDC MDL NFF NDO OFF OBJ OGRE OPENGEX PLY MS3D COB BLEND IFC XGL FBX Q3D Q3BSP RAW SIB SMD STL TERRAGEN 3D X X3D GLTF 3MF MMD
+-- Disabled importer formats: USD
+-- Enabled exporter formats: OBJ OPENGEX PLY 3DS ASSBIN ASSXML COLLADA FBX STL X X3D GLTF 3MF PBRT ASSJSON STEP
+-- Disabled exporter formats:
+-- Configuring done (0.4s)
+-- Generating done (0.9s)
+-- Build files have been written to: C:/Users/jkl22/Modularity/build
+[INFO] Building Release (using all CPU cores)...
+MSBuild version 18.4.0+6e61e96ac for .NET Framework
+
+  Checking File Globs
+  glad.vcxproj -> C:\Users\jkl22\Modularity\build\release\glad.lib
+  PhysXTask.vcxproj -> C:\Users\jkl22\Modularity\build\physx\bin\win.x86_64.vc143.md\release\PhysXTask_static.lib
+  LowLevelAABB.vcxproj -> C:\Users\jkl22\Modularity\build\physx\bin\win.x86_64.vc143.md\release\LowLevelAABB_static.lib
+  SceneQuery.vcxproj -> C:\Users\jkl22\Modularity\build\physx\bin\win.x86_64.vc143.md\release\SceneQuery_static.lib
+  LowLevelDynamics.vcxproj -> C:\Users\jkl22\Modularity\build\physx\bin\win.x86_64.vc143.md\release\LowLevelDynamics_static.lib
+  LowLevel.vcxproj -> C:\Users\jkl22\Modularity\build\physx\bin\win.x86_64.vc143.md\release\LowLevel_static.lib
+  glfw.vcxproj -> C:\Users\jkl22\Modularity\build\src\ThirdParty\glfw\src\release\glfw3.lib
+  PhysXFoundation.vcxproj -> C:\Users\jkl22\Modularity\build\physx\bin\win.x86_64.vc143.md\release\PhysXFoundation.dll
+  zlibstatic.vcxproj -> C:\Users\jkl22\Modularity\build\src\ThirdParty\assimp\contrib\zlib\release\zlibstatic.lib
+  SimulationController.vcxproj -> C:\Users\jkl22\Modularity\build\physx\bin\win.x86_64.vc143.md\release\SimulationController_static.lib
+  PhysXPvdSDK.vcxproj -> C:\Users\jkl22\Modularity\build\physx\bin\win.x86_64.vc143.md\release\PhysXPvdSDK_static.lib
+  PhysXCharacterKinematic.vcxproj -> C:\Users\jkl22\Modularity\build\physx\bin\win.x86_64.vc143.md\release\PhysXCharacterKinematic_static.lib
+  imgui.vcxproj -> C:\Users\jkl22\Modularity\build\release\imgui.lib
+  imguizmo.vcxproj -> C:\Users\jkl22\Modularity\build\release\imguizmo.lib
+  PhysXCommon.vcxproj -> C:\Users\jkl22\Modularity\build\physx\bin\win.x86_64.vc143.md\release\PhysXCommon.dll
+  PhysXCooking.vcxproj -> C:\Users\jkl22\Modularity\build\physx\bin\win.x86_64.vc143.md\release\PhysXCooking.dll
+  assimp.vcxproj -> C:\Users\jkl22\Modularity\build\src\ThirdParty\assimp\lib\release\assimp-vc145-mt.lib
+  PhysX.vcxproj -> C:\Users\jkl22\Modularity\build\physx\bin\win.x86_64.vc143.md\release\PhysX.dll
+  PhysXExtensions.vcxproj -> C:\Users\jkl22\Modularity\build\physx\bin\win.x86_64.vc143.md\release\PhysXExtensions_static.lib
+  PhysXVehicle2.vcxproj -> C:\Users\jkl22\Modularity\build\physx\bin\win.x86_64.vc143.md\release\PhysXVehicle2_static.lib
+  core_player.vcxproj -> C:\Users\jkl22\Modularity\build\release\core_player.lib
+  core.vcxproj -> C:\Users\jkl22\Modularity\build\release\core.lib
+  Auto build dll exports
+  Auto build dll exports
+  ModularityPlayer.vcxproj -> C:\Users\jkl22\Modularity\build\release\ModularityPlayer.exe
+  Modularity.vcxproj -> C:\Users\jkl22\Modularity\build\release\Modularity.exe
+Attempting to cancel the build...
+Terminate batch job (Y/N)? 
+[INFO] Collecting package binaries...
+[INFO] Copying Resources...
+        1 file(s) copied.
+[INFO] Configuring player cache build...
+-- Selecting Windows SDK version 10.0.26100.0 to target Windows 10.0.26200.
+-- Modularity C++ API default: C++26 (/std:c++latest)
+-- Compiler cache enabled, but neither ccache nor sccache was found.
+-- Experimental Vulkan backend enabled.
+-- Including Win32 support
+-- Windows FFmpeg runtime DLLs: C:/Users/jkl22/Downloads/ffmpeg-8.1.1-full_build-shared/ffmpeg-8.1.1-full_build-shared/bin/avformat-62.dll;C:/Users/jkl22/Downloads/ffmpeg-8.1.1-full_build-shared/ffmpeg-8.1.1-full_build-shared/bin/avcodec-62.dll;C:/Users/jkl22/Downloads/ffmpeg-8.1.1-full_build-shared/ffmpeg-8.1.1-full_build-shared/bin/avutil-60.dll;C:/Users/jkl22/Downloads/ffmpeg-8.1.1-full_build-shared/ffmpeg-8.1.1-full_build-shared/bin/swresample-6.dll;C:/Users/jkl22/Downloads/ffmpeg-8.1.1-full_build-shared/ffmpeg-8.1.1-full_build-shared/bin/swscale-9.dll
+-- Windows FFmpeg runtime DLL directories: C:/Users/jkl22/Downloads/ffmpeg-8.1.1-full_build-shared/ffmpeg-8.1.1-full_build-shared/bin
+-- Shared libraries disabled
+-- compiling zlib from sources
+-- VRML disabled
+-- tinyusdz disabled
+-- Enabled importer formats: AMF 3DS AC ASE ASSBIN B3D BVH COLLADA DXF CSM HMP IRRMESH IQM IRR LWO LWS MD2 MD3 MD5 MDC MDL NFF NDO OFF OBJ OGRE OPENGEX PLY MS3D COB BLEND IFC XGL FBX Q3D Q3BSP RAW SIB SMD STL TERRAGEN 3D X X3D GLTF 3MF MMD
+-- Disabled importer formats: USD
+-- Enabled exporter formats: OBJ OPENGEX PLY 3DS ASSBIN ASSXML COLLADA FBX STL X X3D GLTF 3MF PBRT ASSJSON STEP
+-- Disabled exporter formats:
+-- Configuring done (0.4s)
+-- Generating done (0.9s)
+-- Build files have been written to: C:/Users/jkl22/Modularity/build/player-cache
+[INFO] Building ModularityPlayer (Release)...
+MSBuild version 18.4.0+6e61e96ac for .NET Framework
+
+  Checking File Globs
+  LowLevel.vcxproj -> C:\Users\jkl22\Modularity\build\player-cache\physx\bin\win.x86_64.vc143.md\release\LowLevel_static.lib
+  glad.vcxproj -> C:\Users\jkl22\Modularity\build\player-cache\release\glad.lib
+  zlibstatic.vcxproj -> C:\Users\jkl22\Modularity\build\player-cache\src\ThirdParty\assimp\contrib\zlib\release\zlibstatic.lib
+  glfw.vcxproj -> C:\Users\jkl22\Modularity\build\player-cache\src\ThirdParty\glfw\src\release\glfw3.lib
+  PhysXFoundation.vcxproj -> C:\Users\jkl22\Modularity\build\player-cache\physx\bin\win.x86_64.vc143.md\release\PhysXFoundation.dll
+  PhysXTask.vcxproj -> C:\Users\jkl22\Modularity\build\player-cache\physx\bin\win.x86_64.vc143.md\release\PhysXTask_static.lib
+  SceneQuery.vcxproj -> C:\Users\jkl22\Modularity\build\player-cache\physx\bin\win.x86_64.vc143.md\release\SceneQuery_static.lib
+  LowLevelAABB.vcxproj -> C:\Users\jkl22\Modularity\build\player-cache\physx\bin\win.x86_64.vc143.md\release\LowLevelAABB_static.lib
+  imgui.vcxproj -> C:\Users\jkl22\Modularity\build\player-cache\release\imgui.lib
+  LowLevelDynamics.vcxproj -> C:\Users\jkl22\Modularity\build\player-cache\physx\bin\win.x86_64.vc143.md\release\LowLevelDynamics_static.lib
+  PhysXPvdSDK.vcxproj -> C:\Users\jkl22\Modularity\build\player-cache\physx\bin\win.x86_64.vc143.md\release\PhysXPvdSDK_static.lib
+  SimulationController.vcxproj -> C:\Users\jkl22\Modularity\build\player-cache\physx\bin\win.x86_64.vc143.md\release\SimulationController_static.lib
+  imguizmo.vcxproj -> C:\Users\jkl22\Modularity\build\player-cache\release\imguizmo.lib
+  assimp.vcxproj -> C:\Users\jkl22\Modularity\build\player-cache\src\ThirdParty\assimp\lib\release\assimp-vc145-mt.lib
+  PhysXCommon.vcxproj -> C:\Users\jkl22\Modularity\build\player-cache\physx\bin\win.x86_64.vc143.md\release\PhysXCommon.dll
+  PhysX.vcxproj -> C:\Users\jkl22\Modularity\build\player-cache\physx\bin\win.x86_64.vc143.md\release\PhysX.dll
+  PhysXCooking.vcxproj -> C:\Users\jkl22\Modularity\build\player-cache\physx\bin\win.x86_64.vc143.md\release\PhysXCooking.dll
+  PhysXExtensions.vcxproj -> C:\Users\jkl22\Modularity\build\player-cache\physx\bin\win.x86_64.vc143.md\release\PhysXExtensions_static.lib
+  core_player.vcxproj -> C:\Users\jkl22\Modularity\build\player-cache\release\core_player.lib
+  Auto build dll exports
+  ModularityPlayer.vcxproj -> C:\Users\jkl22\Modularity\build\player-cache\release\ModularityPlayer.exe
+[INFO] Collecting player package binaries...
+[INFO] Producing distribution archive (CPack 7z)...
+CPack: Create package using 7Z
+CPack: Install projects
+CPack: - Install project: Modularity [Release]
+Terminate batch job (Y/N)? 
+Terminate batch job (Y/N)? 

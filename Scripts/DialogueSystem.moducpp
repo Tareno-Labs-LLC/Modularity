@@ -1,0 +1,458 @@
+add ModuCPP;
+add ModuCPP.Experimental;
+#include "DialoguePortShared.h"
+using namespace DialoguePort;
+
+public enum MouthState {TalkingOpen, TalkingClosed, NotTalking}
+public class DialogueSystem : ModuNode
+{
+    [Header("Bindings")]
+    [ObjectRef] public string characterNameTextRef;
+    [ObjectRef] public string dialogueTextRef;
+    [ObjectRef] public string playerRef;
+    public Language currentLanguage = Language.English;
+
+    [Header("Timing")]
+    [Slider(0.0f, 2.0f)] public float pitchVariation = 0.1f;
+    [Slider(0.0f, 10.0f)] public float openAnimationDelay = 0.3f;
+    [Slider(0.0f, 10.0f)] public float closeAnimationDelay = 0.3f;
+    [Slider(0.0f, 2.0f)] public float spacingFactor = 0.1f;
+    [Slider(0.1f, 10.0f)] public float sizeMultiplier = 2.0f;
+
+    [Header("Audio")]
+    public string characterSoundClip;
+    public string triggerSoundClip;
+    public string enterSoundClip;
+    public string exitSoundClip;
+    public string skipSoundClip;
+
+    [Header("Flags")]
+    public bool rigidSimulated = true;
+    public bool disableSelfOnEnd = true;
+    public bool autoOpenOnBegin = false;
+    [ObjectList] public string[] itemsToEnable;
+    [ObjectList] public string[] itemsToDisable;
+
+    [Header("Dialogue")]
+    public DialoguePort.DialogueLine[] dialogueLines;
+
+    private bool running = false;
+    private bool isTyping = false;
+    private bool isTextFullyDisplayed = false;
+    private bool autoOpened = false;
+    private int index = 0;
+    private size_t revealedCharacters = 0;
+    private float typeAccumulator = 0.0f;
+    private float holdDelay = 0.0f;
+    private float effectTimer = 0.0f;
+    private float soundCooldown = 0.0f;
+    private float openDelayRemaining = 0.0f;
+    private float closeDelayRemaining = 0.0f;
+    private bool pendingClose = false;
+    private int lastInteractionRequestSerial = 0;
+    private bool prevSubmitDown = false;
+    private string currentCleanSentence;
+    private string currentPlayerRef;
+    private DialoguePort.DialogueLine[] activeLines;
+    private string[] endItemsToEnable;
+    private string[] endItemsToDisable;
+
+    inspector
+    {
+        Tabs {
+            Tab("Bindings") {
+                AutoFields(characterNameTextRef, dialogueTextRef, playerRef);
+                Run(DrawLanguageCombo("Language", currentLanguage));
+            }
+
+            Tab("Timing") {
+                AutoFields(pitchVariation, openAnimationDelay, closeAnimationDelay, spacingFactor, sizeMultiplier);
+            }
+
+            Tab("Audio") {
+                AutoFields(characterSoundClip, triggerSoundClip, enterSoundClip, exitSoundClip, skipSoundClip);
+            }
+
+            Tab("Flags") {
+                AutoFields(rigidSimulated, disableSelfOnEnd, autoOpenOnBegin, itemsToEnable, itemsToDisable);
+            }
+
+            Tab("Dialogue") {
+                AutoFields(dialogueLines);
+            }
+
+            Tab("Runtime") {
+                Run(ImGui::TextDisabled("Running: %s", running ? "Yes" : "No"));
+                Run(ImGui::TextDisabled("Typing: %s", isTyping ? "Yes" : "No"));
+                Run(ImGui::TextDisabled("Line: %d", index + 1));
+                Run(ImGui::TextDisabled("Chars: %zu / %zu", revealedCharacters, currentCleanSentence.size()));
+            }
+        }
+    }
+
+    void Begin()
+    {
+        if (!ctx.object) return;
+        ResetRuntimeState();
+        TryAutoOpenOnBegin();
+    }
+
+    void TickUpdate()
+    {
+        if (!ctx.object) return;
+
+        const float step = Math.Max(0.0f, dt);
+        ConsumeInteractionRequest();
+        TryAutoOpenOnBegin();
+        if (!running) return;
+
+        if (TickPendingClose(step)) return;
+
+        const bool submitPressed = ConsumeSubmitPressed();
+        if (TickOpenDelay(step)) return;
+
+        tickTyping(step);
+        if (submitPressed) {
+            HandleSubmitPressed();
+        }
+    }
+
+    void ResetRuntimeState()
+    {
+        running = false;
+        isTyping = false;
+        isTextFullyDisplayed = false;
+        autoOpened = false;
+        index = 0;
+        revealedCharacters = 0;
+        typeAccumulator = 0.0f;
+        holdDelay = 0.0f;
+        effectTimer = 0.0f;
+        soundCooldown = 0.0f;
+        openDelayRemaining = 0.0f;
+        closeDelayRemaining = 0.0f;
+        pendingClose = false;
+        prevSubmitDown = false;
+        const int interactionSerial = ParseInt(ctx.GetSetting(kInteractionRequestSerial, "0"), 0);
+        const bool interactionPending = ParseBool(ctx.GetSetting(kInteractionRequestPending, "0"), false);
+        lastInteractionRequestSerial = interactionPending ? (interactionSerial - 1) : interactionSerial;
+        currentCleanSentence.clear();
+        currentPlayerRef = playerRef;
+        activeLines.clear();
+        endItemsToEnable.clear();
+        endItemsToDisable.clear();
+        resetTextWidgets();
+    }
+
+    void TryAutoOpenOnBegin()
+    {
+        if (running || autoOpened) return;
+        if (!autoOpenOnBegin || dialogueLines.empty()) return;
+
+        openDialogue(dialogueLines, itemsToEnable, itemsToDisable, playerRef);
+        autoOpened = true;
+    }
+
+    void ConsumeInteractionRequest()
+    {
+        const int interactionSerial = ParseInt(ctx.GetSetting(kInteractionRequestSerial, "0"), 0);
+        const bool interactionPending = ParseBool(ctx.GetSetting(kInteractionRequestPending, "0"), false);
+        if (interactionSerial == lastInteractionRequestSerial && !interactionPending) return;
+
+        lastInteractionRequestSerial = interactionSerial;
+        if (interactionPending) {
+            ctx.SetSetting(kInteractionRequestPending, "0");
+        }
+
+        DialoguePort.DialogueLine[] overrideLines = DeserializeDialogueLines(ctx.GetSetting(kInteractionOverrideLines, ""));
+        string[] overrideEnable = DeserializeObjectRefs(ctx.GetSetting(kInteractionEndEnable, ""));
+        string[] overrideDisable = DeserializeObjectRefs(ctx.GetSetting(kInteractionEndDisable, ""));
+        std::string overridePlayerRef = ctx.GetSetting(kInteractionPlayerRef, "");
+
+        if (overrideLines.empty()) overrideLines = dialogueLines;
+        if (overrideEnable.empty()) overrideEnable = itemsToEnable;
+        if (overrideDisable.empty()) overrideDisable = itemsToDisable;
+        if (overridePlayerRef.empty()) overridePlayerRef = playerRef;
+
+        openDialogue(overrideLines, overrideEnable, overrideDisable, overridePlayerRef);
+    }
+
+    bool TickPendingClose(float step)
+    {
+        if (!pendingClose) return false;
+
+        closeDelayRemaining -= step;
+        if (closeDelayRemaining <= 0.0f) {
+            finalizeDialogueEnd();
+        }
+        return true;
+    }
+
+    bool ConsumeSubmitPressed()
+    {
+        const bool submitDown = IsSubmitDown();
+        const bool submitPressed = submitDown && !prevSubmitDown;
+        prevSubmitDown = submitDown;
+        return submitPressed;
+    }
+
+    bool TickOpenDelay(float step)
+    {
+        if (openDelayRemaining <= 0.0f) return false;
+
+        openDelayRemaining -= step;
+        if (openDelayRemaining <= 0.0f) {
+            if (!enterSoundClip.empty()) {
+                PlaySoundClip(enterSoundClip);
+            }
+            startLine();
+        }
+        return true;
+    }
+
+    void HandleSubmitPressed()
+    {
+        if (isTyping) {
+            completeTyping();
+            if (!skipSoundClip.empty()) {
+                PlaySoundClip(skipSoundClip);
+            }
+            return;
+        }
+
+        if (!isTextFullyDisplayed) return;
+
+        if (index < static_cast<int>(activeLines.size()) - 1) {
+            ++index;
+            if (!enterSoundClip.empty()) {
+                PlaySoundClip(enterSoundClip);
+            }
+            startLine();
+            return;
+        }
+
+        if (!exitSoundClip.empty()) {
+            PlaySoundClip(exitSoundClip);
+        }
+        beginDialogueClose();
+    }
+
+    void resetTextWidgets()
+    {
+        SetUITextLabel(ctx, characterNameTextRef, "");
+        SetUITextLabel(ctx, dialogueTextRef, "");
+        SetUITextEffects(ctx, dialogueTextRef, TextEffectType.None, 1.0f, 0.0f);
+    }
+
+    void revealDialogueText()
+    {
+        const size_t shown = std::min(revealedCharacters, currentCleanSentence.size());
+        SetUITextLabel(ctx, dialogueTextRef, currentCleanSentence.substr(0, shown));
+    }
+
+    void startLine()
+    {
+        if (index < 0 || index >= static_cast<int>(activeLines.size())) {
+            running = false;
+            isTyping = false;
+            isTextFullyDisplayed = false;
+            return;
+        }
+
+        const DialogueLine& line = activeLines[static_cast<size_t>(index)];
+        SetObjectsEnabledState(ctx, line.itemsToDisable, false);
+        SetObjectsEnabledState(ctx, line.itemsToEnable, true);
+
+        SetUITextLabel(ctx, characterNameTextRef, line.characterName);
+
+        currentCleanSentence = ParseSentenceForDisplay(GetSentenceForLanguage(line, currentLanguage));
+        revealedCharacters = 0;
+        typeAccumulator = 0.0f;
+        holdDelay = 0.0f;
+        soundCooldown = 0.0f;
+        isTyping = true;
+        isTextFullyDisplayed = false;
+
+        revealDialogueText();
+        SetUITextEffects(ctx, dialogueTextRef, line.textEffect, line.animationSpeed, line.effectIntensity);
+        applyMouthState(line, MouthState.TalkingClosed);
+    }
+
+    void completeTyping()
+    {
+        if (index < 0 || index >= static_cast<int>(activeLines.size())) return;
+
+        const DialogueLine& line = activeLines[static_cast<size_t>(index)];
+        revealedCharacters = currentCleanSentence.size();
+        isTyping = false;
+        isTextFullyDisplayed = true;
+        holdDelay = 0.0f;
+        typeAccumulator = 0.0f;
+
+        revealDialogueText();
+        applyMouthState(line, MouthState.NotTalking);
+    }
+
+    void finalizeDialogueEnd()
+    {
+        SetObjectsEnabledState(ctx, endItemsToDisable, false);
+        SetObjectsEnabledState(ctx, endItemsToEnable, true);
+        SetRigidbody2DSimulated(ctx, currentPlayerRef, rigidSimulated);
+
+        resetTextWidgets();
+
+        running = false;
+        pendingClose = false;
+        closeDelayRemaining = 0.0f;
+        isTyping = false;
+        isTextFullyDisplayed = false;
+        revealedCharacters = 0;
+        currentCleanSentence.clear();
+        if (disableSelfOnEnd) {
+            autoOpened = false;
+            ctx.SetObjectEnabled(false);
+        }
+    }
+
+    void beginDialogueClose()
+    {
+        if (pendingClose) return;
+        pendingClose = true;
+        closeDelayRemaining = std::max(0.0f, closeAnimationDelay);
+        TryPlayAnimationClipNamed(ctx, "DialogueStateClose");
+
+        if (closeDelayRemaining <= 0.0f) {
+            finalizeDialogueEnd();
+        }
+    }
+
+    void openDialogue(ref DialoguePort.DialogueLine[] lines,
+                      ref string[] itemsToEnableOnEnd,
+                      ref string[] itemsToDisableOnEnd,
+                      const std::string& playerRefOverride)
+    {
+        if (lines.empty()) {
+            ctx.AddConsoleMessage("DialogueSystem: no dialogue lines configured.", ConsoleMessageType.Warning);
+            return;
+        }
+
+        activeLines = lines;
+        endItemsToEnable = itemsToEnableOnEnd;
+        endItemsToDisable = itemsToDisableOnEnd;
+        currentPlayerRef = playerRefOverride.empty() ? playerRef : playerRefOverride;
+
+        running = true;
+        index = 0;
+        revealedCharacters = 0;
+        typeAccumulator = 0.0f;
+        holdDelay = 0.0f;
+        soundCooldown = 0.0f;
+        effectTimer = 0.0f;
+        isTyping = false;
+        isTextFullyDisplayed = false;
+        pendingClose = false;
+        closeDelayRemaining = 0.0f;
+        currentCleanSentence.clear();
+        openDelayRemaining = openAnimationDelay;
+
+        resetTextWidgets();
+        SetRigidbody2DSimulated(ctx, currentPlayerRef, false);
+        TryPlayAnimationClipNamed(ctx, "DialogueStateOpen");
+
+        if (!triggerSoundClip.empty()) {
+            PlaySoundClip(triggerSoundClip);
+        }
+
+        if (openDelayRemaining <= 0.0f) {
+            startLine();
+        }
+    }
+
+    void tickTyping(float step)
+    {
+        if (!isTyping) return;
+        if (index < 0 || index >= static_cast<int>(activeLines.size())) return;
+
+        const DialogueLine& line = activeLines[static_cast<size_t>(index)];
+
+        if (currentCleanSentence.empty()) {
+            completeTyping();
+            return;
+        }
+
+        const float typingSpeed = std::max(0.001f, line.typingSpeed);
+        effectTimer += step;
+        soundCooldown = std::max(0.0f, soundCooldown - step);
+
+        float remaining = step;
+        while (remaining > 0.0f && isTyping) {
+            if (holdDelay > 0.0f) {
+                const float consume = std::min(remaining, holdDelay);
+                holdDelay -= consume;
+                remaining -= consume;
+                continue;
+            }
+
+            typeAccumulator += remaining;
+            remaining = 0.0f;
+
+            bool revealedAny = false;
+            while (typeAccumulator >= typingSpeed && revealedCharacters < currentCleanSentence.size()) {
+                typeAccumulator -= typingSpeed;
+                ++revealedCharacters;
+                revealedAny = true;
+
+                const size_t charIndex = revealedCharacters - 1;
+                const char character = currentCleanSentence[charIndex];
+
+                if (std::isalnum(static_cast<unsigned char>(character)) != 0) {
+                    const std::string& clip = line.characterSoundClip.empty() ? characterSoundClip : line.characterSoundClip;
+                    if (!clip.empty() && soundCooldown <= 0.0f) {
+                        PlaySoundClip(clip);
+                        soundCooldown = std::max(0.01f, typingSpeed * 0.6f);
+                    }
+                }
+
+                if ((charIndex % 2U) == 0U) {
+                    applyMouthState(line, MouthState.TalkingOpen);
+                } else {
+                    applyMouthState(line, MouthState.TalkingClosed);
+                }
+
+                if (character == ',' || character == ';') {
+                    holdDelay += typingSpeed * 3.0f;
+                } else if (character == '.' || character == '!' || character == '?') {
+                    if (character == '.' && charIndex + 2 < currentCleanSentence.size() &&
+                        currentCleanSentence[charIndex + 1] == '.' &&
+                        currentCleanSentence[charIndex + 2] == '.') {
+                        holdDelay += typingSpeed * 5.0f;
+                    } else {
+                        holdDelay += typingSpeed * 5.0f;
+                    }
+                }
+            }
+
+            if (revealedAny) {
+                revealDialogueText();
+            }
+
+            if (revealedCharacters >= currentCleanSentence.size()) {
+                completeTyping();
+                break;
+            }
+            if (typeAccumulator < typingSpeed) break;
+        }
+    }
+    void applyMouthState(const DialogueLine& line, MouthState mouthState)
+    {
+        const bool isOpen = (mouthState == MouthState.TalkingOpen);
+        const bool isClosed = (mouthState == MouthState.TalkingClosed);
+        const bool isIdle = (mouthState == MouthState.NotTalking);
+        auto openObj = ResolveObject(line.openMouthObjectRef);
+        auto closedObj = ResolveObject(line.closedMouthObjectRef);
+        auto idleObj = ResolveObject(line.notTalkingObjectRef);
+        SetObjectEnabledState(ctx, openObj, isOpen);
+        SetObjectEnabledState(ctx, closedObj, isClosed);
+        SetObjectEnabledState(ctx, idleObj, isIdle);
+    }
+}

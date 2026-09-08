@@ -1,0 +1,9 @@
+{
+  "version": "6.7",
+
+  "windows_url": "https://pak.moduengine.xyz/Tareno-Labs-LLC/Modularity/releases/download/Modularity-6.7-Release/Modularity-Windows%20V6.7.zip",
+  "windows_exe": "Modularity-Windows V6.7/Modularity.exe",
+
+  "linux_url": "https://pak.moduengine.xyz/Tareno-Labs-LLC/Modularity/releases/download/Modularity-6.7-Release/Modularity-Linux%20V6.7.tar.gz",
+  "linux_exe": "Modularity-1.0.0-Linux/bin/Modularity",
+}

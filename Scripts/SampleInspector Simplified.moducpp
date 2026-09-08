@@ -1,0 +1,62 @@
+add ModuCPP;
+add ModuEngine;
+
+public class SampleInspectorSimplified : ModuBehaviour
+{
+    void Script_OnInspector()
+    {
+        auto& config = Config<SampleInspectorSimpleConfig>();
+        bindConfig(ctx, config);
+        ModuGUI::TextUnformatted("SampleInspector");
+        ModuGUI::Separator();
+        bool changed = false;
+        changed |= ModuGUI::Checkbox("Auto Rotate", &config.autoRotate);
+        changed |= ModuGUI::DragFloat3("Spin Speed (deg/s)", &config.spinSpeed.x, 1.0f, -360.0f, 360.0f, "%.2f");
+        changed |= ModuGUI::DragFloat3("Offset", &config.offset.x, 0.1f, -1000.0f, 1000.0f, "%.2f");
+        changed |= EditString("Target Name", config.targetName, 128, "targetName");
+        if (changed) SaveAutoSettings();
+        if (obj)
+        {
+            ModuGUI::TextDisabled("Attached to: %s (id=%d)", obj->name.c_str(), obj->id);
+            if (ModuGUI::Button("Apply Offset To Self")) SetPosition(obj->position + config.offset);
+        }
+        if (ModuGUI::Button("Nudge Target"))
+        {
+            if (auto target = ResolveObject(config.targetName)) target->position += config.offset;
+        }
+    }
+    void ApplyBehavior()
+    {
+        auto& config = Config<SampleInspectorSimpleConfig>();
+        bindConfig(ctx, config);
+        ApplyAutoRotate(ctx, config, time.deltaTime);
+    }
+    void Spec() to ApplyBehavior();
+    void TestEditor() to ApplyBehavior();
+    void TickUpdate() to ApplyBehavior();
+}
+
+namespace
+{
+    struct SampleInspectorSimpleConfig
+    {
+        bool autoRotate = false;
+        Vector3 spinSpeed = Vector3(0.0f, 45.0f, 0.0f);
+        Vector3 offset = Vector3(0.0f, 1.0f, 0.0f);
+        string targetName = "MyTarget";
+    };
+
+    void bindConfig(ScriptContext& ctx, SampleInspectorSimpleConfig& config)
+    {
+        BindSetting(ctx, "autoRotate", config.autoRotate);
+        BindSetting(ctx, "spinSpeed", config.spinSpeed);
+        BindSetting(ctx, "offset", config.offset);
+        BindSetting(ctx, "targetName", config.targetName);
+    }
+
+    void ApplyAutoRotate(ScriptContext& ctx, const SampleInspectorSimpleConfig& config, float deltaTime)
+    {
+        if (!ctx.object || !config.autoRotate) return;
+        ctx.SetRotation(ctx.object->rotation + config.spinSpeed * deltaTime);
+    }
+} // namespace

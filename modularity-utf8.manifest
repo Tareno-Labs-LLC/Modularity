@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Forces the process ANSI code page to UTF-8 (Windows 10 1903+).
+
+  Without this, MSVC's std::filesystem::path::string() converts UTF-16 to the
+  system ANSI code page - 1252 on a Western install - and THROWS
+  std::system_error ("No mapping for the Unicode character exists in the target
+  multi-byte code page") for any path holding a character that page cannot
+  represent. This project's Assets folder has Japanese filenames, so every one of
+  the ~700 .string() calls on a path in the engine is a latent crash.
+
+  With CP_ACP = UTF-8 the conversion is lossless and cannot fail, so those calls
+  become safe, and the narrow *A Win32 entry points (plus fopen, which stb_image
+  and other vendored libraries use) interpret the same bytes correctly.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+    </windowsSettings>
+  </application>
+</assembly>

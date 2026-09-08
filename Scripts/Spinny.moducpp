@@ -1,0 +1,31 @@
+add ModuCPP;
+public class Spinny : ModuNode {
+    [Header("Spin")]
+    public bool spin = true;
+    [Slider(0.0f, 720.0f)] public float spinSpeed = 90.0f;
+    [Header("Bob")]
+    public bool bob = true;
+    [Slider(0.0f, 2.0f)]  public float bobAmount = 0.25f;
+    [Slider(0.1f, 10.0f)] public float bobSpeed = 2.0f;
+    private float phase = 0.0f;
+    private float baseY = 0.0f;
+    private bool baseCaptured = false;
+    void Begin() {
+        phase = 0.0f;
+        baseCaptured = false;
+        AddLog("Spinny online, compiled down to C.", Type.Success);
+    }
+    void TickUpdate() {
+        if (dt <= 0.0f) return;
+        if (!baseCaptured) {
+            baseY = obj.Transform.position.y;
+            baseCaptured = true;
+        }
+        phase += dt;
+        if (spin) to obj.Transform.rotation.y += spinSpeed * dt;
+        if (bob) to obj.Transform.position.y = baseY + Wave(phase * bobSpeed) * bobAmount;
+    }
+    float Wave(float t) {
+        return Math.Sin(t * 6.2831853f);
+    }
+}

@@ -1,0 +1,26 @@
+add ModuCPP;
+add ModuEngine;
+add ModuInput;
+public class PlayerMovement : ModuNode {
+    public SceneObj camera;
+    public float walkSpeed = 4.0f;
+    public float sprintSpeed = 7.0f;
+    public float acceleration = 20.0f;
+    public float deceleration = 25.0f;
+    [Header("Ground Check & Jump")]
+    public float groundCheckDistance = 0.1f;
+    public float jumpForce = 6.5f;
+    private float verticalVelocity = 0.0f;
+    void Begin() { Ensure.obj; Ensure.Rigidbody3D(obj); }
+    void TickUpdate() {
+        Vector2 move = Input.WASDMovement();
+        Vector3 direction = Movement.Direction(move, camera);
+        float speed = Input.ButtonHeld("Sprint") ? sprintSpeed : walkSpeed;
+        bool grounded = obj.Physics.IsGrounded(groundCheckDistance);
+        obj.Rigidbody3D.Accelerate(direction, speed, acceleration, deceleration);
+        obj.Transform.Face(direction);
+        if (grounded) { verticalVelocity = 0.0f;  if (Input.ButtonDown("Jump")) then verticalVelocity = jumpForce; }
+        else then verticalVelocity = obj.Rigidbody3D.VelocityY;
+        obj.Rigidbody3D.AddVelocityY(verticalVelocity);
+    }
+}

@@ -1,0 +1,105 @@
+#pragma once
+
+#include "XRInput.h"
+#include "XRMath.h"
+#include "XRRuntime.h"
+#include "XRSession.h"
+#include "XRSettings.h"
+#include "XRSwapchainGL.h"
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace Modularity::XR {
+
+struct XRRenderView {
+    XRView view;
+    uint32_t framebuffer = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t arrayLayer = 0;
+};
+
+class XRSystem {
+public:
+    XRSystem() = default;
+    ~XRSystem();
+
+    XRSystem(const XRSystem&) = delete;
+    XRSystem& operator=(const XRSystem&) = delete;
+
+    struct PlatformHandles {
+        void* applicationVM = nullptr;
+        void* applicationActivity = nullptr;
+        XRGraphicsBinding graphics;
+    };
+
+    bool startup(const ProjectOpenXRSettings& settings, const PlatformHandles& platform,
+                 std::string& outError);
+
+    void shutdown();
+
+    bool isCreated() const { return session_.isCreated(); }
+
+    bool isRunning() const { return session_.isRunning(); }
+
+    bool update();
+
+    bool beginFrame();
+
+    bool beginView(uint32_t viewIndex, XRRenderView& outView);
+    void endView(uint32_t viewIndex);
+
+    void endFrame();
+
+    uint32_t viewCount() const { return static_cast<uint32_t>(views_.size()); }
+
+    XRRenderMode activeRenderMode() const {
+#if MODULARITY_HAS_OPENXR && MODULARITY_XR_HAS_ANY_GL_TYPES
+        return swapchains_.resolvedRenderMode();
+#else
+        return settings_.activeTarget().renderMode;
+#endif
+    }
+
+    void setOriginToWorld(const glm::mat4& matrix) { originToWorld_ = matrix; }
+    const glm::mat4& originToWorld() const { return originToWorld_; }
+
+    void setClipPlanes(float nearPlane, float farPlane);
+    float nearPlane() const { return nearPlane_; }
+    float farPlane() const { return farPlane_; }
+
+    const XRRuntime& runtime() const { return runtime_; }
+    const XRSession& session() const { return session_; }
+
+    glm::mat4 viewMatrix(uint32_t viewIndex) const;
+    glm::mat4 projectionMatrix(uint32_t viewIndex) const;
+
+private:
+    bool createSwapchains(std::string& outError);
+
+    XRRuntime runtime_;
+    XRSession session_;
+    ProjectOpenXRSettings settings_;
+
+#if MODULARITY_HAS_OPENXR && MODULARITY_XR_HAS_ANY_GL_TYPES
+    XRSwapchainSetGL swapchains_;
+#endif
+#if MODULARITY_HAS_OPENXR
+    XRInput input_;
+    XrFrameState frameState_{};
+    std::vector<XrCompositionLayerProjectionView> projectionViews_;
+    XrCompositionLayerProjection projectionLayer_{};
+#endif
+
+    std::vector<XRRenderView> views_;
+    glm::mat4 originToWorld_ = glm::mat4(1.0f);
+    float nearPlane_ = 0.05f;
+    float farPlane_ = 1000.0f;
+
+    bool frameStarted_ = false;
+    bool shouldRender_ = false;
+};
+
+}

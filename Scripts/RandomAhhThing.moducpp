@@ -1,0 +1,4 @@
+add ModuCPP;
+public class Optimizer : ModuNode {
+    public void TickUpdate() AddLog("Yey! it's optimized now...", Type.Warning);
+}

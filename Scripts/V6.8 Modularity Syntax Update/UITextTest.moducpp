@@ -1,0 +1,35 @@
+add ModuCPP;
+add ModuEngine;
+
+// Tests: obj.UI.Text, obj.UI.Color, obj.UI.FontSize, obj.UI.Position,
+//        obj.UI.Alpha, obj.UI.Visible, obj.UI.IsText(), obj.UI.Exists
+
+public class UITextTest : ModuNode
+{
+    public float flashSpeed = 2.0f;
+    public bool showTypeInfo = true;
+
+    void Begin()
+    {
+        if (!obj.UI.Exists) then AddLog("WARNING: No UI component found on this object!", Type.Warning);
+        if (obj.UI.IsText()) then AddLog("UITextTest: confirmed Text component", Type.Info);
+
+        obj.UI.Text = "Hello from ModuCPP!";
+        obj.UI.Color = Color(1.0f, 1.0f, 1.0f, 1.0f);
+        obj.UI.FontSize = 24.0f;
+    }
+
+    void TickUpdate()
+    {
+        float pulse = (Sin(ModuEngine.Time * flashSpeed) + 1.0f) * 0.5f;
+        obj.UI.Alpha = 0.4f + pulse * 0.6f;
+
+        if (showTypeInfo) {
+            obj.UI.Text = "Text=" + BoolStr(obj.UI.IsText())
+                + "  Btn=" + BoolStr(obj.UI.IsButton())
+                + "  Slider=" + BoolStr(obj.UI.IsSlider())
+                + "  Img=" + BoolStr(obj.UI.IsImage())
+                + "  t=" + FloatR(ModuEngine.Time, 1);
+        }
+    }
+}

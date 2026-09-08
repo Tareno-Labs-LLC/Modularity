@@ -1,0 +1,26 @@
+[submodule "src/ThirdParty/ModuGUI"]
+	path = src/ThirdParty/ModuGUI
+	url = https://github.com/darkresident55/ModuGUI.git
+	branch = docking
+[submodule "src/ThirdParty/glfw"]
+	path = src/ThirdParty/glfw
+	url = https://github.com/TheCherno/glfw.git
+[submodule "src/ThirdParty/ImGuizmo"]
+	path = src/ThirdParty/ImGuizmo
+	url = https://github.com/CedricGuillemet/ImGuizmo.git
+[submodule "src/ThirdParty/assimp"]
+	path = src/ThirdParty/assimp
+	url = https://github.com/darkresident55/Modu-assimp.git
+	shallow = true
+[submodule "src/ThirdParty/PhysX"]
+	path = src/ThirdParty/PhysX
+	url = https://github.com/NVIDIA-Omniverse/PhysX.git
+[submodule "src/ThirdParty/JoltPhysics"]
+	path = src/ThirdParty/JoltPhysics
+	url = https://github.com/jrouwe/JoltPhysics.git
+[submodule "src/ThirdParty/opengl_video_player"]
+	path = src/ThirdParty/opengl_video_player
+	url = https://github.com/tcottrill/opengl_video_player.git
+[submodule "Nebula"]
+	path = Nebula
+	url = https://github.com/Far-Beyond-Pulsar/Nebula.git

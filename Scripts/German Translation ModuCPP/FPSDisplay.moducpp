@@ -1,0 +1,5 @@
+Nutze ModuCPP;
+Nutze ModuEngine;
+öffentlich klasse FPSAnzeige : ModuNode {
+    Nichts Tick() {obj.UILabel = "FPS: " + IntR(ModuEngine.FPS);}
+}

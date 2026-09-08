@@ -1,0 +1,410 @@
+{
+	"name": "ModuCPP",
+	"scopeName": "source.moducpp",
+	"fileTypes": [
+		"moducpp"
+	],
+	"patterns": [
+		{
+			"include": "#comments"
+		},
+		{
+			"include": "#localized-german"
+		},
+		{
+			"include": "#imports"
+		},
+		{
+			"include": "#attributes"
+		},
+		{
+			"include": "#class-declaration"
+		},
+		{
+			"include": "#subscript-declaration"
+		},
+		{
+			"include": "#enum-declaration"
+		},
+		{
+			"include": "#qualified-name"
+		},
+		{
+			"include": "#storage-modifiers"
+		},
+		{
+			"include": "#storage-types"
+		},
+		{
+			"include": "#control-keywords"
+		},
+		{
+			"include": "#key-constants"
+		},
+		{
+			"include": "#builtin-types"
+		},
+		{
+			"include": "#builtin-functions"
+		},
+		{
+			"include": "#strings"
+		},
+		{
+			"include": "#strings_single"
+		},
+		{
+			"include": "#numbers"
+		},
+		{
+			"include": "#operators"
+		}
+	],
+	"repository": {
+		"comments": {
+			"patterns": [
+				{
+					"name": "comment.line.double-slash.moducpp",
+					"match": "//.*$"
+				},
+				{
+					"name": "comment.block.moducpp",
+					"begin": "/\\*",
+					"end": "\\*/",
+					"beginCaptures": {
+						"0": {
+							"name": "punctuation.definition.comment.begin.moducpp"
+						}
+					},
+					"endCaptures": {
+						"0": {
+							"name": "punctuation.definition.comment.end.moducpp"
+						}
+					}
+				}
+			]
+		},
+		"localized-german": {
+			"comment": "German syntax layer. These spellings lex to the canonical ModuCPP tokens, so they carry the same scopes as their English counterparts.",
+			"patterns": [
+				{
+					"match": "^\\s*([Nn]utze|markiere)\\s+([\\w][\\w:.]*)",
+					"captures": {
+						"1": {
+							"name": "keyword.control.import.moducpp"
+						},
+						"2": {
+							"name": "entity.name.namespace.moducpp"
+						}
+					}
+				},
+				{
+					"match": "\\b([Öö]ffentlich\\s+[Kk]lasse)\\s+([\\w]+)(?:\\s*:\\s*([\\w]+))?",
+					"captures": {
+						"1": {
+							"name": "storage.type.class.moducpp"
+						},
+						"2": {
+							"name": "entity.name.type.class.moducpp"
+						},
+						"3": {
+							"name": "entity.other.inherited-class.moducpp"
+						}
+					}
+				},
+				{
+					"match": "\\b([Öö]ffentlich\\s+aufzählung|aufzählung)\\s+([\\w]+)",
+					"captures": {
+						"1": {
+							"name": "storage.type.enum.moducpp"
+						},
+						"2": {
+							"name": "entity.name.type.enum.moducpp"
+						}
+					}
+				},
+				{
+					"name": "storage.modifier.moducpp",
+					"match": "\\b([Öö]ffentlich|[Pp]rivat|geschützt|statisch|konstant)\\b"
+				},
+				{
+					"name": "storage.type.moducpp",
+					"match": "\\b([Kk]lasse|aufzählung|UnterSkript|inspektor)\\b"
+				},
+				{
+					"name": "keyword.control.moducpp",
+					"match": "\\b([Ww]enn|[Ss]onst|[Dd]ann|solange|wiederhole|[Zz]urück|abbrechen|fortfahren)\\b"
+				},
+				{
+					"name": "keyword.other.moducpp",
+					"match": "\\b(zu|[Ff]ür|verweis|Beginnen|Aktualisieren)\\b"
+				},
+				{
+					"name": "constant.language.moducpp",
+					"match": "\\b(wahr|falsch)\\b"
+				},
+				{
+					"name": "storage.type.primitive.moducpp",
+					"match": "\\b([Nn]ichts|Zeichenkette|Ganzzahl|Kommazahl|Wahrheitswert)\\b"
+				},
+				{
+					"name": "support.function.moducpp",
+					"match": "(?<=\\.)\\s*(Starten|Bereit|Zustand|Länge|IstLeer)\\b"
+				}
+			]
+		},
+		"imports": {
+			"patterns": [
+				{
+					"match": "^\\s*(add|mark)\\s+([A-Za-z_][A-Za-z0-9_:.]*)",
+					"captures": {
+						"1": {
+							"name": "keyword.control.import.moducpp"
+						},
+						"2": {
+							"name": "entity.name.namespace.moducpp"
+						}
+					}
+				},
+				{
+					"match": "^\\s*(#include)\\s+([A-Za-z_][A-Za-z0-9_:.]*)",
+					"captures": {
+						"1": {
+							"name": "keyword.control.import.moducpp"
+						},
+						"2": {
+							"name": "entity.name.namespace.moducpp"
+						}
+					}
+				}
+			]
+		},
+		"attributes": {
+			"begin": "\\[",
+			"end": "\\]",
+			"beginCaptures": {
+				"0": {
+					"name": "punctuation.definition.attribute.begin.moducpp"
+				}
+			},
+			"endCaptures": {
+				"0": {
+					"name": "punctuation.definition.attribute.end.moducpp"
+				}
+			},
+			"name": "meta.attribute.moducpp",
+			"patterns": [
+				{
+					"name": "entity.name.tag.attribute.moducpp",
+					"match": "\\b(Header|Slider|ObjectRef|ObjectList|DialogueLines|ClipGridPair|Separator|SoundSet|range|step)\\b"
+				},
+				{
+					"include": "#strings"
+				},
+				{
+					"include": "#numbers"
+				}
+			]
+		},
+		"class-declaration": {
+			"match": "\\b(public\\s+class)\\s+([A-Za-z_][A-Za-z0-9_]*)(?:\\s*:\\s*([A-Za-z_][A-Za-z0-9_]*))?",
+			"captures": {
+				"1": {
+					"name": "storage.type.class.moducpp"
+				},
+				"2": {
+					"name": "entity.name.type.class.moducpp"
+				},
+				"3": {
+					"name": "entity.other.inherited-class.moducpp"
+				}
+			}
+		},
+		"subscript-declaration": {
+			"match": "\\b(SubScript)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+			"captures": {
+				"1": {
+					"name": "storage.type.subscript.moducpp"
+				},
+				"2": {
+					"name": "entity.name.type.subscript.moducpp"
+				}
+			}
+		},
+		"enum-declaration": {
+			"match": "\\b(public\\s+enum|enum)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+			"captures": {
+				"1": {
+					"name": "storage.type.enum.moducpp"
+				},
+				"2": {
+					"name": "entity.name.type.enum.moducpp"
+				}
+			}
+		},
+		"qualified-name": {
+			"match": "\\b([A-Za-z_][A-Za-z0-9_]*)(::)([A-Za-z_][A-Za-z0-9_]*)",
+			"captures": {
+				"1": {
+					"name": "entity.name.namespace.moducpp"
+				},
+				"2": {
+					"name": "punctuation.accessor.moducpp"
+				},
+				"3": {
+					"name": "support.function.moducpp"
+				}
+			}
+		},
+		"storage-modifiers": {
+			"name": "storage.modifier.moducpp",
+			"match": "\\b(public|private|protected|static|const|constexpr|inline|virtual|explicit|extern|mutable|volatile|friend|register)\\b"
+		},
+		"storage-types": {
+			"name": "storage.type.moducpp",
+			"match": "\\b(class|struct|union|namespace|template|typedef|typename|using)\\b"
+		},
+		"control-keywords": {
+			"patterns": [
+				{
+					"name": "keyword.control.moducpp",
+					"match": "\\b(if|then|else|for|while|do|switch|case|default|break|continue|return|goto|throw|try|catch|co_await|co_return|co_yield)\\b"
+				},
+				{
+					"name": "keyword.operator.new-delete.moducpp",
+					"match": "\\b(new|delete)\\b"
+				},
+				{
+					"name": "keyword.other.moducpp",
+					"match": "\\b(add|mark|Calc|to|ref|each|auto|decltype|sizeof|alignof|typeid|noexcept|requires|concept)\\b"
+				},
+				{
+					"name": "keyword.operator.cast.moducpp",
+					"match": "\\b(static_cast|dynamic_cast|reinterpret_cast|const_cast)\\b"
+				},
+				{
+					"name": "constant.language.moducpp",
+					"match": "\\b(true|false|null|nullptr|this)\\b"
+				},
+				{
+					"name": "keyword.operator.wordlike.moducpp",
+					"match": "\\b(and|and_eq|or|or_eq|not|not_eq|bitand|bitor|compl|xor|xor_eq)\\b"
+				}
+			]
+		},
+		"key-constants": {
+			"name": "constant.language.key.moducpp",
+			"match": "\\bKEY_[A-Z0-9_]+\\b"
+		},
+		"builtin-types": {
+			"patterns": [
+				{
+					"name": "support.type.primitive.moducpp",
+					"match": "\\b(void|bool|int|float|double|long|short|char|unsigned|signed|wchar_t|char16_t|char32_t)\\b"
+				},
+				{
+					"name": "support.type.moducpp",
+					"match": "\\b(string|vec2|vec3|Vector2|Vector3|SceneObj|SceneObject|Col|ScriptContext|List|IEnum|ConsoleMessageType|UISliderStyle|UIButtonStyle|UIElementType)\\b"
+				},
+				{
+					"name": "support.class.moducpp",
+					"match": "\\b(ModuNode|ModuBehaviour)\\b"
+				}
+			]
+		},
+		"builtin-functions": {
+			"patterns": [
+				{
+					"name": "support.function.moducpp",
+					"match": "\\b(Config|State|BindSetting|BindArray|BindArray2D|SerializeSubScript|DeserializeSubScript|SerializeSubScriptArray|DeserializeSubScriptArray|EditSubScript|EditSubScriptArray|SetFrameDeltaTime|StartTimer|TimerReady|IntRD|IntR|IntRU|AddLog|MODU_SCRIPT)\\b(?=\\s*[(<])"
+				},
+				{
+					"name": "support.function.engine.moducpp",
+					"match": "\\b(GetProjectGravityScale|SetProjectGravityScale|EditFloat|EditVec3|EditBool|EditInt|EditString|hasRigidbody2D|getRigidbody2DVelocity|setRigidbody2DVelocity|moveTowards|TryMoveRigidbody2D|moveRigidbody2D|movePosition2D|warnOnce|warnMissingComponentOnce|hasAudioSource|playSound|EditClipSelector|EditDirectionalClipGrid|EditSoundSet)\\b(?=\\s*[(<])"
+				},
+				{
+					"name": "support.function.input.moducpp",
+					"match": "\\b(KeyDown|KeyPressed|IsRuntimeKeyDown|IsSubmitDown)\\b(?=\\s*[(<])"
+				},
+				{
+					"name": "support.function.experimental.moducpp",
+					"match": "\\b(Trim|ParseInt|ParseFloat|ParseBool|GetScriptSetting|SetScriptSetting|EscapeField|UnescapeField|SplitEscaped|JoinEscaped|DeserializeObjectRefs|SerializeObjectRefs|MakeObjectRef|IsAllDigits|ResolveSceneObjectRef|SetObjectEnabledState|SetObjectsEnabledState|GetObjectReferencePosition|GetCurrentObjectName|TryPlayAnimationClipNamed|ResolveUITextTarget|SetUITextLabel|SetUITextEffects|SetRigidbody2DSimulated|DrawStdStringInput|DrawObjectRefInput|IsAudioClipPath|DrawAudioClipInput|DrawObjectRefListEditor)\\b(?=\\s*[(<])"
+				},
+				{
+					"name": "support.function.ienum.moducpp",
+					"match": "\\b(IEnum_Start|IEnum_Stop|IEnum_Ensure)\\b(?=\\s*[(<])"
+				}
+			]
+		},
+		"strings": {
+			"name": "string.quoted.double.moducpp",
+			"begin": "\"",
+			"end": "\"",
+			"patterns": [
+				{
+					"name": "constant.character.escape.moducpp",
+					"match": "\\\\."
+				}
+			]
+		},
+		"strings_single": {
+		    "name": "string.quoted.single.moducpp",
+		    "begin": "'",
+		    "end": "'",
+		    "patterns": [
+		        {
+		            "name": "constant.character.escape.moducpp",
+		            "match": "\\\\."
+		        }
+		    ]
+		},
+		"numbers": {
+			"patterns": [
+				{
+					"name": "constant.numeric.float.moducpp",
+					"match": "\\b[0-9]+\\.[0-9]*f?\\b"
+				},
+				{
+					"name": "constant.numeric.hex.moducpp",
+					"match": "\\b0[xX][0-9a-fA-F]+\\b"
+				},
+				{
+					"name": "constant.numeric.integer.moducpp",
+					"match": "\\b[0-9]+[uUlL]*\\b"
+				}
+			]
+		},
+		"operators": {
+			"patterns": [
+				{
+					"name": "keyword.operator.comparison.moducpp",
+					"match": "(==|!=|<=|>=|<|>)"
+				},
+				{
+					"name": "keyword.operator.assignment.moducpp",
+					"match": "(\\+=|-=|\\*=|/=|%=|&=|\\|=|\\^=|<<=|>>=|=)"
+				},
+				{
+					"name": "keyword.operator.arithmetic.moducpp",
+					"match": "(\\+\\+|--|\\+|-|\\*|/|%)"
+				},
+				{
+					"name": "keyword.operator.logical.moducpp",
+					"match": "(&&|\\|\\||!)"
+				},
+				{
+					"name": "keyword.operator.bitwise.moducpp",
+					"match": "(&|\\||\\^|~|<<|>>)"
+				},
+				{
+					"name": "keyword.operator.ternary.moducpp",
+					"match": "(\\?|:)"
+				},
+				{
+					"name": "punctuation.accessor.moducpp",
+					"match": "(->|::)"
+				}
+			]
+		}
+	}
+}

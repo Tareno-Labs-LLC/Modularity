@@ -1,0 +1,32 @@
+# Standalone workspace on purpose: this crate consumes Nebula through plain
+# path dependencies so that Nebula/Cargo.toml never has to list it as a member.
+# Nebula stays a pristine upstream checkout.
+[workspace]
+members = ["."]
+
+[package]
+name        = "nebula-modularity"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+description = "C ABI bindings that let the Modularity editor drive Nebula bakes."
+
+[lib]
+name       = "nebula_modularity"
+crate-type = ["cdylib"]
+
+[dependencies]
+nebula-core      = { path = "../Nebula/crates/nebula-core" }
+nebula-light     = { path = "../Nebula/crates/nebula-light" }
+nebula-serialize = { path = "../Nebula/crates/nebula-serialize" }
+
+glam     = { version = "0.33", features = ["bytemuck", "serde"] }
+half     = { version = "2", features = ["bytemuck"] }
+bincode  = { version = "2", features = ["serde"] }
+pollster = "0.3"
+uuid     = { version = "1", features = ["v4", "serde"] }
+log      = "0.4"
+
+[profile.release]
+opt-level = 3
+lto       = "thin"
