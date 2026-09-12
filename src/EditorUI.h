@@ -122,9 +122,18 @@ enum class CardButtonKind { Neutral, Primary, Danger };
 struct CardModalIcon {
     ImTextureID id = static_cast<ImTextureID>(0); bool flipY = false;
 };
+struct CardModalAction {
+    const char* label = nullptr;
+    CardButtonKind kind = CardButtonKind::Neutral;
+    bool disabled = false;
+};
 bool beginCardModal(const char* name, float width = 0.0f, bool* open = nullptr, const CardModalIcon& icon = {});
 void cardModalText(const char* text);
 bool cardModalButton(const char* label, CardButtonKind kind, int index, int count);
+// Lays a whole button set out at once: one even row when the labels fit, uneven
+// widths when they don't, and stacked full-width rows when they still don't.
+// Returns the index of the button pressed this frame, or -1 if none was.
+int cardModalActions(const CardModalAction* actions, int count);
 void endCardModal();
 const EditorChromeMetrics& getEditorChromeMetrics(EditorChromeScale scale = EditorChromeScale::Default);
 const char* getEditorChromeScaleLabel(EditorChromeScale scale);

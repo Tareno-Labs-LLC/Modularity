@@ -1749,7 +1749,10 @@ void Engine::renderLowSpecBenchmarkPopup() {
     namespace HP = Modularity::HardwareProfile;
 
     EditorGlobalPreferences& prefs = projectManager.preferences;
-    if (prefs.lowSpecPromptAnswered || !HP::LooksLowEnd()) {
+    // The Ctrl+T+L launcher preview shows the card on machines the detector never flags,
+    // and leaves without touching the saved answer or the hardware tier.
+    const bool preview = lowSpecBenchmarkPopupForced;
+    if (!preview && (prefs.lowSpecPromptAnswered || !HP::LooksLowEnd())) {
         lowSpecBenchmarkPopupOpened = false;
         return;
     }
@@ -1765,69 +1768,70 @@ void Engine::renderLowSpecBenchmarkPopup() {
         lowSpecBenchmarkPopupOpened = true;
     }
 
-    const ImVec2 displaySize = ImGui::GetIO().DisplaySize;
-    const float popupWidth = ImClamp(displaySize.x * 0.46f, 440.0f, 620.0f);
-    ImGui::SetNextWindowPos(ImVec2(displaySize.x * 0.5f, displaySize.y * 0.5f),
-                            ImGuiCond_Appearing,
-                            ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(popupWidth, 0.0f), ImGuiCond_Appearing);
-
-    const ImGuiWindowFlags popupFlags =
-        ImGuiWindowFlags_AlwaysAutoResize |
-        ImGuiWindowFlags_NoCollapse |
-        ImGuiWindowFlags_NoDocking |
-        ImGuiWindowFlags_NoSavedSettings;
-
-    if (ImGui::BeginPopupModal(popupTitle, nullptr, popupFlags)) {
-        ImGui::PushTextWrapPos(ImGui::GetCursorPos().x + popupWidth -
-                               ImGui::GetStyle().WindowPadding.x * 2.0f);
-        ImGui::TextWrapped("Modularity has detected a low-end system.");
-        ImGui::Spacing();
-        ImGui::TextWrapped("%s", HP::Static().summary().c_str());
-        ImGui::Spacing();
-        ImGui::TextWrapped("Would you like to run a microbenchmark and auto profile for "
-                           "performance tweaks? It renders a few test frames offscreen, "
-                           "takes about a second, and nothing changes until it finishes.");
-        ImGui::PopTextWrapPos();
-
-        ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::Spacing();
-
-        const float available = ImGui::GetContentRegionAvail().x;
-        const float spacing = ImGui::GetStyle().ItemSpacing.x;
-        const float buttonWidth = (available - spacing) * 0.5f;
-
-        if (ImGui::Button("Sure!", ImVec2(buttonWidth, 0.0f))) {
-            const HP::BenchmarkResult r = HP::RunBenchmark();
-            if (r.valid) {
-                prefs.hardwareTier = HP::ToString(r.tier);
-                prefs.benchFullscreenPassMs = r.fullscreenPassMs;
-                prefs.benchBlurPassMs = r.blurPassMs;
-                prefs.benchDrawCallBatchMs = r.drawCallBatchMs;
-                syncGlassBlurToHardwareTier();
+    CardModalIcon icon{};
+    {
+        constexpr const char* iconPath =
+            "Resources/Engine-Root/Pop-up Confirmation Icons/Low End PC detection Icon.png";
+        if (rendererInitialized) {
+            if (Texture* tex = renderer.getTexture(iconPath, MaterialProperties::TextureFilter::Point);
+                tex && tex->GetID()) {
+                icon = { static_cast<ImTextureID>(tex->GetID()), true };
             }
-            prefs.lowSpecPromptAnswered = true;
-            projectManager.saveLauncherSettings();
-            ImGui::CloseCurrentPopup();
         }
-        ImGui::SameLine();
-        if (ImGui::Button("Nah, I'll manually tweak it", ImVec2(buttonWidth, 0.0f))) {
+        if (icon.id == static_cast<ImTextureID>(0) && usingVulkan() && vulkanRendererInitialized && vulkanRenderer) {
+            icon = { vulkanRenderer->getOrCreateUIImage(iconPath), false };
+        }
+    }
+
+    // Wider than the rename/delete cards because this one carries three paragraphs.
+    const float cardWidth = ImClamp(ImGui::GetIO().DisplaySize.x * 0.42f, 430.0f, 560.0f);
+
+    auto dismiss = [&]() {
+        if (preview) {
+            lowSpecBenchmarkPopupForced = false;
+            addConsoleMessage("Low-end prompt preview closed (no settings were changed)",
+                              ConsoleMessageType::Info);
+        } else {
             prefs.lowSpecPromptAnswered = true;
             projectManager.saveLauncherSettings();
-            ImGui::CloseCurrentPopup();
+        }
+        lowSpecBenchmarkPopupOpened = false;
+        ImGui::CloseCurrentPopup();
+    };
+
+    if (beginCardModal(popupTitle, cardWidth, nullptr, icon)) {
+        cardModalText("Modularity has detected a low-end system.");
+        cardModalText(HP::Static().summary().c_str());
+        cardModalText("Would you like to run a microbenchmark and auto profile for "
+                      "performance tweaks? It renders a few test frames offscreen, "
+                      "takes about a second, and nothing changes until it finishes.");
+
+        static constexpr CardModalAction actions[] = {
+            { "Sure!", CardButtonKind::Primary, false },
+            { "Nah, I'll manually tweak it", CardButtonKind::Neutral, false },
+        };
+        const int answer = cardModalActions(actions, IM_ARRAYSIZE(actions));
+        if (answer == 0) {
+            if (!preview) {
+                const HP::BenchmarkResult r = HP::RunBenchmark();
+                if (r.valid) {
+                    prefs.hardwareTier = HP::ToString(r.tier);
+                    prefs.benchFullscreenPassMs = r.fullscreenPassMs;
+                    prefs.benchBlurPassMs = r.blurPassMs;
+                    prefs.benchDrawCallBatchMs = r.drawCallBatchMs;
+                    syncGlassBlurToHardwareTier();
+                }
+            }
+            dismiss();
+        } else if (answer == 1) {
+            dismiss();
         }
 
         ImGui::Spacing();
-        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-        ImGui::PushTextWrapPos(ImGui::GetCursorPos().x + popupWidth -
-                               ImGui::GetStyle().WindowPadding.x * 2.0f);
-        ImGui::TextWrapped("Either way you can change this later in the launcher's "
-                           "Settings > Performance tab.");
-        ImGui::PopTextWrapPos();
-        ImGui::PopStyleColor();
+        cardModalText("Either way you can change this later in the launcher's "
+                      "Settings > Performance tab.");
 
-        ImGui::EndPopup();
+        endCardModal();
     }
 #else
     lowSpecBenchmarkPopupOpened = false;
@@ -1978,6 +1982,17 @@ void Engine::renderLauncher() {
     }
     // Smooth S-curve ease so the zoom feels like it accelerates and decelerates.
     const float transitionEase = EaseInOutCubic(transitionT);
+
+    // Ctrl+T+L previews the low-end machine prompt. It lives here, on the project
+    // selection screen only, so nobody trips it by accident while editing a scene.
+    if (launcherIntroFinished && !launcherTransitionActive && !io.WantTextInput && io.KeyCtrl) {
+        const bool chord = (ImGui::IsKeyDown(ImGuiKey_T) && ImGui::IsKeyPressed(ImGuiKey_L, false)) ||
+                           (ImGui::IsKeyDown(ImGuiKey_L) && ImGui::IsKeyPressed(ImGuiKey_T, false));
+        if (chord && !lowSpecBenchmarkPopupForced) {
+            lowSpecBenchmarkPopupForced = true;
+            lowSpecBenchmarkPopupOpened = false;  // let the popup re-open this frame
+        }
+    }
 
     const bool isLoadingActive = projectLoadInProgress || sceneLoadInProgress;
     float loadingScreenT = launcherTransitionActive ? transitionEase : 0.0f;

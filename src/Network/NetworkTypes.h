@@ -185,4 +185,50 @@ struct SpawnRequest {
     bool spawnDisabled = false;
 };
 
+// ---------------------------------------------------------------------------
+// Avatar pose channel
+// ---------------------------------------------------------------------------
+//
+// Transform sync covers one transform per network object - NetworkObject carries a
+// single rootSceneObjectId - so the children of a spawned instance are not synced.
+// A VR rig is exactly that shape: one object with a head and two hands under it,
+// all moving independently every frame.
+//
+// Rather than spawn a network object per body part (three ownership records and no
+// guarantee they stay grouped), a player streams its tracked parts on a channel of
+// its own, keyed by player rather than by object. This is how Photon's own VR rigs
+// work, and it keeps the parts atomic: one packet carries the whole pose.
+//
+// Rotations here are quaternions, not the Euler degrees SceneObject stores. Headset
+// orientation cannot survive a Euler round-trip without gimbal artefacts, and the
+// engine's Euler composition (QuatFromEulerXYZ, Rx*Ry*Rz) is not glm's default, so
+// converting on the wire would bake in a convention mismatch. Scripts convert once
+// at the point they apply a pose, through ScriptContext::QuatToEulerDegrees.
+//
+// The engine deliberately stores only the latest pose and does no smoothing: a
+// receiver knows its own frame rate and what it is attached to, so damping belongs
+// there. `timestamp` is the sender's session clock, for scripts that want to age
+// or extrapolate a pose.
+
+// Slot numbering is open-ended on purpose. Head/hands are what a rig needs today;
+// hips, feet and elbows are the obvious next ones, and adding them must not mean an
+// ABI change, so the slot crosses every boundary as a plain int.
+namespace AvatarSlot {
+constexpr int kHead = 0;
+constexpr int kLeftHand = 1;
+constexpr int kRightHand = 2;
+}  // namespace AvatarSlot
+
+// Bounded so a malformed or hostile packet cannot make the receiver allocate: the
+// slot count is validated against this before any indexing.
+constexpr int kAvatarSlotCount = 8;
+
+struct AvatarPose {
+    bool valid = false;
+    double timestamp = 0.0;
+    float position[3] = {0.0f, 0.0f, 0.0f};
+    float rotation[4] = {0.0f, 0.0f, 0.0f, 1.0f};  // quaternion, xyzw
+};
+
+
 }  // namespace Net

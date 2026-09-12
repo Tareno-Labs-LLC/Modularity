@@ -425,6 +425,8 @@ private:
     bool editorSettingsDirty = false;
     bool windowsDisclaimerPopupOpened = false;
     bool lowSpecBenchmarkPopupOpened = false;
+    // Ctrl+T+L on the launcher previews the prompt on machines that never trip the detector.
+    bool lowSpecBenchmarkPopupForced = false;
     bool androidStorageAccessPopupOpened = false;
     bool moduCppNvimWarningChecked = false;
     bool moduCppNvimWarningDetected = false;
@@ -1543,6 +1545,25 @@ private:
     void openModuPakImportDialog(const fs::path& packagePath = {});
     void openModuObjExportDialog();
     void openModuObjImportDialog(const fs::path& packagePath = {});
+
+    // ModuOBJ prefab edit mode. Opening a packaged object points the scene editor
+    // at its contents instead of the scene; the scene it displaced is held in
+    // moduObjEditReturnScene and put back on close. See ModuObjEditorWindow.cpp.
+    bool createModuObjAssetFromSelection();
+    bool openModuObjEditor(const fs::path& assetPath);
+    bool saveModuObjEdits();
+    void closeModuObjEditor(bool saveFirst);
+    void renderModuObjEditorBar();
+    bool isEditingModuObj() const { return moduObjEditMode; }
+
+    bool moduObjEditMode = false;
+    bool moduObjEditDirty = false;
+    fs::path moduObjEditPath;
+    std::string moduObjEditAssetId;
+    std::string moduObjEditName;
+    SceneSnapshot moduObjEditReturnScene;
+    bool moduObjEditReturnValid = false;
+    bool moduObjEditReturnUnsaved = false;
     void renderDialogs();
     void updateCompileJob();
     void renderProjectBrowserPanel();
@@ -2018,6 +2039,12 @@ public:
     bool setAnimationPlayOnAwakeFromScript(int id, bool playOnAwake);
     void syncLocalTransform(SceneObject& obj);
     const std::vector<SceneObject>& getSceneObjects() const { return sceneObjects; }
+    // Script-facing access to the live session. Scripts never name a Net:: type
+    // themselves - ScriptContext's Network* methods are the only callers, and they
+    // flatten everything to ints, floats and strings before it reaches a script.
+    Net::NetworkSession& getNetworkSession() { return networkSession; }
+    const Net::NetworkSession& getNetworkSession() const { return networkSession; }
+    bool isNetworkSessionActive() const { return networkSessionActive; }
     const std::vector<UIStylePreset>& getUIStylePresets() const { return uiStylePresets; }
     const std::vector<UIFontCatalogEntry>& getUIFontCatalog() const { return uiFontCatalog; }
     const std::string& getEditorUIFontAsset() const { return uiEditorFontAsset; }

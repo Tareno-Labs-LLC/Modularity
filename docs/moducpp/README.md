@@ -55,6 +55,7 @@ Older documentation often read as if `add ModuCPP;` brought the whole scripting 
 | `add ModuCPP;` | Core script base names, object/state facades, timers, math/value helpers, script context | Nearly every gameplay script |
 | `add ModuEngine;` | Engine-facing helpers such as object utilities, editor widgets, movement/audio helpers, project/runtime helpers | Gameplay scripts that touch more engine systems |
 | `add ModuInput;` | Input constants, direct key polling, directional input helpers | Character control, UI navigation, debug controls |
+| `add ModuNetwork;` | Session, rooms, players, ownership, ModuOBJ spawning, avatar pose channel | Multiplayer scenes, networked rigs |
 | `add RMeshBuilder;` | Reserved mesh-builder import | Future-facing or placeholder usage only |
 | `add ModuCPP.Experimental;` | Experimental helpers such as object-reference serialization and extra UI/editor helpers | Tools, prototypes, unstable feature work |
 

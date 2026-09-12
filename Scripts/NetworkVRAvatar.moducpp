@@ -1,0 +1,226 @@
+add ModuCPP;
+add ModuNetwork;
+
+// NetworkVRAvatar - one networked player body, mirrored from a local rig.
+//
+// Put this on the ROOT of a packaged avatar object whose children are named Head,
+// LeftHand and RightHand, and spawn that object through NetworkVRManager. Every
+// client spawns exactly one, so each player has a body everyone else can see.
+//
+// The script does NOT drive the local player. Locomotion already owns that - SCL
+// pushes the body around with physics hands, and a second script writing to the same
+// transforms would fight it every frame. What this does instead:
+//
+//   the avatar you own   - copies the local rig's body/head/hands, and publishes the
+//                          head and hands on the avatar pose channel
+//   everyone else's      - reads their poses off that channel and applies them
+//
+// That split is why the same script works whatever the local rig is. It never reads
+// a headset directly, so a flat-mode camera rig mirrors exactly as well as a VR one -
+// and remote players cannot tell which was which.
+//
+// How the two halves of the transform travel:
+//
+//   avatar root - a networked object, so ordinary transform sync streams it.
+//   head/hands  - children, which transform sync does NOT cover (one transform per
+//                 network object). They go on the avatar pose channel, RELATIVE to
+//                 the root, so the remote copy rebuilds them on top of wherever
+//                 transform sync put the root.
+public class NetworkVRAvatar : ModuNode
+{
+    [Header("Local Rig To Mirror")]
+    public string localBodyName = "SCL";
+    public string localHeadName = "XR Camera 1";
+    public string localLeftHandName = "PhysL";
+    public string localRightHandName = "PhysR";
+
+    [Header("Avatar Parts")]
+    public string headName = "Head";
+    public string leftHandName = "LeftHand";
+    public string rightHandName = "RightHand";
+
+    [Header("Remote Smoothing")]
+    public bool smoothRemote = true;
+    [Slider(1.0f, 40.0f)] public float positionSmoothing = 18.0f;
+    [Slider(1.0f, 40.0f)] public float rotationSmoothing = 18.0f;
+
+    [Header("Debug")]
+    public bool logOwnership = true;
+
+    private int headId = -1;
+    private int leftId = -1;
+    private int rightId = -1;
+    private bool partsResolved = false;
+    private bool partsWarned = false;
+    private bool wasMine = false;
+    private bool ownershipLogged = false;
+
+    void Begin()
+    {
+        ResolveParts();
+        wasMine = false;
+        ownershipLogged = false;
+    }
+
+    void TickUpdate()
+    {
+        if (dt <= 0.0f) return;
+        if (!partsResolved) ResolveParts();
+        if (!partsResolved)
+        {
+            // Silence here is the worst outcome: the avatar spawns, renders, and does
+            // nothing, with no clue why. Say it once rather than every frame.
+            if (!partsWarned)
+            {
+                partsWarned = true;
+                AddLog("[VRAvatar] No child named '" + headName + "' under this object. A packaged avatar needs Head, LeftHand and RightHand children (or matching headName/leftHandName/rightHandName).", Type.Error);
+            }
+            return;
+        }
+
+        NetworkId avatarId = Net.NetworkIdOf(obj->id);
+        // HasAuthority reports true with no session at all, and an avatar placed by
+        // hand rather than spawned has no network id, where HasAuthority(0) is false
+        // while connected. Both cases mean the same thing: this body is mine.
+        bool mine = (avatarId == 0) || Net.HasAuthority(avatarId);
+
+        if (mine != wasMine || !ownershipLogged)
+        {
+            wasMine = mine;
+            ownershipLogged = true;
+            if (logOwnership)
+            {
+                if (mine) AddLog("[VRAvatar] Mirroring the local rig.", Type.Success);
+                else AddLog("[VRAvatar] Playing back a remote player.", Type.Info);
+            }
+        }
+
+        if (mine) MirrorLocalRig();
+        else PlayBackRemote(Net.OwnerOf(avatarId));
+    }
+
+    void ResolveParts()
+    {
+        int selfId = obj->id;
+        if (selfId < 0) return;
+        headId = FindChild(selfId, headName).Id();
+        leftId = FindChild(selfId, leftHandName).Id();
+        rightId = FindChild(selfId, rightHandName).Id();
+        partsResolved = (headId >= 0);
+    }
+
+    // --- The avatar you own --------------------------------------------------
+
+    void MirrorLocalRig()
+    {
+        // Found by name rather than through [ObjectRef] fields on purpose:
+        // ModuObj::Instantiate remaps ids, parent ids and child lists when it spawns
+        // a packaged object, but it does NOT remap [ObjectRef] strings. A ref baked
+        // into this prefab would point at whatever happens to hold that id in the
+        // scene it landed in. Names survive spawning; ids do not.
+        auto body = FindObject(localBodyName);
+        if (!body) return;
+
+        Vector3 bodyPos = body.Transform.position;
+        Vector3 bodyRotDeg = body.Transform.rotation;
+
+        // The root follows the local body, and transform sync streams it from here.
+        obj.Transform.position = bodyPos;
+        obj.Transform.rotation = bodyRotDeg;
+
+        Quaternion bodyRot = Net.EulerToQuat(bodyRotDeg);
+        // Inverse of the body rotation, to take a world pose back into rig space.
+        Quaternion bodyRotInv = glm::inverse(bodyRot);
+
+        PublishPart(AvatarSlot.Head, localHeadName, headId, bodyPos, bodyRotInv);
+        PublishPart(AvatarSlot.LeftHand, localLeftHandName, leftId, bodyPos, bodyRotInv);
+        PublishPart(AvatarSlot.RightHand, localRightHandName, rightId, bodyPos, bodyRotInv);
+    }
+
+    // Take one local rig object's world pose, express it relative to the body, put
+    // the avatar's matching part there, and publish the rig-local pose.
+    //
+    // Rig-local rather than world is what makes the two halves compose on the far
+    // end: a remote avatar puts its root wherever transform sync says, then rebuilds
+    // the parts on top of that. Publishing world poses would fight the root's own
+    // interpolation and make hands swim whenever a player moved.
+    void PublishPart(int slot, string sourceName, int partId, Vector3 bodyPos, Quaternion bodyRotInv)
+    {
+        auto source = FindObject(sourceName);
+        if (!source) return;
+
+        Vector3 sourcePos = source.Transform.position;
+        Vector3 sourceRotDeg = source.Transform.rotation;
+        Quaternion sourceRot = Net.EulerToQuat(sourceRotDeg);
+
+        Vector3 offset = sourcePos - bodyPos;
+        Vector3 localPos = bodyRotInv * offset;
+        Quaternion localRot = bodyRotInv * sourceRot;
+
+        if (partId >= 0)
+        {
+            auto part = ObjectById(partId);
+            part.Transform.position = sourcePos;
+            part.Transform.rotation = sourceRotDeg;
+        }
+
+        // Called every frame on purpose: the session rate-limits the stream at
+        // serializationRateHz, the script does not.
+        Net.Avatar.SetLocal(slot, localPos, localRot);
+    }
+
+    // --- Everyone else -------------------------------------------------------
+
+    void PlayBackRemote(int owner)
+    {
+        if (owner == 0) return;
+
+        Vector3 pos = Vector3(0.0f, 0.0f, 0.0f);
+        Quaternion rot = Quaternion(1.0f, 0.0f, 0.0f, 0.0f);
+        if (Net.Avatar.TryGet(owner, AvatarSlot.Head, pos, rot)) ApplyPart(headId, pos, rot);
+        if (Net.Avatar.TryGet(owner, AvatarSlot.LeftHand, pos, rot)) ApplyPart(leftId, pos, rot);
+        if (Net.Avatar.TryGet(owner, AvatarSlot.RightHand, pos, rot)) ApplyPart(rightId, pos, rot);
+    }
+
+    // Compose a rig-local pose onto the avatar root and ease toward it. The engine
+    // stores the latest received pose and never smooths it, because only the receiver
+    // knows its own frame rate - so the damping lives here.
+    //
+    // Ids rather than resolved objects are passed around deliberately: a SceneObj
+    // method parameter is lowered to a bare SceneObject and loses .Transform.
+    void ApplyPart(int partId, Vector3 localPos, Quaternion localRot)
+    {
+        if (partId < 0) return;
+
+        Vector3 rootPos = obj.Transform.position;
+        Vector3 rootRotDeg = obj.Transform.rotation;
+        Quaternion rootRot = Net.EulerToQuat(rootRotDeg);
+
+        Vector3 targetPos = rootPos + rootRot * localPos;
+        Quaternion targetRot = rootRot * localRot;
+
+        auto part = ObjectById(partId);
+        if (!smoothRemote)
+        {
+            part.Transform.position = targetPos;
+            part.Transform.rotation = Net.QuatToEuler(targetRot);
+            return;
+        }
+
+        Vector3 currentPos = part.Transform.position;
+        Vector3 currentRotDeg = part.Transform.rotation;
+        Quaternion currentRot = Net.EulerToQuat(currentRotDeg);
+
+        // Frame-rate independent easing: the blend comes from the frame delta rather
+        // than being a fixed fraction, so a 144Hz client and a 60Hz one converge at
+        // the same speed instead of the faster one arriving sooner.
+        float posBlend = Math.Clamp(positionSmoothing * DeltaTime(), 0.0f, 1.0f);
+        float rotBlend = Math.Clamp(rotationSmoothing * DeltaTime(), 0.0f, 1.0f);
+
+        Vector3 blendedPos = currentPos + (targetPos - currentPos) * posBlend;
+        Quaternion blendedRot = glm::slerp(currentRot, targetRot, rotBlend);
+
+        part.Transform.position = blendedPos;
+        part.Transform.rotation = Net.QuatToEuler(blendedRot);
+    }
+}

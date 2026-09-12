@@ -40,9 +40,16 @@ std::string GetPlatformDefaultProjectsPath() {
     }
     return std::string("/data/local/tmp/ModularityProjects");
 #elif defined(_WIN32)
+    // The user root, matching the Linux branch below rather than burying projects
+    // under Documents. Windows sat under Documents only because reading a project
+    // straight from the user root used to crash; that was a path-handling bug, since
+    // fixed, not a reason to keep the two platforms disagreeing.
+    //
+    // Only a fallback: a stored defaultProjectLocation always wins, so existing
+    // installs keep pointing wherever they already pointed.
     const char* userProfile = std::getenv("USERPROFILE");
     if (userProfile && *userProfile) {
-        return (fs::path(userProfile) / "Documents" / "ModularityProjects").string();
+        return (fs::path(userProfile) / "ModularityProjects").string();
     }
 #else
     const char* home = std::getenv("HOME");

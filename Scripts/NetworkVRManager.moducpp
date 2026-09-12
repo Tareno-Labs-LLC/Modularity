@@ -1,0 +1,129 @@
+add ModuCPP;
+add ModuNetwork;
+
+// NetworkVRManager - session lifecycle and rig ownership for a networked VR scene.
+//
+// Put this on any object in the scene alongside a Network Manager component (which
+// is where the Photon App ID, region and nickname live). It joins a room, spawns one
+// NetworkedVRRig for the local player, and lets it go on the way out.
+//
+// It deliberately does NOT spawn rigs for other players: Net.Spawn replicates, so
+// every client spawning its own rig is exactly enough for everyone to see everyone.
+// Spawning one per remote player as well would give each player N copies of
+// themselves - the single most common way a first networked scene goes wrong.
+public class NetworkVRManager : ModuNode
+{
+    [Header("Room")]
+    public string roomName = "vr-thingy";
+    [Slider(2.0f, 32.0f)] public float maxPlayers = 16.0f;
+    public bool autoJoin = true;
+    public string playerName = "Player";
+
+    [Header("Rig")]
+    public string rigAssetId = "";
+    public Vector3 spawnPosition = Vector3(0.0f, 0.0f, 0.0f);
+    public Vector3 spawnRotation = Vector3(0.0f, 0.0f, 0.0f);
+    [Slider(0.0f, 6.0f)] public float spawnSpread = 1.5f;
+
+    [Header("Debug")]
+    public bool logStateChanges = true;
+
+    private bool joinRequested = false;
+    private bool rigSpawned = false;
+    private NetworkId rigId = 0;
+    private int lastLoggedState = -1;
+    private int lastPlayerCount = -1;
+
+    void Begin()
+    {
+        joinRequested = false;
+        rigSpawned = false;
+        rigId = 0;
+        lastLoggedState = -1;
+        lastPlayerCount = -1;
+
+        if (!Net.Active)
+        {
+            AddLog("[VRNet] No network session. Add a Network Manager component with a Photon App ID, or run offline.", Type.Warning);
+            return;
+        }
+        if (playerName.length() > 0) Net.SetNickname(playerName);
+    }
+
+    void TickUpdate()
+    {
+        if (logStateChanges) ReportStateChanges();
+
+        if (!Net.Active) return;
+
+        // One join attempt, not one per frame: JoinOrCreateRoom is an operation sent
+        // to the server, and re-sending it every frame while the reply is in flight
+        // is how a client ends up rate-limited by Photon rather than connected.
+        if (!joinRequested && autoJoin && !Net.InRoom)
+        {
+            NetState phase = Net.State;
+            if (phase == NetState.ConnectedToMaster || phase == NetState.InLobby)
+            {
+                joinRequested = true;
+                int cap = (int)maxPlayers;
+                if (!Net.JoinOrCreateRoom(roomName, cap))
+                {
+                    joinRequested = false;
+                    AddLog("[VRNet] Room join was rejected; will retry.", Type.Warning);
+                }
+            }
+        }
+
+        if (Net.InRoom && !rigSpawned) SpawnLocalRig();
+
+        // Leaving the room takes every spawned object with it, so the handle we hold
+        // is stale rather than something to despawn.
+        if (!Net.InRoom && rigSpawned)
+        {
+            rigSpawned = false;
+            rigId = 0;
+            joinRequested = false;
+        }
+    }
+
+    void SpawnLocalRig()
+    {
+        if (rigAssetId.length() == 0)
+        {
+            AddLog("[VRNet] No rig asset id set; nothing to spawn.", Type.Warning);
+            rigSpawned = true;
+            return;
+        }
+
+        // Fan players out from the spawn point by player id so two rigs do not open
+        // inside one another. Crude on purpose - a real scene uses spawn markers.
+        int slot = Net.LocalPlayer;
+        float angle = (float)slot * 2.399963f;
+        Vector3 where = spawnPosition;
+        where.x = where.x + Math.Sin(angle) * spawnSpread;
+        where.z = where.z + Math.Cos(angle) * spawnSpread;
+
+        rigId = Net.Spawn(rigAssetId, where, spawnRotation, Vector3(1.0f, 1.0f, 1.0f));
+        rigSpawned = true;
+        if (rigId == 0) AddLog("[VRNet] Rig spawn failed. Check the asset id is a packaged object in this project.", Type.Error);
+        else AddLog("[VRNet] Spawned local rig as player " + std::to_string(slot) + ".", Type.Success);
+    }
+
+    void ReportStateChanges()
+    {
+        NetState phase = Net.State;
+        int current = (int)phase;
+        if (current != lastLoggedState)
+        {
+            lastLoggedState = current;
+            AddLog("[VRNet] " + std::string(ToString(phase)) + " (" + std::string(Net.Backend.Value()) + ")", Type.Info);
+        }
+
+        int players = Net.PlayerCount;
+        if (players != lastPlayerCount)
+        {
+            lastPlayerCount = players;
+            AddLog("[VRNet] Players in room: " + std::to_string(players), Type.Info);
+        }
+    }
+}

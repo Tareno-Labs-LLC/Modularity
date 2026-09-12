@@ -5572,12 +5572,49 @@ void Engine::onWindowResized(int width, int height) {
 bool Engine::init() {
 #if defined(_WIN32) && !defined(__ANDROID__)
     {
-        const HANDLE errHandle = GetStdHandle(STD_ERROR_HANDLE);
-        if (errHandle == nullptr || errHandle == INVALID_HANDLE_VALUE) {
+        // Test the STREAM, not the OS handle.
+        //
+        // GetStdHandle(STD_ERROR_HANDLE) still reports NULL in a windowed build even
+        // after CrashReporter::Install has given stderr a real file, so checking the
+        // handle here reopened a stream that was already perfectly good - throwing away
+        // the redirect that had just been set up.
+        //
+        // That was worse than wasteful, because freopen closes the stream *before* it
+        // tries to reopen, and this used a fixed relative filename. A second editor
+        // process - whose first copy already holds modularity-boot.log open - failed the
+        // reopen and was left with a CLOSED stderr. Measured: an unattached stderr
+        // (fd=-2) writes harmlessly, but a closed one makes the very next fprintf trip
+        // the CRT invalid-parameter handler, which the crash reporter turns into a fatal
+        // "CRT invalid parameter" before the window ever appears. _initMark's timing
+        // line was the trigger.
+        //
+        // _fileno is what fprintf itself ends up using, so it is the honest question to
+        // ask, and it is already true when the crash reporter has done its job.
+        if (stderr == nullptr || _fileno(stderr) < 0) {
+            // Per-process filename, so a second instance does not fight the first over
+            // the same log. The plain name is kept for the common single-instance case
+            // because it is what the docs and existing habits point at.
+            const std::string bootLogName =
+                "modularity-boot.log";
             FILE* redirected = nullptr;
-            if (freopen_s(&redirected, "modularity-boot.log", "w", stderr) == 0 && redirected) {
+            bool opened = (freopen_s(&redirected, bootLogName.c_str(), "w", stderr) == 0 &&
+                           redirected != nullptr);
+            if (!opened) {
+                const std::string fallbackName =
+                    "modularity-boot-" + std::to_string(static_cast<unsigned long>(GetCurrentProcessId())) +
+                    ".log";
+                opened = (freopen_s(&redirected, fallbackName.c_str(), "w", stderr) == 0 &&
+                          redirected != nullptr);
+            }
+            if (opened) {
                 std::setvbuf(stderr, nullptr, _IONBF, 0);
                 std::fprintf(stderr, "[Modularity] Diagnostic log. Delete this file freely.\n");
+            } else {
+                // Both reopens failed, and freopen has already taken the original stream
+                // down with it. NUL always opens; a sink that discards beats a closed
+                // FILE* that kills the process on the next write.
+                FILE* nullSink = nullptr;
+                freopen_s(&nullSink, "NUL", "w", stderr);
             }
         }
     }
@@ -6483,6 +6520,7 @@ void Engine::run() {
                 renderModuPakImportDialog();
                 renderModuObjExportDialog();
                 renderModuObjImportDialog();
+                renderModuObjEditorBar();
 #endif
             }
         }
@@ -8320,6 +8358,39 @@ void Engine::updateNetworking(float delta) {
             return moduObjAssetCache.get(it->second, outError);
         };
 
+
+        // A networked spawn appends straight into sceneObjects through the
+        // SceneBridge, which has no way to tell the engine it happened. Everything
+        // the engine caches about the scene is then describing the scene as it was:
+        //
+        //   runtimeScriptBindings - the list updateScripts walks. A spawned object is
+        //                           absent from it, so its scripts never tick, and
+        //                           because Begin() fires on a script's first tick
+        //                           (mod->beginCalledObjects), it never begins either.
+        //                           That is the "it spawned but does nothing" case.
+        //   sceneObjectIndexById  - id lookups miss the new objects entirely.
+        //   hierarchy transforms  - localPosition/localRotation are uninitialised
+        //                           until a hierarchy pass runs, so a child spawned
+        //                           under a parent sits at the wrong offset.
+        //
+        // Rebuilding is cheap next to a spawn and only happens per spawned object, so
+        // this marks everything dirty rather than trying to patch the caches in place.
+        auto refreshAfterSceneMutation = [this]() {
+            markRuntimeScriptBindingsDirty();
+            sceneObjectIndexById.clear();
+            sceneObjectIndexData = nullptr;
+            sceneObjectIndexCount = 0;
+            updateHierarchyWorldTransforms();
+        };
+        networkSession.onObjectSpawned = [refreshAfterSceneMutation](Net::NetworkId) {
+            refreshAfterSceneMutation();
+        };
+        // Despawn removes objects from the same vector, so stale bindings would point
+        // at ids that are gone - harmless today because updateScripts skips unknown
+        // ids, but it leaves the index wrong for everything that follows.
+        networkSession.onObjectDespawned = [refreshAfterSceneMutation](Net::NetworkId) {
+            refreshAfterSceneMutation();
+        };
         networkSession.onLog = [this](Net::LogLevel level, const std::string& message) {
             ConsoleMessageType type = ConsoleMessageType::Info;
             switch (level) {
@@ -15789,6 +15860,13 @@ bool Engine::createScriptAsset(ScriptScaffoldKind kind,
 }
 
 void Engine::markProjectDirty() {
+    // In prefab edit mode the scene IS the asset, so the same edit signal drives the
+    // asset's unsaved marker. The project flag is left alone: the scene on disk has
+    // not changed, and setting it would prompt to save a scene nobody edited.
+    if (moduObjEditMode) {
+        moduObjEditDirty = true;
+        return;
+    }
     projectManager.currentProject.hasUnsavedChanges = true;
 }
 

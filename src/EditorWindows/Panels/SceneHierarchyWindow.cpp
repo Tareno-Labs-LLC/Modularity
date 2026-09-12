@@ -1312,6 +1312,15 @@ void Engine::renderObjectNode(SceneObject& obj, const std::string& filter,
             setPrimarySelection(obj.id);
             duplicateSelected();
         }
+        // Creates the prefab asset the engine actually instantiates and spawns.
+        // "Export As ModuOBJ..." below writes the other .moduobj - a zip package with
+        // bundled dependencies, for sending to someone else.
+        if (ImGui::MenuItem("Create Packaged Object")) {
+            if (std::find(selectedObjectIds.begin(), selectedObjectIds.end(), obj.id) == selectedObjectIds.end()) {
+                setPrimarySelection(obj.id);
+            }
+            createModuObjAssetFromSelection();
+        }
         if (ImGui::MenuItem("Export As ModuOBJ...")) {
             if (std::find(selectedObjectIds.begin(), selectedObjectIds.end(), obj.id) == selectedObjectIds.end()) {
                 setPrimarySelection(obj.id);
@@ -1602,33 +1611,6 @@ void Engine::renderConsolePanel() {
         consolePanelExpanded = keepOpen;
     }
 
-    bool settingsChanged = false;
-    if (ImGui::Button("Clear")) {
-        consoleLog.clear();
-        latestErrorMessage.clear();
-        latestErrorTimestamp.clear();
-    }
-
-    ImGui::SameLine();
-    ImGui::Checkbox("Auto-scroll", &autoScroll);
-    ImGui::SameLine();
-    if (ImGui::Checkbox("Wrap Text", &consoleWrapText)) {
-        settingsChanged = true;
-    }
-
-    ImGui::Separator();
-
-    Texture* infoLogo = nullptr;
-    Texture* warningLogo = nullptr;
-    Texture* errorLogo = nullptr;
-    Texture* successLogo = nullptr;
-    if (rendererInitialized) {
-        infoLogo = renderer.getTexture("Resources/Engine-Root/Info Logo.png");
-        warningLogo = renderer.getTexture("Resources/Engine-Root/Warning Logo.png");
-        errorLogo = renderer.getTexture("Resources/Engine-Root/Error Logo.png");
-        successLogo = renderer.getTexture("Resources/Engine-Root/Modu-Logo.png");
-    }
-
     const ProjectConsoleTone consoleTone = projectManager.currentProject.isLoaded
         ? projectManager.currentProject.consoleSettings.tone
         : ProjectConsoleTone::Fun;
@@ -1650,6 +1632,53 @@ void Engine::renderConsolePanel() {
             default: return "Just so you know";
         }
     };
+
+    bool settingsChanged = false;
+    if (ImGui::Button("Clear")) {
+        consoleLog.clear();
+        latestErrorMessage.clear();
+        latestErrorTimestamp.clear();
+    }
+
+    ImGui::SameLine();
+    ImGui::Checkbox("Auto-scroll", &autoScroll);
+    ImGui::SameLine();
+    if (ImGui::Checkbox("Wrap Text", &consoleWrapText)) {
+        settingsChanged = true;
+    }
+
+    // Console rows are painted straight onto the draw list rather than submitted as
+    // ImGui text items, which is fast but leaves nothing to select or drag over. These
+    // two are the only way text gets out of here: the whole log, or one row from the
+    // right-click menu on it.
+    ImGui::SameLine();
+    if (ImGui::Button("Copy All")) {
+        std::string all;
+        for (const ConsoleEntry& entry : consoleLog) {
+            all += "[" + entry.timestamp + "] " + typeLabel(entry.type) + "\n";
+            all += entry.message + "\n";
+        }
+        ImGui::SetClipboardText(all.c_str());
+        showEditorToast("Copied " + std::to_string(consoleLog.size()) + " console message(s).",
+                        ConsoleMessageType::Success, 1.4);
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Copy every message to the clipboard.\nRight-click a row to copy just that one.");
+    }
+
+    ImGui::Separator();
+
+    Texture* infoLogo = nullptr;
+    Texture* warningLogo = nullptr;
+    Texture* errorLogo = nullptr;
+    Texture* successLogo = nullptr;
+    if (rendererInitialized) {
+        infoLogo = renderer.getTexture("Resources/Engine-Root/Info Logo.png");
+        warningLogo = renderer.getTexture("Resources/Engine-Root/Warning Logo.png");
+        errorLogo = renderer.getTexture("Resources/Engine-Root/Error Logo.png");
+        successLogo = renderer.getTexture("Resources/Engine-Root/Modu-Logo.png");
+    }
+
 
     auto typeColor = [&](ConsoleMessageType type) -> ImVec4 {
         switch (type) {
@@ -1755,6 +1784,19 @@ void Engine::renderConsolePanel() {
 
             const ImVec2 rowMin = ImGui::GetCursorScreenPos();
             ImGui::Dummy(ImVec2(rowWidth, rowHeight));
+            // The Dummy is the only real item on this row, so it carries the copy menu.
+            // It has to come before the spacer Dummy at the end of the loop, which
+            // would otherwise be the item a context popup attaches to.
+            if (ImGui::BeginPopupContextItem("##consoleRow")) {
+                if (ImGui::MenuItem("Copy Message")) {
+                    ImGui::SetClipboardText(log.message.c_str());
+                }
+                if (ImGui::MenuItem("Copy With Timestamp")) {
+                    const std::string full = row.header + "\n" + log.message;
+                    ImGui::SetClipboardText(full.c_str());
+                }
+                ImGui::EndPopup();
+            }
             const ImVec2 rowMax = ImVec2(rowMin.x + rowWidth, rowMin.y + rowHeight);
 
             ImDrawList* draw = ImGui::GetWindowDrawList();

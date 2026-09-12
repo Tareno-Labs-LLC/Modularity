@@ -27,7 +27,7 @@ class Engine;
     #define MODULARITY_SCRIPT_EXPORT __attribute__((visibility("default")))
 #endif
 
-#define MODULARITY_NATIVE_SCRIPT_ABI_VERSION 53
+#define MODULARITY_NATIVE_SCRIPT_ABI_VERSION 54
 
 #define MODULARITY_SCRIPT_LAYOUT_SIGNATURE() \
     ((static_cast<unsigned long long>(sizeof(SceneObject)) << 40) ^ \
@@ -60,6 +60,13 @@ struct MODULARITY_SCRIPT_API ScriptContext {
     /// @returns Matching object pointer, or nullptr when not found.
     SceneObject* FindObjectByName(const std::string& name);
     SceneObject* FindObjectById(int id);
+    // First descendant of parentObjectId with this exact name, or -1. Scene objects
+    // only store parentId, so this walks each candidate's parent chain rather than a
+    // child list. Needed because ModuObj::Instantiate remaps ids, parentId and
+    // children when it spawns a packaged object but does NOT remap [ObjectRef]
+    // strings - so a prefab cannot reference its own parts by ref and has to find
+    // them by name at runtime.
+    int FindChildByName(int parentObjectId, const std::string& name) const;
     SceneObject* ResolveObjectRef(const std::string& ref);
     void SyncObjectLocalTransform(int objectId);
     int GetSceneObjectCount() const;
@@ -103,6 +110,68 @@ struct MODULARITY_SCRIPT_API ScriptContext {
     bool GetXRVelocity(int device, glm::vec3& linear, glm::vec3& angular) const;
     void XRHapticPulse(int device, float amplitude, float duration, float frequency = 0.0f) const;
     std::string GetXRInteractionProfile(int device) const;
+
+    // --- Networking (ModuNetwork) -------------------------------------------
+    //
+    // Flat by design: every parameter and return is an int, float, string or glm
+    // vector, so no Net:: type ever crosses into a compiled script and the ABI does
+    // not move when the networking internals do. ModuNetworkScriptApi.h is the
+    // facade that makes these read like an API.
+    //
+    // With no session running every query reports a neutral value - disconnected,
+    // no players, no authority - and every command is a no-op returning false, so a
+    // networked script still runs in a single-player scene without guards.
+    bool IsNetworkActive() const;
+    bool IsNetworkOffline() const;
+    int GetNetworkState() const;
+    int GetNetworkPing() const;
+    std::string GetNetworkRegion() const;
+    std::string GetNetworkBackendName() const;
+    bool NetworkConnect();
+    void NetworkDisconnect();
+
+    bool IsInNetworkRoom() const;
+    bool NetworkJoinOrCreateRoom(const std::string& name, int maxPlayers);
+    bool NetworkJoinRandomRoom();
+    bool NetworkLeaveRoom();
+
+    int GetLocalNetworkPlayerId() const;
+    int GetNetworkHostPlayerId() const;
+    bool IsNetworkHost() const;
+    int GetNetworkPlayerCount() const;
+    int GetNetworkPlayerIdAt(int index) const;
+    std::string GetNetworkPlayerNickname(int playerId) const;
+    bool SetNetworkNickname(const std::string& nickname);
+
+    // NetworkId is unsigned on the wire; 0 is kInvalidNetworkId and is what every
+    // one of these returns when it fails, so a caller can test the result directly.
+    unsigned int NetworkSpawn(const std::string& assetId,
+                              const glm::vec3& position,
+                              const glm::vec3& rotationDegrees,
+                              const glm::vec3& scale);
+    bool NetworkDespawn(unsigned int networkId);
+    bool NetworkHasAuthority(unsigned int networkId) const;
+    bool NetworkTransferOwnership(unsigned int networkId, int newOwner);
+    int GetNetworkObjectOwner(unsigned int networkId) const;
+    int GetNetworkObjectSceneId(unsigned int networkId) const;
+    unsigned int FindNetworkIdForObject(int sceneObjectId) const;
+    int GetNetworkObjectCount() const;
+    unsigned int GetNetworkObjectIdAt(int index) const;
+
+    // Avatar pose channel - the per-player stream a rig uses for parts that move
+    // independently of the object root. Rotations are quaternions here because a
+    // headset orientation does not survive a Euler round trip.
+    void SetLocalAvatarPose(int slot, const glm::vec3& position, const glm::quat& rotation);
+    void ClearLocalAvatarPose(int slot);
+    bool GetAvatarPose(int playerId, int slot, glm::vec3& position, glm::quat& rotation) const;
+
+    // Rotation conversion in the engine's own convention (Rx*Ry*Rz, degrees), which
+    // is NOT glm's default quat(vec3) composition - the two agree only while a
+    // single axis is non-zero. Exposed here rather than as free functions so a
+    // compiled script picks up the engine's implementation instead of linking its
+    // own, and so scripts converting XR poses cannot get the convention wrong.
+    glm::vec3 QuatToEulerDegrees(const glm::quat& rotation) const;
+    glm::quat EulerDegreesToQuat(const glm::vec3& degrees) const;
     bool IsXRHovered() const;
     bool IsXRSelected() const;
     bool XRHoverEntered() const;

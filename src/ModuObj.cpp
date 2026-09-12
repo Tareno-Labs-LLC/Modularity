@@ -156,6 +156,18 @@ bool ReadAssetStream(std::istream& in, Asset& outAsset, std::string& outError) {
     outAsset = Asset{};
     outError.clear();
 
+    // Captured before parsing so a wrong-format file can be named for what it is
+    // rather than reported as a missing header. Peeked, not consumed.
+    std::string firstBytes;
+    {
+        const std::istream::pos_type start = in.tellg();
+        char magic[2] = {0, 0};
+        in.read(magic, 2);
+        firstBytes.assign(magic, static_cast<size_t>(in.gcount()));
+        in.clear();
+        in.seekg(start);
+    }
+
     std::ostringstream rest;
     std::string line;
     bool sawHeader = false;
@@ -222,7 +234,17 @@ bool ReadAssetStream(std::istream& in, Asset& outAsset, std::string& outError) {
     }
 
     if (!sawHeader) {
-        outError = "Not a ModuOBJ asset: missing MODU_OBJASSET header.";
+        // Two formats have always shared this extension. A zip here is the package
+        // "Export As ModuOBJ..." writes - a manifest plus bundled dependencies, meant
+        // for sharing - not the prefab asset the engine instantiates and spawns.
+        // Saying so beats "missing header", which reads as file corruption.
+        if (firstBytes.rfind("PK", 0) == 0) {
+            outError = "This is a shared ModuOBJ package, not a packaged object asset. "
+                       "Use Import ModuOBJ to bring it into the scene, then Create Packaged "
+                       "Object on the result.";
+        } else {
+            outError = "Not a ModuOBJ asset: missing MODU_OBJASSET header.";
+        }
         return false;
     }
     if (headerVersion < 0) {

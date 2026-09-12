@@ -1717,7 +1717,11 @@ void Engine::renderFileBrowserPanel() {
             return;
         }
         if (packageExt == ".moduobj") {
-            openModuObjImportDialog(entry.path());
+            // Opens for editing, the way double-clicking a scene loads it - a packaged
+            // object is the thing you edit, and instancing one into the scene is what
+            // dragging it does. Import stays on the right-click menu for the cases
+            // where a copy in the current scene really is what was wanted.
+            openModuObjEditor(entry.path());
             return;
         }
         if (fileBrowser.getFileCategory(entry) == FileCategory::Material) {
@@ -2662,6 +2666,15 @@ void Engine::renderFileBrowserPanel() {
         const ImVec2 contentMax(contentMin.x + ImGui::GetWindowWidth(),
                                 contentMin.y + ImGui::GetWindowHeight());
         for (const ExternalFileDropEvent& drop : pendingExternalFileDrops) {
+            // A package is an action, not an asset. Dropping one anywhere in the editor
+            // opens its import dialog instead of copying the archive into the project,
+            // which is both what someone dragging one in is asking for and what keeps
+            // .modupak files from accumulating in Assets/ as dead weight.
+            const std::string droppedExt = PathToUtf8(drop.path.extension());
+            if (droppedExt == ".modupak") {
+                openModuPakImportDialog(drop.path);
+                continue;
+            }
             const bool droppedOverPanel =
                 (drop.mouseX >= contentMin.x && drop.mouseX <= contentMax.x &&
                  drop.mouseY >= contentMin.y && drop.mouseY <= contentMax.y);
@@ -3096,6 +3109,9 @@ void Engine::renderFileBrowserPanel() {
                             if (entry.path().extension() == ".moduobj" && ImGui::MenuItem("Import ModuOBJ...")) {
                                 openModuObjImportDialog(entry.path());
                             }
+                            if (entry.path().extension() == ".moduobj" && ImGui::MenuItem("Edit Packaged Object")) {
+                                openModuObjEditor(entry.path());
+                            }
                             if (ImGui::MenuItem("Export Into ModuPAK...")) {
                                 std::vector<fs::path> seed = fileBrowser.selectedFiles.empty()
                                     ? std::vector<fs::path>{entry.path()}
@@ -3397,6 +3413,9 @@ void Engine::renderFileBrowserPanel() {
                 }
                 if (entry.path().extension() == ".moduobj" && ImGui::MenuItem("Import ModuOBJ...")) {
                     openModuObjImportDialog(entry.path());
+                }
+                if (entry.path().extension() == ".moduobj" && ImGui::MenuItem("Edit Packaged Object")) {
+                    openModuObjEditor(entry.path());
                 }
                 if (ImGui::MenuItem("Export Into ModuPAK...")) {
                     std::vector<fs::path> seed = fileBrowser.selectedFiles.empty()

@@ -535,6 +535,12 @@ namespace {
         cmd << " -fno-gnu-unique";
     }
 
+    const char* posixOptFlags(const ScriptBuildConfig& config) {
+        return config.optimization == ScriptOptimizationLevel::Speed
+                   ? " -O2"
+                   : " -O0";
+    }
+
     void appendExtraCompileFlags(std::ostringstream& cmd, const ScriptBuildConfig& config) {
         for (const std::string& flag : config.extraCompileFlags) cmd << " " << flag;
     }
@@ -866,11 +872,6 @@ namespace {
                    ? " /O2 /Gy"
                    : " /Od";
     }
-    const char* posixOptFlags(const ScriptBuildConfig& config) {
-        return config.optimization == ScriptOptimizationLevel::Speed
-                   ? " -O2"
-                   : " -O0";
-    }
 
     std::string ensureScriptPrecompiledHeader(const fs::path& outDir,
                                               const std::string& sharedFlags);
@@ -913,14 +914,27 @@ namespace {
         const fs::path objPath = pchDir / "ModuScriptPCH.obj";
         const fs::path rspPath = pchDir / "ModuScriptPCH.rsp";
         const fs::path sigPath = pchDir / "ModuScriptPCH.sig";
-
+        // outDir is folded in because gPchSignature is process-global while the .pch
+        // lives per project. Without it, opening a second project whose compile flags
+        // happen to match reuses the first project's cached flags, pointing /Fp at a
+        // .pch belonging to a project that is no longer open.
         const std::string signature =
-            sharedFlags + scriptSdkHeaderSignature(sharedFlags);
-        if (signature == gPchSignature) {
-            return gPchFlags;
-        }
+            outDir.string() + "|" + sharedFlags + scriptSdkHeaderSignature(sharedFlags);
 
         std::error_code ec;
+        // A matching signature says the PCH *would* be built the same way - not that it
+        // is still on disk. gPchSignature is process-global and survives the .pch being
+        // deleted underneath a running editor, which is exactly what the escape hatch
+        // for a stale PCH tells you to do. Returning /Yu /Fp flags for a file that is
+        // gone then fails every single script with
+        //     fatal error C1083: Cannot open precompiled header file
+        // naming a path that plainly does not exist. So verify the artifact, not just
+        // the signature, and fall through to rebuild when it is missing.
+        if (signature == gPchSignature && fs::exists(pchPath, ec) && !ec) {
+            return gPchFlags;
+        }
+        ec.clear();
+
         fs::create_directories(pchDir, ec);
         if (ec) return std::string();
 

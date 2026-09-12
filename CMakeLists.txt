@@ -337,20 +337,36 @@ option(MODULARITY_ENABLE_PHYSX "Enable PhysX physics integration" ${MODULARITY_E
 option(MODULARITY_ENABLE_JOLT "Enable JoltPhysics physics backend" ON)
 # Photon Realtime networking backend.
 #
-# Auto-detected: if the photon.realtime-sdk package is present the backend is
-# built, otherwise the engine builds without it and Net::CreatePhotonBackend()
+# Auto-detected: if a Photon SDK package is present the backend is built,
+# otherwise the engine builds without it and Net::CreatePhotonBackend()
 # returns nullptr, so NetworkSession falls back to the offline backend. A missing
 # SDK is never a build failure.
 #
 # Override explicitly with:
 #   -DMODULARITY_ENABLE_PHOTON=ON|OFF
-#   -DMODULARITY_PHOTON_SDK_ROOT=/path/to/photon.realtime-sdk-5.0.14.3
+#   -DMODULARITY_PHOTON_SDK_ROOT=/path/to/photon.realtime-sdk[-windows]-<version>
 # Asking for ON explicitly *is* a hard error when the SDK cannot be found, so a
 # deliberate request never silently degrades.
 #
-# The vendored SDK is the Photon *Linux* SDK: GCC .a libraries only, no Windows
-# binaries, so Windows cross-builds skip it.
+# Photon publishes headers and prebuilt libraries as one matched set per platform,
+# so the registry carries two packages: photon.realtime-sdk (Linux, GCC .a) and
+# photon.realtime-sdk-windows (MSVC x64 .lib). Both may be installed side by side,
+# because a candidate only counts once its libraries resolve for *this* toolchain.
+# Finding the header is not enough - that alone would happily pick the Linux
+# payload on Windows.
 set(MODULARITY_PHOTON_SDK_ROOT "" CACHE PATH "Root of the Photon Realtime C++ SDK")
+
+# Before Windows SDK support landed, this flag was an option(), so the first
+# configure cached whatever it auto-decided. option() never revisits a cached
+# value, and a cached value also makes the DEFINED test below true, so a machine
+# that once configured without an SDK stayed pinned OFF - reporting itself
+# "disabled by request" - even after the package was installed. Clear that entry
+# once; from here the auto decision is a normal variable instead.
+if(NOT MODULARITY_PHOTON_OPTION_MIGRATED)
+    unset(MODULARITY_ENABLE_PHOTON CACHE)
+    set(MODULARITY_PHOTON_OPTION_MIGRATED ON CACHE INTERNAL
+        "Legacy cached MODULARITY_ENABLE_PHOTON option entry has been cleared")
+endif()
 
 # Remember whether the user asked for Photon explicitly, before we default it.
 if(DEFINED MODULARITY_ENABLE_PHOTON)
@@ -359,41 +375,226 @@ else()
     set(_modularity_photon_explicit FALSE)
 endif()
 
-function(modularity_find_photon_sdk out_var)
-    set(${out_var} "" PARENT_SCOPE)
-    # Explicit root wins.
-    if(MODULARITY_PHOTON_SDK_ROOT AND EXISTS "${MODULARITY_PHOTON_SDK_ROOT}/LoadBalancing-cpp/inc/Client.h")
-        set(${out_var} "${MODULARITY_PHOTON_SDK_ROOT}" PARENT_SCOPE)
+# Resolve the three libraries src/Network/PhotonBackend.cpp links out of an SDK
+# root, in link order.
+#
+# Sets in the caller's scope:
+#   <prefix>_RELEASE - release libraries
+#   <prefix>_DEBUG   - debug libraries (falls back to the release ones when no
+#                      debug set is vendored and none is needed)
+#   <prefix>_COMMON  - the release Common-cpp library alone, for the ABI probe
+#   <prefix>_REASON  - empty on success, otherwise why this root is unusable
+function(modularity_photon_resolve_libs root prefix)
+    set(${prefix}_RELEASE "" PARENT_SCOPE)
+    set(${prefix}_DEBUG "" PARENT_SCOPE)
+    set(${prefix}_COMMON "" PARENT_SCOPE)
+    set(${prefix}_REASON "" PARENT_SCOPE)
+
+    if(NOT EXISTS "${root}/LoadBalancing-cpp/inc/Client.h")
+        set(${prefix}_REASON "LoadBalancing-cpp/inc/Client.h is missing" PARENT_SCOPE)
         return()
     endif()
 
-    # Otherwise look where the package manager puts the package: the sibling
-    # registry checkout, then the per-user global package folder.
-    set(_search_globs
-        "${PROJECT_SOURCE_DIR}/../Modu-Package-Manager/Packages/*/Photon/photon.realtime-sdk-*"
-        "${PROJECT_SOURCE_DIR}/../Modu-Package-Manager/Packages/*/*/photon.realtime-sdk-*"
-        "$ENV{HOME}/.Modularity/Packages/*/*/photon.realtime-sdk-*"
-        "$ENV{HOME}/.Modularity/Packages/*/photon.realtime-sdk-*")
-    foreach(_glob IN LISTS _search_globs)
-        file(GLOB _candidates "${_glob}")
-        foreach(_candidate IN LISTS _candidates)
-            if(EXISTS "${_candidate}/LoadBalancing-cpp/inc/Client.h")
-                set(${out_var} "${_candidate}" PARENT_SCOPE)
+    # A Debug configuration has to link the debug libraries: upstream builds those
+    # against the debug CRT and the release ones against the release CRT, so mixing
+    # them drags two CRTs into one binary. Multi-config generators can build either
+    # configuration from a single configure, so there both sets must be present.
+    get_property(_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+    set(_need_debug FALSE)
+    if(_multi_config OR CMAKE_BUILD_TYPE STREQUAL "Debug")
+        set(_need_debug TRUE)
+    endif()
+
+    set(_release_libs "")
+    set(_debug_libs "")
+
+    if(MSVC)
+        # Upstream names every variant
+        #   <Module>-cpp_vc<NN>_<debug|release>_windows_<md|mt>_<arch>.lib
+        # and ships 60 of them per module. Three axes have to match how this build
+        # is configured, or the link quietly pulls in a second CRT.
+
+        # CRT flavour: md is the dynamic CRT, mt the static one. The CMake default,
+        # when CMAKE_MSVC_RUNTIME_LIBRARY is unset, is dynamic - which is what the
+        # engine builds with (Jolt is forced to agree through
+        # USE_STATIC_MSVC_RUNTIME_LIBRARY).
+        set(_crt "md")
+        if(CMAKE_MSVC_RUNTIME_LIBRARY AND NOT CMAKE_MSVC_RUNTIME_LIBRARY MATCHES "DLL")
+            set(_crt "mt")
+        endif()
+
+        # Architecture, from the generator platform (build.ps1 passes -A x64).
+        if(CMAKE_GENERATOR_PLATFORM)
+            set(_arch "${CMAKE_GENERATOR_PLATFORM}")
+        elseif(CMAKE_SIZEOF_VOID_P EQUAL 8)
+            set(_arch "x64")
+        else()
+            set(_arch "Win32")
+        endif()
+        if(_arch STREQUAL "win32")
+            set(_arch "Win32")
+        endif()
+
+        # Toolset tags, newest first. MSVC is binary compatible forward from v140,
+        # so a newer compiler links older libraries and vc17 - the newest tag
+        # upstream publishes - works on the VS 2026 toolset. The reverse does not
+        # hold, so a tag built by a newer compiler than this one is never offered.
+        set(_tags "")
+        foreach(_candidate_tag vc17 vc16 vc15 vc14)
+            if(_candidate_tag STREQUAL "vc17")
+                set(_tag_floor 1930)
+            elseif(_candidate_tag STREQUAL "vc16")
+                set(_tag_floor 1920)
+            elseif(_candidate_tag STREQUAL "vc15")
+                set(_tag_floor 1910)
+            else()
+                set(_tag_floor 1900)
+            endif()
+            if(MSVC_VERSION GREATER_EQUAL ${_tag_floor})
+                list(APPEND _tags "${_candidate_tag}")
+            endif()
+        endforeach()
+
+        foreach(_tag IN LISTS _tags)
+            set(_release_libs "")
+            set(_debug_libs "")
+            set(_tag_ok TRUE)
+            foreach(_module LoadBalancing Photon Common)
+                set(_lib_dir "${root}/${_module}-cpp/lib")
+                set(_rel "${_lib_dir}/${_module}-cpp_${_tag}_release_windows_${_crt}_${_arch}.lib")
+                set(_dbg "${_lib_dir}/${_module}-cpp_${_tag}_debug_windows_${_crt}_${_arch}.lib")
+                if(NOT EXISTS "${_rel}")
+                    set(_tag_ok FALSE)
+                    break()
+                endif()
+                if(_need_debug AND NOT EXISTS "${_dbg}")
+                    set(_tag_ok FALSE)
+                    break()
+                endif()
+                list(APPEND _release_libs "${_rel}")
+                if(EXISTS "${_dbg}")
+                    list(APPEND _debug_libs "${_dbg}")
+                else()
+                    list(APPEND _debug_libs "${_rel}")
+                endif()
+            endforeach()
+            if(_tag_ok)
+                # The Photon libraries declare no /DEFAULTLIB for the Win32 APIs
+                # they call, so those imports have to be named here: ws2_32 for the
+                # sockets (WSAStartup, socket, getaddrinfo, select), winmm for
+                # timeGetTime and bcrypt for BCryptGenRandom.
+                list(APPEND _release_libs ws2_32 winmm bcrypt)
+                list(APPEND _debug_libs ws2_32 winmm bcrypt)
+                set(${prefix}_RELEASE "${_release_libs}" PARENT_SCOPE)
+                set(${prefix}_DEBUG "${_debug_libs}" PARENT_SCOPE)
+                set(${prefix}_COMMON
+                    "${root}/Common-cpp/lib/Common-cpp_${_tag}_release_windows_${_crt}_${_arch}.lib"
+                    PARENT_SCOPE)
                 return()
             endif()
         endforeach()
+
+        set(${prefix}_REASON
+            "no ${_crt}/${_arch} libraries for the vc14-vc17 toolsets under <Module>-cpp/lib (this is probably the Linux payload, which ships GCC .a archives)"
+            PARENT_SCOPE)
+        return()
+    endif()
+
+    # GCC/Clang layout: lib<Module><Debug|Release><bits>.a, sitting directly in
+    # <Module>-cpp rather than in a lib/ subdirectory.
+    set(_bits 64)
+    if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+        set(_bits 32)
+    endif()
+    foreach(_module LoadBalancing Photon Common)
+        set(_rel "${root}/${_module}-cpp/lib${_module}Release${_bits}.a")
+        set(_dbg "${root}/${_module}-cpp/lib${_module}Debug${_bits}.a")
+        if(NOT EXISTS "${_rel}")
+            set(${prefix}_REASON
+                "${_rel} is missing (this is probably the Windows payload, which ships MSVC .lib files)"
+                PARENT_SCOPE)
+            return()
+        endif()
+        if(_need_debug AND NOT EXISTS "${_dbg}")
+            set(${prefix}_REASON "${_dbg} is missing" PARENT_SCOPE)
+            return()
+        endif()
+        list(APPEND _release_libs "${_rel}")
+        if(EXISTS "${_dbg}")
+            list(APPEND _debug_libs "${_dbg}")
+        else()
+            list(APPEND _debug_libs "${_rel}")
+        endif()
     endforeach()
+    set(${prefix}_RELEASE "${_release_libs}" PARENT_SCOPE)
+    set(${prefix}_DEBUG "${_debug_libs}" PARENT_SCOPE)
+    set(${prefix}_COMMON "${root}/Common-cpp/libCommonRelease${_bits}.a" PARENT_SCOPE)
+endfunction()
+
+function(modularity_find_photon_sdk out_var out_notes)
+    set(${out_var} "" PARENT_SCOPE)
+    set(${out_notes} "" PARENT_SCOPE)
+
+    set(_roots "")
+    # Explicit root wins.
+    if(MODULARITY_PHOTON_SDK_ROOT)
+        list(APPEND _roots "${MODULARITY_PHOTON_SDK_ROOT}")
+    endif()
+
+    # Otherwise look where the package manager puts the package: the sibling
+    # registry checkout, then the per-user global package folder. That folder is
+    # %APPDATA%/.Modularity on Windows and $HOME/.Modularity elsewhere, matching
+    # PackageManager::globalPackagesFolder() - checking only $HOME here used to
+    # miss every globally installed package on Windows.
+    set(_search_globs
+        "${PROJECT_SOURCE_DIR}/../Modu-Package-Manager/Packages/*/Photon/photon.realtime-sdk*"
+        "${PROJECT_SOURCE_DIR}/../Modu-Package-Manager/Packages/*/*/photon.realtime-sdk*"
+        "$ENV{APPDATA}/.Modularity/Packages/*/*/photon.realtime-sdk*"
+        "$ENV{APPDATA}/.Modularity/Packages/*/photon.realtime-sdk*"
+        "$ENV{HOME}/.Modularity/Packages/*/*/photon.realtime-sdk*"
+        "$ENV{HOME}/.Modularity/Packages/*/photon.realtime-sdk*")
+    foreach(_glob IN LISTS _search_globs)
+        file(GLOB _candidates "${_glob}")
+        list(APPEND _roots ${_candidates})
+    endforeach()
+    if(_roots)
+        list(REMOVE_DUPLICATES _roots)
+    endif()
+
+    # A root counts only when its libraries resolve for this toolchain, so an
+    # installed wrong-platform package is skipped rather than half-adopted.
+    set(_notes "")
+    foreach(_candidate IN LISTS _roots)
+        if(NOT IS_DIRECTORY "${_candidate}")
+            continue()
+        endif()
+        modularity_photon_resolve_libs("${_candidate}" _photon_candidate)
+        if(NOT _photon_candidate_REASON)
+            set(${out_var} "${_candidate}" PARENT_SCOPE)
+            return()
+        endif()
+        list(APPEND _notes "${_candidate}: ${_photon_candidate_REASON}")
+    endforeach()
+
+    set(${out_notes} "${_notes}" PARENT_SCOPE)
 endfunction()
 
 set(_modularity_photon_found "")
-if(NOT MODULARITY_CROSS_WINDOWS AND NOT WIN32 AND NOT ANDROID)
-    modularity_find_photon_sdk(_modularity_photon_found)
+set(_modularity_photon_notes "")
+# Cross-builds to Windows use MinGW, which links neither the MSVC .lib files nor
+# the Linux .a archives, so they still skip Photon.
+if(NOT MODULARITY_CROSS_WINDOWS AND NOT ANDROID)
+    modularity_find_photon_sdk(_modularity_photon_found _modularity_photon_notes)
 endif()
 
-# Finding the SDK is not enough: the vendored Photon Linux SDK ships binary-only
-# Common-cpp/Photon-cpp libraries, and an SDK built by a much older compiler is not
-# ABI-compatible with the current one. Header inline code and the prebuilt
-# out-of-line code then disagree, and Photon faults inside its own memory manager.
+if(_modularity_photon_found)
+    modularity_photon_resolve_libs("${_modularity_photon_found}" _modularity_photon)
+endif()
+
+# Finding the SDK is not enough: it ships binary-only Common-cpp/Photon-cpp
+# libraries, and an SDK built by a much older compiler is not ABI-compatible with
+# the current one. Header inline code and the prebuilt out-of-line code then
+# disagree, and Photon faults inside its own memory manager.
 #
 # So actually compile, link and RUN a tiny snippet. If it does not run cleanly the
 # backend is disabled with an explanation instead of shipping an editor that
@@ -409,13 +610,37 @@ if(_modularity_photon_found AND NOT DEFINED MODULARITY_PHOTON_SDK_USABLE)
 "    ExitGames::Common::JString j(s.c_str());\n"
 "    return j.length() > 0 ? 0 : 1;\n"
 "}\n")
+    set(_photon_probe_flags
+        "-DINCLUDE_DIRECTORIES=${_modularity_photon_found};${_modularity_photon_found}/Common-cpp/inc")
+    set(_photon_probe_libs "${_modularity_photon_COMMON}")
+    if(MSVC)
+        # The probe links the release Common library, so it must be built in the
+        # release configuration and with the engine CRT: a default Debug probe
+        # would pull in the debug CRT and collide with the release one in the
+        # library.
+        # Saved and restored below: this variable steers every try_compile in the
+        # project, so the probe must not leave it changed behind it.
+        set(_photon_saved_try_config "${CMAKE_TRY_COMPILE_CONFIGURATION}")
+        set(CMAKE_TRY_COMPILE_CONFIGURATION Release)
+        if(CMAKE_MSVC_RUNTIME_LIBRARY)
+            list(APPEND _photon_probe_flags
+                 "-DCMAKE_MSVC_RUNTIME_LIBRARY=${CMAKE_MSVC_RUNTIME_LIBRARY}")
+        endif()
+        # Photon names no /DEFAULTLIB for the Win32 imports it uses, and JString
+        # alone does not need them, but the linker still resolves the whole object.
+        list(APPEND _photon_probe_libs ws2_32 winmm bcrypt)
+    else()
+        list(APPEND _photon_probe_libs pthread)
+    endif()
     try_run(_photon_run_result _photon_compile_ok
         "${CMAKE_BINARY_DIR}/CMakeFiles/photon_abi_probe"
         "${_photon_probe}"
-        CMAKE_FLAGS
-            "-DINCLUDE_DIRECTORIES=${_modularity_photon_found};${_modularity_photon_found}/Common-cpp/inc"
-        LINK_LIBRARIES "${_modularity_photon_found}/Common-cpp/libCommonRelease64.a" pthread
+        CMAKE_FLAGS ${_photon_probe_flags}
+        LINK_LIBRARIES ${_photon_probe_libs}
         COMPILE_OUTPUT_VARIABLE _photon_compile_log)
+    if(MSVC)
+        set(CMAKE_TRY_COMPILE_CONFIGURATION "${_photon_saved_try_config}")
+    endif()
     if(_photon_compile_ok AND _photon_run_result EQUAL 0)
         set(MODULARITY_PHOTON_SDK_USABLE ON CACHE INTERNAL "Photon SDK passed the ABI probe")
     else()
@@ -429,7 +654,7 @@ if(_modularity_photon_found AND NOT MODULARITY_PHOTON_SDK_USABLE)
         "compiler (${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}). The vendored SDK ships "
         "binary-only Common-cpp/Photon-cpp libraries; if they were built by a much older toolchain "
         "they are not ABI-compatible and Photon faults inside its own memory manager. "
-        "Networking will run offline-only. Vendor a Photon Linux SDK built for this toolchain to "
+        "Networking will run offline-only. Vendor a Photon SDK built for this toolchain to "
         "enable it, then re-run CMake.")
     set(_modularity_photon_unusable TRUE)
     set(_modularity_photon_found "")
@@ -441,32 +666,40 @@ else()
     set(MODULARITY_ENABLE_PHOTON_DEFAULT OFF)
 endif()
 
-option(MODULARITY_ENABLE_PHOTON "Enable the Photon Realtime networking backend"
-       ${MODULARITY_ENABLE_PHOTON_DEFAULT})
+# Deliberately a normal variable rather than an option() when auto-decided: the
+# decision has to be re-derived on every configure so that installing the package
+# later actually takes effect. An explicit -DMODULARITY_ENABLE_PHOTON=ON|OFF does
+# land in the cache and stays authoritative - that is what the DEFINED test above
+# detects. Auto-decided values never reach the cache, so the SDK vanishing again
+# simply flips the default back to OFF.
+if(NOT _modularity_photon_explicit)
+    set(MODULARITY_ENABLE_PHOTON ${MODULARITY_ENABLE_PHOTON_DEFAULT})
+endif()
 
 if(MODULARITY_ENABLE_PHOTON AND _modularity_photon_found AND NOT MODULARITY_PHOTON_SDK_ROOT)
     set(MODULARITY_PHOTON_SDK_ROOT "${_modularity_photon_found}" CACHE PATH
         "Root of the Photon Realtime C++ SDK" FORCE)
 endif()
 
-if(MODULARITY_ENABLE_PHOTON AND NOT _modularity_photon_found AND NOT _modularity_photon_explicit)
-    # Auto-enabled but the SDK vanished between configures: degrade quietly.
-    set(MODULARITY_ENABLE_PHOTON OFF CACHE BOOL
-        "Enable the Photon Realtime networking backend" FORCE)
-endif()
-
 if(NOT MODULARITY_ENABLE_PHOTON)
     if(_modularity_photon_explicit)
         message(STATUS "Photon Realtime backend disabled by request; networking runs offline-only.")
-    elseif(MODULARITY_CROSS_WINDOWS OR WIN32 OR ANDROID)
+    elseif(MODULARITY_CROSS_WINDOWS OR ANDROID)
         message(STATUS "Photon Realtime backend skipped on this platform "
-                       "(the vendored SDK is Linux-only); networking runs offline-only.")
+                       "(no SDK payload is vendored for it); networking runs offline-only.")
     elseif(_modularity_photon_unusable)
         message(STATUS "Photon Realtime backend disabled: the installed SDK is not ABI-compatible "
                        "with this compiler (see the warning above). Networking runs offline-only.")
     else()
-        message(STATUS "Photon Realtime backend disabled: photon.realtime-sdk package not found. "
-                       "Networking runs offline-only; install the package to enable it.")
+        # Name the candidates that were rejected and why. A wrong-platform package
+        # sitting installed and silently ignored is otherwise hard to diagnose.
+        foreach(_note IN LISTS _modularity_photon_notes)
+            message(STATUS "Photon Realtime: skipped ${_note}")
+        endforeach()
+        message(STATUS "Photon Realtime backend disabled: no Photon SDK package with libraries for "
+                       "this toolchain was found. Networking runs offline-only; install "
+                       "photon.realtime-sdk-windows (Windows) or photon.realtime-sdk (Linux) to "
+                       "enable it.")
     endif()
 endif()
 option(MODULARITY_BUILD_EDITOR "Build the Modularity editor target" ${MODULARITY_BUILD_EDITOR_DEFAULT})
@@ -1082,24 +1315,31 @@ modularity_apply_cxx_api_standard(core)
 # Photon Realtime backend. Only src/Network/PhotonBackend.cpp sees these headers
 # and libraries; the rest of the engine stays transport-agnostic.
 if(MODULARITY_ENABLE_PHOTON)
-    if(NOT MODULARITY_PHOTON_SDK_ROOT OR NOT EXISTS "${MODULARITY_PHOTON_SDK_ROOT}/LoadBalancing-cpp/inc/Client.h")
+    if(NOT MODULARITY_PHOTON_SDK_ROOT)
         message(FATAL_ERROR
-            "MODULARITY_ENABLE_PHOTON=ON but MODULARITY_PHOTON_SDK_ROOT does not point at a "
-            "Photon Realtime C++ SDK (expected LoadBalancing-cpp/inc/Client.h under it). "
-            "Install the photon.realtime-sdk package and pass -DMODULARITY_PHOTON_SDK_ROOT=<path>.")
+            "MODULARITY_ENABLE_PHOTON=ON but MODULARITY_PHOTON_SDK_ROOT is not set. Install the "
+            "photon.realtime-sdk-windows (Windows) or photon.realtime-sdk (Linux) package, or pass "
+            "-DMODULARITY_PHOTON_SDK_ROOT=<path>.")
     endif()
-    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-        set(MODULARITY_PHOTON_LIB_SUFFIX "Debug64")
-    else()
-        set(MODULARITY_PHOTON_LIB_SUFFIX "Release64")
+    modularity_photon_resolve_libs("${MODULARITY_PHOTON_SDK_ROOT}" _modularity_photon_link)
+    if(_modularity_photon_link_REASON)
+        message(FATAL_ERROR
+            "MODULARITY_ENABLE_PHOTON=ON but the SDK at ${MODULARITY_PHOTON_SDK_ROOT} carries no "
+            "Photon libraries this toolchain can link: ${_modularity_photon_link_REASON}. "
+            "Install photon.realtime-sdk-windows on Windows or photon.realtime-sdk on Linux, or "
+            "point -DMODULARITY_PHOTON_SDK_ROOT=<path> at the matching SDK.")
     endif()
-    foreach(_photon_lib LoadBalancing Photon Common)
-        set(_photon_path
-            "${MODULARITY_PHOTON_SDK_ROOT}/${_photon_lib}-cpp/lib${_photon_lib}${MODULARITY_PHOTON_LIB_SUFFIX}.a")
-        if(NOT EXISTS "${_photon_path}")
-            message(FATAL_ERROR "Photon library not found: ${_photon_path}")
-        endif()
-        list(APPEND MODULARITY_PHOTON_LIBRARIES "${_photon_path}")
+    # Debug and release libraries are not interchangeable: upstream builds them
+    # against different CRTs, so linking the release set into a Debug build pulls
+    # two CRTs into one binary. CMAKE_BUILD_TYPE cannot make this call - it is
+    # empty under multi-config generators, which is exactly what build.ps1 uses -
+    # so the choice is deferred to generate time, per configuration.
+    set(MODULARITY_PHOTON_LIBRARIES "")
+    foreach(_photon_lib IN LISTS _modularity_photon_link_DEBUG)
+        list(APPEND MODULARITY_PHOTON_LIBRARIES "$<$<CONFIG:Debug>:${_photon_lib}>")
+    endforeach()
+    foreach(_photon_lib IN LISTS _modularity_photon_link_RELEASE)
+        list(APPEND MODULARITY_PHOTON_LIBRARIES "$<$<NOT:$<CONFIG:Debug>>:${_photon_lib}>")
     endforeach()
     # Scoped to PhotonBackend.cpp ONLY, never the whole target. The SDK ships
     # Common-cpp/inc/Common.h, which shadows the engine's own src/Common.h (the
@@ -1122,7 +1362,12 @@ if(MODULARITY_ENABLE_PHOTON)
     if(TARGET core_player)
         target_link_libraries(core_player PUBLIC ${MODULARITY_PHOTON_LIBRARIES})
     endif()
-    message(STATUS "Photon Realtime backend enabled (${MODULARITY_PHOTON_SDK_ROOT})")
+    # Name the library actually chosen: its filename encodes the toolset tag, CRT
+    # flavour and architecture on Windows, so a mismatched link is visible here
+    # rather than only in the linker output.
+    list(GET _modularity_photon_link_RELEASE 0 _photon_reported_lib)
+    get_filename_component(_photon_reported_lib "${_photon_reported_lib}" NAME)
+    message(STATUS "Photon Realtime backend enabled (${MODULARITY_PHOTON_SDK_ROOT}, linking ${_photon_reported_lib})")
 endif()
 set(MODULARITY_ASSIMP_INCLUDE_DIRS
     ${PROJECT_SOURCE_DIR}/src/ThirdParty/assimp/include

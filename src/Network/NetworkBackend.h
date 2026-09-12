@@ -33,6 +33,7 @@ constexpr uint8_t kDespawn = 2;
 constexpr uint8_t kRpc = 3;
 constexpr uint8_t kStateSync = 4;
 constexpr uint8_t kOwnershipTransfer = 5;
+constexpr uint8_t kAvatarPose = 6;
 constexpr uint8_t kUserBase = 64;
 }  // namespace EventCode
 

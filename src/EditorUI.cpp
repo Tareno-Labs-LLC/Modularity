@@ -1059,12 +1059,9 @@ void cardModalText(const char* text) {
     ImGui::PopStyleColor();
     ImGui::Spacing();
 }
-bool cardModalButton(const char* label, CardButtonKind kind, int index, int count) {
+// Paints one pill button at a width the caller has already worked out.
+static bool drawCardModalButton(const char* label, CardButtonKind kind, float width, bool disabled) {
     const ImGuiStyle& style = ImGui::GetStyle();
-    if (index > 0) ImGui::SameLine();
-    count = std::max(count, 1);
-    const float rowWidth = ImGui::GetWindowWidth() - style.WindowPadding.x * 2.0f;
-    const float buttonWidth = (rowWidth - style.ItemSpacing.x * (float)(count - 1)) / (float)count;
     ImVec4 base;
     bool tinted = true;
     switch (kind) {
@@ -1080,9 +1077,63 @@ bool cardModalButton(const char* label, CardButtonKind kind, int index, int coun
     }
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, ImGui::GetFrameHeight() * 0.5f + 2.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(style.FramePadding.x, style.FramePadding.y + 2.0f));
-    const bool pressed = ImGui::Button(label, ImVec2(buttonWidth, 0.0f));
+    if (disabled) ImGui::BeginDisabled();
+    const bool pressed = ImGui::Button(label, ImVec2(width, 0.0f));
+    if (disabled) ImGui::EndDisabled();
     ImGui::PopStyleVar(2);
     if (tinted) ImGui::PopStyleColor(4);
+    return pressed;
+}
+// The width a button needs before it starts clipping its own label.
+static float cardModalButtonNaturalWidth(const char* label) {
+    const ImGuiStyle& style = ImGui::GetStyle();
+    return ImGui::CalcTextSize(label ? label : "", nullptr, true).x + style.FramePadding.x * 2.0f;
+}
+bool cardModalButton(const char* label, CardButtonKind kind, int index, int count) {
+    const ImGuiStyle& style = ImGui::GetStyle();
+    if (index > 0) ImGui::SameLine();
+    count = std::max(count, 1);
+    const float rowWidth = ImGui::GetWindowWidth() - style.WindowPadding.x * 2.0f;
+    const float buttonWidth = (rowWidth - style.ItemSpacing.x * (float)(count - 1)) / (float)count;
+    return drawCardModalButton(label, kind, buttonWidth, false);
+}
+int cardModalActions(const CardModalAction* actions, int count) {
+    if (!actions || count <= 0) return -1;
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float rowWidth = ImGui::GetWindowWidth() - style.WindowPadding.x * 2.0f;
+    const float gaps = style.ItemSpacing.x * (float)(count - 1);
+
+    float widest = 0.0f;
+    float natural = 0.0f;
+    for (int i = 0; i < count; ++i) {
+        const float w = cardModalButtonNaturalWidth(actions[i].label);
+        widest = std::max(widest, w);
+        natural += w;
+    }
+    const float evenWidth = (rowWidth - gaps) / (float)count;
+
+    int pressed = -1;
+    if (widest <= evenWidth) {
+        // Every label fits an equal share, so keep the tidy even split.
+        for (int i = 0; i < count; ++i) {
+            if (i > 0) ImGui::SameLine();
+            if (drawCardModalButton(actions[i].label, actions[i].kind, evenWidth, actions[i].disabled)) pressed = i;
+        }
+    } else if (natural + gaps <= rowWidth) {
+        // One row still works, but a long label needs more than its even share.
+        // Hand the leftover space out evenly so the row still fills the card.
+        const float slack = (rowWidth - natural - gaps) / (float)count;
+        for (int i = 0; i < count; ++i) {
+            if (i > 0) ImGui::SameLine();
+            const float width = cardModalButtonNaturalWidth(actions[i].label) + slack;
+            if (drawCardModalButton(actions[i].label, actions[i].kind, width, actions[i].disabled)) pressed = i;
+        }
+    } else {
+        // Too much text for one row: stack them full width rather than clip labels.
+        for (int i = 0; i < count; ++i) {
+            if (drawCardModalButton(actions[i].label, actions[i].kind, rowWidth, actions[i].disabled)) pressed = i;
+        }
+    }
     return pressed;
 }
 void endCardModal() {

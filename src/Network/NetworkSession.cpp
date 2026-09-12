@@ -88,6 +88,7 @@ bool NetworkSession::startWithBackend(const SessionConfig& cfg,
                 if (onOwnershipChanged) onOwnershipChanged(entry.first, entry.second.owner);
             }
         }
+        remoteAvatars.erase(id);
         log(LogLevel::Warning, "[Network] Player " + std::to_string(id) + " left the room.");
         if (onPlayerLeft) onPlayerLeft(id);
     };
@@ -108,6 +109,8 @@ bool NetworkSession::startWithBackend(const SessionConfig& cfg,
         for (const auto& entry : objects) ids.push_back(entry.first);
         for (NetworkId id : ids) applyDespawn(id);
         objects.clear();
+        remoteAvatars.clear();
+        lastAvatarSendTime = -1.0;
     };
     callbacks.onHostChanged = [this](PlayerId newHost) {
         log(LogLevel::Info, "[Network] Host is now player " + std::to_string(newHost) +
@@ -137,6 +140,10 @@ void NetworkSession::shutdown() {
     objects.clear();
     syncStates.clear();
     rpcHandlers.clear();
+    localAvatar = {};
+    localAvatarLive = false;
+    lastAvatarSendTime = -1.0;
+    remoteAvatars.clear();
     stats = BandwidthStats{};
     clock = 0.0;
     budgetWindowStart = 0.0;
@@ -160,6 +167,7 @@ void NetworkSession::tick(float deltaSeconds) {
 
     if (inRoom()) {
         sendOwnedTransforms(deltaSeconds);
+        sendAvatarPoses();
     }
     applyRemoteTransforms(deltaSeconds);
 }
@@ -283,6 +291,133 @@ void NetworkSession::sendOwnedTransforms(float) {
     }
 }
 
+
+void NetworkSession::setLocalAvatarPose(int slot, const float position[3], const float rotationXyzw[4]) {
+    if (slot < 0 || slot >= kAvatarSlotCount) return;
+    AvatarPose& pose = localAvatar[static_cast<size_t>(slot)];
+    pose.valid = true;
+    pose.timestamp = clock;
+    if (position) std::copy(position, position + 3, pose.position);
+    if (rotationXyzw) std::copy(rotationXyzw, rotationXyzw + 4, pose.rotation);
+    localAvatarLive = true;
+}
+
+void NetworkSession::clearLocalAvatarPose(int slot) {
+    if (slot < 0 || slot >= kAvatarSlotCount) return;
+    localAvatar[static_cast<size_t>(slot)] = AvatarPose{};
+    localAvatarLive = false;
+    for (const AvatarPose& pose : localAvatar) {
+        if (pose.valid) {
+            localAvatarLive = true;
+            break;
+        }
+    }
+}
+
+bool NetworkSession::avatarPose(PlayerId player, int slot, AvatarPose& out) const {
+    if (slot < 0 || slot >= kAvatarSlotCount) return false;
+
+    // The local player reads back what it set this frame rather than waiting for a
+    // round trip, so a rig can drive itself and remote copies through one code path.
+    if (player == localPlayerId()) {
+        const AvatarPose& pose = localAvatar[static_cast<size_t>(slot)];
+        if (!pose.valid) return false;
+        out = pose;
+        return true;
+    }
+
+    auto it = remoteAvatars.find(player);
+    if (it == remoteAvatars.end()) return false;
+    const AvatarPose& pose = it->second[static_cast<size_t>(slot)];
+    if (!pose.valid) return false;
+    out = pose;
+    return true;
+}
+
+void NetworkSession::clearAvatarPoses(PlayerId player) {
+    remoteAvatars.erase(player);
+}
+
+void NetworkSession::sendAvatarPoses() {
+    if (!backend || !localAvatarLive) return;
+
+    const int rate = std::max(1, config.serializationRateHz);
+    const double interval = 1.0 / static_cast<double>(rate);
+    if (lastAvatarSendTime >= 0.0 && (clock - lastAvatarSendTime) < interval) return;
+
+    // One packet carries every live slot: the parts of a rig are only meaningful
+    // together, and splitting them would let a head and its hands arrive a frame
+    // apart. A bitmask keeps absent slots off the wire entirely.
+    uint8_t mask = 0;
+    for (int slot = 0; slot < kAvatarSlotCount; ++slot) {
+        if (localAvatar[static_cast<size_t>(slot)].valid) mask |= static_cast<uint8_t>(1u << slot);
+    }
+    if (mask == 0) {
+        localAvatarLive = false;
+        return;
+    }
+
+    Writer writer;
+    writer.writeDouble(clock);
+    writer.writeUInt8(mask);
+    for (int slot = 0; slot < kAvatarSlotCount; ++slot) {
+        const AvatarPose& pose = localAvatar[static_cast<size_t>(slot)];
+        if (!pose.valid) continue;
+        writer.writeVec3(pose.position);
+        writer.writeQuat(pose.rotation);
+    }
+
+    const size_t packetBytes = writer.size();
+    if (config.maxOutboundBytesPerSecond > 0 &&
+        budgetWindowBytes + packetBytes >
+            static_cast<uint64_t>(config.maxOutboundBytesPerSecond)) {
+        ++stats.sendsSkippedByBudget;
+        return;
+    }
+
+    if (backend->sendEvent(EventCode::kAvatarPose, writer.data(),
+                           RpcTarget::Others, SendMode::Unreliable)) {
+        budgetWindowBytes += packetBytes;
+        stats.bytesSent += packetBytes;
+        ++stats.packetsSent;
+    }
+    lastAvatarSendTime = clock;
+}
+
+void NetworkSession::handleAvatarPose(PlayerId sender, Reader& reader) {
+    const double timestamp = reader.readDouble();
+    const uint8_t mask = reader.readUInt8();
+    if (reader.failed()) {
+        fail(ErrorCode::OperationFailed, "Malformed avatar pose packet ignored.");
+        return;
+    }
+
+    // Decode into a local copy first. A packet that runs out part-way would
+    // otherwise leave a rig with some slots from this frame and some from the last,
+    // which reads as a hand detaching from its arm.
+    std::array<AvatarPose, kAvatarSlotCount> decoded{};
+    for (int slot = 0; slot < kAvatarSlotCount; ++slot) {
+        if ((mask & (1u << slot)) == 0) continue;
+        AvatarPose& pose = decoded[static_cast<size_t>(slot)];
+        reader.readVec3(pose.position);
+        reader.readQuat(pose.rotation);
+        pose.timestamp = timestamp;
+        pose.valid = true;
+    }
+    if (reader.failed()) {
+        fail(ErrorCode::OperationFailed, "Truncated avatar pose packet ignored.");
+        return;
+    }
+
+    // Slots absent from this packet keep their previous value rather than being
+    // cleared: a sender that stops streaming its hands (controllers put down) should
+    // not make them snap to the origin.
+    auto& slots = remoteAvatars[sender];
+    for (int slot = 0; slot < kAvatarSlotCount; ++slot) {
+        if ((mask & (1u << slot)) == 0) continue;
+        slots[static_cast<size_t>(slot)] = decoded[static_cast<size_t>(slot)];
+    }
+}
 void NetworkSession::handleStateSync(PlayerId, Reader& reader) {
     const NetworkId networkId = reader.readNetworkId();
     const double timestamp = reader.readDouble();
@@ -731,6 +866,10 @@ void NetworkSession::handleEvent(PlayerId sender, uint8_t code, const std::vecto
         }
         case EventCode::kStateSync: {
             handleStateSync(sender, reader);
+            return;
+        }
+        case EventCode::kAvatarPose: {
+            handleAvatarPose(sender, reader);
             return;
         }
         case EventCode::kRpc: {

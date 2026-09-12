@@ -1910,6 +1910,7 @@ namespace {
             {"ModuEngine", "ModuEngineScriptApi.h"},
             {"ModuInput", "ModuInputScriptApi.h"},
             {"ModuInput.XR", "ModuInputXRScriptApi.h"},
+            {"ModuNetwork", "ModuNetworkScriptApi.h"},
             {"RMeshBuilder", "RMeshBuilderScriptApi.h"},
             {"ModuCPP.Experimental", "ModuCPPExperimentalScriptApi.h"},
         };
@@ -2272,6 +2273,7 @@ namespace {
             "ModuEngine",
             "ModuInput",
             "ModuInput.XR",
+            "ModuNetwork",
             "RMeshBuilder",
             "ModuCPP.Experimental",
         };
@@ -2751,6 +2753,13 @@ namespace {
                         "::ModuCPP::InputXR.$1");
         replaceRegexAll(out, std::regex(R"(\bXRInteraction::([A-Za-z_][A-Za-z0-9_]*)\b)"),
                         "::ModuCPP::XRInteraction.$1");
+        // Net is a facade object, not a namespace, but the Capital.Capital rule
+        // above has already turned every `Net.Member` into `Net::Member`. Put it
+        // back, the same way InputXR is restored just above. NetState and
+        // AvatarSlot really are scoped and must NOT be caught here - they are not,
+        // because \bNet:: requires "Net" immediately followed by "::".
+        replaceRegexAll(out, std::regex(R"(\bNet::([A-Za-z_][A-Za-z0-9_]*)\b)"),
+                        "::ModuCPP::Net.$1");
         // Fully qualify 'time.' to avoid ambiguity with the C standard library ::time() function
         // when 'using namespace ::ModuCPP' is in scope.
         replaceRegexAll(out, std::regex(R"(\btime\s*\.)"), "::ModuCPP::time.");

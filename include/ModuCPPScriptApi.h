@@ -1412,6 +1412,30 @@ inline SceneObj ResolveObject(const std::string& ref) {
     return SceneObj{ c ? c->ResolveObjectRef(ref) : nullptr };
 }
 
+inline SceneObj ObjectById(int id) {
+    ScriptContext* c = ctxPtr();
+    return SceneObj{ c && id >= 0 ? c->FindObjectById(id) : nullptr };
+}
+
+// Resolve by plain scene-object name, or by an "Object.ID-N" / "Object.Name" ref.
+// ResolveObject() alone does not handle a bare name - that fallback lives in
+// SmartResolveRef - which matters for anything spawned: ModuObj::Instantiate remaps
+// ids but not [ObjectRef] strings, so a prefab that needs to find something in the
+// scene around it has to go by name.
+inline SceneObj FindObject(const std::string& nameOrRef) {
+    return SceneObj{ SmartResolveRef(nameOrRef) };
+}
+
+// First descendant of parentObjectId named `name`, as a SceneObj, or an empty one.
+// This is how a spawned prefab finds its own parts: ModuObj::Instantiate remaps ids
+// but not [ObjectRef] strings, so refs baked into a packaged object point at whatever
+// happens to hold that id in the scene it landed in.
+inline SceneObj FindChild(int parentObjectId, const std::string& name) {
+    ScriptContext* c = ctxPtr();
+    if (!c) return SceneObj{};
+    return ObjectById(c->FindChildByName(parentObjectId, name));
+}
+
 inline bool HasUI(const SceneObject* obj) {
     return obj && ::HasUIComponent(*obj);
 }

@@ -777,11 +777,39 @@ namespace Modularity::CrashReporter {
             else                    {details << "signal " << signalValue << " with no structured exception attached (raised by abort() or raise())";}
             handleCrash(summary[0] != '\0' ? "Fatal exception" : "Fatal signal", details.str(), 128 + signalValue);
         }
-        void invalidParameterHandler(const wchar_t* /*expression*/, const wchar_t* /*function*/,
-                                     const wchar_t* /*file*/, unsigned int /*line*/, uintptr_t /*reserved*/) {
-            handleCrash("CRT invalid parameter",
-                        "A CRT function was called with arguments it rejects (bad index, null buffer, bad format).",
-                        EXIT_FAILURE);
+        void invalidParameterHandler(const wchar_t* expression, const wchar_t* function,
+                                     const wchar_t* file, unsigned int line, uintptr_t /*reserved*/) {
+            std::string details =
+                "A CRT function was called with arguments it rejects (bad index, null buffer, bad format).";
+        #if defined(_WIN32)
+            // The release UCRT usually passes nulls here, but when it does not these are
+            // the only clue to WHICH call failed: the stack alone stops inside ucrtbase,
+            // several frames below anything in this codebase.
+            auto narrow = [](const wchar_t* wide) {
+                if (wide == nullptr || *wide == L'\0') return std::string();
+                char buffer[512] = {};
+                if (WideCharToMultiByte(CP_UTF8, 0, wide, -1, buffer, sizeof(buffer),
+                                        nullptr, nullptr) <= 0) {
+                    return std::string();
+                }
+                return std::string(buffer);
+            };
+            const std::string expressionText = narrow(expression);
+            const std::string functionText = narrow(function);
+            const std::string fileText = narrow(file);
+            if (!functionText.empty()) details += "\nFunction: " + functionText;
+            if (!expressionText.empty()) details += "\nExpression: " + expressionText;
+            if (!fileText.empty()) {
+                details += "\nAt: " + fileText + ":" + std::to_string(line);
+            }
+            if (functionText.empty() && expressionText.empty() && fileText.empty()) {
+                details +=
+                    "\nThe CRT reported no function name (normal in a release build). A common "
+                    "cause is writing to stdout/stderr in a windowed build launched without a "
+                    "console - see the stdio redirect in CrashReporter::Install.";
+            }
+        #endif
+            handleCrash("CRT invalid parameter", details, EXIT_FAILURE);
         }
         void pureCallHandler() {
             handleCrash("Pure virtual call",
@@ -1133,6 +1161,56 @@ namespace Modularity::CrashReporter {
         storePathForSignal(crashDirectory() / (productName + "-signal-last.log"), gSignalCrashLogPath, sizeof(gSignalCrashLogPath));
         storePathForSignal(crashDirectory() / "last_crash.txt", gCrashSummaryPathForSignal, sizeof(gCrashSummaryPathForSignal));
         gSignalLoggingReady = 1;
+    #endif
+    #if defined(_WIN32)
+        // Release builds are GUI-subsystem binaries (WIN32_EXECUTABLE in CMakeLists),
+        // so the process only has stdout/stderr if whoever launched it supplied them.
+        // Start it from a terminal and it inherits that console; start it from Explorer
+        // and the C stdio streams point at nothing.
+        //
+        // On its own that is harmless - writing to a dead stream just fails. What makes
+        // it fatal is the invalid-parameter handler installed below, which treats any
+        // CRT complaint as a crash. So a bare fprintf(stderr, ...) - which Engine::init
+        // does for its startup timings - takes the editor down before the window even
+        // appears, reporting "CRT invalid parameter" over a stack that ends inside
+        // ucrtbase and names nothing useful.
+        //
+        // Two things had to be right here, and the first attempt got both wrong:
+        //
+        //   * Test the CRT stream, not GetStdHandle. A std handle can come back non-null
+        //     and still leave the stream without a usable descriptor. Checking only the
+        //     handle redirected stdout, decided stderr was fine, and the crash survived
+        //     unchanged. _fileno is what fprintf itself ends up using, so ask that.
+        //   * One file per stream. Pointing both at a single path left the second
+        //     freopen failing, and freopen closes the original stream before it tries to
+        //     reopen - so a failed redirect leaves the stream deader than it found it.
+        {
+            auto streamIsDead = [](FILE* stream) {
+                return stream == nullptr || _fileno(stream) < 0;
+            };
+            auto redirectStream = [](FILE* stream, const std::string& path) {
+                FILE* reopened = nullptr;
+                if (freopen_s(&reopened, path.c_str(), "w", stream) == 0 && reopened != nullptr) {
+                    return;
+                }
+                // The stream is closed at this point whether or not the reopen worked, so
+                // leaving it alone is not an option. NUL always opens, and a sink that
+                // discards still beats a dead FILE* that takes the process down.
+                FILE* nullSink = nullptr;
+                freopen_s(&nullSink, "NUL", "w", stream);
+            };
+
+            const bool outDead = streamIsDead(stdout);
+            const bool errDead = streamIsDead(stderr);
+            if (outDead || errDead) {
+                std::error_code redirectEc;
+                fs::create_directories(ctx.sessionLogPath.parent_path(), redirectEc);
+                const fs::path base =
+                    ctx.sessionLogPath.parent_path() / ctx.sessionLogPath.stem();
+                if (outDead) redirectStream(stdout, base.string() + ".stdout.log");
+                if (errDead) redirectStream(stderr, base.string() + ".stderr.log");
+            }
+        }
     #endif
         ctx.logFile.open(ctx.sessionLogPath, std::ios::out | std::ios::trunc);
         if (ctx.logFile.is_open()) {

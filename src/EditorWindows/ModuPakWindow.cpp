@@ -298,9 +298,17 @@ void Engine::renderModuObjExportDialog() {
             ModuPakManifest manifest = makeManifest(moduObjName, moduObjAuthor, moduObjDescription, moduObjVersion, "ModuOBJ", moduObjOutputPath);
             ModuPakExportResult result;
             if (ModuObjExporter::exportObject(projectManager.currentProject.projectPath, moduObjOutputPath, manifest, sceneObjects, ids, nextObjectId, result)) {
-                addConsoleMessage("Exported ModuOBJ '" + manifest.name + "' (" + std::to_string(result.fileCount) +
-                                  " files, " + formatBytes(result.packageSizeBytes) + "): " +
+                // Says what this file is NOT, because the extension is shared with the
+                // prefab asset and the two are easy to confuse: this one is a shareable
+                // package, and Net.Spawn / prefab edit mode cannot read it.
+                addConsoleMessage("Exported shareable ModuOBJ package '" + manifest.name + "' (" +
+                                  std::to_string(result.fileCount) + " files, " +
+                                  formatBytes(result.packageSizeBytes) + "): " +
                                   std::string(moduObjOutputPath), ConsoleMessageType::Success);
+                addConsoleMessage("That package is for sharing, not for spawning. To get a "
+                                  "packaged object the engine can instantiate (and Net.Spawn can "
+                                  "find), right-click the selection and use Create Packaged Object.",
+                                  ConsoleMessageType::Info);
                 showModuObjExportDialog = false;
                 ImGui::CloseCurrentPopup();
             } else {
@@ -312,6 +320,18 @@ void Engine::renderModuObjExportDialog() {
         if (ImGui::Button("Cancel")) {
             showModuObjExportDialog = false;
             ImGui::CloseCurrentPopup();
+        }
+        if (!canExport) {
+            // Export disables itself when a required field is blank, which reads as a
+            // broken button unless it says which one. Author Name has no default at
+            // all, so it is empty on a first export and this is the usual culprit.
+            std::string missing;
+            if (!textFilled(moduObjName)) missing += "Object Name, ";
+            if (!textFilled(moduObjAuthor)) missing += "Author Name, ";
+            if (!textFilled(moduObjOutputPath)) missing += "Output, ";
+            if (selectedObjectIds.empty() && selectedObjectId < 0) missing += "a scene selection, ";
+            if (missing.size() >= 2) missing.resize(missing.size() - 2);
+            ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.25f, 1.0f), "Still needed: %s", missing.c_str());
         }
         ImGui::EndPopup();
     }

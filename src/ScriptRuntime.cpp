@@ -304,6 +304,31 @@ SceneObject* ScriptContext::FindObjectById(int id) {
     return engine->findObjectById(id);
 }
 
+int ScriptContext::FindChildByName(int parentObjectId, const std::string& name) const {
+    if (!engine || parentObjectId < 0 || name.empty()) return -1;
+    const std::vector<SceneObject>& objects = engine->getSceneObjects();
+
+    // Parent chains are walked per candidate rather than descending a child list,
+    // because SceneObject stores only parentId. The step cap is a cycle guard: a
+    // corrupted scene with a parent loop would otherwise spin here forever, and a
+    // hierarchy deeper than this is not something a prefab should rely on.
+    constexpr int kMaxDepth = 64;
+    for (const SceneObject& candidate : objects) {
+        if (candidate.name != name) continue;
+        int walker = candidate.parentId;
+        for (int depth = 0; depth < kMaxDepth && walker >= 0; ++depth) {
+            if (walker == parentObjectId) return candidate.id;
+            const SceneObject* parent = nullptr;
+            for (const SceneObject& obj : objects) {
+                if (obj.id == walker) { parent = &obj; break; }
+            }
+            if (!parent) break;
+            walker = parent->parentId;
+        }
+    }
+    return -1;
+}
+
 SceneObject* ScriptContext::ResolveObjectRef(const std::string& ref) {
     if (ref.empty()) return nullptr;
     std::string trimmed = trimString(ref);
@@ -706,6 +731,245 @@ std::string ScriptContext::GetXRInteractionProfile(int device) const {
     const auto* controller = ResolveXRController(device);
     if (!controller) return {};
     return controller->interactionProfile;
+}
+
+// Common.h declares these two, but in this translation unit ScriptSdkCommon.h wins
+// the MODULARITY_COMMON_SHARED_DECLS guard - ScriptRuntime.h is included first - and
+// the SDK copy of that block omits them. Redeclared here rather than added to the SDK
+// block on purpose: the SDK does not export them, so a script calling them directly
+// would compile and then fail to link. Scripts get the conversion through
+// ScriptContext::QuatToEulerDegrees instead.
+glm::vec3 QuatToEulerXYZDegrees(const glm::quat& q);
+glm::quat EulerXYZDegreesToQuat(const glm::vec3& deg);
+
+// --- Networking (ModuNetwork) -----------------------------------------------
+//
+// Every accessor funnels through NetSession() so the "no session" case is written
+// once. A script that spawns, queries players or streams an avatar pose in a
+// single-player scene gets neutral answers instead of a crash, which is what lets
+// the same script run in and out of a networked room.
+
+namespace {
+
+Net::NetworkSession* NetSession(const ScriptContext* ctx) {
+    if (!ctx || !ctx->engine) return nullptr;
+    if (!ctx->engine->isNetworkSessionActive()) return nullptr;
+    return &ctx->engine->getNetworkSession();
+}
+
+const Net::NetworkSession* NetSessionConst(const ScriptContext* ctx) {
+    if (!ctx || !ctx->engine) return nullptr;
+    if (!ctx->engine->isNetworkSessionActive()) return nullptr;
+    return &ctx->engine->getNetworkSession();
+}
+
+}  // namespace
+
+bool ScriptContext::IsNetworkActive() const {
+    return NetSessionConst(this) != nullptr;
+}
+
+bool ScriptContext::IsNetworkOffline() const {
+    const Net::NetworkSession* s = NetSessionConst(this);
+    // No session at all is "offline" as far as a script is concerned: there is no
+    // one else out there either way.
+    return !s || s->isOffline();
+}
+
+int ScriptContext::GetNetworkState() const {
+    const Net::NetworkSession* s = NetSessionConst(this);
+    if (!s) return static_cast<int>(Net::ConnectionState::Disconnected);
+    return static_cast<int>(s->state());
+}
+
+int ScriptContext::GetNetworkPing() const {
+    const Net::NetworkSession* s = NetSessionConst(this);
+    return s ? s->pingMs() : 0;
+}
+
+std::string ScriptContext::GetNetworkRegion() const {
+    const Net::NetworkSession* s = NetSessionConst(this);
+    return s ? s->region() : std::string();
+}
+
+std::string ScriptContext::GetNetworkBackendName() const {
+    const Net::NetworkSession* s = NetSessionConst(this);
+    if (!s) return std::string("None");
+    const char* name = s->backendName();
+    return name ? std::string(name) : std::string("None");
+}
+
+bool ScriptContext::NetworkConnect() {
+    Net::NetworkSession* s = NetSession(this);
+    return s && s->connect();
+}
+
+void ScriptContext::NetworkDisconnect() {
+    if (Net::NetworkSession* s = NetSession(this)) s->disconnect();
+}
+
+bool ScriptContext::IsInNetworkRoom() const {
+    const Net::NetworkSession* s = NetSessionConst(this);
+    return s && s->inRoom();
+}
+
+bool ScriptContext::NetworkJoinOrCreateRoom(const std::string& name, int maxPlayers) {
+    Net::NetworkSession* s = NetSession(this);
+    if (!s || name.empty()) return false;
+    Net::RoomOptions options;
+    options.maxPlayers = maxPlayers > 0 ? maxPlayers : 0;
+    return s->joinOrCreateRoom(name, options);
+}
+
+bool ScriptContext::NetworkJoinRandomRoom() {
+    Net::NetworkSession* s = NetSession(this);
+    return s && s->joinRandomRoom();
+}
+
+bool ScriptContext::NetworkLeaveRoom() {
+    Net::NetworkSession* s = NetSession(this);
+    return s && s->leaveRoom();
+}
+
+int ScriptContext::GetLocalNetworkPlayerId() const {
+    const Net::NetworkSession* s = NetSessionConst(this);
+    return s ? static_cast<int>(s->localPlayerId()) : static_cast<int>(Net::kInvalidPlayerId);
+}
+
+int ScriptContext::GetNetworkHostPlayerId() const {
+    const Net::NetworkSession* s = NetSessionConst(this);
+    return s ? static_cast<int>(s->hostPlayerId()) : static_cast<int>(Net::kInvalidPlayerId);
+}
+
+bool ScriptContext::IsNetworkHost() const {
+    const Net::NetworkSession* s = NetSessionConst(this);
+    // Alone in a single-player scene the script *is* the authority, so claiming host
+    // here keeps "if (host) spawn the world" logic working with no session.
+    return s ? s->isHost() : true;
+}
+
+int ScriptContext::GetNetworkPlayerCount() const {
+    const Net::NetworkSession* s = NetSessionConst(this);
+    return s ? static_cast<int>(s->players().size()) : 0;
+}
+
+int ScriptContext::GetNetworkPlayerIdAt(int index) const {
+    const Net::NetworkSession* s = NetSessionConst(this);
+    if (!s) return static_cast<int>(Net::kInvalidPlayerId);
+    const std::vector<Net::NetworkPlayer>& players = s->players();
+    if (index < 0 || static_cast<size_t>(index) >= players.size()) {
+        return static_cast<int>(Net::kInvalidPlayerId);
+    }
+    return static_cast<int>(players[static_cast<size_t>(index)].id);
+}
+
+std::string ScriptContext::GetNetworkPlayerNickname(int playerId) const {
+    const Net::NetworkSession* s = NetSessionConst(this);
+    if (!s) return std::string();
+    for (const Net::NetworkPlayer& player : s->players()) {
+        if (static_cast<int>(player.id) == playerId) return player.nickname;
+    }
+    return std::string();
+}
+
+bool ScriptContext::SetNetworkNickname(const std::string& nickname) {
+    Net::NetworkSession* s = NetSession(this);
+    return s && s->setNickname(nickname);
+}
+
+unsigned int ScriptContext::NetworkSpawn(const std::string& assetId,
+                                         const glm::vec3& position,
+                                         const glm::vec3& rotationDegrees,
+                                         const glm::vec3& scale) {
+    Net::NetworkSession* s = NetSession(this);
+    if (!s || assetId.empty()) return Net::kInvalidNetworkId;
+    const float pos[3] = {position.x, position.y, position.z};
+    const float rot[3] = {rotationDegrees.x, rotationDegrees.y, rotationDegrees.z};
+    const float scl[3] = {scale.x, scale.y, scale.z};
+    return static_cast<unsigned int>(s->spawn(assetId, pos, rot, scl));
+}
+
+bool ScriptContext::NetworkDespawn(unsigned int networkId) {
+    Net::NetworkSession* s = NetSession(this);
+    return s && s->despawn(static_cast<Net::NetworkId>(networkId));
+}
+
+bool ScriptContext::NetworkHasAuthority(unsigned int networkId) const {
+    const Net::NetworkSession* s = NetSessionConst(this);
+    // Same reasoning as IsNetworkHost: with no session the local script owns
+    // everything it can see.
+    return s ? s->hasAuthority(static_cast<Net::NetworkId>(networkId)) : true;
+}
+
+bool ScriptContext::NetworkTransferOwnership(unsigned int networkId, int newOwner) {
+    Net::NetworkSession* s = NetSession(this);
+    return s && s->transferOwnership(static_cast<Net::NetworkId>(networkId),
+                                     static_cast<Net::PlayerId>(newOwner));
+}
+
+int ScriptContext::GetNetworkObjectOwner(unsigned int networkId) const {
+    const Net::NetworkSession* s = NetSessionConst(this);
+    if (!s) return static_cast<int>(Net::kInvalidPlayerId);
+    const Net::NetworkObject* object = s->findObject(static_cast<Net::NetworkId>(networkId));
+    return object ? static_cast<int>(object->owner) : static_cast<int>(Net::kInvalidPlayerId);
+}
+
+int ScriptContext::GetNetworkObjectSceneId(unsigned int networkId) const {
+    const Net::NetworkSession* s = NetSessionConst(this);
+    if (!s) return -1;
+    const Net::NetworkObject* object = s->findObject(static_cast<Net::NetworkId>(networkId));
+    return object ? object->rootSceneObjectId : -1;
+}
+
+unsigned int ScriptContext::FindNetworkIdForObject(int sceneObjectId) const {
+    const Net::NetworkSession* s = NetSessionConst(this);
+    if (!s) return Net::kInvalidNetworkId;
+    return static_cast<unsigned int>(s->findNetworkIdForSceneObject(sceneObjectId));
+}
+
+int ScriptContext::GetNetworkObjectCount() const {
+    const Net::NetworkSession* s = NetSessionConst(this);
+    return s ? static_cast<int>(s->allObjects().size()) : 0;
+}
+
+unsigned int ScriptContext::GetNetworkObjectIdAt(int index) const {
+    const Net::NetworkSession* s = NetSessionConst(this);
+    if (!s || index < 0) return Net::kInvalidNetworkId;
+    const std::vector<Net::NetworkId> ids = s->allObjects();
+    if (static_cast<size_t>(index) >= ids.size()) return Net::kInvalidNetworkId;
+    return static_cast<unsigned int>(ids[static_cast<size_t>(index)]);
+}
+
+void ScriptContext::SetLocalAvatarPose(int slot, const glm::vec3& position, const glm::quat& rotation) {
+    Net::NetworkSession* s = NetSession(this);
+    if (!s) return;
+    const float pos[3] = {position.x, position.y, position.z};
+    // glm::quat stores w first but indexes x,y,z,w; the wire format is xyzw, and
+    // Writer::writeQuat/readQuat agree on that order.
+    const float rot[4] = {rotation.x, rotation.y, rotation.z, rotation.w};
+    s->setLocalAvatarPose(slot, pos, rot);
+}
+
+void ScriptContext::ClearLocalAvatarPose(int slot) {
+    if (Net::NetworkSession* s = NetSession(this)) s->clearLocalAvatarPose(slot);
+}
+
+bool ScriptContext::GetAvatarPose(int playerId, int slot, glm::vec3& position, glm::quat& rotation) const {
+    const Net::NetworkSession* s = NetSessionConst(this);
+    if (!s) return false;
+    Net::AvatarPose pose;
+    if (!s->avatarPose(static_cast<Net::PlayerId>(playerId), slot, pose)) return false;
+    position = glm::vec3(pose.position[0], pose.position[1], pose.position[2]);
+    rotation = glm::quat(pose.rotation[3], pose.rotation[0], pose.rotation[1], pose.rotation[2]);
+    return true;
+}
+
+glm::vec3 ScriptContext::QuatToEulerDegrees(const glm::quat& rotation) const {
+    return QuatToEulerXYZDegrees(rotation);
+}
+
+glm::quat ScriptContext::EulerDegreesToQuat(const glm::vec3& degrees) const {
+    return EulerXYZDegreesToQuat(degrees);
 }
 
 namespace {

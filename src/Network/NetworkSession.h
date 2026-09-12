@@ -4,6 +4,7 @@
 #include "NetworkSerializer.h"
 #include "../ModuObj.h"
 
+#include <array>
 #include <functional>
 #include <memory>
 #include <string>
@@ -90,6 +91,23 @@ public:
 
     size_t bufferedSnapshotCount(NetworkId networkId) const;
 
+    // Avatar pose channel. Keyed by player rather than by network object, because
+    // transform sync moves one transform per object and a rig needs several moving
+    // independently - see the block comment in NetworkTypes.h.
+    //
+    // Setting a slot marks it live; it streams to the room at serializationRateHz
+    // for as long as it stays set. Poses are sent unreliably: a dropped one is
+    // replaced by the next in ~50ms, and re-sending a stale head position is worse
+    // than missing it.
+    void setLocalAvatarPose(int slot, const float position[3], const float rotationXyzw[4]);
+    void clearLocalAvatarPose(int slot);
+
+    // Latest pose received for a player, or the local one for the local player id.
+    // Returns false for an unknown player, an out-of-range slot, or a slot that has
+    // never been set - callers should treat that as "not tracked" rather than zero.
+    bool avatarPose(PlayerId player, int slot, AvatarPose& out) const;
+    void clearAvatarPoses(PlayerId player);
+
     const BandwidthStats& bandwidth() const { return stats; }
     void resetBandwidthStats() { stats = BandwidthStats{}; }
 
@@ -130,6 +148,8 @@ private:
     void log(LogLevel level, const std::string& message) const;
 
     void sendOwnedTransforms(float deltaSeconds);
+    void sendAvatarPoses();
+    void handleAvatarPose(PlayerId sender, Reader& reader);
     void applyRemoteTransforms(float deltaSeconds);
     void handleStateSync(PlayerId sender, Reader& reader);
     SceneObject* findSceneObject(int sceneObjectId);
@@ -144,6 +164,14 @@ private:
         std::vector<TransformSnapshot> snapshots;
     };
     std::unordered_map<NetworkId, SyncState> syncStates;
+
+    // Local slots are the source for outgoing packets; remote ones are the latest
+    // received per player. Both are fixed-size so a player costs a known amount and
+    // a bad slot index cannot reach past the end.
+    std::array<AvatarPose, kAvatarSlotCount> localAvatar{};
+    bool localAvatarLive = false;
+    double lastAvatarSendTime = -1.0;
+    std::unordered_map<PlayerId, std::array<AvatarPose, kAvatarSlotCount>> remoteAvatars;
 
     BandwidthStats stats;
     double clock = 0.0;

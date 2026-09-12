@@ -111,22 +111,88 @@ bool copyFileChecked(const fs::path& from, const fs::path& to, std::string& erro
     return true;
 }
 
+#ifdef _WIN32
+// A PowerShell single-quoted literal, for embedding inside the double-quoted
+// -Command argument in runZipCreate.
+//
+// Double quotes cannot be used there. The command is already wrapped in them for
+// `-Command "..."`, so a nested pair closes that argument early and PowerShell then
+// reads the rest of the path as separate positional arguments. Any project or
+// output folder containing a space therefore failed to export, reporting the
+// misleading "Ensure zip/PowerShell archive support is available" - the support was
+// fine, the path had been split in half.
+//
+// Single quotes nest cleanly inside the double-quoted command, and PowerShell
+// escapes one by doubling it. Wildcards still work: -Path resolves those itself,
+// so quoting only stops PowerShell's own argument splitting.
+std::string quotePowerShellLiteral(const fs::path& path) {
+    const std::string s = path.string();
+    std::string out = "'";
+    for (char c : s) {
+        if (c == '\'') out += "''";
+        else out += c;
+    }
+    out += "'";
+    return out;
+}
+#endif
+
 bool runZipCreate(const fs::path& stagingRoot, const fs::path& outputPath, std::string& error) {
     std::error_code ec;
     fs::create_directories(outputPath.parent_path(), ec);
     fs::remove(outputPath, ec);
 #ifdef _WIN32
-    std::string command = "powershell -NoProfile -ExecutionPolicy Bypass -Command \"Compress-Archive -Path " +
-                          quotePath(stagingRoot / "*") + " -DestinationPath " + quotePath(outputPath) + " -Force\"";
+    // Compress-Archive refuses to write anything but a .zip: "-.moduobj is not a
+    // supported archive file format. .zip is the only supported archive file
+    // format." A ModuOBJ and a ModuPAK are both zips under a different extension, so
+    // the archive is built beside the target as .zip and renamed into place.
+    //
+    // Without this, Windows export failed for every package regardless of path - the
+    // extension check alone was enough. (Linux never hit it: `zip` writes whatever
+    // filename it is given.)
+    const fs::path tempZip =
+        outputPath.parent_path() / (outputPath.filename().string() + ".tmp.zip");
+    fs::remove(tempZip, ec);
+
+    const std::string command =
+        "powershell -NoProfile -ExecutionPolicy Bypass -Command \"Compress-Archive -Path " +
+        quotePowerShellLiteral(stagingRoot / "*") + " -DestinationPath " +
+        quotePowerShellLiteral(tempZip) + " -Force\"";
+
+    const int rc = std::system(command.c_str());
+    if (rc != 0 || !fs::exists(tempZip)) {
+        fs::remove(tempZip, ec);
+        error = "Failed to create archive. Ensure PowerShell archive support is available.";
+        return false;
+    }
+
+    fs::rename(tempZip, outputPath, ec);
+    if (ec) {
+        // Rename is confined to one directory here, so it should not cross a device
+        // boundary - but a synced or virtualised folder can still refuse it, and
+        // losing a finished archive to that would be a poor trade.
+        ec.clear();
+        fs::copy_file(tempZip, outputPath, fs::copy_options::overwrite_existing, ec);
+        const bool copied = !ec;
+        std::error_code cleanupEc;
+        fs::remove(tempZip, cleanupEc);
+        if (!copied) {
+            error = "Built the archive but could not move it to " + outputPath.string() +
+                    " (" + ec.message() + ").";
+            return false;
+        }
+    }
+    return true;
 #else
-    std::string command = "cd " + quotePath(stagingRoot) + " && zip -X -q -r " + quotePath(outputPath) + " .";
-#endif
-    int rc = std::system(command.c_str());
+    const std::string command =
+        "cd " + quotePath(stagingRoot) + " && zip -X -q -r " + quotePath(outputPath) + " .";
+    const int rc = std::system(command.c_str());
     if (rc != 0 || !fs::exists(outputPath)) {
-        error = "Failed to create archive. Ensure zip/PowerShell archive support is available.";
+        error = "Failed to create archive. Ensure the 'zip' command is available.";
         return false;
     }
     return true;
+#endif
 }
 
 bool runZipExtract(const fs::path& archivePath, const fs::path& destination, std::string& error) {
