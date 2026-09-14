@@ -1992,7 +1992,7 @@ bool SceneSerializationInternal::WriteLegacySceneStream(std::ostream& file,
             file << "uiSliderValue=" << obj.ui.sliderValue << "\n";
             file << "uiSliderMin=" << obj.ui.sliderMin << "\n";
             file << "uiSliderMax=" << obj.ui.sliderMax << "\n";
-            file << "uiLabel=" << obj.ui.label << "\n";
+            file << "uiLabel=" << EncodeSceneTextValue(obj.ui.label) << "\n";
             file << "uiColor=" << obj.ui.color.r << "," << obj.ui.color.g << "," << obj.ui.color.b << "," << obj.ui.color.a << "\n";
             file << "uiInteractable=" << (obj.ui.interactable ? 1 : 0) << "\n";
             file << "uiSliderStyle=" << static_cast<int>(obj.ui.sliderStyle) << "\n";
@@ -2248,6 +2248,46 @@ bool SceneSerializationInternal::WriteLegacySceneStream(std::ostream& file,
     }
 }
 
+std::string SceneSerializationInternal::EncodeSceneTextValue(const std::string& value) {
+    std::string encoded;
+    encoded.reserve(value.size());
+    for (char c : value) {
+        switch (c) {
+            case '\\': encoded += "\\\\"; break;
+            case '\n': encoded += "\\n"; break;
+            case '\r': encoded += "\\r"; break;
+            case '\t': encoded += "\\t"; break;
+            default: encoded.push_back(c); break;
+        }
+    }
+    return encoded;
+}
+
+std::string SceneSerializationInternal::DecodeSceneTextValue(const std::string& value) {
+    std::string decoded;
+    decoded.reserve(value.size());
+    for (size_t i = 0; i < value.size(); ++i) {
+        if (value[i] != '\\' || i + 1 >= value.size()) {
+            decoded.push_back(value[i]);
+            continue;
+        }
+        // Unrecognised escapes are kept verbatim so labels written before escaping
+        // existed (a Windows path typed into a label, say) still load unchanged.
+        switch (value[i + 1]) {
+            case 'n': decoded.push_back('\n'); ++i; break;
+            case 'r': decoded.push_back('\r'); ++i; break;
+            case 't': decoded.push_back('\t'); ++i; break;
+            case '\\': decoded.push_back('\\'); ++i; break;
+            default: decoded.push_back('\\'); break;
+        }
+    }
+    return decoded;
+}
+
+bool SceneSerializationInternal::SceneKeyHoldsFreeformText(const std::string& key) {
+    return key == "uiLabel";
+}
+
 bool SceneSerializationInternal::SceneValueLooksLikeAbsolutePath(const std::string& value) {
     if (value.size() < 2) return false;
     if (value[0] == '/' || value[0] == '\\') return true;
@@ -2269,7 +2309,8 @@ std::string SceneSerializationInternal::MakeSceneTextPathsPortable(const std::st
                 carriage = "\r";
                 value.pop_back();
             }
-            if (SceneValueLooksLikeAbsolutePath(value)) {
+            if (!SceneKeyHoldsFreeformText(line.substr(0, eq)) &&
+                SceneValueLooksLikeAbsolutePath(value)) {
                 line = line.substr(0, eq + 1) +
                        Modularity::Platform::ToPortableAssetPath(value) + carriage;
             }
@@ -3061,7 +3102,7 @@ const std::unordered_map<std::string, KeyHandler>& GetSceneObjectKeyHandlers() {
         {"uiSliderValue", +[](SceneObject& obj, const std::string& value) { obj.ui.sliderValue = std::stof(value); }},
         {"uiSliderMin", +[](SceneObject& obj, const std::string& value) { obj.ui.sliderMin = std::stof(value); }},
         {"uiSliderMax", +[](SceneObject& obj, const std::string& value) { obj.ui.sliderMax = std::stof(value); }},
-        {"uiLabel", +[](SceneObject& obj, const std::string& value) { obj.ui.label = value; }},
+        {"uiLabel", +[](SceneObject& obj, const std::string& value) { obj.ui.label = SceneSerializationInternal::DecodeSceneTextValue(value); }},
         {"uiColor", +[](SceneObject& obj, const std::string& value) { ParseVec4(value, obj.ui.color); }},
         {"uiInteractable", +[](SceneObject& obj, const std::string& value) { obj.ui.interactable = (std::stoi(value) != 0); }},
         {"uiSliderStyle", +[](SceneObject& obj, const std::string& value) { obj.ui.sliderStyle = static_cast<UISliderStyle>(std::stoi(value)); }},
@@ -3504,7 +3545,7 @@ bool SceneSerializationInternal::LoadLegacySceneStream(std::istream& file,
             std::string key = line.substr(0, eqPos);
             std::string value = line.substr(eqPos + 1);
 
-            if (SceneValueLooksLikeAbsolutePath(value)) {
+            if (!SceneKeyHoldsFreeformText(key) && SceneValueLooksLikeAbsolutePath(value)) {
                 value = Modularity::Platform::ToPortableAssetPath(value);
             }
 

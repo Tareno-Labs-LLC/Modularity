@@ -3,6 +3,7 @@
 #include "ThirdParty/ModuGUI/imgui.h"
 #include "ThirdParty/glfw/deps/stb_image_write.h"
 #include "../../include/ThirdParty/stb_image.h"
+#include "../../include/Textures/StbFlipScope.h"
 #include "../SpritesheetFormat.h"
 #include <algorithm>
 #include <array>
@@ -434,7 +435,8 @@ bool Engine::loadPixelSpriteDocument(const fs::path& imagePath) {
     int width = 0;
     int height = 0;
     int channels = 0;
-    stbi_set_flip_vertically_on_load(0);
+    // The document keeps pixels in image order, top row first.
+    const StbFlipScope flipForDocument(false);
     unsigned char* data = stbi_load(imagePath.string().c_str(), &width, &height, &channels, STBI_rgb_alpha);
     if (!data || width <= 0 || height <= 0) {
         if (data) stbi_image_free(data);

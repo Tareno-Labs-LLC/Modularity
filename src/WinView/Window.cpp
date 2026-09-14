@@ -1,5 +1,6 @@
 #include "../../include/Window/Window.h"
 #include "../../include/ThirdParty/stb_image.h"
+#include "../../include/Textures/StbFlipScope.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -99,6 +100,8 @@ namespace
 
 GLFWwindow* Window::makeWindow(Modularity::GraphicsBackend backend)
 {
+    // GLFW window icons are top-row-first.
+    const StbFlipScope flipForIcon(false);
     unsigned char* pixels = stbi_load(
         "Resources/Engine-Root/Modu-Logo.png",
         &width,

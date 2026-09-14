@@ -1,6 +1,10 @@
 #include "../../include/Textures/Texture.h"
 #include "../../include/Platform/AssetSource.h"
 #include "../../include/Textures/ExrLoader.h"
+// Ahead of STB_IMAGE_IMPLEMENTATION on purpose: this pulls in stb_image.h for the
+// declarations, and stb leaves its implementation block outside the header guard,
+// so including it again after the define would emit every definition twice.
+#include "../../include/Textures/StbFlipScope.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "../../include/ThirdParty/stb_image.h"
@@ -53,7 +57,8 @@ Texture::Texture(const std::string& path,
                  TextureFormatPolicy formatPolicy)
     : m_FormatPolicy(formatPolicy)
 {
-    stbi_set_flip_vertically_on_load(1);
+    // Scene textures are stored bottom-up to match GL's texture origin.
+    const StbFlipScope flipForScene(true);
     std::vector<uint8_t> fileBytes =
         Modularity::Platform::GetAssetSource().ReadAll(path);
     if (fileBytes.empty()) {

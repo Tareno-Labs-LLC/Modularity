@@ -3,6 +3,7 @@
 #include "ModelLoader.h"
 #include "../../include/Platform/AssetSource.h"
 #include "../../include/ThirdParty/stb_image.h"
+#include "../../include/Textures/StbFlipScope.h"
 #include "../DragPreviewOverlay.h"
 #include "../EditorLocalization.h"
 #include "../ModuCPPLanguagePack.h"
@@ -131,7 +132,8 @@ namespace FileIcons {
         }
 
         std::vector<unsigned char> DecodeIconAtlasPixels() {
-            stbi_set_flip_vertically_on_load_thread(0);
+            // ImGui samples the atlas top-down, so it is decoded top-down.
+            const StbFlipScope flipForAtlas(false);
             std::vector<unsigned char> atlas(
                 static_cast<size_t>(kIconAtlasWidth) * kIconAtlasHeight * 4, 0);
             for (int slot = 0; slot < IconSlot_Count; ++slot) {
@@ -666,6 +668,28 @@ namespace {
 
     int g_texturePreviewGeneration = 0;
 
+    // Upper bound on a thumbnail's long edge. The cells are drawn at roughly 64px, so 256
+    // leaves room for larger grid zoom levels while keeping a 4K source from costing 21 MB
+    // (2048^2 after Texture's size cap, with mips) to show as an icon.
+    constexpr int kTexturePreviewMaxDim = 256;
+
+    bool PreviewGlContextLive() {
+#ifdef __ANDROID__
+        return true;
+#else
+        return glfwGetCurrentContext() != nullptr;
+#endif
+    }
+
+    // A thumbnail used to draw the scene texture's GL id straight from
+    // Renderer::getTexture, which cost twice over. The full-resolution texture stayed
+    // resident in the scene cache just to fill a ~64px cell, and the id was captured once
+    // and then drawn for up to 1800 frames while the renderer - which refreshes an entry's
+    // LRU stamp only inside getTexture - saw that entry as idle and was free to evict it.
+    // Drawing a deleted name samples black, or shows whatever texture later inherited the
+    // recycled id. Previews that this editor can decode itself now own a small copy;
+    // formats only the engine decoders handle are still borrowed, but re-requested every
+    // frame so the renderer sees them as in use.
     struct CachedTexturePreview {
         fs::file_time_type stamp{};
         GLuint textureId = 0;
@@ -675,6 +699,46 @@ namespace {
         int generation = 0;
         bool attempted = false;
         bool ready = false;
+        bool ownsTexture = false;
+
+        CachedTexturePreview() = default;
+        ~CachedTexturePreview() { releaseTexture(); }
+        CachedTexturePreview(const CachedTexturePreview&) = delete;
+        CachedTexturePreview& operator=(const CachedTexturePreview&) = delete;
+        CachedTexturePreview(CachedTexturePreview&& other) noexcept { takeFrom(other); }
+        CachedTexturePreview& operator=(CachedTexturePreview&& other) noexcept {
+            if (this != &other) {
+                releaseTexture();
+                takeFrom(other);
+            }
+            return *this;
+        }
+
+        void releaseTexture() {
+            // This cache is a function-local static, so it is destroyed after the window and
+            // its context are gone. Deleting a name on a dead context is undefined, hence the
+            // liveness check rather than an unconditional glDeleteTextures.
+            if (ownsTexture && textureId != 0 && PreviewGlContextLive()) {
+                glDeleteTextures(1, &textureId);
+            }
+            textureId = 0;
+            ownsTexture = false;
+        }
+
+    private:
+        void takeFrom(CachedTexturePreview& other) {
+            stamp = other.stamp;
+            textureId = other.textureId;
+            width = other.width;
+            height = other.height;
+            lastUsedFrame = other.lastUsedFrame;
+            generation = other.generation;
+            attempted = other.attempted;
+            ready = other.ready;
+            ownsTexture = other.ownsTexture;
+            other.textureId = 0;
+            other.ownsTexture = false;
+        }
     };
 
     struct CachedModelPreview {
@@ -841,6 +905,106 @@ namespace {
         }
     }
 
+    // Alpha-weighted box filter, matching BlitIconIntoAtlasCell: averaging straight RGB
+    // would let fully transparent texels drag colour into the visible ones and haloes show
+    // up on cutout foliage and UI sprites.
+    void BoxDownsampleRGBA(const unsigned char* src, int srcW, int srcH,
+                           unsigned char* dst, int dstW, int dstH) {
+        for (int y = 0; y < dstH; ++y) {
+            const int sy0 = static_cast<int>(static_cast<int64_t>(y) * srcH / dstH);
+            const int sy1 = std::max(sy0 + 1,
+                static_cast<int>(static_cast<int64_t>(y + 1) * srcH / dstH));
+            for (int x = 0; x < dstW; ++x) {
+                const int sx0 = static_cast<int>(static_cast<int64_t>(x) * srcW / dstW);
+                const int sx1 = std::max(sx0 + 1,
+                    static_cast<int>(static_cast<int64_t>(x + 1) * srcW / dstW));
+                uint64_t accR = 0, accG = 0, accB = 0, accA = 0, samples = 0;
+                for (int sy = sy0; sy < sy1 && sy < srcH; ++sy) {
+                    const unsigned char* row = src + (static_cast<size_t>(sy) * srcW + sx0) * 4;
+                    for (int sx = sx0; sx < sx1 && sx < srcW; ++sx, row += 4) {
+                        const uint64_t a = row[3];
+                        accR += static_cast<uint64_t>(row[0]) * a;
+                        accG += static_cast<uint64_t>(row[1]) * a;
+                        accB += static_cast<uint64_t>(row[2]) * a;
+                        accA += a;
+                        ++samples;
+                    }
+                }
+                unsigned char* out = dst + (static_cast<size_t>(y) * dstW + x) * 4;
+                if (samples == 0) {
+                    out[0] = out[1] = out[2] = out[3] = 0;
+                    continue;
+                }
+                out[0] = accA ? static_cast<unsigned char>(accR / accA) : 0;
+                out[1] = accA ? static_cast<unsigned char>(accG / accA) : 0;
+                out[2] = accA ? static_cast<unsigned char>(accB / accA) : 0;
+                out[3] = static_cast<unsigned char>(accA / samples);
+            }
+        }
+    }
+
+    // stb_image covers the common cases; .dds and .exr need the engine decoders and are
+    // left to the scene cache.
+    bool PreviewFormatDecodableHere(const fs::path& path) {
+        std::string ext = PathToUtf8(path.extension());
+        for (char& c : ext) {
+            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+        }
+        return ext == ".png" || ext == ".jpg" || ext == ".jpeg" ||
+               ext == ".bmp" || ext == ".tga" || ext == ".hdr";
+    }
+
+    // Decodes at full size (stb cannot decode partially) but uploads only the reduced copy,
+    // so the cost is transient CPU work instead of a permanent resident texture.
+    GLuint CreateDownscaledPreviewTexture(const fs::path& path, int& outW, int& outH) {
+        // The scene textures are loaded bottom-up, and DrawTexturePreview flips V to match.
+        // Decoding the same way keeps one set of UVs correct for both preview paths.
+        const StbFlipScope flipForPreview(true);
+        int srcW = 0, srcH = 0, channels = 0;
+        unsigned char* pixels = stbi_load(PathToUtf8(path).c_str(), &srcW, &srcH, &channels, 4);
+        if (!pixels || srcW <= 0 || srcH <= 0) {
+            if (pixels) stbi_image_free(pixels);
+            return 0;
+        }
+
+        int dstW = srcW, dstH = srcH;
+        const int longEdge = std::max(srcW, srcH);
+        if (longEdge > kTexturePreviewMaxDim) {
+            const double scale = static_cast<double>(kTexturePreviewMaxDim) / longEdge;
+            dstW = std::max(1, static_cast<int>(srcW * scale));
+            dstH = std::max(1, static_cast<int>(srcH * scale));
+        }
+
+        std::vector<unsigned char> scaled;
+        const unsigned char* upload = pixels;
+        if (dstW != srcW || dstH != srcH) {
+            scaled.assign(static_cast<size_t>(dstW) * dstH * 4, 0);
+            BoxDownsampleRGBA(pixels, srcW, srcH, scaled.data(), dstW, dstH);
+            upload = scaled.data();
+        }
+
+        GLint previousTexture = 0;
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture);
+        GLuint id = 0;
+        glGenTextures(1, &id);
+        if (id == 0) {
+            stbi_image_free(pixels);
+            return 0;
+        }
+        glBindTexture(GL_TEXTURE_2D, id);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, dstW, dstH, 0, GL_RGBA, GL_UNSIGNED_BYTE, upload);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture));
+
+        stbi_image_free(pixels);
+        outW = dstW;
+        outH = dstH;
+        return id;
+    }
+
     CachedTexturePreview& GetTexturePreviewData(Renderer& renderer,
                                                 const fs::path& path,
                                                 const fs::file_time_type& stamp) {
@@ -858,12 +1022,44 @@ namespace {
         if (!preview.attempted && ConsumeFileBrowserPreviewBudget()) {
             preview.attempted = true;
             MODU_PROFILE_SCOPE("Thumbnail Texture Load", ProfilerSampleCategory::UI);
-            if (Texture* tex = renderer.getTexture(PathToUtf8(path));
+            bool loaded = false;
+            if (PreviewFormatDecodableHere(path)) {
+                int decodedW = 0, decodedH = 0;
+                const GLuint id = CreateDownscaledPreviewTexture(path, decodedW, decodedH);
+                if (id != 0) {
+                    preview.textureId = id;
+                    preview.ownsTexture = true;
+                    preview.width = decodedW;
+                    preview.height = decodedH;
+                    preview.ready = true;
+                    loaded = true;
+                }
+            }
+            // Falling through on a failed decode is deliberate: a .png that is really an EXR
+            // still reaches the engine decoders, and a genuine failure gets recorded in
+            // textureLoadErrors so TexturePreviewError can explain it.
+            if (!loaded) {
+                if (Texture* tex = renderer.getTexture(key);
+                    tex && tex->GetID() != 0 && tex->GetWidth() > 0 && tex->GetHeight() > 0) {
+                    preview.textureId = tex->GetID();
+                    preview.width = tex->GetWidth();
+                    preview.height = tex->GetHeight();
+                    preview.ready = true;
+                }
+            }
+        } else if (preview.ready && !preview.ownsTexture) {
+            // Borrowed from the scene cache, so re-request it to refresh the renderer's LRU
+            // stamp. purgeTextureCacheIfNeeded spares only entries touched this frame and its
+            // second pass ignores recency entirely, so without this the id about to be drawn
+            // can be deleted underneath us and the cell shows another texture entirely.
+            if (Texture* tex = renderer.getTexture(key);
                 tex && tex->GetID() != 0 && tex->GetWidth() > 0 && tex->GetHeight() > 0) {
                 preview.textureId = tex->GetID();
                 preview.width = tex->GetWidth();
                 preview.height = tex->GetHeight();
-                preview.ready = true;
+            } else {
+                preview.textureId = 0;
+                preview.ready = false;
             }
         }
         TrimFileBrowserPreviewCache(cache, key, kMaxTexturePreviewEntries, 1800);

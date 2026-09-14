@@ -15,6 +15,7 @@ namespace Modularity::CrashReporter {
 #include "ThirdParty/ModuGUI/backends/imgui_impl_opengl3.h"
 #include "ThirdParty/ModuGUI/imgui.h"
 #include "../include/ThirdParty/stb_image.h"
+#include "../include/Textures/StbFlipScope.h"
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -931,6 +932,7 @@ namespace Modularity::CrashReporter {
         }
         GLuint createTextureFromImage(const fs::path& imagePath, int& width, int& height) {
             int channels = 0;
+            const StbFlipScope flipForUi(false);
             unsigned char* pixels = stbi_load(imagePath.string().c_str(), &width, &height, &channels, STBI_rgb_alpha);
             if (!pixels) {return 0;}
             GLuint texture = 0;

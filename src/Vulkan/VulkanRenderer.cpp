@@ -5,6 +5,7 @@
 #if MODULARITY_HAS_VULKAN
 #include "../ThirdParty/ModuGUI/backends/imgui_impl_vulkan.h"
 #include "../../include/ThirdParty/stb_image.h"
+#include "../../include/Textures/StbFlipScope.h"
 
 #include <algorithm>
 #include <array>
@@ -2423,6 +2424,8 @@ bool VulkanRenderer::createSceneTextureFromFile(const std::string& path, SceneTe
     int width = 0;
     int height = 0;
     int channels = 0;
+    // Same memory order as the GL scene path, so both backends read one set of mesh UVs.
+    const StbFlipScope flipForScene(true);
     unsigned char* pixels = stbi_load(path.c_str(), &width, &height, &channels, STBI_rgb_alpha);
     if (!pixels || width <= 0 || height <= 0) {
         if (pixels) stbi_image_free(pixels);
@@ -2741,6 +2744,8 @@ bool VulkanRenderer::createUiImageTexture(const std::string& path, UiImageTextur
     int width = 0;
     int height = 0;
     int channels = 0;
+    // ImGui samples UI images top-down.
+    const StbFlipScope flipForUi(false);
     unsigned char* pixels = stbi_load(path.c_str(), &width, &height, &channels, STBI_rgb_alpha);
     if (!pixels || width <= 0 || height <= 0) {
         if (pixels) stbi_image_free(pixels);
