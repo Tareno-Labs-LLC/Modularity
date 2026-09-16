@@ -12,6 +12,9 @@ Modularity is a custom C++14 game engine + editor with its own scripting languag
 ./build.sh --clean               # wipe build dirs first
 ./build.sh --build-type=Debug
 ./build.sh --fsanitize           # AddressSanitizer + UBSan (-DMODULARITY_ENABLE_ASAN=ON)
+./build.sh --low                 # low-end profile: PhysX/Vulkan/OpenXR + Jolt LTO off (auto on <=2-thread hosts)
+./build.sh --full                # every module even on a <=2-thread host; undoes a previous --low
+./build.sh --lto / --no-lto      # force Jolt LTO (auto: off for --low and <=2-thread hosts; LTO relinks take minutes there)
 ./build.sh --Windows             # cross-compile Windows via MinGW-w64
 ./build.sh --jobs=N              # parallel jobs (default: nproc-2)
 ./build.sh --generator=Ninja

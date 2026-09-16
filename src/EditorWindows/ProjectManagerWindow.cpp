@@ -6086,7 +6086,22 @@ void Engine::renderProjectBrowserPanel() {
 
         ImGui::Spacing();
 
-        auto scenes = projectManager.currentProject.getSceneList();
+        // Listing the scenes folder every frame was a directory scan per editor frame; a short
+        // refresh interval still picks up scenes created or deleted outside this panel.
+        struct SceneListCache {
+            fs::path scenesPath;
+            std::vector<std::string> scenes;
+            double refreshTime = -1.0;
+        };
+        static SceneListCache sSceneListCache;
+        const double sceneListNow = ImGui::GetTime();
+        if (sSceneListCache.refreshTime < 0.0 || sceneListNow - sSceneListCache.refreshTime > 1.0 ||
+            sSceneListCache.scenesPath != projectManager.currentProject.scenesPath) {
+            sSceneListCache.scenesPath = projectManager.currentProject.scenesPath;
+            sSceneListCache.scenes = projectManager.currentProject.getSceneList();
+            sSceneListCache.refreshTime = sceneListNow;
+        }
+        const std::vector<std::string>& scenes = sSceneListCache.scenes;
         for (const auto& scene : scenes) {
             if (!ProjectSettingsMatchesSearch(settingsSearch, "Scenes", scene.c_str(), "scene load duplicate delete")) {
                 continue;
@@ -6116,6 +6131,7 @@ void Engine::renderProjectBrowserPanel() {
                 if (ImGui::MenuItem("Delete") && !isCurrentScene) {
                     fs::remove(projectManager.currentProject.getSceneFilePath(scene));
                     addConsoleMessage("Deleted scene: " + scene, ConsoleMessageType::Info);
+                    sSceneListCache.refreshTime = -1.0;
                 }
                 ImGui::EndPopup();
             }

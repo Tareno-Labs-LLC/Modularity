@@ -345,6 +345,22 @@ Tier TierFromMeasurements(const BenchmarkResult& r)
     return Tier::High;
 }
 
+// The probe only measures GPU fill rate and draw submission, and a current Mesa driver clears it
+// comfortably even on an HD Graphics 400 (a Celeron N3060 measures "High"). The editor itself is
+// bound by the CPU and memory, which the probe never sees, so the static signals cap its verdict.
+Tier CapTierByStaticInfo(Tier measured)
+{
+    const StaticInfo& info = Static();
+    if (IsKnownWeakRenderer(ToLowerCopy(info.glRenderer)) ||
+        (info.cpuThreads > 0 && info.cpuThreads <= 2)) {
+        return Tier::Low;
+    }
+    if (info.systemMemoryMB > 0 && info.systemMemoryMB <= 4096 && measured == Tier::High) {
+        return Tier::Balanced;
+    }
+    return measured;
+}
+
 } // namespace
 
 const char* ToString(Tier tier)
@@ -654,7 +670,7 @@ BenchmarkResult RunBenchmark()
         result.fullscreenPassBudget60 = result.fullscreenPassMs > 0.0001f
             ? kPassBudgetMsAt60 / result.fullscreenPassMs
             : 0.0f;
-        result.tier = TierFromMeasurements(result);
+        result.tier = CapTierByStaticInfo(TierFromMeasurements(result));
     } else {
         std::cerr << "[WARN] HardwareProfile: probe framebuffers incomplete" << std::endl;
     }

@@ -360,7 +360,12 @@ const float PI = 3.14159265359;
 
 vec3 fresnelSchlick(float cosTheta, vec3 F0)
 {
-    return F0 + (1.0 - F0) * pow(1.0 - clamp(cosTheta, 0.0, 1.0), 5.0);
+    // x^5 as three multiplies. pow() goes through the GPU's transcendental
+    // unit, which runs at a fraction of ALU rate on low-end parts, and this is
+    // evaluated per light per fragment.
+    float x = 1.0 - clamp(cosTheta, 0.0, 1.0);
+    float x2 = x * x;
+    return F0 + (1.0 - F0) * (x2 * x2 * x);
 }
 
 float distributionGGX(float NdotH, float roughness)
@@ -710,6 +715,16 @@ void main()
     vec3 ambient = ambientStrength * ambientColor * diffuseColor * occlusion;
     vec3 lighting = ambient;
 
+    // Both of these depend only on the material's smoothness, so they are loop
+    // invariant - computing them per light cost two pow() per light per
+    // fragment. The PBR path and specular-off path never read them at all.
+    float specPower = 0.0;
+    float specEnergy = 0.0;
+    if (specularEnabled && !usePbr) {
+        specPower = mix(2.0, 4096.0, pow(smoothness, 1.35));
+        specEnergy = mix(0.0, 2.8, pow(smoothness, 0.7));
+    }
+
     int count = min(lightCount, MAX_LIGHTS);
     for (int i = 0; i < count; ++i) {
         int ltype = lightTypeArr[i];
@@ -802,9 +817,6 @@ void main()
             diffuse *= vec3(1.0) - fresnelSchlick(max(dot(viewDir, halfVec), 0.0), F0);
         }
 
-        // Dynamic scaling: smooth materials pop more, rough ones stay broad/matte.
-        float specPower = mix(2.0, 4096.0, pow(smoothness, 1.35));
-        float specEnergy = mix(0.0, 2.8, pow(smoothness, 0.7));
         vec3 specular;
         if (!specularEnabled) {
             specular = vec3(0.0);
@@ -881,7 +893,9 @@ void main()
     if (specularEnabled && hasReflectionCast && reflectionIntensity > 0.0) {
         vec3 reflectionDir = reflect(-viewDir, norm);
         float distanceFade = smoothstep(reflectionFadeStart, max(reflectionFadeStart + 0.01, reflectionFadeEnd), length(viewPos - FragPos));
-        float fresnel = pow(1.0 - clamp(dot(norm, viewDir), 0.0, 1.0), 5.0);
+        float fresnelBase = 1.0 - clamp(dot(norm, viewDir), 0.0, 1.0);
+        float fresnelBase2 = fresnelBase * fresnelBase;
+        float fresnel = fresnelBase2 * fresnelBase2 * fresnelBase;
         float reflectivity = smoothness * mix(0.18, 1.0, distanceFade) * mix(0.35, 1.0, fresnel);
         vec3 reflected = texture(reflectionCube, reflectionDir).rgb;
         lighting = mix(lighting, reflected, clamp(reflectivity * reflectionIntensity, 0.0, 1.0));

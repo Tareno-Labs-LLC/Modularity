@@ -7,6 +7,9 @@ See `CLAUDE.md` for the full flag list. (it's human readable too, no worries!)
 ./build.sh --clean               # Wipe build dirs first
 ./build.sh --build-type=Debug    # Builds in Debug Mode
 ./build.sh --fsanitize           # AddressSanitizer + UBSan (-DMODULARITY_ENABLE_ASAN=ON)
+./build.sh --low                 # Low-end profile: PhysX, Vulkan, OpenXR and Jolt LTO off (auto on <=2-thread CPUs)
+./build.sh --full                # Every module, even on a <=2-thread CPU; undoes a previous --low
+./build.sh --lto / --no-lto      # Force JoltPhysics LTO on/off (auto: off on --low and <=2-thread CPUs)
 ./build.sh --Windows             # Cross-compile Windows via MinGW-w64
 ./build.sh --Android             # Build an installable Android .apk (arm64-v8a)
 ./build.sh --jobs=N              # Parallel jobs (default: nproc-2)

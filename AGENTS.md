@@ -41,6 +41,7 @@ Build and run:
 - Default packaging is `.zip` (fast to compress) — this is the right choice for normal dev builds
 - Pass `--7z` only for final/release builds: smaller artifact, but MUCH slower to compress
 - Other useful flags: `--clean`, `--build-type=Debug`, `--fsanitize` (ASan + UBSan), `--Windows` (MinGW cross-build), `--jobs=N`, `--generator=Ninja`
+- `--low` builds without PhysX, Vulkan, OpenXR and Jolt LTO, and is picked automatically on hosts with 2 or fewer CPU threads; `--full` forces every module back on. Switching an existing build dir between the two recompiles the whole engine once
 - `./buildandrun.sh` builds then launches the binary
 - Editor target is `Modularity` (open a project with `./Modularity --project <path.modu>`); standalone runtime target is `ModularityPlayer`
 - There is no automated test suite — verify by building and running the editor/player

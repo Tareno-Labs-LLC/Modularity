@@ -426,6 +426,15 @@ Options:
   --zip                   Package as .zip (default; fast to compress)
   --7z                    Package as .7z (smaller, but much slower to compress)
   --fsanitize             Build with AddressSanitizer + UBSan (-DMODULARITY_ENABLE_ASAN=ON)
+  --low                   Low-end build profile: turns off PhysX (Jolt stays the
+                          physics backend), the experimental Vulkan backend and
+                          OpenXR, plus JoltPhysics LTO. Picked automatically on
+                          hosts with 2 or fewer CPU threads.
+  --full                  Build every module even on a 2-thread host, and restore
+                          modules a previous --low build turned off
+  --lto / --no-lto        Force JoltPhysics LTO on/off (default: on, except off on
+                          --low builds and hosts with 2 or fewer CPU threads,
+                          where each LTO link takes minutes)
   --help                  Show this help message
 EOF
 }
@@ -439,6 +448,8 @@ cpu_target="baseline"
 skip_deps=0
 package_format="ZIP"
 enable_asan=0
+jolt_lto="auto"
+build_profile="auto"
 ncpus="$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 4)"
 jobs=$(( ncpus - 2 ))
 if (( jobs < 1 )); then
@@ -519,6 +530,18 @@ for arg in "$@"; do
         --fsanitize|--asan|--sanitize=address)
             enable_asan=1
             ;;
+        --low)
+            build_profile="low"
+            ;;
+        --full)
+            build_profile="full"
+            ;;
+        --lto)
+            jolt_lto="ON"
+            ;;
+        --no-lto)
+            jolt_lto="OFF"
+            ;;
         --help)
             usage
             exit 0
@@ -576,6 +599,68 @@ fi
 if [[ "${enable_asan}" -eq 0 ]]; then
     cmake_platform_args+=(-DMODULARITY_ENABLE_ASAN=OFF)
 fi
+
+# Build profile. "low" drops the modules a 2-thread laptop pays heavily to compile
+# but cannot use: PhysX (~460 of ~1100 compile units; projects set to PhysX fall
+# back to Jolt at runtime), the experimental Vulkan backend, and OpenXR. "auto"
+# only picks low on <=2-thread hosts and otherwise leaves the build dir's cached
+# module choices alone; an explicit --full clears them back to their defaults.
+build_profile_reason=""
+build_profile_explicit=1
+low_profile_modules=(MODULARITY_ENABLE_PHYSX MODULARITY_ENABLE_VULKAN MODULARITY_ENABLE_OPENXR)
+if [[ "${build_profile}" == "auto" ]]; then
+    build_profile_explicit=0
+    if (( ncpus <= 2 )); then
+        build_profile="low"
+        build_profile_reason=" (auto: ${ncpus}-thread host; --full to build every module)"
+    else
+        build_profile="full"
+    fi
+fi
+if [[ "${build_profile}" == "low" ]]; then
+    for module in "${low_profile_modules[@]}"; do
+        cmake_platform_args+=(-D"${module}"=OFF)
+    done
+elif [[ "${build_profile_explicit}" -eq 1 ]]; then
+    # -U drops the cached OFF so each option() falls back to its platform default.
+    # Prepended so platform-forced values (the Windows cross-build turns PhysX and
+    # Vulkan off) are applied after it and still win.
+    unset_args=()
+    for module in "${low_profile_modules[@]}"; do
+        unset_args+=(-U"${module}")
+    done
+    cmake_platform_args=("${unset_args[@]}" "${cmake_platform_args[@]}")
+fi
+
+jolt_lto_reason=""
+if [[ "${jolt_lto}" == "auto" ]]; then
+    if [[ "${build_profile}" == "low" ]]; then
+        jolt_lto="OFF"
+        jolt_lto_reason=" (low profile; --lto to force)"
+    elif (( ncpus <= 2 )); then
+        jolt_lto="OFF"
+        jolt_lto_reason=" (auto: ${ncpus}-thread host, LTO links take minutes here; --lto to force)"
+    else
+        jolt_lto="ON"
+    fi
+fi
+cmake_platform_args+=(-DMODULARITY_JOLT_LTO="${jolt_lto}")
+
+# Every module toggle above is a PUBLIC compile definition on the engine targets,
+# so flipping one in an existing build dir recompiles the whole engine once.
+warn_if_profile_switch() {
+    local cache="${build_dir}/CMakeCache.txt"
+    [[ -f "${cache}" ]] || return 0
+    local module state
+    for module in "${low_profile_modules[@]}"; do
+        state="$(sed -n "s/^${module}:BOOL=//p" "${cache}" | head -n1)"
+        if [[ "${build_profile}" == "low" && "${state}" == "ON" ]] ||
+           [[ "${build_profile}" == "full" && "${build_profile_explicit}" -eq 1 && "${state}" == "OFF" ]]; then
+            log_warn "This build dir was configured with ${module}=${state}; switching to the ${build_profile} profile recompiles the whole engine once (this can take hours on a slow CPU)."
+            return 0
+        fi
+    done
+}
 
 pkg_manager=""
 pkg_prefix=()
@@ -734,7 +819,7 @@ ensure_linux_dependencies() {
                 missing+=("${module}-dev")
             fi
         done
-        if ! pkg-config --exists vulkan; then
+        if [[ "${build_profile}" != "low" ]] && ! pkg-config --exists vulkan; then
             need_install=1
             missing+=("vulkan-dev")
         fi
@@ -746,13 +831,15 @@ ensure_linux_dependencies() {
         done
     fi
 
-    if ! command -v glslc >/dev/null 2>&1; then
-        need_install=1
-        missing+=("glslc")
-    fi
-    if ! command -v vulkaninfo >/dev/null 2>&1; then
-        need_install=1
-        missing+=("vulkan-tools")
+    if [[ "${build_profile}" != "low" ]]; then
+        if ! command -v glslc >/dev/null 2>&1; then
+            need_install=1
+            missing+=("glslc")
+        fi
+        if ! command -v vulkaninfo >/dev/null 2>&1; then
+            need_install=1
+            missing+=("vulkan-tools")
+        fi
     fi
 
     local -a required_pkgs=()
@@ -800,6 +887,11 @@ ensure_linux_dependencies() {
             glslc_candidates=(shaderc shaderc-devel)
             ;;
     esac
+    if [[ "${build_profile}" == "low" ]]; then
+        # The low profile builds without Vulkan, so skip its SDK and shader tools.
+        vulkan_pkgs=()
+        glslc_candidates=()
+    fi
     required_pkgs=(
         "${core_pkgs[@]}"
         "${x11_pkgs[@]}"
@@ -816,8 +908,10 @@ ensure_linux_dependencies() {
     for pkg in "${x11_pkgs[@]}"; do echo "  |   +-- ${pkg}"; done
     echo "  +-- OpenGL/EGL/Wayland"
     for pkg in "${graphics_pkgs[@]}"; do echo "  |   +-- ${pkg}"; done
-    echo "  +-- Vulkan stack"
-    for pkg in "${vulkan_pkgs[@]}"; do echo "  |   +-- ${pkg}"; done
+    if [[ "${#vulkan_pkgs[@]}" -gt 0 ]]; then
+        echo "  +-- Vulkan stack"
+        for pkg in "${vulkan_pkgs[@]}"; do echo "  |   +-- ${pkg}"; done
+    fi
     echo "  +-- Audio import (sndfile, opusfile)"
     for pkg in "${audio_pkgs[@]}"; do echo "  |   +-- ${pkg}"; done
     echo "  +-- Optional acceleration"
@@ -832,6 +926,10 @@ ensure_linux_dependencies() {
     log_info "Installing packages using ${pkg_manager}..."
 
     install_packages "${required_pkgs[@]}"
+
+    if [[ "${build_profile}" == "low" ]]; then
+        return
+    fi
 
     if ! command -v glslc >/dev/null 2>&1; then
         install_optional_first_hit "${glslc_candidates[@]}" || log_warn "glslc package candidate not found; Vulkan runtime shader compile may fail."
@@ -1334,6 +1432,13 @@ if [[ -n "${cmake_generator}" ]]; then
     log_info "CMake generator: ${cmake_generator}"
 fi
 log_info "Package format: ${package_format}"
+if [[ "${build_profile}" == "low" ]]; then
+    log_info "Build profile: low - PhysX, Vulkan and OpenXR off${build_profile_reason}"
+else
+    log_info "Build profile: full"
+fi
+warn_if_profile_switch
+log_info "JoltPhysics LTO: ${jolt_lto}${jolt_lto_reason}"
 if [[ "${cpu_target}" == "native" ]]; then
     log_warn "CPU target: native (DEV ONLY — host-specific ISA; do not ship this build)"
 else

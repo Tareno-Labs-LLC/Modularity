@@ -1080,6 +1080,64 @@ void Engine::renderInspectorPanel() {
         return changed;
     };
 
+    // The material preview is a full off-screen scene render (four objects, its own lights). It
+    // only changes when its inputs change, but it used to be re-rendered every frame an object was
+    // selected, which is most of what the Inspector cost. The referenced texture ids are part of
+    // the signature so a preview still refreshes once a texture finishes loading. This mirrors the
+    // file browser's thumbnail cache.
+    auto previewInputSignature = [&](const MaterialProperties& material,
+                                     const std::string& albedoPath,
+                                     const std::string& overlayPath,
+                                     const std::string& normalPath,
+                                     bool useOverlay,
+                                     const std::string& vertShaderPath,
+                                     const std::string& fragShaderPath,
+                                     int targetWidth,
+                                     int targetHeight,
+                                     const glm::vec2& orbitAngles) {
+        auto mix64 = [](uint64_t seed, uint64_t value) {
+            return seed ^ (value + 0x9e3779b97f4a7c15ull + (seed << 6) + (seed >> 2));
+        };
+        auto mixFloat = [&](uint64_t seed, float value) {
+            uint32_t bits = 0;
+            std::memcpy(&bits, &value, sizeof(bits));
+            return mix64(seed, bits);
+        };
+        auto mixString = [&](uint64_t seed, const std::string& value) {
+            return mix64(seed, static_cast<uint64_t>(std::hash<std::string>{}(value)));
+        };
+        auto mixTexture = [&](uint64_t seed, const std::string& path) {
+            if (path.empty()) return mix64(seed, 0ull);
+            Texture* tex = renderer.getTexture(path, material.textureFilter);
+            return mix64(seed, static_cast<uint64_t>(tex ? tex->GetID() : 0u));
+        };
+
+        // MaterialProperties holds no heap members, so its bytes cover every field that
+        // reaches the preview shader without a list here to keep in sync.
+        static_assert(std::is_trivially_copyable<MaterialProperties>::value,
+                      "Material preview signature hashes MaterialProperties byte-wise");
+        uint64_t seed = 1469598103934665603ull;
+        std::array<unsigned char, sizeof(MaterialProperties)> materialBytes{};
+        std::memcpy(materialBytes.data(), &material, sizeof(MaterialProperties));
+        for (unsigned char byte : materialBytes) {
+            seed = mix64(seed, byte);
+        }
+        seed = mixString(seed, albedoPath);
+        seed = mixString(seed, overlayPath);
+        seed = mixString(seed, normalPath);
+        seed = mixString(seed, vertShaderPath);
+        seed = mixString(seed, fragShaderPath);
+        seed = mix64(seed, useOverlay ? 2ull : 1ull);
+        seed = mix64(seed, static_cast<uint64_t>(targetWidth));
+        seed = mix64(seed, static_cast<uint64_t>(targetHeight));
+        seed = mixFloat(seed, orbitAngles.x);
+        seed = mixFloat(seed, orbitAngles.y);
+        seed = mixTexture(seed, albedoPath);
+        seed = mixTexture(seed, overlayPath);
+        seed = mixTexture(seed, normalPath);
+        return seed;
+    };
+
     auto renderMaterialPreviewTexture = [&](const MaterialProperties& material,
                                             const std::string& albedoPath,
                                             const std::string& overlayPath,
@@ -1092,6 +1150,19 @@ void Engine::renderInspectorPanel() {
                                             int previewSlot,
                                             const glm::vec2& orbitAngles) {
         static const std::string kPreviewWhiteTexture = "Resources/Textures/editor_preview_white.ppm";
+
+        struct PreviewCacheEntry {
+            uint64_t signature = 0;
+            unsigned int texture = 0;
+        };
+        static std::unordered_map<int, PreviewCacheEntry> sPreviewCacheBySlot;
+        const uint64_t signature = previewInputSignature(
+            material, albedoPath, overlayPath, normalPath, useOverlay,
+            vertShaderPath, fragShaderPath, targetWidth, targetHeight, orbitAngles);
+        PreviewCacheEntry& cacheEntry = sPreviewCacheBySlot[previewSlot];
+        if (cacheEntry.texture != 0 && cacheEntry.signature == signature) {
+            return cacheEntry.texture;
+        }
 
         Camera previewCamera;
         previewCamera.position = glm::vec3(0.0f, 0.18f, 2.9f);
@@ -1142,7 +1213,7 @@ void Engine::renderInspectorPanel() {
         previewSphere.fragmentShaderPath = fragShaderPath;
         previewScene.push_back(previewSphere);
 
-        return renderer.renderScenePreview(
+        const unsigned int previewTexture = renderer.renderScenePreview(
             previewCamera,
             previewScene,
             targetWidth,
@@ -1154,6 +1225,9 @@ void Engine::renderInspectorPanel() {
             previewSlot,
             true
         );
+        cacheEntry.signature = signature;
+        cacheEntry.texture = previewTexture;
+        return previewTexture;
     };
 
     auto drawMaterialPreview = [&](const char* idSuffix,

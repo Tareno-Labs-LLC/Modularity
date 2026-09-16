@@ -783,6 +783,32 @@ namespace {
         std::unordered_map<FileBrowserTextLayoutKey, std::string, FileBrowserTextLayoutKeyHash> labels;
     };
 
+    // The breadcrumb and Favorites labels go through fs::relative / weakly_canonical, which
+    // lstat and readlink every component of both paths - too slow to redo every frame on a
+    // low-end machine. The results only change with the browsed folder, the project root, the
+    // favorites list, or the disk, so they are recomputed on a key change or once a second.
+    constexpr double kFileBrowserPathLabelRefreshSeconds = 1.0;
+
+    struct FileBrowserBreadcrumbCache {
+        fs::path currentPath;
+        fs::path projectRoot;
+        fs::path relativePath;
+        double refreshTime = -1.0;
+    };
+
+    struct FileBrowserFavoritesCache {
+        struct Row {
+            std::string label;
+            bool exists = false;
+            bool isCurrent = false;
+        };
+        fs::path currentPath;
+        fs::path baseRoot;
+        std::vector<fs::path> favorites;
+        std::vector<Row> rows;
+        double refreshTime = -1.0;
+    };
+
     struct FolderTreeChildCache {
         struct Node {
             std::vector<fs::path> childDirs;
@@ -2752,16 +2778,26 @@ void Engine::renderFileBrowserPanel() {
     ImGui::PopStyleVar(2);
 
     {
-        fs::path relativePath;
-        if (fileBrowser.projectRoot.empty()) {
-            relativePath = fileBrowser.currentPath.filename();
-        } else {
-            try {
-                relativePath = fs::relative(fileBrowser.currentPath, fileBrowser.projectRoot);
-            } catch (...) {
-                relativePath = fileBrowser.currentPath.filename();
+        static FileBrowserBreadcrumbCache sBreadcrumbCache;
+        const double breadcrumbNow = ImGui::GetTime();
+        if (sBreadcrumbCache.refreshTime < 0.0 ||
+            breadcrumbNow - sBreadcrumbCache.refreshTime > kFileBrowserPathLabelRefreshSeconds ||
+            sBreadcrumbCache.currentPath != fileBrowser.currentPath ||
+            sBreadcrumbCache.projectRoot != fileBrowser.projectRoot) {
+            sBreadcrumbCache.currentPath = fileBrowser.currentPath;
+            sBreadcrumbCache.projectRoot = fileBrowser.projectRoot;
+            sBreadcrumbCache.refreshTime = breadcrumbNow;
+            if (fileBrowser.projectRoot.empty()) {
+                sBreadcrumbCache.relativePath = fileBrowser.currentPath.filename();
+            } else {
+                try {
+                    sBreadcrumbCache.relativePath = fs::relative(fileBrowser.currentPath, fileBrowser.projectRoot);
+                } catch (...) {
+                    sBreadcrumbCache.relativePath = fileBrowser.currentPath.filename();
+                }
             }
         }
+        const fs::path& relativePath = sBreadcrumbCache.relativePath;
 
         std::vector<fs::path> pathParts;
         pathParts.push_back(fileBrowser.projectRoot);
@@ -2914,32 +2950,51 @@ void Engine::renderFileBrowserPanel() {
         fs::path baseRoot = fileBrowser.projectRoot.empty()
             ? projectManager.currentProject.projectPath
             : fileBrowser.projectRoot;
-        fs::path normalizedCurrent = normalizePath(fileBrowser.currentPath);
-
-        for (size_t i = 0; i < fileBrowserFavorites.size(); ++i) {
-            fs::path fav = fileBrowserFavorites[i];
-            std::string label;
-            std::error_code ec;
-            fs::path rel = fs::relative(fav, baseRoot, ec);
-            std::string relStr = rel.generic_string();
-            if (!ec && !rel.empty() && relStr.find("..") != 0) {
-                label = relStr;
-                if (label.empty() || label == ".") {
-                    label = "Project";
+        static FileBrowserFavoritesCache sFavoritesCache;
+        const double favoritesNow = ImGui::GetTime();
+        if (sFavoritesCache.refreshTime < 0.0 ||
+            favoritesNow - sFavoritesCache.refreshTime > kFileBrowserPathLabelRefreshSeconds ||
+            sFavoritesCache.currentPath != fileBrowser.currentPath ||
+            sFavoritesCache.baseRoot != baseRoot ||
+            sFavoritesCache.favorites != fileBrowserFavorites) {
+            sFavoritesCache.currentPath = fileBrowser.currentPath;
+            sFavoritesCache.baseRoot = baseRoot;
+            sFavoritesCache.favorites = fileBrowserFavorites;
+            sFavoritesCache.refreshTime = favoritesNow;
+            sFavoritesCache.rows.clear();
+            sFavoritesCache.rows.reserve(fileBrowserFavorites.size());
+            const fs::path normalizedCurrent = normalizePath(fileBrowser.currentPath);
+            for (const fs::path& fav : fileBrowserFavorites) {
+                FileBrowserFavoritesCache::Row row;
+                std::error_code ec;
+                fs::path rel = fs::relative(fav, baseRoot, ec);
+                std::string relStr = rel.generic_string();
+                if (!ec && !rel.empty() && relStr.find("..") != 0) {
+                    row.label = relStr;
+                    if (row.label.empty() || row.label == ".") {
+                        row.label = "Project";
+                    }
+                } else {
+                    row.label = PathToUtf8(fav.filename());
+                    if (row.label.empty()) {
+                        row.label = PathToUtf8(fav);
+                    }
                 }
-            } else {
-                label = PathToUtf8(fav.filename());
-                if (label.empty()) {
-                    label = PathToUtf8(fav);
-                }
+                row.exists = fs::exists(fav, ec);
+                row.isCurrent = normalizePath(fav) == normalizedCurrent;
+                sFavoritesCache.rows.push_back(std::move(row));
             }
+        }
 
-            bool exists = fs::exists(fav);
+        for (size_t i = 0; i < fileBrowserFavorites.size() && i < sFavoritesCache.rows.size(); ++i) {
+            fs::path fav = fileBrowserFavorites[i];
+            const std::string& label = sFavoritesCache.rows[i].label;
+            const bool exists = sFavoritesCache.rows[i].exists;
             ImGui::PushID(static_cast<int>(i));
             if (!exists) {
                 ImGui::BeginDisabled();
             }
-            if (ImGui::Selectable(label.c_str(), normalizePath(fav) == normalizedCurrent)) {
+            if (ImGui::Selectable(label.c_str(), sFavoritesCache.rows[i].isCurrent)) {
                 if (exists) {
                     fileBrowser.navigateTo(fav);
                 }

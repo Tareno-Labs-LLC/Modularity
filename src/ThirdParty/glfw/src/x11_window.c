@@ -147,6 +147,37 @@ static int getWindowState(_GLFWwindow* window)
     return result;
 }
 
+// Size and iconification are tracked from ConfigureNotify and WM_STATE events,
+// so the getters answer from that cache instead of a server round trip per call.
+// Round trips add up fast when an app queries them every frame and the X server
+// is competing with it for a small CPU. After GLFW itself requests a change the
+// matching event may not have been processed yet, so for a short grace period
+// the getters ask the server as before.
+//
+static void markWindowStateRequested(_GLFWwindow* window)
+{
+    window->x11.stateQueryDeadline =
+        _glfwPlatformGetTimerValue() + _glfwPlatformGetTimerFrequency();
+}
+
+static GLFWbool windowStateNeedsQuery(_GLFWwindow* window)
+{
+    return _glfwPlatformGetTimerValue() < window->x11.stateQueryDeadline;
+}
+
+// Queries the window size from the server
+//
+static void queryWindowSize(_GLFWwindow* window, int* width, int* height)
+{
+    XWindowAttributes attribs;
+    XGetWindowAttributes(_glfw.x11.display, window->x11.handle, &attribs);
+
+    if (width)
+        *width = attribs.width;
+    if (height)
+        *height = attribs.height;
+}
+
 // Returns whether the event is a selection event
 //
 static Bool isSelectionEvent(Display* display, XEvent* event, XPointer pointer)
@@ -241,6 +272,8 @@ static void updateNormalHints(_GLFWwindow* window, int width, int height)
 {
     XSizeHints* hints = XAllocSizeHints();
 
+    markWindowStateRequested(window);
+
     if (!window->monitor)
     {
         if (window->resizable)
@@ -288,6 +321,8 @@ static void updateNormalHints(_GLFWwindow* window, int width, int height)
 //
 static void updateWindowMode(_GLFWwindow* window)
 {
+    markWindowStateRequested(window);
+
     if (window->monitor)
     {
         if (_glfw.x11.xinerama.available &&
@@ -748,7 +783,9 @@ static GLFWbool createNativeWindow(_GLFWwindow* window,
 
     _glfwSetWindowTitleX11(window, wndconfig->title);
     _glfwGetWindowPosX11(window, &window->x11.xpos, &window->x11.ypos);
-    _glfwGetWindowSizeX11(window, &window->x11.width, &window->x11.height);
+    queryWindowSize(window, &window->x11.width, &window->x11.height);
+    // The window manager may still resize the window as it gets mapped
+    markWindowStateRequested(window);
 
     return GLFW_TRUE;
 }
@@ -1060,6 +1097,8 @@ static const char* getSelectionString(Atom selection)
 //
 static void acquireMonitor(_GLFWwindow* window)
 {
+    markWindowStateRequested(window);
+
     if (_glfw.x11.saver.count == 0)
     {
         // Remember old screen saver settings
@@ -1102,6 +1141,7 @@ static void releaseMonitor(_GLFWwindow* window)
     if (window->monitor->window != window)
         return;
 
+    markWindowStateRequested(window);
     _glfwInputMonitorWindow(window->monitor, NULL);
     _glfwRestoreVideoModeX11(window->monitor);
 
@@ -1470,6 +1510,11 @@ static void processEvent(XEvent *event)
             if (event->xconfigure.width != window->x11.width ||
                 event->xconfigure.height != window->x11.height)
             {
+                // Update the cache first, size getters called from the
+                // callbacks answer from it
+                window->x11.width = event->xconfigure.width;
+                window->x11.height = event->xconfigure.height;
+
                 _glfwInputFramebufferSize(window,
                                           event->xconfigure.width,
                                           event->xconfigure.height);
@@ -1477,9 +1522,6 @@ static void processEvent(XEvent *event)
                 _glfwInputWindowSize(window,
                                      event->xconfigure.width,
                                      event->xconfigure.height);
-
-                window->x11.width = event->xconfigure.width;
-                window->x11.height = event->xconfigure.height;
             }
 
             int xpos = event->xconfigure.x;
@@ -2155,17 +2197,22 @@ void _glfwSetWindowPosX11(_GLFWwindow* window, int xpos, int ypos)
 
 void _glfwGetWindowSizeX11(_GLFWwindow* window, int* width, int* height)
 {
-    XWindowAttributes attribs;
-    XGetWindowAttributes(_glfw.x11.display, window->x11.handle, &attribs);
+    if (windowStateNeedsQuery(window))
+    {
+        queryWindowSize(window, width, height);
+        return;
+    }
 
     if (width)
-        *width = attribs.width;
+        *width = window->x11.width;
     if (height)
-        *height = attribs.height;
+        *height = window->x11.height;
 }
 
 void _glfwSetWindowSizeX11(_GLFWwindow* window, int width, int height)
 {
+    markWindowStateRequested(window);
+
     if (window->monitor)
     {
         if (window->monitor->window == window)
@@ -2187,7 +2234,7 @@ void _glfwSetWindowSizeLimitsX11(_GLFWwindow* window,
                                  int maxwidth, int maxheight)
 {
     int width, height;
-    _glfwGetWindowSizeX11(window, &width, &height);
+    queryWindowSize(window, &width, &height);
     updateNormalHints(window, width, height);
     XFlush(_glfw.x11.display);
 }
@@ -2195,7 +2242,7 @@ void _glfwSetWindowSizeLimitsX11(_GLFWwindow* window,
 void _glfwSetWindowAspectRatioX11(_GLFWwindow* window, int numer, int denom)
 {
     int width, height;
-    _glfwGetWindowSizeX11(window, &width, &height);
+    queryWindowSize(window, &width, &height);
     updateNormalHints(window, width, height);
     XFlush(_glfw.x11.display);
 }
@@ -2285,6 +2332,7 @@ void _glfwIconifyWindowX11(_GLFWwindow* window)
         return;
     }
 
+    markWindowStateRequested(window);
     XIconifyWindow(_glfw.x11.display, window->x11.handle, _glfw.x11.screen);
     XFlush(_glfw.x11.display);
 }
@@ -2299,6 +2347,8 @@ void _glfwRestoreWindowX11(_GLFWwindow* window)
                         "X11: Iconification of full screen windows requires a WM that supports EWMH full screen");
         return;
     }
+
+    markWindowStateRequested(window);
 
     if (_glfwWindowIconifiedX11(window))
     {
@@ -2325,6 +2375,8 @@ void _glfwRestoreWindowX11(_GLFWwindow* window)
 
 void _glfwMaximizeWindowX11(_GLFWwindow* window)
 {
+    markWindowStateRequested(window);
+
     if (!_glfw.x11.NET_WM_STATE ||
         !_glfw.x11.NET_WM_STATE_MAXIMIZED_VERT ||
         !_glfw.x11.NET_WM_STATE_MAXIMIZED_HORZ)
@@ -2390,6 +2442,8 @@ void _glfwMaximizeWindowX11(_GLFWwindow* window)
 
 void _glfwShowWindowX11(_GLFWwindow* window)
 {
+    markWindowStateRequested(window);
+
     if (_glfwWindowVisibleX11(window))
         return;
 
@@ -2399,6 +2453,7 @@ void _glfwShowWindowX11(_GLFWwindow* window)
 
 void _glfwHideWindowX11(_GLFWwindow* window)
 {
+    markWindowStateRequested(window);
     XUnmapWindow(_glfw.x11.display, window->x11.handle);
     XFlush(_glfw.x11.display);
 }
@@ -2435,6 +2490,8 @@ void _glfwSetWindowMonitorX11(_GLFWwindow* window,
                               int width, int height,
                               int refreshRate)
 {
+    markWindowStateRequested(window);
+
     if (window->monitor == monitor)
     {
         if (monitor)
@@ -2497,7 +2554,10 @@ int _glfwWindowFocusedX11(_GLFWwindow* window)
 
 int _glfwWindowIconifiedX11(_GLFWwindow* window)
 {
-    return getWindowState(window) == IconicState;
+    if (windowStateNeedsQuery(window))
+        return getWindowState(window) == IconicState;
+
+    return window->x11.iconified;
 }
 
 int _glfwWindowVisibleX11(_GLFWwindow* window)
@@ -2580,12 +2640,14 @@ int _glfwFramebufferTransparentX11(_GLFWwindow* window)
 void _glfwSetWindowResizableX11(_GLFWwindow* window, GLFWbool enabled)
 {
     int width, height;
-    _glfwGetWindowSizeX11(window, &width, &height);
+    queryWindowSize(window, &width, &height);
     updateNormalHints(window, width, height);
 }
 
 void _glfwSetWindowDecoratedX11(_GLFWwindow* window, GLFWbool enabled)
 {
+    markWindowStateRequested(window);
+
     struct
     {
         unsigned long flags;

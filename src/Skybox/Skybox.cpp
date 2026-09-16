@@ -95,8 +95,14 @@ void Skybox::releaseBakedSky() {
 }
 
 bool Skybox::cachedSkyUsable() const {
+    // Scrolling mode without a usable texture falls back to the procedural sky in the shader
+    // (uSkyMode == 1 && uHasScrollTexture), so it is just as cacheable as Procedural mode.
+    const bool hasScrollTexture = scrollingTexture != nullptr && scrollingTexture->GetID() != 0;
+    const bool drawsProceduralSky =
+        settings.mode == SkyboxMode::Procedural ||
+        (settings.mode == SkyboxMode::Scrolling && !hasScrollTexture);
     return settings.cachedSky &&
-           settings.mode == SkyboxMode::Procedural &&
+           drawsProceduralSky &&
            fragPath == "Resources/Shaders/skybox_frag.glsl" &&
            skyboxShader && skyboxShader->ID != 0;
 }
@@ -437,14 +443,18 @@ void Skybox::draw(const float* view, const float* projection) {
                               glm::distance(currentCameraPos, bakedCameraPos) > moveThreshold;
             }
 
-            if (refreshDue || cameraMoved) {
+            // A periodic refresh starts only once the previous one has rolled through every
+            // face, and bakes one face per draw while a full capture exists: re-baking all six
+            // at once made a 6x sky-cost frame every refresh interval, a visible hitch on
+            // low-end GPUs. The first capture (and a sun change above) still bakes all faces.
+            if ((refreshDue || cameraMoved) && bakedDirtyMask == 0) {
                 bakedDirtyMask = 0x3F;
                 bakedLastRefreshSec = animationTime;
                 bakedCameraPos = currentCameraPos;
                 bakedCameraValid = true;
             }
 
-            bakeDirtyFaces(6);
+            bakeDirtyFaces(bakedHasFullCapture ? 1 : 6);
             sampleBaked = bakedHasFullCapture;
         }
     }

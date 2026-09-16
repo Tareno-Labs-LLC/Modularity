@@ -5828,6 +5828,26 @@ void Engine::logWindowLifecycle(const char* event, bool iconified, int fbWidth, 
     std::fflush(stderr);
 }
 
+#if !MODULARITY_RUNTIME_ONLY && !defined(__ANDROID__)
+namespace {
+// True when the user touched the editor this frame, or is still holding something down (a drag,
+// a fly-camera key, a gizmo). InputEventsTrail holds exactly the events NewFrame() consumed, and
+// ImGui drops duplicate mouse-position events, so a mouse resting over the window reads as idle.
+bool EditorFrameHadUserInput() {
+    ImGuiContext* ctx = ImGui::GetCurrentContext();
+    if (!ctx) return true;
+    if (ctx->InputEventsTrail.Size > 0 || ImGui::IsAnyItemActive()) return true;
+    for (bool down : ctx->IO.MouseDown) {
+        if (down) return true;
+    }
+    for (int key = ImGuiKey_NamedKey_BEGIN; key < ImGuiKey_NamedKey_END; ++key) {
+        if (ImGui::IsKeyDown(static_cast<ImGuiKey>(key))) return true;
+    }
+    return false;
+}
+} // namespace
+#endif
+
 void Engine::run() {
     constexpr float kRigidbody2DFixedStep = 1.0f / 120.0f;
     constexpr int kMaxRigidbody2DStepsPerFrame = 4;
@@ -6758,6 +6778,45 @@ void Engine::run() {
                 paceFrame(frameStart);
             }
         }
+
+#if !MODULARITY_RUNTIME_ONLY && !defined(__ANDROID__)
+        {
+            // Low performance mode: an editor nobody is touching has nothing new to show, but it
+            // would otherwise redraw both viewports at full rate and keep a weak laptop's CPU and
+            // GPU pinned. Once input has been quiet for a moment, block on the event queue instead
+            // of sleeping - any input wakes it at once, so interaction latency is unchanged.
+            // MODULARITY_EDITOR_IDLE_THROTTLE=0 turns it off.
+            constexpr double kIdleGraceSec = 1.0;
+            constexpr double kIdleFocusedInterval = 1.0 / 15.0;
+            constexpr double kIdleUnfocusedInterval = 1.0 / 8.0;
+            static const bool idleThrottleAllowed = [] {
+                const char* v = std::getenv("MODULARITY_EDITOR_IDLE_THROTTLE");
+                return !(v && v[0] == '0' && v[1] == '\0');
+            }();
+            static double lastEditorActivityTime = 0.0;
+
+            const double now = glfwGetTime();
+            const bool editorBusy =
+                playerMode || isPlaying || specMode || testMode || showLauncher ||
+                projectLoadInProgress || sceneLoadInProgress || xrSystem.isRunning() ||
+                cursorLocked || gameViewCursorLocked || EditorFrameHadUserInput();
+            if (editorBusy) {
+                lastEditorActivityTime = now;
+            } else if (idleThrottleAllowed &&
+                       now - lastEditorActivityTime > kIdleGraceSec &&
+                       projectManager.preferences.effectiveTier() ==
+                           Modularity::HardwareProfile::Tier::Low) {
+                MODU_PROFILE_SCOPE("Idle Throttle", ProfilerSampleCategory::Render);
+                const double interval = glfwGetWindowAttrib(editorWindow, GLFW_FOCUSED)
+                                            ? kIdleFocusedInterval
+                                            : kIdleUnfocusedInterval;
+                const double remaining = frameStart + interval - now;
+                if (remaining > 0.0) {
+                    glfwWaitEventsTimeout(remaining);
+                }
+            }
+        }
+#endif
 
         if (runtime2DProfileThisFrame) {
             gRuntime2DProfileFrame.renderSubmissionMs += profileRenderSubmissionMs;

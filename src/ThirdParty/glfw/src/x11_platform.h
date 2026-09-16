@@ -537,6 +537,9 @@ typedef struct _GLFWwindowX11
     // Cached position and size used to filter out duplicate events
     int             width, height;
     int             xpos, ypos;
+    // Timer value until which size and iconified queries go to the server
+    // instead of the event-tracked cache (set when GLFW requests a change)
+    uint64_t        stateQueryDeadline;
 
     // The last received cursor position, regardless of source
     int             lastCursorPosX, lastCursorPosY;

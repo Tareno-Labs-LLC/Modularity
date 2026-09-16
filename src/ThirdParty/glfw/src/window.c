@@ -931,6 +931,10 @@ GLFWAPI void glfwSetWindowAttrib(GLFWwindow* handle, int attrib, int value)
             return;
 
         case GLFW_MOUSE_PASSTHROUGH:
+            // Callers (the ImGui backend) re-apply this every frame, and on
+            // X11 each apply is a shape request to the server
+            if (window->mousePassthrough == value)
+                return;
             window->mousePassthrough = value;
             _glfw.platform.setWindowMousePassthrough(window, value);
             return;

@@ -99,7 +99,6 @@ namespace {
     };
 
     struct HierarchyFrameCache {
-        std::unordered_map<int, size_t> visibleIndex;
         std::unordered_set<int> selectedIds;
         std::vector<HierarchyNavRow> navRows;
         int scrollToObjectId = -1;
@@ -517,25 +516,42 @@ namespace {
         DrawSvgIcon(drawList, kEmptyObjectSvg, gEmptyObjectSvgCache, min, max, color, stroke, 0.9f);
     }
 
-    const char* GetHierarchyComponentIconPath(const SceneObject& obj) {
-        if (obj.hasCamera) return "Resources/Engine-Root/Hierarchy/Component Camera.png";
-        if (obj.hasLight || obj.hasLight2D) return "Resources/Engine-Root/Hierarchy/Component Light Bulb.png";
-        if (obj.hasPostFX) return "Resources/Engine-Root/Hierarchy/Component ModuVolume.png";
+    // Returns a reference to a static string: rows look their icon up every frame through
+    // Renderer::getTexture(const std::string&), and handing it a literal built a heap string
+    // for every row on every frame.
+    const std::string& GetHierarchyComponentIconPath(const SceneObject& obj) {
+        static const std::string kIconComponentCamera = "Resources/Engine-Root/Hierarchy/Component Camera.png";
+        static const std::string kIconComponentLightBulb = "Resources/Engine-Root/Hierarchy/Component Light Bulb.png";
+        static const std::string kIconComponentModuvolume = "Resources/Engine-Root/Hierarchy/Component ModuVolume.png";
+        static const std::string kIconComponentCanvas = "Resources/Engine-Root/Hierarchy/Component Canvas.png";
+        static const std::string kIconComponentText = "Resources/Engine-Root/Hierarchy/Component Text.png";
+        static const std::string kIconComponentSprite = "Resources/Engine-Root/Hierarchy/Component Sprite.png";
+        static const std::string kIconVideoPlayer = "Resources/Engine-Root/Hierarchy/Video Player.png";
+        static const std::string kIconParticleSystemAnyType = "Resources/Engine-Root/Hierarchy/Particle System any type.png";
+        static const std::string kIconComponentMesh = "Resources/Engine-Root/Hierarchy/Component Mesh.png";
+        static const std::string kIconComponentAudioSource = "Resources/Engine-Root/Hierarchy/Component Audio Source.png";
+        static const std::string kIconScript = "Resources/Engine-Root/Hierarchy/Script.png";
+        static const std::string kIconRigidbody2DAnd3DType = "Resources/Engine-Root/Hierarchy/Rigidbody 2D and 3D type.png";
+        static const std::string kIconColliderAnyType = "Resources/Engine-Root/Hierarchy/Collider any type.png";
+        static const std::string kIconComponentDefaultOrUnknown = "Resources/Engine-Root/Hierarchy/Component Default or Unknown.png";
+        if (obj.hasCamera) return kIconComponentCamera;
+        if (obj.hasLight || obj.hasLight2D) return kIconComponentLightBulb;
+        if (obj.hasPostFX) return kIconComponentModuvolume;
         if (obj.hasUI) {
             switch (obj.ui.type) {
-                case UIElementType::Canvas: return "Resources/Engine-Root/Hierarchy/Component Canvas.png";
-                case UIElementType::Text: return "Resources/Engine-Root/Hierarchy/Component Text.png";
+                case UIElementType::Canvas: return kIconComponentCanvas;
+                case UIElementType::Text: return kIconComponentText;
                 case UIElementType::Image:
-                case UIElementType::Sprite2D: return "Resources/Engine-Root/Hierarchy/Component Sprite.png";
+                case UIElementType::Sprite2D: return kIconComponentSprite;
                 default: break;
             }
         }
-        if (obj.hasVideoPlayer) return "Resources/Engine-Root/Hierarchy/Video Player.png";
-        if (obj.hasParticleSystem2D) return "Resources/Engine-Root/Hierarchy/Particle System any type.png";
+        if (obj.hasVideoPlayer) return kIconVideoPlayer;
+        if (obj.hasParticleSystem2D) return kIconParticleSystemAnyType;
         if (obj.hasRenderer) {
             switch (obj.renderType) {
                 case RenderType::Sprite:
-                    return "Resources/Engine-Root/Hierarchy/Component Sprite.png";
+                    return kIconComponentSprite;
                 case RenderType::Cube:
                 case RenderType::Sphere:
                 case RenderType::Capsule:
@@ -544,17 +560,17 @@ namespace {
                 case RenderType::Mirror:
                 case RenderType::Plane:
                 case RenderType::Torus:
-                    return "Resources/Engine-Root/Hierarchy/Component Mesh.png";
+                    return kIconComponentMesh;
                 case RenderType::None:
                 default:
                     break;
             }
         }
-        if (obj.hasAudioSource) return "Resources/Engine-Root/Hierarchy/Component Audio Source.png";
-        if (!obj.scripts.empty()) return "Resources/Engine-Root/Hierarchy/Script.png";
-        if (obj.hasRigidbody || obj.hasRigidbody2D) return "Resources/Engine-Root/Hierarchy/Rigidbody 2D and 3D type.png";
-        if (obj.hasCollider || obj.hasCollider2D) return "Resources/Engine-Root/Hierarchy/Collider any type.png";
-        return "Resources/Engine-Root/Hierarchy/Component Default or Unknown.png";
+        if (obj.hasAudioSource) return kIconComponentAudioSource;
+        if (!obj.scripts.empty()) return kIconScript;
+        if (obj.hasRigidbody || obj.hasRigidbody2D) return kIconRigidbody2DAnd3DType;
+        if (obj.hasCollider || obj.hasCollider2D) return kIconColliderAnyType;
+        return kIconComponentDefaultOrUnknown;
     }
 
     void DrawHierarchyLines(ImDrawList* drawList, const ImVec2& itemMin, const ImVec2& itemMax,
@@ -779,8 +795,6 @@ void Engine::renderHierarchyPanel() {
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, listItemSpacing);
     ImGui::BeginChild("HierarchyList", ImVec2(-1.0f, 0.0f), false);
 
-    gHierarchyFrameCache.visibleIndex.clear();
-    gHierarchyFrameCache.visibleIndex.reserve(sceneObjects.size());
     gHierarchyFrameCache.navRows.clear();
     gHierarchyFrameCache.navRows.reserve(sceneObjects.size());
     gHierarchyFrameCache.selectedIds.clear();
@@ -960,7 +974,6 @@ void Engine::renderObjectNode(SceneObject& obj, const std::string& filter,
     }
 
     hierarchyVisibleOrder.push_back(obj.id);
-    gHierarchyFrameCache.visibleIndex[obj.id] = hierarchyVisibleOrder.size() - 1;
 
     bool hasChildren = !obj.childIds.empty();
     bool isSelected = gHierarchyFrameCache.selectedIds.find(obj.id) != gHierarchyFrameCache.selectedIds.end();
@@ -1041,8 +1054,7 @@ void Engine::renderObjectNode(SceneObject& obj, const std::string& filter,
         iconColor = ImGui::ColorConvertFloat4ToU32(dimmed);
     }
     Texture* componentIcon = obj.editorIconPath.empty()
-        ? renderer.getTexture(GetHierarchyComponentIconPath(obj),
-                              MaterialProperties::TextureFilter::Bilinear)
+        ? nullptr
         : renderer.getTexture(obj.editorIconPath,
                               MaterialProperties::TextureFilter::Bilinear);
     if (!componentIcon || !componentIcon->GetID()) {
@@ -1129,10 +1141,12 @@ void Engine::renderObjectNode(SceneObject& obj, const std::string& filter,
                 anchorId = obj.id;
             }
 
+            // Only needed on shift-click, so the rows drawn so far are searched here instead of
+            // every row paying a hash-map insert on every frame.
             auto findOrderIndex = [&](int id) -> int {
-                auto it = gHierarchyFrameCache.visibleIndex.find(id);
-                if (it == gHierarchyFrameCache.visibleIndex.end()) return -1;
-                return static_cast<int>(it->second);
+                auto it = std::find(hierarchyVisibleOrder.begin(), hierarchyVisibleOrder.end(), id);
+                if (it == hierarchyVisibleOrder.end()) return -1;
+                return static_cast<int>(it - hierarchyVisibleOrder.begin());
             };
 
             const int anchorIndex = findOrderIndex(anchorId);

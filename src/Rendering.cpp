@@ -678,13 +678,15 @@ const std::vector<float>& GetPrimitiveTriangleVertices(RenderType type) {
     }
 }
 
-void AppendStaticMergeMaterialKey(const SceneObject& obj, std::string& out) {
+// Every field that decides whether two objects can share a static merge batch. The batch key
+// string and the per-frame change signature both walk this list, so they cannot drift apart.
+template <typename Visitor>
+void VisitStaticMergeMaterialKey(const SceneObject& obj, Visitor& visitor) {
     const MaterialProperties& m = obj.material;
-    auto sep = [&]() { out += '|'; };
-    auto num = [&](float v) { out += std::to_string(v); sep(); };
-    auto integer = [&](int v) { out += std::to_string(v); sep(); };
-    auto flag = [&](bool v) { out += v ? '1' : '0'; sep(); };
-    auto str = [&](const std::string& v) { out += v; sep(); };
+    auto num = [&](float v) { visitor.num(v); };
+    auto integer = [&](int v) { visitor.integer(v); };
+    auto flag = [&](bool v) { visitor.flag(v); };
+    auto str = [&](const std::string& v) { visitor.str(v); };
 
     integer(static_cast<int>(obj.renderType));
     str(obj.vertexShaderPath);
@@ -735,6 +737,32 @@ void AppendStaticMergeMaterialKey(const SceneObject& obj, std::string& out) {
     num(m.heightScale);
     integer(m.parallaxSteps);
     flag(m.parallaxInvertHeight);
+}
+
+void AppendStaticMergeMaterialKey(const SceneObject& obj, std::string& out) {
+    struct StringKeyVisitor {
+        std::string& out;
+        void num(float v) { out += std::to_string(v); out += '|'; }
+        void integer(int v) { out += std::to_string(v); out += '|'; }
+        void flag(bool v) { out += v ? '1' : '0'; out += '|'; }
+        void str(const std::string& v) { out += v; out += '|'; }
+    } visitor{out};
+    VisitStaticMergeMaterialKey(obj, visitor);
+}
+
+// Hashes the same fields as AppendStaticMergeMaterialKey without formatting them. The signature
+// is rebuilt every frame to notice scene edits, and std::to_string on ~45 floats per object was a
+// measurable share of a frame on low-end CPUs.
+uint64_t HashStaticMergeMaterialKey(const SceneObject& obj, uint64_t seed) {
+    struct HashKeyVisitor {
+        uint64_t hash;
+        void num(float v) { hash = HashCombine64(hash, HashFloat64(v == 0.0f ? 0.0f : v)); }
+        void integer(int v) { hash = HashCombine64(hash, static_cast<uint64_t>(static_cast<int64_t>(v))); }
+        void flag(bool v) { hash = HashCombine64(hash, v ? 2u : 1u); }
+        void str(const std::string& v) { hash = HashCombine64(hash, HashString64(v)); }
+    } visitor{seed};
+    VisitStaticMergeMaterialKey(obj, visitor);
+    return visitor.hash;
 }
 
 bool IsStaticMergeCandidate(const SceneObject& obj) {
@@ -1968,8 +1996,6 @@ void Renderer::rebuildStaticMergeBatches(const std::vector<SceneObject>& sceneOb
 
     uint64_t signature = 1469598103934665603ull;
     size_t candidateCount = 0;
-    std::string materialKeyScratch;
-    materialKeyScratch.reserve(512);
     for (const auto& obj : sceneObjects) {
         if (!isStaticMergeBatchable(obj)) continue;
         ++candidateCount;
@@ -1984,9 +2010,7 @@ void Renderer::rebuildStaticMergeBatches(const std::vector<SceneObject>& sceneOb
         signature = HashCombine64(signature, HashFloat64(obj.scale.x));
         signature = HashCombine64(signature, HashFloat64(obj.scale.y));
         signature = HashCombine64(signature, HashFloat64(obj.scale.z));
-        materialKeyScratch.clear();
-        AppendStaticMergeMaterialKey(obj, materialKeyScratch);
-        signature = HashCombine64(signature, HashString64(materialKeyScratch));
+        signature = HashStaticMergeMaterialKey(obj, signature);
     }
     signature = HashCombine64(signature, static_cast<uint64_t>(candidateCount));
 
@@ -7398,8 +7422,7 @@ void Renderer::renderScene(const Camera &camera,
     viewportPostStats = {};
     clearHistory();
   }
-  activeStats = nullptr;
-}
+  activeStats = nullptr;}
 
 void Renderer::renderSceneToTarget(const Camera& camera,
                                    const std::vector<SceneObject>& sceneObjects,
@@ -7858,6 +7881,20 @@ void Renderer::renderSelectionOutline(const Camera& camera, const std::vector<Sc
     const bool outlineShaderFallbackToDefault = (outlineShader == defaultShader);
     if (outlineShaderFallbackToDefault) return;
 
+    // Optional coarse occupancy pre-pass (selection_outline_coarse_frag.glsl) that lets the outline
+    // shader skip its neighbourhood search away from the selection. Without it the outline still
+    // renders, it just searches every pixel.
+    static const std::string kSelectionOutlineCoarseFragPath =
+        "Resources/Shaders/selection_outline_coarse_frag.glsl";
+    Shader* coarseMaskShader = getShader(postVertPath, kSelectionOutlineCoarseFragPath);
+    if (coarseMaskShader == defaultShader || (coarseMaskShader && coarseMaskShader->ID == 0)) {
+        coarseMaskShader = nullptr;
+    }
+    // A reserved slot in the renderer-owned auxiliary target map, so the coarse target is created,
+    // resized and released with the renderer without widening Rendering.h.
+    constexpr int kSelectionCoarseMaskSlot = -7101;
+    constexpr int kCoarseBlockSize = 8;
+
     GLint prevDrawFbo = 0;
     GLint prevReadFbo = 0;
     GLint prevViewport[4] = { 0, 0, currentWidth, currentHeight };
@@ -7895,14 +7932,126 @@ void Renderer::renderSelectionOutline(const Camera& camera, const std::vector<Sc
     glGetIntegerv(GL_CULL_FACE_MODE, &prevCullMode);
     GLboolean blendEnabled = glIsEnabled(GL_BLEND);
     GLboolean stencilEnabled = glIsEnabled(GL_STENCIL_TEST);
+    GLboolean scissorEnabled = glIsEnabled(GL_SCISSOR_TEST);
+    GLint prevScissorBox[4] = { 0, 0, currentWidth, currentHeight };
+    glGetIntegerv(GL_SCISSOR_BOX, prevScissorBox);
     GLboolean polyOffsetFill = glIsEnabled(GL_POLYGON_OFFSET_FILL);
     GLboolean prevColorMask[4] = { GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE };
     glGetBooleanv(GL_COLOR_WRITEMASK, prevColorMask);
 
     const glm::mat4 view = camera.getViewMatrix();
     const glm::mat4 projection = BuildCameraProjection(camera, currentWidth, currentHeight, fovDeg, nearPlane, farPlane);
+    const glm::mat4 viewProjection = projection * view;
+
+    // The outline shader searches a neighbourhood of the mask per pixel, so run over the whole
+    // viewport it cost tens of millions of texture fetches per frame to draw a few-pixel border.
+    // An outline pixel can only appear within the search radius of the selected object, and the
+    // pass is alpha blended, so every pixel outside that box writes alpha 0 and leaves the target
+    // untouched: restricting the pass to the box is the same image for a fraction of the fill.
+    // These match the uniforms the pass sets below.
+    constexpr float kOutlineRadiusPx = 2.7f;
+    constexpr float kOutlineSoftnessPx = 1.15f;
+    const int outlineMarginPx =
+        static_cast<int>(std::ceil(kOutlineRadiusPx + kOutlineSoftnessPx)) + 1;
+
+    struct ScreenBox {
+        int x = 0;
+        int y = 0;
+        int w = 0;
+        int h = 0;
+        bool valid = false;   // false: projection not trusted, keep the full viewport
+        bool empty = false;   // wholly off screen, nothing to draw
+    };
+
+    // Conservative screen rect (GL pixels, bottom-left origin) of the objects being outlined: the
+    // object's bounding box, clipped against the near plane so geometry that surrounds the camera
+    // (a floor plane) still gets a partial rect instead of the whole viewport.
+    auto computeScreenBox = [&](const std::vector<MaskDrawItem>& drawItems, int marginPx) -> ScreenBox {
+        ScreenBox box;
+        const float clipW = std::max(nearPlane, 0.0001f);
+        float minX = FLT_MAX, minY = FLT_MAX, maxX = -FLT_MAX, maxY = -FLT_MAX;
+        bool anyInFront = false;
+        auto accumulate = [&](const glm::vec4& clip) {
+            const float sx = (clip.x / clip.w * 0.5f + 0.5f) * static_cast<float>(currentWidth);
+            const float sy = (clip.y / clip.w * 0.5f + 0.5f) * static_cast<float>(currentHeight);
+            if (!std::isfinite(sx) || !std::isfinite(sy)) return false;
+            minX = std::min(minX, sx);
+            minY = std::min(minY, sy);
+            maxX = std::max(maxX, sx);
+            maxY = std::max(maxY, sy);
+            return true;
+        };
+        for (const auto& drawItem : drawItems) {
+            if (!drawItem.obj) return box;
+            // Skinned meshes can deform past their bind-pose bounds.
+            if (drawItem.obj->hasSkeletalAnimation && drawItem.obj->skeletal.enabled) return box;
+            glm::vec3 localCenter(0.0f);
+            glm::vec3 localExtents(0.0f);
+            if (!TryGetObjectLocalBounds(*drawItem.obj, localCenter, localExtents)) return box;
+            const glm::mat4 mvp = viewProjection *
+                BuildSceneObjectModelMatrix(*drawItem.obj, &camera.position, &camera.up);
+
+            std::array<glm::vec4, 8> clip;
+            for (int corner = 0; corner < 8; ++corner) {
+                const glm::vec3 local(
+                    localCenter.x + ((corner & 1) ? localExtents.x : -localExtents.x),
+                    localCenter.y + ((corner & 2) ? localExtents.y : -localExtents.y),
+                    localCenter.z + ((corner & 4) ? localExtents.z : -localExtents.z));
+                clip[corner] = mvp * glm::vec4(local, 1.0f);
+            }
+            for (int corner = 0; corner < 8; ++corner) {
+                if (clip[corner].w >= clipW) {
+                    anyInFront = true;
+                    if (!accumulate(clip[corner])) return box;
+                }
+                // Each box edge that crosses the near plane contributes its crossing point.
+                for (int axisBit : {1, 2, 4}) {
+                    if (corner & axisBit) continue;
+                    const glm::vec4& a = clip[corner];
+                    const glm::vec4& b = clip[corner | axisBit];
+                    if ((a.w >= clipW) == (b.w >= clipW)) continue;
+                    const float t = (clipW - a.w) / (b.w - a.w);
+                    if (!accumulate(glm::mix(a, b, t))) return box;
+                }
+            }
+        }
+        box.valid = true;
+        if (!anyInFront) {
+            box.empty = true; // wholly behind the camera
+            return box;
+        }
+
+        const float marginF = static_cast<float>(marginPx);
+        const float fx0 = std::max(0.0f, std::floor(minX) - marginF);
+        const float fy0 = std::max(0.0f, std::floor(minY) - marginF);
+        const float fx1 = std::min(static_cast<float>(currentWidth), std::ceil(maxX) + marginF);
+        const float fy1 = std::min(static_cast<float>(currentHeight), std::ceil(maxY) + marginF);
+        box.empty = (fx1 <= fx0 || fy1 <= fy0);
+        box.x = static_cast<int>(fx0);
+        box.y = static_cast<int>(fy0);
+        box.w = box.empty ? 0 : static_cast<int>(fx1 - fx0);
+        box.h = box.empty ? 0 : static_cast<int>(fy1 - fy0);
+        return box;
+    };
+
     auto drawOutlinePass = [&](const std::vector<MaskDrawItem>& drawItems, float passWeight) {
         if (drawItems.empty() || passWeight <= 0.001f) return;
+
+        // Box the outline can cover, and the mask region it reads: outline pixels at the edge of
+        // their box still sample up to the search radius further out, so the mask has to be
+        // cleared and filled over a box one margin larger again.
+        const ScreenBox outlineBox = computeScreenBox(drawItems, outlineMarginPx);
+        const ScreenBox maskBox = computeScreenBox(drawItems, outlineMarginPx * 2);
+        const bool useScissor = outlineBox.valid && maskBox.valid;
+        if (useScissor && (outlineBox.empty || maskBox.empty)) {
+            return; // selection is off screen; the pass would be a no-op
+        }
+        if (useScissor) {
+            glEnable(GL_SCISSOR_TEST);
+            glScissor(maskBox.x, maskBox.y, maskBox.w, maskBox.h);
+        } else {
+            glDisable(GL_SCISSOR_TEST);
+        }
 
         glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, selectionMaskTarget.fbo);
@@ -7981,11 +8130,47 @@ void Renderer::renderSelectionOutline(const Camera& camera, const std::vector<Sc
             drawItem.mesh->draw();
         }
 
-        glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
-        glViewport(0, 0, currentWidth, currentHeight);
         glDisable(GL_DEPTH_TEST);
         glDepthMask(GL_FALSE);
         glDisable(GL_CULL_FACE);
+
+        unsigned int coarseMaskTexture = 0;
+        if (coarseMaskShader) {
+            const int coarseWidth = (currentWidth + kCoarseBlockSize - 1) / kCoarseBlockSize;
+            const int coarseHeight = (currentHeight + kCoarseBlockSize - 1) / kCoarseBlockSize;
+            RenderTarget& coarseTarget = extraPreviewTargets[kSelectionCoarseMaskSlot];
+            extraPreviewTargetLastUsed[kSelectionCoarseMaskSlot] = ++previewTargetUseSerial;
+            RenderTargetOptions coarseOptions;
+            coarseOptions.depth = false;
+            ensureRenderTarget(coarseTarget, coarseWidth, coarseHeight, coarseOptions);
+            if (coarseTarget.fbo != 0 && coarseTarget.texture != 0) {
+                glBindFramebuffer(GL_FRAMEBUFFER, coarseTarget.fbo);
+                glViewport(0, 0, coarseWidth, coarseHeight);
+                glDisable(GL_BLEND);
+                if (useScissor) {
+                    // Blocks covering the mask box: every block the outline pass reads lies inside.
+                    const int bx0 = maskBox.x / kCoarseBlockSize;
+                    const int by0 = maskBox.y / kCoarseBlockSize;
+                    const int bx1 = (maskBox.x + maskBox.w + kCoarseBlockSize - 1) / kCoarseBlockSize;
+                    const int by1 = (maskBox.y + maskBox.h + kCoarseBlockSize - 1) / kCoarseBlockSize;
+                    glEnable(GL_SCISSOR_TEST);
+                    glScissor(bx0, by0, std::max(0, bx1 - bx0), std::max(0, by1 - by0));
+                }
+                glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+                glClear(GL_COLOR_BUFFER_BIT);
+                coarseMaskShader->use();
+                coarseMaskShader->setInt("maskTex", 0);
+                coarseMaskShader->setVec2("maskSize", glm::vec2(static_cast<float>(currentWidth),
+                                                                static_cast<float>(currentHeight)));
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, selectionMaskTarget.texture);
+                drawFullscreenQuad();
+                coarseMaskTexture = coarseTarget.texture;
+            }
+        }
+
+        glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+        glViewport(0, 0, currentWidth, currentHeight);
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
@@ -7996,9 +8181,23 @@ void Renderer::renderSelectionOutline(const Camera& camera, const std::vector<Sc
         outlineShader->setFloat("outlineRadiusPx", 2.7f);
         outlineShader->setFloat("outlineSoftnessPx", 1.15f);
         outlineShader->setFloat("outlineOpacity", 0.95f * selectionOutlineBlend * passWeight);
+        outlineShader->setInt("coarseMaskTex", 1);
+        outlineShader->setBool("useCoarseMask", coarseMaskTexture != 0);
+        outlineShader->setVec2("maskSize", glm::vec2(static_cast<float>(currentWidth),
+                                                     static_cast<float>(currentHeight)));
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, coarseMaskTexture);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, selectionMaskTarget.texture);
+        if (useScissor) {
+            glEnable(GL_SCISSOR_TEST);
+            glScissor(outlineBox.x, outlineBox.y, outlineBox.w, outlineBox.h);
+        }
         drawFullscreenQuad();
+        glDisable(GL_SCISSOR_TEST);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glActiveTexture(GL_TEXTURE0);
     };
 
     float currentPassWeight = 1.0f;
@@ -8023,6 +8222,8 @@ void Renderer::renderSelectionOutline(const Camera& camera, const std::vector<Sc
     if (blendEnabled) glEnable(GL_BLEND); else glDisable(GL_BLEND);
     glBlendFuncSeparate(prevBlendSrcRGB, prevBlendDstRGB, prevBlendSrcAlpha, prevBlendDstAlpha);
     if (stencilEnabled) glEnable(GL_STENCIL_TEST); else glDisable(GL_STENCIL_TEST);
+    if (scissorEnabled) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
+    glScissor(prevScissorBox[0], prevScissorBox[1], prevScissorBox[2], prevScissorBox[3]);
     if (polyOffsetFill) glEnable(GL_POLYGON_OFFSET_FILL); else glDisable(GL_POLYGON_OFFSET_FILL);
     glPolygonOffset(prevPolyOffsetFactor, prevPolyOffsetUnits);
     glDepthFunc(prevDepthFunc);

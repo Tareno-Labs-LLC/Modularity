@@ -857,6 +857,12 @@ GLFWAPI void glfwSetCursor(GLFWwindow* windowHandle, GLFWcursor* cursorHandle)
 
     _GLFW_REQUIRE_INIT();
 
+    // The ImGui backend re-applies the cursor every frame; on X11 each apply
+    // is a request plus a flush. Cursor mode changes refresh the image on
+    // their own, so an unchanged cursor has nothing to update.
+    if (window->cursor == cursor)
+        return;
+
     window->cursor = cursor;
 
     _glfw.platform.setCursor(window, cursor);

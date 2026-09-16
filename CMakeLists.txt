@@ -1621,7 +1621,12 @@ if(MODULARITY_ENABLE_JOLT)
     set(USE_STATIC_MSVC_RUNTIME_LIBRARY OFF CACHE BOOL "" FORCE)
     # LTO inlines Jolt's hot paths into engine callers and is a real perf
     # win in Release. Turn it off in Debug to keep iteration fast.
-    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    # Jolt is built with slim LTO objects, so every link of Modularity and
+    # ModularityPlayer re-runs code generation for all of Jolt - even when only
+    # one engine file changed. On a 2-thread Celeron N3060 that is ~3.5 minutes
+    # per link. MODULARITY_JOLT_LTO=OFF trades that for plain -O3 Jolt objects.
+    option(MODULARITY_JOLT_LTO "Build JoltPhysics with LTO in non-Debug builds (slow links on low-core machines)" ON)
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug" OR NOT MODULARITY_JOLT_LTO)
         set(INTERPROCEDURAL_OPTIMIZATION OFF CACHE BOOL "" FORCE)
     else()
         set(INTERPROCEDURAL_OPTIMIZATION ON CACHE BOOL "" FORCE)
