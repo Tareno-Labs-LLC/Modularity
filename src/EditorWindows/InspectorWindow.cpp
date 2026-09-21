@@ -4,6 +4,7 @@
 #include "MapMaker.h"
 #include "MaterialAssetUtils.h"
 #include "ModelLoader.h"
+#include "SceneObjectIcons.h"
 #include "../../SpritesheetFormat.h"
 #include "DragPreviewOverlay.h"
 #include "imgui.h"
@@ -384,6 +385,597 @@ void EnsureSpriteClipScales(std::vector<glm::vec2>& scales, size_t count) {
     }
 }
 
+#pragma region Reference Slots
+// One drag-and-drop assigner shared by every reference field in the editor. The row carries an
+// icon on the left - a live thumbnail for images, the same component icon the Hierarchy uses
+// for SceneOBJs, the Project's file-type icon for everything else - and the reference's name
+// beside it, or "None (<type>)" when it is empty so the field says what it wants dropped on it.
+//
+// This replaces the old "Use Selection" / "Clear" button pairs: dropping assigns, left-click
+// opens a searchable picker, and right-click holds Clear, Use Project Selection and Reveal.
+namespace {
+
+constexpr float kReferenceSlotLabelWidth = 126.0f;
+
+std::string FitLabelToWidth(const std::string& text, float maxWidth) {
+    const float safeWidth = std::max(12.0f, maxWidth);
+    if (ImGui::CalcTextSize(text.c_str()).x <= safeWidth) {
+        return text;
+    }
+    constexpr const char* kEllipsis = "...";
+    std::string clipped = text;
+    while (!clipped.empty()) {
+        std::string candidate = clipped + kEllipsis;
+        if (ImGui::CalcTextSize(candidate.c_str()).x <= safeWidth) {
+            return candidate;
+        }
+        clipped.pop_back();
+    }
+    return std::string(kEllipsis);
+}
+
+// Inline label to the left of a value control, clipped rather than wrapped so a long field
+// name can never push the control off the panel.
+void DrawInspectorInlineLabel(const char* label, float width) {
+    ImGui::AlignTextToFramePadding();
+
+    const float rowHeight = std::max(20.0f, ImGui::GetFrameHeight());
+    const ImVec2 labelMin = ImGui::GetCursorScreenPos();
+
+    ImGui::Dummy(ImVec2(width, rowHeight));
+
+    const std::string clippedLabel = FitLabelToWidth(label, std::max(12.0f, width - 6.0f));
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+
+    drawList->PushClipRect(labelMin, ImVec2(labelMin.x + width, labelMin.y + rowHeight), true);
+    drawList->AddText(
+        ImVec2(labelMin.x, labelMin.y + std::max(0.0f, (rowHeight - ImGui::GetTextLineHeight()) * 0.5f)),
+        ImGui::GetColorU32(ImGuiCol_TextDisabled),
+        clippedLabel.c_str());
+    drawList->PopClipRect();
+
+    if (clippedLabel != label && ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("%s", label);
+    }
+}
+
+// Checkerboard behind a thumbnail so a texture's alpha reads as transparency rather than as
+// whatever colour happens to sit under the panel.
+void DrawTransparencyCheckerboard(ImDrawList* drawList,
+                                  const ImVec2& minPos,
+                                  const ImVec2& maxPos,
+                                  float rounding,
+                                  float cellSize = 10.0f) {
+    drawList->AddRectFilled(minPos, maxPos, IM_COL32(34, 37, 44, 120), rounding);
+
+    const ImU32 lightCell = IM_COL32(78, 84, 96, 90);
+    const ImU32 darkCell = IM_COL32(52, 57, 68, 90);
+    const int cols = std::max(1, static_cast<int>(std::ceil((maxPos.x - minPos.x) / cellSize)));
+    const int rows = std::max(1, static_cast<int>(std::ceil((maxPos.y - minPos.y) / cellSize)));
+    for (int y = 0; y < rows; ++y) {
+        for (int x = 0; x < cols; ++x) {
+            const float x0 = minPos.x + x * cellSize;
+            const float y0 = minPos.y + y * cellSize;
+            const float x1 = std::min(maxPos.x, x0 + cellSize);
+            const float y1 = std::min(maxPos.y, y0 + cellSize);
+            drawList->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1),
+                                    ((x + y) & 1) == 0 ? lightCell : darkCell, 0.0f);
+        }
+    }
+
+    drawList->AddRect(minPos, maxPos, IM_COL32(92, 100, 116, 120), rounding, 0, 1.0f);
+}
+
+bool MatchesAssetFilter(const std::string& text, const std::string& filter) {
+    if (filter.empty()) {
+        return true;
+    }
+    return MaterialAssetLowercase(text).find(MaterialAssetLowercase(filter)) != std::string::npos;
+}
+
+std::vector<fs::path> CollectAssetsInDirectory(
+        const fs::path& root,
+        const std::function<bool(const fs::directory_entry&)>& predicate) {
+    std::vector<fs::path> matches;
+    if (root.empty()) {
+        return matches;
+    }
+
+    std::error_code ec;
+    if (!fs::exists(root, ec) || ec) {
+        return matches;
+    }
+
+    for (fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec), end;
+         it != end; it.increment(ec)) {
+        if (ec) {
+            ec.clear();
+            continue;
+        }
+
+        const fs::directory_entry& entry = *it;
+        if (!entry.is_regular_file(ec) || ec) {
+            ec.clear();
+            continue;
+        }
+
+        if (predicate(entry)) {
+            matches.push_back(entry.path());
+        }
+    }
+
+    std::sort(matches.begin(), matches.end(), [](const fs::path& a, const fs::path& b) {
+        return a.filename().string() < b.filename().string();
+    });
+    matches.erase(std::unique(matches.begin(), matches.end()), matches.end());
+    return matches;
+}
+
+// The frame every reference slot draws itself into. Recessed like the editor's other input
+// frames, so a slot reads as something you drop into rather than as a button.
+struct ReferenceSlotFrame {
+    ImVec2 min{};
+    ImVec2 max{};
+    ImVec2 iconMin{};
+    ImVec2 iconMax{};
+    float textLeft = 0.0f;
+    float rowHeight = 0.0f;
+    bool pressed = false;
+    bool hovered = false;
+};
+
+ReferenceSlotFrame BeginReferenceSlotFrame(const char* strId, bool dropCandidate) {
+    const ImGuiStyle& style = ImGui::GetStyle();
+    ReferenceSlotFrame frame;
+    frame.rowHeight = std::max(20.0f, ImGui::GetFrameHeight());
+    const float width = std::max(48.0f, ImGui::GetContentRegionAvail().x);
+
+    frame.pressed = ImGui::InvisibleButton(strId, ImVec2(width, frame.rowHeight));
+    frame.hovered = ImGui::IsItemHovered();
+    const bool held = ImGui::IsItemActive();
+    frame.min = ImGui::GetItemRectMin();
+    frame.max = ImGui::GetItemRectMax();
+
+    const ImU32 fill = ImGui::GetColorU32(held ? ImGuiCol_FrameBgActive
+                                               : (frame.hovered ? ImGuiCol_FrameBgHovered : ImGuiCol_FrameBg));
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    ImGui::ShadeRect(drawList, frame.min, frame.max, fill, ImGuiShadeClass_Frame,
+                     ImGui::ShadeStateFromInteraction(frame.hovered, held), style.FrameRounding);
+    if (dropCandidate) {
+        drawList->AddRect(frame.min, frame.max, ImGui::GetColorU32(ImGuiCol_DragDropTarget),
+                          style.FrameRounding, 0, 2.0f);
+    }
+
+    const float inset = 2.0f;
+    const float iconSize = std::max(10.0f, frame.rowHeight - inset * 2.0f);
+    frame.iconMin = ImVec2(frame.min.x + inset, frame.min.y + (frame.rowHeight - iconSize) * 0.5f);
+    frame.iconMax = ImVec2(frame.iconMin.x + iconSize, frame.iconMin.y + iconSize);
+    frame.textLeft = frame.iconMax.x + 6.0f;
+    return frame;
+}
+
+void DrawReferenceSlotText(const ReferenceSlotFrame& frame, const std::string& text, bool empty) {
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    const float avail = std::max(8.0f, frame.max.x - frame.textLeft - 6.0f);
+    const std::string clipped = FitLabelToWidth(text, avail);
+    drawList->PushClipRect(ImVec2(frame.textLeft, frame.min.y), ImVec2(frame.max.x - 4.0f, frame.max.y), true);
+    drawList->AddText(
+        ImVec2(frame.textLeft, frame.min.y + std::max(0.0f, (frame.rowHeight - ImGui::GetTextLineHeight()) * 0.5f)),
+        ImGui::GetColorU32(empty ? ImGuiCol_TextDisabled : ImGuiCol_Text),
+        clipped.c_str());
+    drawList->PopClipRect();
+}
+
+// Drawn in place of an icon that could not be loaded, so the slot never shows a blank gap
+// where the type marker belongs.
+void DrawReferenceSlotIconPlaceholder(const ReferenceSlotFrame& frame, bool empty) {
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    const ImU32 color = ImGui::GetColorU32(ImGuiCol_TextDisabled, empty ? 0.45f : 0.85f);
+    drawList->AddRect(frame.iconMin, frame.iconMax, color, 3.0f, 0, 1.0f);
+}
+
+}  // namespace
+
+bool Engine::drawAssetReferenceSlot(const char* id,
+                                    const char* label,
+                                    const std::string& currentPath,
+                                    FileCategory expectedCategory,
+                                    const char* typeName,
+                                    fs::path& outAssigned,
+                                    const ReferenceSlotFilter& customFilter) {
+    outAssigned.clear();
+    bool changed = false;
+
+    ImGui::PushID(id);
+
+    const bool wantsTexture = (expectedCategory == FileCategory::Texture);
+    const std::string typeLabel = (typeName && *typeName) ? std::string(typeName) : std::string("Asset");
+    const std::string emptyText = "None (" + typeLabel + ")";
+    const fs::path resolved = resolveProjectAssetPath(currentPath);
+
+    // FileCategory::Unknown means "any regular file". Every other category is matched exactly,
+    // so a Sound Clip slot cannot swallow a mesh.
+    auto accepts = [&](const fs::path& candidate) -> bool {
+        if (candidate.empty()) {
+            return false;
+        }
+        std::error_code ec;
+        if (wantsTexture && IsSpriteSheetSidecarPath(candidate)) {
+            return fs::exists(ResolveSpriteSheetImagePath(candidate), ec) && !ec;
+        }
+        fs::directory_entry entry(candidate, ec);
+        if (ec) {
+            return false;
+        }
+        if (!entry.is_regular_file(ec) || ec) {
+            return false;
+        }
+        if (customFilter) {
+            return customFilter(candidate);
+        }
+        if (expectedCategory == FileCategory::Unknown) {
+            return true;
+        }
+        return fileBrowser.getFileCategory(entry) == expectedCategory;
+    };
+    auto assign = [&](const fs::path& candidate) {
+        outAssigned = wantsTexture ? ResolveSpriteSheetImagePath(candidate) : candidate;
+        changed = true;
+    };
+
+    if (label && *label) {
+        DrawInspectorInlineLabel(label, kReferenceSlotLabelWidth);
+        ImGui::SameLine();
+    }
+
+    bool dropCandidate = false;
+    if (const ImGuiPayload* dragging = ImGui::GetDragDropPayload()) {
+        if (dragging->IsDataType("FILE_PATH") && dragging->Data) {
+            dropCandidate = accepts(fs::path(static_cast<const char*>(dragging->Data)));
+        }
+    }
+
+    const ReferenceSlotFrame frame = BeginReferenceSlotFrame("##Slot", dropCandidate);
+    const char* popupId = "##ReferenceSlotPicker";
+    if (frame.pressed) {
+        ImGui::OpenPopup(popupId);
+    }
+
+    if (ImGui::BeginDragDropTarget()) {
+        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("FILE_PATH")) {
+            const char* dropped = static_cast<const char*>(payload->Data);
+            if (dropped && *dropped) {
+                const fs::path droppedPath(dropped);
+                if (accepts(droppedPath)) {
+                    assign(droppedPath);
+                }
+            }
+        }
+        ImGui::EndDragDropTarget();
+    }
+
+    // Icon: a live thumbnail for an assigned image, otherwise the Project's file-type icon -
+    // dimmed while the slot is empty, so an empty row still shows what it takes.
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    bool iconDrawn = false;
+    if (rendererInitialized) {
+        if (wantsTexture && !currentPath.empty()) {
+            Texture* thumb = renderer.getTexture(resolved.string(),
+                                                 MaterialProperties::TextureFilter::Bilinear);
+            if (thumb && thumb->GetID()) {
+                DrawTransparencyCheckerboard(drawList, frame.iconMin, frame.iconMax, 3.0f, 6.0f);
+                drawList->AddImage((ImTextureID)(intptr_t)thumb->GetID(),
+                                   frame.iconMin, frame.iconMax, ImVec2(0, 1), ImVec2(1, 0));
+                iconDrawn = true;
+            }
+        }
+        if (!iconDrawn) {
+            Texture* icon = renderer.getTexture(AssetCategoryIconPath(expectedCategory),
+                                                MaterialProperties::TextureFilter::Bilinear);
+            if (icon && icon->GetID()) {
+                drawList->AddImage((ImTextureID)(intptr_t)icon->GetID(),
+                                   frame.iconMin, frame.iconMax, ImVec2(0, 1), ImVec2(1, 0),
+                                   currentPath.empty() ? IM_COL32(255, 255, 255, 96) : IM_COL32_WHITE);
+                iconDrawn = true;
+            }
+        }
+    }
+    if (!iconDrawn) {
+        DrawReferenceSlotIconPlaceholder(frame, currentPath.empty());
+    }
+
+    std::string displayName = emptyText;
+    if (!currentPath.empty()) {
+        displayName = resolved.stem().string();
+        if (displayName.empty()) {
+            displayName = resolved.filename().string();
+        }
+        if (displayName.empty()) {
+            displayName = currentPath;
+        }
+    }
+    DrawReferenceSlotText(frame, displayName, currentPath.empty());
+
+    if (frame.hovered) {
+        if (currentPath.empty()) {
+            ImGui::SetTooltip("Drag a %s here, or click to pick one.", typeLabel.c_str());
+        } else {
+            ImGui::SetTooltip("%s\nClick to pick another, right-click for more.", currentPath.c_str());
+        }
+    }
+
+    const bool selectionMatches = accepts(fileBrowser.selectedFile);
+    if (ImGui::BeginPopupContextItem("##ReferenceSlotMenu")) {
+        ImGui::BeginDisabled(currentPath.empty());
+        if (ImGui::MenuItem("Clear")) {
+            outAssigned.clear();
+            changed = true;
+        }
+        if (ImGui::MenuItem("Reveal in Project")) {
+            std::error_code ec;
+            if (fs::exists(resolved, ec) && !ec) {
+                fileBrowser.navigateTo(resolved.parent_path());
+                fileBrowser.selectedFile = resolved;
+            }
+        }
+        if (ImGui::MenuItem("Copy Path")) {
+            ImGui::SetClipboardText(currentPath.c_str());
+        }
+        ImGui::EndDisabled();
+        // The slot is not a text field, so pasting is how a path from outside the Project
+        // tree still gets in.
+        const char* clipboard = ImGui::GetClipboardText();
+        const bool clipboardMatches = clipboard && *clipboard && accepts(fs::path(clipboard));
+        ImGui::BeginDisabled(!clipboardMatches);
+        if (ImGui::MenuItem("Paste Path")) {
+            assign(fs::path(clipboard));
+        }
+        ImGui::EndDisabled();
+        ImGui::Separator();
+        ImGui::BeginDisabled(!selectionMatches);
+        if (ImGui::MenuItem("Use Project Selection")) {
+            assign(fileBrowser.selectedFile);
+        }
+        ImGui::EndDisabled();
+        ImGui::EndPopup();
+    }
+
+    if (ImGui::BeginPopup(popupId)) {
+        static std::unordered_map<std::string, std::string> pickerFilters;
+        std::string& filter = pickerFilters[std::string(id)];
+        char searchBuf[128] = {};
+        std::snprintf(searchBuf, sizeof(searchBuf), "%s", filter.c_str());
+        if (ImGui::IsWindowAppearing()) {
+            ImGui::SetKeyboardFocusHere();
+        }
+        ImGui::SetNextItemWidth(320.0f);
+        if (ImGui::InputTextWithHint("##Filter", ("Filter " + typeLabel).c_str(),
+                                     searchBuf, sizeof(searchBuf))) {
+            filter = searchBuf;
+        }
+
+        if (ImGui::Selectable(emptyText.c_str(), currentPath.empty())) {
+            outAssigned.clear();
+            changed = true;
+            ImGui::CloseCurrentPopup();
+        }
+        if (selectionMatches && ImGui::Selectable("Use Project Selection")) {
+            assign(fileBrowser.selectedFile);
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::Separator();
+        ImGui::BeginChild("##ReferenceSlotList", ImVec2(320.0f, 180.0f), false);
+        const fs::path assetRoot = projectManager.currentProject.isLoaded
+            ? projectManager.currentProject.assetsPath
+            : fileBrowser.projectRoot;
+        const std::vector<fs::path> candidates = CollectAssetsInDirectory(
+            assetRoot, [&](const fs::directory_entry& entry) { return accepts(entry.path()); });
+        for (const fs::path& assetPath : candidates) {
+            const std::string assetName = assetPath.filename().string();
+            if (!MatchesAssetFilter(assetName, filter)) {
+                continue;
+            }
+            const bool selected = (resolved == assetPath);
+            if (ImGui::Selectable((assetName + "##" + assetPath.string()).c_str(), selected)) {
+                assign(assetPath);
+                ImGui::CloseCurrentPopup();
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("%s", assetPath.string().c_str());
+            }
+        }
+        ImGui::EndChild();
+        ImGui::EndPopup();
+    }
+
+    ImGui::PopID();
+    return changed;
+}
+
+bool Engine::drawAssetReferenceSlot(const char* id,
+                                    const char* label,
+                                    std::string& path,
+                                    FileCategory expectedCategory,
+                                    const char* typeName) {
+    fs::path assigned;
+    if (!drawAssetReferenceSlot(id, label, path, expectedCategory, typeName, assigned)) {
+        return false;
+    }
+    const std::string next = assigned.empty() ? std::string() : assigned.string();
+    if (next == path) {
+        return false;
+    }
+    path = next;
+    return true;
+}
+
+bool Engine::drawObjectReferenceSlot(const char* id,
+                                     const char* label,
+                                     int& targetId,
+                                     int disallowId,
+                                     const char* typeName) {
+    bool changed = false;
+
+    ImGui::PushID(id);
+
+    const std::string typeLabel = (typeName && *typeName) ? std::string(typeName) : std::string("Game Object");
+    const std::string emptyText = "None (" + typeLabel + ")";
+
+    SceneObject* current = (targetId >= 0) ? findObjectById(targetId) : nullptr;
+    if (targetId >= 0 && !current) {
+        // The referenced SceneOBJ is gone - deleted, or the scene reloaded without it.
+        targetId = -1;
+        changed = true;
+    }
+
+    if (label && *label) {
+        DrawInspectorInlineLabel(label, kReferenceSlotLabelWidth);
+        ImGui::SameLine();
+    }
+
+    bool dropCandidate = false;
+    if (const ImGuiPayload* dragging = ImGui::GetDragDropPayload()) {
+        if (dragging->IsDataType("SCENE_OBJECT") && dragging->DataSize == sizeof(int)) {
+            dropCandidate = (*static_cast<const int*>(dragging->Data) != disallowId);
+        }
+    }
+
+    const ReferenceSlotFrame frame = BeginReferenceSlotFrame("##Slot", dropCandidate);
+    const char* popupId = "##ObjectReferenceSlotPicker";
+    if (frame.pressed) {
+        ImGui::OpenPopup(popupId);
+    }
+
+    if (ImGui::BeginDragDropTarget()) {
+        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("SCENE_OBJECT")) {
+            if (payload->DataSize == sizeof(int)) {
+                const int droppedId = *static_cast<const int*>(payload->Data);
+                if (droppedId != disallowId && droppedId != targetId) {
+                    targetId = droppedId;
+                    current = findObjectById(targetId);
+                    changed = true;
+                }
+            }
+        }
+        ImGui::EndDragDropTarget();
+    }
+
+    // Same component icon the Hierarchy row shows, custom editor icon included; an empty slot
+    // wears a dimmed generic SceneOBJ icon so it still reads as a SceneOBJ field.
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    bool iconDrawn = false;
+    if (rendererInitialized) {
+        Texture* icon = nullptr;
+        if (current) {
+            if (!current->editorIconPath.empty()) {
+                icon = renderer.getTexture(current->editorIconPath,
+                                           MaterialProperties::TextureFilter::Bilinear);
+            }
+            if (!icon || !icon->GetID()) {
+                icon = renderer.getTexture(SceneObjectComponentIconPath(*current),
+                                           MaterialProperties::TextureFilter::Bilinear);
+            }
+        } else {
+            icon = renderer.getTexture("Resources/Engine-Root/Inspector/GameObject Icon.png",
+                                       MaterialProperties::TextureFilter::Bilinear);
+        }
+        if (icon && icon->GetID()) {
+            drawList->AddImage((ImTextureID)(intptr_t)icon->GetID(),
+                               frame.iconMin, frame.iconMax, ImVec2(0, 1), ImVec2(1, 0),
+                               current ? IM_COL32_WHITE : IM_COL32(255, 255, 255, 96));
+            iconDrawn = true;
+        }
+    }
+    if (!iconDrawn) {
+        DrawReferenceSlotIconPlaceholder(frame, current == nullptr);
+    }
+
+    const std::string displayName = current
+        ? (current->name + " (" + std::to_string(current->id) + ")")
+        : emptyText;
+    DrawReferenceSlotText(frame, displayName, current == nullptr);
+
+    if (frame.hovered) {
+        if (current) {
+            ImGui::SetTooltip("%s\nClick to pick another, right-click for more.", current->name.c_str());
+        } else {
+            ImGui::SetTooltip("Drag a SceneOBJ here, or click to pick one.");
+        }
+    }
+
+    SceneObject* editorSelection = findObjectById(selectedObjectId);
+    const bool canUseSelection = editorSelection && editorSelection->id != disallowId;
+    if (ImGui::BeginPopupContextItem("##ObjectReferenceSlotMenu")) {
+        ImGui::BeginDisabled(targetId < 0);
+        if (ImGui::MenuItem("Clear")) {
+            targetId = -1;
+            changed = true;
+        }
+        if (ImGui::MenuItem("Select in Hierarchy")) {
+            if (current) {
+                setPrimarySelection(current->id);
+            }
+        }
+        ImGui::EndDisabled();
+        ImGui::Separator();
+        ImGui::BeginDisabled(!canUseSelection);
+        if (ImGui::MenuItem("Use Hierarchy Selection")) {
+            targetId = editorSelection->id;
+            changed = true;
+        }
+        ImGui::EndDisabled();
+        ImGui::EndPopup();
+    }
+
+    if (ImGui::BeginPopup(popupId)) {
+        static std::unordered_map<std::string, std::string> pickerFilters;
+        std::string& filter = pickerFilters[std::string(id)];
+        char searchBuf[128] = {};
+        std::snprintf(searchBuf, sizeof(searchBuf), "%s", filter.c_str());
+        if (ImGui::IsWindowAppearing()) {
+            ImGui::SetKeyboardFocusHere();
+        }
+        ImGui::SetNextItemWidth(320.0f);
+        if (ImGui::InputTextWithHint("##Filter", "Filter SceneOBJs", searchBuf, sizeof(searchBuf))) {
+            filter = searchBuf;
+        }
+
+        if (ImGui::Selectable(emptyText.c_str(), targetId < 0)) {
+            targetId = -1;
+            changed = true;
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::Separator();
+        ImGui::BeginChild("##ObjectReferenceSlotList", ImVec2(320.0f, 180.0f), false);
+        for (const SceneObject& candidate : sceneObjects) {
+            if (candidate.id == disallowId) {
+                continue;
+            }
+            const std::string option = candidate.name + " (" + std::to_string(candidate.id) + ")";
+            if (!MatchesAssetFilter(option, filter)) {
+                continue;
+            }
+            const bool selected = (candidate.id == targetId);
+            if (ImGui::Selectable(option.c_str(), selected)) {
+                targetId = candidate.id;
+                changed = true;
+                ImGui::CloseCurrentPopup();
+            }
+            if (selected) {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        ImGui::EndChild();
+        ImGui::EndPopup();
+    }
+
+    ImGui::PopID();
+    return changed;
+}
+#pragma endregion
+
 #pragma region Inspector Panel
 void Engine::renderInspectorPanel() {
     const auto __ipStart = std::chrono::steady_clock::now();
@@ -738,22 +1330,8 @@ void Engine::renderInspectorPanel() {
         }
     };
 
-    auto fitLabelToWidth = [&](const std::string& text, float maxWidth) {
-        const float safeWidth = std::max(12.0f, maxWidth);
-        if (ImGui::CalcTextSize(text.c_str()).x <= safeWidth) {
-            return text;
-        }
-
-        constexpr const char* kEllipsis = "...";
-        std::string clipped = text;
-        while (!clipped.empty()) {
-            std::string candidate = clipped + kEllipsis;
-            if (ImGui::CalcTextSize(candidate.c_str()).x <= safeWidth) {
-                return candidate;
-            }
-            clipped.pop_back();
-        }
-        return std::string(kEllipsis);
+    auto fitLabelToWidth = [](const std::string& text, float maxWidth) {
+        return FitLabelToWidth(text, maxWidth);
     };
 
     auto drawAudioCenteredText = [&](const std::string& text,
@@ -777,28 +1355,8 @@ void Engine::renderInspectorPanel() {
         }
     };
 
-    auto drawMaterialInlineLabel = [&](const char* label, float width = 126.0f) {
-        ImGui::AlignTextToFramePadding();
-
-        const float rowHeight = std::max(20.0f, ImGui::GetFrameHeight());
-        const ImVec2 labelMin = ImGui::GetCursorScreenPos();
-
-        ImGui::Dummy(ImVec2(width, rowHeight));
-
-        const std::string clippedLabel = fitLabelToWidth(label, std::max(12.0f, width - 6.0f));
-        ImDrawList* drawList = ImGui::GetWindowDrawList();
-
-        drawList->PushClipRect(labelMin, ImVec2(labelMin.x + width, labelMin.y + rowHeight), true);
-        drawList->AddText(
-            ImVec2(labelMin.x, labelMin.y + std::max(0.0f, (rowHeight - ImGui::GetTextLineHeight()) * 0.5f)),
-            ImGui::GetColorU32(ImGuiCol_TextDisabled),
-            clippedLabel.c_str()
-        );
-        drawList->PopClipRect();
-
-        if (clippedLabel != label && ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("%s", label);
-        }
+    auto drawMaterialInlineLabel = [](const char* label, float width = 126.0f) {
+        DrawInspectorInlineLabel(label, width);
     };
 
     auto drawAudioPlayerIconButton = [&](const char* id,
@@ -952,132 +1510,6 @@ void Engine::renderInspectorPanel() {
             (ImGui::GetContentRegionAvail().x - buttonsWidth) >= minFieldWidth;
         ImGui::SetNextItemWidth(fits ? -buttonsWidth : -FLT_MIN);
         return fits;
-    };
-
-    auto drawFileReferenceSlot = [&](const char* label,
-                                     const char* id,
-                                     std::string& path,
-                                     FileCategory expectedCategory,
-                                     const char* noneLabel) -> bool {
-        bool changed = false;
-        const std::string display = path.empty() ? std::string(noneLabel) : fs::path(path).filename().string();
-        char displayBuf[512] = {};
-        std::snprintf(displayBuf, sizeof(displayBuf), "%s", display.c_str());
-        ImGui::PushID(id);
-
-        ImGui::TextDisabled("%s", label);
-        const bool slotButtonsInline =
-            fieldWidthBeforeButtons(smallButtonRunWidth({"Use Selection", "Clear"}));
-        ImGui::InputText("##SlotValue", displayBuf, sizeof(displayBuf), ImGuiInputTextFlags_ReadOnly);
-        if (ImGui::IsItemHovered()) {
-            if (path.empty()) {
-                ImGui::SetTooltip("Drag a matching asset here.");
-            } else {
-                ImGui::SetTooltip("%s", path.c_str());
-            }
-        }
-        if (ImGui::BeginDragDropTarget()) {
-            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("FILE_PATH")) {
-                const char* droppedPath = static_cast<const char*>(payload->Data);
-                if (droppedPath && *droppedPath) {
-                    std::error_code ec;
-                    fs::directory_entry entry(droppedPath, ec);
-                    if (!ec && fileBrowser.getFileCategory(entry) == expectedCategory) {
-                        path = entry.path().string();
-                        changed = true;
-                    }
-                }
-            }
-            ImGui::EndDragDropTarget();
-        }
-
-        if (slotButtonsInline) ImGui::SameLine();
-        bool selectionMatches = false;
-        if (!fileBrowser.selectedFile.empty() && fs::exists(fileBrowser.selectedFile)) {
-            selectionMatches = fileBrowser.getFileCategory(fs::directory_entry(fileBrowser.selectedFile)) == expectedCategory;
-        }
-        ImGui::BeginDisabled(!selectionMatches);
-        if (ImGui::SmallButton("Use Selection")) {
-            path = fileBrowser.selectedFile.string();
-            changed = true;
-        }
-        ImGui::EndDisabled();
-        ImGui::SameLine();
-        ImGui::BeginDisabled(path.empty());
-        if (ImGui::SmallButton("Clear")) {
-            path.clear();
-            changed = true;
-        }
-        ImGui::EndDisabled();
-        ImGui::PopID();
-        return changed;
-    };
-
-    auto drawSceneObjectReferenceSlot = [&](const char* label,
-                                            const char* id,
-                                            int& targetId,
-                                            int disallowId,
-                                            const char* noneLabel) -> bool {
-        bool changed = false;
-        ImGui::PushID(id);
-        std::string display = noneLabel;
-        if (targetId >= 0) {
-            if (SceneObject* current = findObjectById(targetId)) {
-                display = current->name + " (" + std::to_string(current->id) + ")";
-            } else {
-                targetId = -1;
-            }
-        }
-
-        if (ImGui::BeginCombo(label, display.c_str())) {
-            if (ImGui::Selectable(noneLabel, targetId < 0)) {
-                targetId = -1;
-                changed = true;
-            }
-            for (const auto& candidate : sceneObjects) {
-                if (candidate.id == disallowId) continue;
-                const std::string option = candidate.name + " (" + std::to_string(candidate.id) + ")";
-                const bool selected = candidate.id == targetId;
-                if (ImGui::Selectable(option.c_str(), selected)) {
-                    targetId = candidate.id;
-                    changed = true;
-                }
-                if (selected) {
-                    ImGui::SetItemDefaultFocus();
-                }
-            }
-            ImGui::EndCombo();
-        }
-        if (ImGui::BeginDragDropTarget()) {
-            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("SCENE_OBJECT")) {
-                if (payload->DataSize == sizeof(int)) {
-                    int droppedId = *static_cast<const int*>(payload->Data);
-                    if (droppedId != disallowId) {
-                        targetId = droppedId;
-                        changed = true;
-                    }
-                }
-            }
-            ImGui::EndDragDropTarget();
-        }
-        ImGui::SameLine();
-        SceneObject* selectedTarget = findObjectById(selectedObjectId);
-        const bool canUseSelected = selectedTarget && selectedTarget->id != disallowId;
-        ImGui::BeginDisabled(!canUseSelected);
-        if (ImGui::SmallButton("Use Selected")) {
-            targetId = selectedTarget->id;
-            changed = true;
-        }
-        ImGui::EndDisabled();
-        ImGui::SameLine();
-        ImGui::BeginDisabled(targetId < 0);
-        if (ImGui::SmallButton("Clear")) {
-            targetId = -1;
-            changed = true;
-        }
-        ImGui::EndDisabled();
-        ImGui::PopID();
-        return changed;
     };
 
     // The material preview is a full off-screen scene render (four objects, its own lights). It
@@ -1514,75 +1946,21 @@ void Engine::renderInspectorPanel() {
         return clicked;
     };
 
-    auto drawTransparencyAwareBackground = [&](ImDrawList* drawList,
-                                               const ImVec2& minPos,
-                                               const ImVec2& maxPos,
-                                               float rounding,
-                                               float cellSize = 10.0f) {
-        drawList->AddRectFilled(minPos, maxPos, IM_COL32(34, 37, 44, 120), rounding);
-
-        const ImU32 lightCell = IM_COL32(78, 84, 96, 90);
-        const ImU32 darkCell = IM_COL32(52, 57, 68, 90);
-        const int cols = std::max(1, static_cast<int>(std::ceil((maxPos.x - minPos.x) / cellSize)));
-        const int rows = std::max(1, static_cast<int>(std::ceil((maxPos.y - minPos.y) / cellSize)));
-        for (int y = 0; y < rows; ++y) {
-            for (int x = 0; x < cols; ++x) {
-                const float x0 = minPos.x + x * cellSize;
-                const float y0 = minPos.y + y * cellSize;
-                const float x1 = std::min(maxPos.x, x0 + cellSize);
-                const float y1 = std::min(maxPos.y, y0 + cellSize);
-                drawList->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1),
-                                        ((x + y) & 1) == 0 ? lightCell : darkCell, 0.0f);
-            }
-        }
-
-        drawList->AddRect(minPos, maxPos, IM_COL32(92, 100, 116, 120), rounding, 0, 1.0f);
+    auto drawTransparencyAwareBackground = [](ImDrawList* drawList,
+                                              const ImVec2& minPos,
+                                              const ImVec2& maxPos,
+                                              float rounding,
+                                              float cellSize = 10.0f) {
+        DrawTransparencyCheckerboard(drawList, minPos, maxPos, rounding, cellSize);
     };
 
     auto matchesPopupFilter = [](const std::string& text, const std::string& filter) {
-        if (filter.empty()) {
-            return true;
-        }
-
-        const std::string filterLower = MaterialAssetLowercase(filter);
-        return MaterialAssetLowercase(text).find(filterLower) != std::string::npos;
+        return MatchesAssetFilter(text, filter);
     };
 
-    auto collectAssetsInDirectory = [&](const fs::path& root,
-                                        const std::function<bool(const fs::directory_entry&)>& predicate) {
-        std::vector<fs::path> matches;
-        if (root.empty()) {
-            return matches;
-        }
-
-        std::error_code ec;
-        if (!fs::exists(root, ec) || ec) {
-            return matches;
-        }
-
-        for (fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec), end;
-             it != end; it.increment(ec)) {
-            if (ec) {
-                ec.clear();
-                continue;
-            }
-
-            const fs::directory_entry& entry = *it;
-            if (!entry.is_regular_file(ec) || ec) {
-                ec.clear();
-                continue;
-            }
-
-            if (predicate(entry)) {
-                matches.push_back(entry.path());
-            }
-        }
-
-        std::sort(matches.begin(), matches.end(), [](const fs::path& a, const fs::path& b) {
-            return a.filename().string() < b.filename().string();
-        });
-        matches.erase(std::unique(matches.begin(), matches.end()), matches.end());
-        return matches;
+    auto collectAssetsInDirectory = [](const fs::path& root,
+                                       const std::function<bool(const fs::directory_entry&)>& predicate) {
+        return CollectAssetsInDirectory(root, predicate);
     };
 
     auto collectProjectTextureAssets = [&]() {
@@ -2899,16 +3277,25 @@ void Engine::renderInspectorPanel() {
         useOverlayValue = !overlayPath.empty();
 
         if (spriteTarget && spriteTarget->renderType == RenderType::Sprite) {
-            const bool canUseSpriteAsset = isTextureOrSpriteSheetSelection(fileBrowser.selectedFile);
-            ImGui::BeginDisabled(!canUseSpriteAsset);
-            if (ImGui::SmallButton((std::string("Use Selection As Sprite Asset##") + idPrefix).c_str())) {
-                if (assignSpriteTextureOrClips(*spriteTarget, fileBrowser.selectedFile)) {
+            // Assigning through this slot also pulls in the sprite's .spritesheet clips,
+            // which the plain Base Color slot above does not.
+            fs::path assignedSpriteAsset;
+            if (drawAssetReferenceSlot((std::string("##SpriteAsset") + idPrefix).c_str(),
+                                       "Sprite Asset", albedoPath, FileCategory::Texture,
+                                       "Sprite", assignedSpriteAsset)) {
+                if (assignedSpriteAsset.empty()) {
+                    spriteTarget->albedoTexturePath.clear();
+                    spriteTarget->ui.spriteCustomFrames.clear();
+                    spriteTarget->ui.spriteCustomFrameNames.clear();
+                    spriteTarget->ui.spriteCustomFramesEnabled = false;
+                    spriteTarget->ui.spriteSheetFrame = 0;
+                    albedoPath.clear();
+                    changed = true;
+                } else if (assignSpriteTextureOrClips(*spriteTarget, assignedSpriteAsset)) {
                     albedoPath = spriteTarget->albedoTexturePath;
                     changed = true;
                 }
             }
-            ImGui::EndDisabled();
-            ImGui::SameLine();
             ImGui::BeginDisabled(albedoPath.empty());
             if (ImGui::SmallButton((std::string("Reload Clips##") + idPrefix).c_str())) {
                 if (assignSpriteTextureOrClips(*spriteTarget, fs::path(albedoPath))) {
@@ -5287,41 +5674,25 @@ void Engine::renderInspectorPanel() {
             }
 
             if (obj.ui.type == UIElementType::Image || obj.ui.type == UIElementType::Sprite2D) {
-                ImGui::TextUnformatted("Texture");
-                const bool uiTexButtonsInline = fieldWidthBeforeButtons(
-                    smallButtonRunWidth({"Clear", "Use Selection", "Reload Clips"}));
-                char texBuf[512] = {};
-                std::snprintf(texBuf, sizeof(texBuf), "%s", obj.albedoTexturePath.c_str());
-                if (ImGui::InputText("##UITexture", texBuf, sizeof(texBuf))) {
-                    obj.albedoTexturePath = texBuf;
-                    obj.ui.spriteCustomFrames.clear();
-                    obj.ui.spriteCustomFrameNames.clear();
-                    obj.ui.spriteCustomFramesEnabled = false;
-                    obj.ui.spriteSourceWidth = 0;
-                    obj.ui.spriteSourceHeight = 0;
-                    changed = true;
-                }
-                if (uiTexButtonsInline) ImGui::SameLine();
-                if (ImGui::SmallButton("Clear##UITexture")) {
-                    obj.albedoTexturePath.clear();
-                    obj.ui.spriteCustomFrames.clear();
-                    obj.ui.spriteCustomFrameNames.clear();
-                    obj.ui.spriteCustomFramesEnabled = false;
-                    obj.ui.spriteSourceWidth = 0;
-                    obj.ui.spriteSourceHeight = 0;
-                    obj.ui.spriteSheetFrame = 0;
-                    changed = true;
-                }
-                ImGui::SameLine();
-                bool canUseTex = isTextureOrSpriteSheetSelection(fileBrowser.selectedFile);
-                ImGui::BeginDisabled(!canUseTex);
-                if (ImGui::SmallButton("Use Selection##UITexture")) {
-                    if (assignSpriteTextureOrClips(obj, fileBrowser.selectedFile)) {
+                // Assigning a sprite also pulls in the clips from its .spritesheet sidecar,
+                // so the slot routes through assignSpriteTextureOrClips instead of just
+                // writing the path.
+                fs::path assignedSprite;
+                if (drawAssetReferenceSlot("##UITexture", "Texture", obj.albedoTexturePath,
+                                           FileCategory::Texture, "Sprite", assignedSprite)) {
+                    if (assignedSprite.empty()) {
+                        obj.albedoTexturePath.clear();
+                        obj.ui.spriteCustomFrames.clear();
+                        obj.ui.spriteCustomFrameNames.clear();
+                        obj.ui.spriteCustomFramesEnabled = false;
+                        obj.ui.spriteSourceWidth = 0;
+                        obj.ui.spriteSourceHeight = 0;
+                        obj.ui.spriteSheetFrame = 0;
+                        changed = true;
+                    } else if (assignSpriteTextureOrClips(obj, assignedSprite)) {
                         changed = true;
                     }
                 }
-                ImGui::EndDisabled();
-                ImGui::SameLine();
                 ImGui::BeginDisabled(obj.albedoTexturePath.empty());
                 if (ImGui::SmallButton("Reload Clips##UITexture")) {
                     if (assignSpriteTextureOrClips(obj, fs::path(obj.albedoTexturePath))) {
@@ -5329,15 +5700,6 @@ void Engine::renderInspectorPanel() {
                     }
                 }
                 ImGui::EndDisabled();
-                if (ImGui::BeginDragDropTarget()) {
-                    if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("FILE_PATH")) {
-                        const char* dropped = static_cast<const char*>(payload->Data);
-                        if (assignSpriteTextureOrClips(obj, fs::path(dropped))) {
-                            changed = true;
-                        }
-                    }
-                    ImGui::EndDragDropTarget();
-                }
 
                 if (!obj.albedoTexturePath.empty()) {
                     ImGui::SameLine();
@@ -5922,8 +6284,8 @@ void Engine::renderInspectorPanel() {
                         ImGui::PushID(static_cast<int>(clipIndex));
                         char slotLabel[48] = {};
                         std::snprintf(slotLabel, sizeof(slotLabel), "Step %d", static_cast<int>(clipIndex) + 1);
-                        if (drawFileReferenceSlot(slotLabel, "##StepClip", ma.footstepClips[clipIndex],
-                                                  FileCategory::Audio, "None (Sound Clip)")) {
+                        if (drawAssetReferenceSlot("##StepClip", slotLabel, ma.footstepClips[clipIndex],
+                                                   FileCategory::Audio, "Sound Clip")) {
                             changed = true;
                         }
                         ImGui::SameLine();
@@ -5948,12 +6310,12 @@ void Engine::renderInspectorPanel() {
                     ImGui::PopID();
 
                     ImGui::Spacing();
-                    if (drawFileReferenceSlot("Jump", "##JumpClipSlot", ma.jumpClip,
-                                              FileCategory::Audio, "None (Sound Clip)")) {
+                    if (drawAssetReferenceSlot("##JumpClipSlot", "Jump", ma.jumpClip,
+                                               FileCategory::Audio, "Sound Clip")) {
                         changed = true;
                     }
-                    if (drawFileReferenceSlot("Land", "##LandClipSlot", ma.landClip,
-                                              FileCategory::Audio, "None (Sound Clip)")) {
+                    if (drawAssetReferenceSlot("##LandClipSlot", "Land", ma.landClip,
+                                               FileCategory::Audio, "Sound Clip")) {
                         changed = true;
                     }
 
@@ -6775,7 +7137,7 @@ void Engine::renderInspectorPanel() {
             auto& src = obj.audioSource;
             const std::string previousClipPath = src.clipPath;
 
-            if (drawFileReferenceSlot("Sound Clip", "##AudioClipSlot", src.clipPath, FileCategory::Audio, "None (Sound Clip)")) {
+            if (drawAssetReferenceSlot("##AudioClipSlot", "Sound Clip", src.clipPath, FileCategory::Audio, "Sound Clip")) {
                 if (previousClipPath != src.clipPath && audio.isPreviewing(previousClipPath)) {
                     stopClipPreview();
                 }
@@ -7134,37 +7496,10 @@ void Engine::renderInspectorPanel() {
                     ImGui::Dummy(ImVec2(0.0f, 1.0f));
                     if (beginCompFields("##VP_Playback")) {
                         fieldRow(Loc::T("COMPONENT_VIDEO_PLAYER_VIDEO", "Video"));
-                        char pathBuf[512] = {};
-                        std::snprintf(pathBuf, sizeof(pathBuf), "%s", player.videoPath.c_str());
-                        if (ImGui::InputText("##VideoPath", pathBuf, sizeof(pathBuf))) {
-                            player.videoPath = pathBuf;
+                        if (drawAssetReferenceSlot("##VideoPath", nullptr, player.videoPath,
+                                                   FileCategory::Video, "Video Clip")) {
                             changed = true;
                         }
-                        if (ImGui::BeginDragDropTarget()) {
-                            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("FILE_PATH")) {
-                                const char* droppedPath = static_cast<const char*>(payload->Data);
-                                if (droppedPath != nullptr) {
-                                    std::error_code ec;
-                                    fs::directory_entry droppedEntry{fs::path(droppedPath), ec};
-                                    if (!ec && !droppedEntry.is_directory() &&
-                                        fileBrowser.getFileCategory(droppedEntry) == FileCategory::Video) {
-                                        player.videoPath = droppedEntry.path().string();
-                                        changed = true;
-                                    }
-                                }
-                            }
-                            ImGui::EndDragDropTarget();
-                        }
-                        ImGui::SameLine();
-                        const bool canUseSelectedVideo = !fileBrowser.selectedFile.empty() &&
-                                                         fs::exists(fileBrowser.selectedFile) &&
-                                                         browserHasVideo;
-                        ImGui::BeginDisabled(!canUseSelectedVideo);
-                        if (ImGui::SmallButton("Use")) {
-                            player.videoPath = selectedVideoPath.string();
-                            changed = true;
-                        }
-                        ImGui::EndDisabled();
                         if (boolRow(Loc::T("COMPONENT_VIDEO_PLAYER_PLAY_ON_AWAKE", "Play On Awake"), &player.playOnAwake)) { changed = true; }
                         if (boolRow(Loc::T("COMPONENT_VIDEO_PLAYER_LOOP", "Loop"), &player.loop))                  { changed = true; }
                         if (boolRow(Loc::T("COMPONENT_VIDEO_PLAYER_FLIP_X", "Flip X"), &player.flipX))               { changed = true; }
@@ -7204,11 +7539,12 @@ void Engine::renderInspectorPanel() {
 
                         if (audioMode == 2) {
                             fieldRow(Loc::T("COMPONENT_AUDIO_MODE_AUDIO_SOURCE", "Audio Source"));
-                            if (drawSceneObjectReferenceSlot("##VideoOutputAudioSource",
-                                                             "##VideoOutputAudioSourceRef",
-                                                             player.outputAudioSourceObjectId,
-                                                             -1,
-                                                             "Self")) {
+                            // Empty falls back to the video player's own audio output.
+                            if (drawObjectReferenceSlot("##VideoOutputAudioSourceRef",
+                                                        nullptr,
+                                                        player.outputAudioSourceObjectId,
+                                                        -1,
+                                                        "Audio Source")) {
                                 changed = true;
                             }
                         }
@@ -8299,7 +8635,7 @@ void Engine::renderInspectorPanel() {
                 if (obj.aiAgent.useTargetObject) {
                     endCompFields();
                     agentFieldsOpen = false;
-                    if (drawSceneObjectReferenceSlot("Target Object", "##AIAgentTarget", obj.aiAgent.targetId, obj.id, "None (Target Object)")) {
+                    if (drawObjectReferenceSlot("##AIAgentTarget", "Target Object", obj.aiAgent.targetId, obj.id, "Target Object")) {
                         aiPreviewTargetId = obj.aiAgent.targetId;
                         changed = true;
                     }
@@ -9337,7 +9673,7 @@ void Engine::renderInspectorPanel() {
             if (!obj.hasCamera) {
                 ImGui::TextDisabled("Requires a Camera component.");
             }
-            if (drawSceneObjectReferenceSlot("Target", "##CameraFollowTarget", obj.cameraFollow2D.targetId, obj.id, "None (Target Object)")) {
+            if (drawObjectReferenceSlot("##CameraFollowTarget", "Target", obj.cameraFollow2D.targetId, obj.id, "Target Object")) {
                 changed = true;
             }
             if (beginCompFields("##Fields_CameraFollow2D")) {
@@ -10051,57 +10387,33 @@ void Engine::renderInspectorPanel() {
                 ImGui::RadioButton("##SelectedSlot", &selectedMaterialSlot, slotIndex);
                 ImGui::SameLine();
                 ImGui::TextDisabled("Slot %d", slotIndex);
-                ImGui::SameLine();
-                float matButtonsWidth = smallButtonRunWidth({"Use Selection", "Clear"});
-                if (!primarySlot) matButtonsWidth += smallButtonRunWidth({"Remove"});
-                const bool matButtonsInline =
-                    fieldWidthBeforeButtons(matButtonsWidth, 70.0f);
-                char slotBuf[512] = {};
-                std::snprintf(slotBuf, sizeof(slotBuf), "%s", pathRef.c_str());
-                if (ImGui::InputText("##MaterialSlotPath", slotBuf, sizeof(slotBuf))) {
-                    pathRef = slotBuf;
-                    slotChanged = true;
-                }
-                if (ImGui::BeginDragDropTarget()) {
-                    if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("FILE_PATH")) {
-                        const char* dropped = static_cast<const char*>(payload->Data);
-                        std::error_code ec;
-                        fs::directory_entry droppedEntry(fs::path(dropped), ec);
-                        if (!ec && fileBrowser.getFileCategory(droppedEntry) == FileCategory::Material) {
-                            if (primarySlot) {
-                                slotChanged |= assignPrimaryMaterialPath(dropped, true);
-                            } else {
-                                pathRef = dropped;
-                                slotChanged = true;
-                            }
-                        }
-                    }
-                    ImGui::EndDragDropTarget();
-                }
-                if (matButtonsInline) ImGui::SameLine();
-                ImGui::BeginDisabled(!browserHasMaterial);
-                if (ImGui::SmallButton("Use Selection")) {
-                    if (primarySlot) {
-                        slotChanged |= assignPrimaryMaterialPath(selectedMaterialPath.string(), true);
-                    } else {
-                        pathRef = selectedMaterialPath.string();
-                        slotChanged = true;
-                    }
-                }
-                ImGui::EndDisabled();
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Clear")) {
-                    pathRef.clear();
-                    slotChanged = true;
-                }
+                // Remove sits with the slot number so the reference slot itself can run to the
+                // right edge like every other one.
                 if (!primarySlot) {
                     ImGui::SameLine();
-                    if (ImGui::SmallButton("Remove")) {
+                    if (ImGui::SmallButton("X")) {
                         obj.additionalMaterialPaths.erase(
                             obj.additionalMaterialPaths.begin() + static_cast<long>(slotIndex - 1));
                         selectedMaterialSlot = std::clamp(
                             selectedMaterialSlot, 0,
                             std::max(0, static_cast<int>(obj.additionalMaterialPaths.size())));
+                        ImGui::PopID();
+                        return true;
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Remove this material slot");
+                    }
+                }
+                ImGui::SameLine();
+                fs::path assignedMaterial;
+                if (drawAssetReferenceSlot("##MaterialSlotPath", nullptr, pathRef,
+                                           FileCategory::Material, "Material", assignedMaterial)) {
+                    const std::string nextPath =
+                        assignedMaterial.empty() ? std::string() : assignedMaterial.string();
+                    if (primarySlot) {
+                        slotChanged |= assignPrimaryMaterialPath(nextPath, true);
+                    } else if (pathRef != nextPath) {
+                        pathRef = nextPath;
                         slotChanged = true;
                     }
                 }
@@ -10125,32 +10437,18 @@ void Engine::renderInspectorPanel() {
             }
 
             if (usesMeshAsset) {
-                char meshPathBuf[512] = {};
-                std::snprintf(meshPathBuf, sizeof(meshPathBuf), "%s", obj.meshPath.c_str());
-                const bool meshButtonsInline = fieldWidthBeforeButtons(
-                    smallButtonRunWidth({"Use Selection", "Reload"}));
-                if (ImGui::InputText("##RendererMeshPath", meshPathBuf, sizeof(meshPathBuf))) {
-                    obj.meshPath = meshPathBuf;
-                    rendererChanged = true;
-                }
-                if (ImGui::BeginDragDropTarget()) {
-                    if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("FILE_PATH")) {
-                        const char* dropped = static_cast<const char*>(payload->Data);
-                        if (assignRendererMeshAsset(obj, fs::path(dropped))) {
-                            rendererChanged = true;
-                        }
-                    }
-                    ImGui::EndDragDropTarget();
-                }
-                if (meshButtonsInline) ImGui::SameLine();
-                ImGui::BeginDisabled(!browserHasModel);
-                if (ImGui::SmallButton("Use Selection")) {
-                    if (assignRendererMeshAsset(obj, fileBrowser.selectedFile)) {
+                // assignRendererMeshAsset does more than set the path (submesh index, bounds),
+                // so the slot reports what was picked rather than writing obj.meshPath itself.
+                fs::path assignedMesh;
+                if (drawAssetReferenceSlot("##RendererMeshPath", "Mesh", obj.meshPath,
+                                           FileCategory::Model, "Mesh", assignedMesh)) {
+                    if (assignedMesh.empty()) {
+                        obj.meshPath.clear();
+                        rendererChanged = true;
+                    } else if (assignRendererMeshAsset(obj, assignedMesh)) {
                         rendererChanged = true;
                     }
                 }
-                ImGui::EndDisabled();
-                ImGui::SameLine();
                 ImGui::BeginDisabled(obj.meshPath.empty());
                 if (ImGui::SmallButton("Reload")) {
                     reloadRendererMeshAsset(obj);
@@ -10158,6 +10456,7 @@ void Engine::renderInspectorPanel() {
                 }
                 ImGui::EndDisabled();
                 if (obj.meshSourceIndex >= 0) {
+                    ImGui::SameLine();
                     ImGui::TextDisabled("Source mesh index: %d", obj.meshSourceIndex);
                 }
             } else {
@@ -11013,65 +11312,42 @@ void Engine::renderInspectorPanel() {
                     }
                 }
 
-                char pathBuf[512] = {};
-                std::snprintf(pathBuf, sizeof(pathBuf), "%s", sc.path.c_str());
                 beginMetaRow(sc.language == ScriptLanguage::CSharp ? "Assembly Path" : "Path");
-                const bool hasFileSelection = !fileBrowser.selectedFile.empty() && fs::exists(fileBrowser.selectedFile);
-                bool canUseSelection = false;
-                if (hasFileSelection) {
-                    fs::directory_entry entry(fileBrowser.selectedFile);
-                    if (isNativeScriptLanguage(sc.language)) {
-                        canUseSelection = isNativeScriptSourcePath(entry.path());
-                    } else {
-                        std::string ext = entry.path().extension().string();
-                        std::transform(ext.begin(), ext.end(), ext.begin(),
-                                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                        canUseSelection = (ext == ".dll" || ext == ".cs");
-                    }
-                }
-                const float useSelectionWidth = 112.0f;
-                ImGui::SetNextItemWidth(-useSelectionWidth);
-                if (ImGui::InputText("##ScriptPath", pathBuf, sizeof(pathBuf))) {
-                    sc.path = pathBuf;
-                    sc.lastBinaryPath.clear();
-                    sc.lastBinaryVerified = false;
-                    scriptsChanged = true;
-                    if (sc.language == ScriptLanguage::CSharp) {
-                        std::string stem = fs::path(sc.path).stem().string();
-                        if (sc.managedType.empty() || sc.managedType == stem) {
-                            if (auto inferred = InferManagedTypeFromFile(sc.path)) {
-                                sc.managedType = *inferred;
-                            } else if (!stem.empty()) {
-                                sc.managedType = stem;
+                // A script slot does not map onto one FileCategory: native scripts take their
+                // own source extensions, C# takes a built .dll or a loose .cs.
+                const bool nativeScript = isNativeScriptLanguage(sc.language);
+                fs::path assignedScript;
+                if (drawAssetReferenceSlot(
+                        "##ScriptPath", nullptr, sc.path, FileCategory::Script,
+                        nativeScript ? "Script" : "Assembly", assignedScript,
+                        [&](const fs::path& candidate) {
+                            if (nativeScript) {
+                                return isNativeScriptSourcePath(candidate);
                             }
-                        }
-                    } else if (!sc.path.empty()) {
-                        sc.language = inferNativeLanguageFromPath(sc.path);
-                    }
-                }
-
-                ImGui::SameLine();
-                ImGui::BeginDisabled(!canUseSelection);
-                if (ImGui::SmallButton("Use Selection")) {
-                    fs::directory_entry entry(fileBrowser.selectedFile);
-                    sc.path = entry.path().string();
+                            std::string ext = candidate.extension().string();
+                            std::transform(ext.begin(), ext.end(), ext.begin(),
+                                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                            return ext == ".dll" || ext == ".cs";
+                        })) {
+                    sc.path = assignedScript.empty() ? std::string() : assignedScript.string();
                     sc.lastBinaryPath.clear();
                     sc.lastBinaryVerified = false;
                     scriptsChanged = true;
-                    if (isNativeScriptLanguage(sc.language)) {
-                        sc.language = inferNativeLanguageFromPath(entry.path());
-                    } else if (sc.language == ScriptLanguage::CSharp) {
-                        std::string stem = entry.path().stem().string();
-                        if (sc.managedType.empty() || sc.managedType == stem) {
-                            if (auto inferred = InferManagedTypeFromFile(entry.path())) {
-                                sc.managedType = *inferred;
-                            } else if (!stem.empty()) {
-                                sc.managedType = stem;
+                    if (!sc.path.empty()) {
+                        if (nativeScript) {
+                            sc.language = inferNativeLanguageFromPath(sc.path);
+                        } else if (sc.language == ScriptLanguage::CSharp) {
+                            const std::string stem = fs::path(sc.path).stem().string();
+                            if (sc.managedType.empty() || sc.managedType == stem) {
+                                if (auto inferred = InferManagedTypeFromFile(sc.path)) {
+                                    sc.managedType = *inferred;
+                                } else if (!stem.empty()) {
+                                    sc.managedType = stem;
+                                }
                             }
                         }
                     }
                 }
-                ImGui::EndDisabled();
 
                 if (sc.language == ScriptLanguage::CSharp) {
                     char typeBuf[256] = {};

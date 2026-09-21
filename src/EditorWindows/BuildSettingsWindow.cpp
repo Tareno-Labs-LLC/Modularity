@@ -242,6 +242,18 @@ void Engine::renderBuildSettingsWindow() {
     if (ImGui::Checkbox("Include Editor Target", &buildSettings.includeEditor)) changed = true;
     if (ImGui::Checkbox("Lean Runtime Export", &buildSettings.leanRuntimeExport)) changed = true;
     if (ImGui::Checkbox("Ship ScriptSDK", &buildSettings.shipScriptSdk)) changed = true;
+    if (ImGui::Checkbox("Compress Audio (Vorbis)", &buildSettings.compressAudio)) changed = true;
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("WAV, AIFF and FLAC clips ship as Ogg Vorbis. MP3 and OGG are left as they are.\n"
+                          "Scenes and scripts keep using the original file names.");
+    }
+    if (buildSettings.compressAudio) {
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::SliderFloat("##AudioVorbisQuality", &buildSettings.audioVorbisQuality, 0.0f, 10.0f,
+                               "Vorbis quality %.1f")) {
+            changed = true;
+        }
+    }
     if (ImGui::Checkbox("Development Build",  &buildSettings.developmentBuild))  changed = true;
     if (ImGui::Checkbox("Server Build",       &buildSettings.serverBuild))       changed = true;
     if (ImGui::Checkbox("Script Debugging",   &buildSettings.scriptDebugging))   changed = true;

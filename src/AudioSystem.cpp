@@ -7,6 +7,7 @@
 #include <atomic>
 #include <array>
 #include "../include/Platform/AssetSource.h"
+#include "AudioExportCompression.h"
 #if defined(__ANDROID__)
 #include <cstdio>
 #endif
@@ -511,12 +512,23 @@ AssetVfs g_androidAssetVfs = { {
 #endif // __ANDROID__
 
 namespace {
+// Exported builds replace lossless clips with a Vorbis sidecar ("hit.wav" ships as "hit.wav.ogg",
+// see AudioExportCompression.h) while scenes and scripts keep the original path.
+std::string CompressedSidecarFor(const std::string& path) {
+    if (!Modularity::AudioExport::IsLosslessClipPath(path)) return {};
+    auto& assets = Modularity::Platform::GetAssetSource();
+    if (assets.Exists(path)) return {};
+    std::string sidecar = path + Modularity::AudioExport::kSidecarSuffix;
+    return assets.Exists(sidecar) ? sidecar : std::string();
+}
+
 bool AudioClipExists(const std::string& path) {
-    return Modularity::Platform::GetAssetSource().Exists(path);
+    return Modularity::Platform::GetAssetSource().Exists(path) || !CompressedSidecarFor(path).empty();
 }
 
 std::string ResolveClipPath(const std::string& path) {
-    return Modularity::Platform::ResolveAssetPath(path);
+    const std::string sidecar = CompressedSidecarFor(path);
+    return Modularity::Platform::ResolveAssetPath(sidecar.empty() ? path : sidecar);
 }
 } // namespace
 

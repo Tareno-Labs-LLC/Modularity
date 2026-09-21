@@ -216,7 +216,10 @@ GLFWwindow* Window::makeWindow(Modularity::GraphicsBackend backend)
             return nullptr;
         }
 
-        std::cout << Modularity::OpenGLApiName() << ": " << glGetString(GL_VERSION) << "\n";
+        // The version string alone does not say which GPU ran - on a hybrid laptop that is the
+        // first thing a performance report needs.
+        std::cout << Modularity::OpenGLApiName() << ": " << glGetString(GL_VERSION)
+                  << " | " << glGetString(GL_RENDERER) << " (" << glGetString(GL_VENDOR) << ")\n";
     }
 #endif
 

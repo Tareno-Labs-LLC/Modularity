@@ -5,6 +5,8 @@
 #include "../../SpritesheetFormat.h"
 #include "../../DragPreviewOverlay.h"
 #include "../../Modu2DStats.h"
+#include "../../SceneAssetReferences.h"
+#include "../SceneObjectIcons.h"
 #include "imgui.h"
 #include <algorithm>
 #include <array>
@@ -39,6 +41,65 @@ namespace ImGui {
 
 #pragma region Hierarchy Helpers
 namespace {
+    // Unity-style "missing reference" marker. Filesystem checks are cached per object and only run
+    // for rows that are drawn, re-checked every few seconds or immediately when a path changes, and
+    // capped per frame so opening a large scene cannot stall on thousands of stat calls.
+    struct HierarchyMissingAssetState {
+        size_t signature = 0;
+        double checkedAt = -1.0;
+        std::string firstMissing;  // empty = nothing missing
+        int missingCount = 0;
+    };
+    std::unordered_map<int, HierarchyMissingAssetState> gHierarchyMissingAssets;
+    int gHierarchyMissingCheckFrame = -1;
+    int gHierarchyMissingChecksThisFrame = 0;
+
+    const HierarchyMissingAssetState& GetHierarchyMissingAssetState(const SceneObject& obj) {
+        size_t signature = 0x9e3779b97f4a7c15ull;
+        ForEachSceneObjectAssetReference(obj,
+            [&](const std::string& value, SceneAssetRefKind, const char*, const char*) {
+                signature ^= std::hash<std::string>{}(value) + 0x9e3779b97f4a7c15ull +
+                             (signature << 6) + (signature >> 2);
+                return true;
+            });
+
+        HierarchyMissingAssetState& state = gHierarchyMissingAssets[obj.id];
+        const double now = ImGui::GetTime();
+        const bool pathsChanged = state.signature != signature;
+        if (!pathsChanged && state.checkedAt >= 0.0 && now - state.checkedAt < 3.0) {
+            return state;
+        }
+
+        const int frame = ImGui::GetFrameCount();
+        if (frame != gHierarchyMissingCheckFrame) {
+            gHierarchyMissingCheckFrame = frame;
+            gHierarchyMissingChecksThisFrame = 0;
+        }
+        if (pathsChanged) {
+            state = HierarchyMissingAssetState{};
+            state.signature = signature;
+        }
+        if (gHierarchyMissingChecksThisFrame >= 24) {
+            return state;
+        }
+        ++gHierarchyMissingChecksThisFrame;
+
+        state.firstMissing.clear();
+        state.missingCount = 0;
+        ForEachSceneObjectAssetReference(obj,
+            [&](const std::string& value, SceneAssetRefKind, const char*, const char* label) {
+                if (SceneAssetReferenceMissing(value)) {
+                    if (state.firstMissing.empty()) {
+                        state.firstMissing = std::string(label) + ": " + value;
+                    }
+                    ++state.missingCount;
+                }
+                return true;
+            });
+        state.checkedAt = now;
+        return state;
+    }
+
     ImGuiID HierarchyExpandStorageKey(int objectId) {
         return static_cast<ImGuiID>(0x40000000u + static_cast<uint32_t>(objectId));
     }
@@ -516,63 +577,6 @@ namespace {
         DrawSvgIcon(drawList, kEmptyObjectSvg, gEmptyObjectSvgCache, min, max, color, stroke, 0.9f);
     }
 
-    // Returns a reference to a static string: rows look their icon up every frame through
-    // Renderer::getTexture(const std::string&), and handing it a literal built a heap string
-    // for every row on every frame.
-    const std::string& GetHierarchyComponentIconPath(const SceneObject& obj) {
-        static const std::string kIconComponentCamera = "Resources/Engine-Root/Hierarchy/Component Camera.png";
-        static const std::string kIconComponentLightBulb = "Resources/Engine-Root/Hierarchy/Component Light Bulb.png";
-        static const std::string kIconComponentModuvolume = "Resources/Engine-Root/Hierarchy/Component ModuVolume.png";
-        static const std::string kIconComponentCanvas = "Resources/Engine-Root/Hierarchy/Component Canvas.png";
-        static const std::string kIconComponentText = "Resources/Engine-Root/Hierarchy/Component Text.png";
-        static const std::string kIconComponentSprite = "Resources/Engine-Root/Hierarchy/Component Sprite.png";
-        static const std::string kIconVideoPlayer = "Resources/Engine-Root/Hierarchy/Video Player.png";
-        static const std::string kIconParticleSystemAnyType = "Resources/Engine-Root/Hierarchy/Particle System any type.png";
-        static const std::string kIconComponentMesh = "Resources/Engine-Root/Hierarchy/Component Mesh.png";
-        static const std::string kIconComponentAudioSource = "Resources/Engine-Root/Hierarchy/Component Audio Source.png";
-        static const std::string kIconScript = "Resources/Engine-Root/Hierarchy/Script.png";
-        static const std::string kIconRigidbody2DAnd3DType = "Resources/Engine-Root/Hierarchy/Rigidbody 2D and 3D type.png";
-        static const std::string kIconColliderAnyType = "Resources/Engine-Root/Hierarchy/Collider any type.png";
-        static const std::string kIconComponentDefaultOrUnknown = "Resources/Engine-Root/Hierarchy/Component Default or Unknown.png";
-        if (obj.hasCamera) return kIconComponentCamera;
-        if (obj.hasLight || obj.hasLight2D) return kIconComponentLightBulb;
-        if (obj.hasPostFX) return kIconComponentModuvolume;
-        if (obj.hasUI) {
-            switch (obj.ui.type) {
-                case UIElementType::Canvas: return kIconComponentCanvas;
-                case UIElementType::Text: return kIconComponentText;
-                case UIElementType::Image:
-                case UIElementType::Sprite2D: return kIconComponentSprite;
-                default: break;
-            }
-        }
-        if (obj.hasVideoPlayer) return kIconVideoPlayer;
-        if (obj.hasParticleSystem2D) return kIconParticleSystemAnyType;
-        if (obj.hasRenderer) {
-            switch (obj.renderType) {
-                case RenderType::Sprite:
-                    return kIconComponentSprite;
-                case RenderType::Cube:
-                case RenderType::Sphere:
-                case RenderType::Capsule:
-                case RenderType::OBJMesh:
-                case RenderType::Model:
-                case RenderType::Mirror:
-                case RenderType::Plane:
-                case RenderType::Torus:
-                    return kIconComponentMesh;
-                case RenderType::None:
-                default:
-                    break;
-            }
-        }
-        if (obj.hasAudioSource) return kIconComponentAudioSource;
-        if (!obj.scripts.empty()) return kIconScript;
-        if (obj.hasRigidbody || obj.hasRigidbody2D) return kIconRigidbody2DAnd3DType;
-        if (obj.hasCollider || obj.hasCollider2D) return kIconColliderAnyType;
-        return kIconComponentDefaultOrUnknown;
-    }
-
     void DrawHierarchyLines(ImDrawList* drawList, const ImVec2& itemMin, const ImVec2& itemMax,
                             const std::vector<bool>& ancestorHasNext, int depth, bool isLast) {
         if (depth <= 0) {
@@ -722,12 +726,13 @@ void Engine::renderHierarchyPanel() {
         (ImGui::IsKeyPressed(ImGuiKey_Menu, false) ||
          (ImGui::GetIO().KeyShift && ImGui::IsKeyPressed(ImGuiKey_F10, false)));
 
-    const ImVec2 hierarchyHeaderPadding(10.0f, 6.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, hierarchyHeaderPadding);
+    // No padding of its own: the add button and the search box sit flush against the panel's
+    // own padding, and the strip is exactly one control tall, so nothing is indented or spaced
+    // out behind them.
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f, 5.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.0f, 5.0f));
-    const float hierarchyHeaderHeight =
-        ImGui::GetFrameHeight() + hierarchyHeaderPadding.y * 2.0f;
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.0f, 0.0f));
+    const float hierarchyHeaderHeight = ImGui::GetFrameHeight();
     ImGui::BeginChild("HierarchyHeader", ImVec2(-1.0f, hierarchyHeaderHeight), false, ImGuiWindowFlags_NoScrollbar);
 
     const float headerButtonSize = ImGui::GetFrameHeight();
@@ -972,6 +977,9 @@ void Engine::renderObjectNode(SceneObject& obj, const std::string& filter,
     if (depth > 256 || !renderPath.insert(obj.id).second) {
         return;
     }
+    // Held separately because a context menu further down can mutate sceneObjects and leave
+    // `obj` dangling before the cleanup at the end of this function runs.
+    const int objectId = obj.id;
 
     hierarchyVisibleOrder.push_back(obj.id);
 
@@ -1058,7 +1066,7 @@ void Engine::renderObjectNode(SceneObject& obj, const std::string& filter,
         : renderer.getTexture(obj.editorIconPath,
                               MaterialProperties::TextureFilter::Bilinear);
     if (!componentIcon || !componentIcon->GetID()) {
-        componentIcon = renderer.getTexture(GetHierarchyComponentIconPath(obj),
+        componentIcon = renderer.getTexture(SceneObjectComponentIconPath(obj),
                                             MaterialProperties::TextureFilter::Bilinear);
     }
     ImU32 iconTintU32 = ImGui::ColorConvertFloat4ToU32(
@@ -1081,6 +1089,23 @@ void Engine::renderObjectNode(SceneObject& obj, const std::string& filter,
     textCol.y = std::min(1.0f, textCol.y + 0.15f * hoverT + 0.2f * activeT);
     textCol.z = std::min(1.0f, textCol.z + 0.15f * hoverT + 0.2f * activeT);
     textCol.w = std::min(1.0f, textCol.w + 0.2f * hoverT + 0.35f * activeT);
+    const HierarchyMissingAssetState& missingAssets = GetHierarchyMissingAssetState(obj);
+    if (!missingAssets.firstMissing.empty()) {
+        textCol.x = std::min(1.0f, 0.95f + 0.05f * hoverT);
+        textCol.y = std::min(1.0f, 0.36f + 0.15f * hoverT);
+        textCol.z = std::min(1.0f, 0.36f + 0.15f * hoverT);
+        if (hovered && ImGui::BeginTooltip()) {
+            const ImVec4 missingTitleColor(0.95f, 0.45f, 0.45f, 1.0f);
+            if (missingAssets.missingCount == 1) {
+                ImGui::TextColored(missingTitleColor, "Missing asset");
+            } else {
+                ImGui::TextColored(missingTitleColor, "Missing assets (%d)", missingAssets.missingCount);
+            }
+            ImGui::TextUnformatted(missingAssets.firstMissing.c_str());
+            ImGui::TextDisabled("Export leaves broken references out and reports them.");
+            ImGui::EndTooltip();
+        }
+    }
     if (rowDim < 1.0f) {
         textCol.x *= rowDim;
         textCol.y *= rowDim;
@@ -1195,7 +1220,7 @@ void Engine::renderObjectNode(SceneObject& obj, const std::string& filter,
             ? nullptr
             : renderer.getTexture(obj.editorIconPath, MaterialProperties::TextureFilter::Bilinear);
         if (!dragIconTex || !dragIconTex->GetID()) {
-            dragIconTex = renderer.getTexture(GetHierarchyComponentIconPath(obj),
+            dragIconTex = renderer.getTexture(SceneObjectComponentIconPath(obj),
                                               MaterialProperties::TextureFilter::Bilinear);
         }
         ImTextureID dragIcon = (dragIconTex && dragIconTex->GetID())
@@ -1317,57 +1342,72 @@ void Engine::renderObjectNode(SceneObject& obj, const std::string& filter,
         gHierarchyFrameCache.contextMenuKeyRequested = false;
     }
 
+    // Menu items here can add or remove SceneOBJs, which reallocates `sceneObjects` and leaves
+    // `obj` dangling for everything below. Work from the id instead of the reference, and bail
+    // out of this node if the vector moved.
+    const int contextObjectId = objectId;
+    const int contextObjectParentId = obj.parentId;
+    const SceneObject* sceneDataBeforeMenu = sceneObjects.data();
+    const size_t sceneCountBeforeMenu = sceneObjects.size();
+
     if (ImGui::BeginPopupContextItem()) {
         if (ImGui::MenuItem("Rename", "F2")) {
-            setPrimarySelection(obj.id);
-            gHierarchyRenameRequestId = obj.id;
+            setPrimarySelection(contextObjectId);
+            gHierarchyRenameRequestId = contextObjectId;
         }
         if (ImGui::MenuItem("Duplicate", "Ctrl+D")) {
-            setPrimarySelection(obj.id);
+            setPrimarySelection(contextObjectId);
             duplicateSelected();
         }
         // Creates the prefab asset the engine actually instantiates and spawns.
         // "Export As ModuOBJ..." below writes the other .moduobj - a zip package with
         // bundled dependencies, for sending to someone else.
         if (ImGui::MenuItem("Create Packaged Object")) {
-            if (std::find(selectedObjectIds.begin(), selectedObjectIds.end(), obj.id) == selectedObjectIds.end()) {
-                setPrimarySelection(obj.id);
+            if (std::find(selectedObjectIds.begin(), selectedObjectIds.end(), contextObjectId) == selectedObjectIds.end()) {
+                setPrimarySelection(contextObjectId);
             }
             createModuObjAssetFromSelection();
         }
         if (ImGui::MenuItem("Export As ModuOBJ...")) {
-            if (std::find(selectedObjectIds.begin(), selectedObjectIds.end(), obj.id) == selectedObjectIds.end()) {
-                setPrimarySelection(obj.id);
+            if (std::find(selectedObjectIds.begin(), selectedObjectIds.end(), contextObjectId) == selectedObjectIds.end()) {
+                setPrimarySelection(contextObjectId);
             }
             openModuObjExportDialog();
         }
         if (ImGui::MenuItem("Delete", "Del")) {
-            setPrimarySelection(obj.id);
+            setPrimarySelection(contextObjectId);
             deleteSelected();
         }
         if (ImGui::MenuItem("Frame in Viewport", "F")) {
-            setPrimarySelection(obj.id);
+            setPrimarySelection(contextObjectId);
             focusViewportOnSelection();
         }
         ImGui::Separator();
-        if (obj.hasUI && obj.ui.type == UIElementType::Canvas && ImGui::BeginMenu("Create UI Child")) {
-            auto createChild = [&](ObjectType type, const std::string& baseName) {
-                addObject(type, baseName);
-                if (!sceneObjects.empty()) {
-                    setParent(sceneObjects.back().id, obj.id);
-                }
-            };
-            if (ImGui::MenuItem("UI Image")) createChild(ObjectType::UIImage, "UI Image");
-            if (ImGui::MenuItem("UI Slider")) createChild(ObjectType::UISlider, "UI Slider");
-            if (ImGui::MenuItem("UI Button")) createChild(ObjectType::UIButton, "UI Button");
-            if (ImGui::MenuItem("UI Text")) createChild(ObjectType::UIText, "UI Text");
-            if (ImGui::MenuItem("Sprite2D")) createChild(ObjectType::Sprite2D, "Sprite2D");
+        // The full create menu, parented to the object that was right-clicked. This replaces
+        // the Canvas-only "Create UI Child" submenu - a UI element dropped on a Canvas still
+        // lands under it, and every other SceneOBJ type can now be created as a child too.
+        if (ImGui::BeginMenu("Create Child")) {
+            renderSceneObjectCreateMenu(contextObjectId);
             ImGui::EndMenu();
         }
-        if (ImGui::MenuItem("Clear Parent") && obj.parentId != -1) {
-            setParent(obj.id, -1);
+        if (ImGui::MenuItem("Clear Parent") && contextObjectParentId != -1) {
+            setParent(contextObjectId, -1);
         }
         ImGui::EndPopup();
+    }
+
+    // Reparenting to the root reorders the vector in place, so also check that this slot still
+    // holds the same object. `obj` is only read once the buffer is known not to have moved.
+    const bool sceneVectorMoved = (sceneObjects.data() != sceneDataBeforeMenu ||
+                                   sceneObjects.size() != sceneCountBeforeMenu);
+    if (sceneVectorMoved || obj.id != contextObjectId) {
+        // The menu added, removed or moved SceneOBJs. `obj` may now point at a freed or
+        // shifted element, so stop drawing this node and let the next frame redraw the tree.
+        if (nodeOpen) {
+            ImGui::TreePop();
+        }
+        renderPath.erase(contextObjectId);
+        return;
     }
 
     if (hierarchyShowTexturePreview) {
@@ -1445,17 +1485,29 @@ void Engine::renderObjectNode(SceneObject& obj, const std::string& filter,
 
             ancestorHasNext.push_back(!isLast);
             if (!treePushed) ++gHierarchyNavCaptureSuppress;
+            // A descendant's context menu can create or delete SceneOBJs mid-walk, which
+            // reallocates sceneObjects and would leave `obj` (and this loop's iterator over
+            // its childIds) dangling. Walk a copy of the ids and stop as soon as the vector
+            // moves; the next frame redraws the new tree.
+            const std::vector<int> childIdsSnapshot = obj.childIds;
+            const SceneObject* sceneDataBeforeChildren = sceneObjects.data();
+            const size_t sceneCountBeforeChildren = sceneObjects.size();
             size_t visibleChildIndex = 0;
-            for (int childId : obj.childIds) {
+            for (int childId : childIdsSnapshot) {
                 auto idxIt = sceneObjectIndexById.find(childId);
                 if (idxIt == sceneObjectIndexById.end()) continue;
                 size_t idx = idxIt->second;
                 if (idx >= sceneObjects.size()) continue;
                 SceneObject& child = sceneObjects[idx];
+                if (child.id != childId) continue;
                 if (!HierarchyNameMatchesFilter(child.name, filter)) continue;
                 const bool childLast = (visibleChildIndex + 1 == visibleChildCount);
                 ++visibleChildIndex;
                 renderObjectNode(child, filter, ancestorHasNext, renderPath, childLast, depth + 1, animStep);
+                if (sceneObjects.data() != sceneDataBeforeChildren ||
+                    sceneObjects.size() != sceneCountBeforeChildren) {
+                    break;
+                }
             }
             if (!treePushed) --gHierarchyNavCaptureSuppress;
             ancestorHasNext.pop_back();
@@ -1490,7 +1542,7 @@ void Engine::renderObjectNode(SceneObject& obj, const std::string& filter,
     } else if (nodeOpen) {
         ImGui::TreePop();
     }
-    renderPath.erase(obj.id);
+    renderPath.erase(objectId);
 }
 
 #pragma endregion

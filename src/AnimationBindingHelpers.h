@@ -362,18 +362,21 @@ namespace AnimationBinding {
         if (propertyId.rfind("localPosition.", 0) == 0 || propertyId.rfind("localScale.", 0) == 0) {return 0.0005f;}
         return 0.001f;
     }
+    // The transform channels every object has, split out from EnumerateProperties() because
+    // "Bind Hierarchy" must bind these and nothing else. A bound track is written back to the
+    // object on every frame the clip plays, so binding the rest turns a clip into a per-frame
+    // overwrite of UI, material, audio and - worst - script settings the script itself owns.
+    inline std::vector<std::string> EnumerateTransformProperties() {
+        return {
+            "localPosition.x", "localPosition.y", "localPosition.z",
+            "localRotation.x", "localRotation.y", "localRotation.z",
+            "localScale.x",    "localScale.y",    "localScale.z",
+        };
+    }
+
     inline std::vector<std::string> EnumerateProperties(const SceneObject& obj) {
-        std::vector<std::string> props;
+        std::vector<std::string> props = EnumerateTransformProperties();
         props.reserve(64 + obj.scripts.size() * 8);
-        props.push_back("localPosition.x");
-        props.push_back("localPosition.y");
-        props.push_back("localPosition.z");
-        props.push_back("localRotation.x");
-        props.push_back("localRotation.y");
-        props.push_back("localRotation.z");
-        props.push_back("localScale.x");
-        props.push_back("localScale.y");
-        props.push_back("localScale.z");
         if (obj.hasUI) {
             props.push_back("UI.Position.x");
             props.push_back("UI.Position.y");

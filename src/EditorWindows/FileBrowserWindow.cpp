@@ -2665,21 +2665,21 @@ void Engine::renderFileBrowserPanel() {
                    fileBrowser.currentPath.has_parent_path();
 
     ImGui::BeginDisabled(!canGoBack);
-    ImGui::Button("<##Back", ImVec2(24, 0));
+    ImGui::ArrowButton("##Back", ImGuiDir_Left);
     if (ImGui::IsItemActivated()) fileBrowser.navigateBack();
     ImGui::EndDisabled();
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Back");
 
     ImGui::SameLine();
     ImGui::BeginDisabled(!canGoForward);
-    ImGui::Button(">##Forward", ImVec2(24, 0));
+    ImGui::ArrowButton("##Forward", ImGuiDir_Right);
     if (ImGui::IsItemActivated()) fileBrowser.navigateForward();
     ImGui::EndDisabled();
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Forward");
 
     ImGui::SameLine();
     ImGui::BeginDisabled(!canGoUp);
-    ImGui::Button("^##Up", ImVec2(24, 0));
+    ImGui::ArrowButton("##Up", ImGuiDir_Up);
     if (ImGui::IsItemActivated()) fileBrowser.navigateUp();
     ImGui::EndDisabled();
     if (canGoUp && ImGui::BeginDragDropTarget()) {

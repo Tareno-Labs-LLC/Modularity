@@ -17,6 +17,13 @@
 extern int __argc;
 extern char** __argv;
 #endif
+// Hybrid-graphics laptops run an executable on the integrated GPU unless the executable itself
+// exports these (NVIDIA Optimus and AMD PowerXpress). GLFW can emit them, but only when built with
+// GLFW_USE_HYBRID_HPG, which this build does not enable. Exported games are this binary renamed.
+extern "C" {
+__declspec(dllexport) unsigned long NvOptimusEnablement = 0x00000001;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+}
 #else
 #include <unistd.h>
 #endif

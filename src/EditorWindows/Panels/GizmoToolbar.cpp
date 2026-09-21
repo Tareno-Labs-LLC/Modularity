@@ -1,19 +1,25 @@
-#include "Engine.h"
+#include "GizmoToolbar.h"
 namespace GizmoToolbar {
-enum class Icon {
-  Translate,
-  Rotate,
-  Scale,
-  Bounds,
-  Universal,
-  Mesh,
-  GizmoToggle,
-  GridToggle,
-  SnapToggle,
-  LocalMode,
-  WorldMode,
-  UiWorldToggle
-};
+
+const char *IconTexturePath(Icon icon) {
+  switch (icon) {
+  case Icon::Translate:      return "Resources/Engine-Root/Editor Viewport Toolbar/Transform Icon.png";
+  case Icon::Rotate:         return "Resources/Engine-Root/Editor Viewport Toolbar/Rotation Icon.png";
+  case Icon::Scale:          return "Resources/Engine-Root/Editor Viewport Toolbar/Scale Icon.png";
+  case Icon::Bounds:         return "Resources/Engine-Root/Editor Viewport Toolbar/Rect Scale Icon.png";
+  case Icon::Universal:      return "Resources/Engine-Root/Editor Viewport Toolbar/Universal Icon.png";
+  case Icon::GizmoToggle:    return "Resources/Engine-Root/Editor Viewport Toolbar/Gizmo Icon.png";
+  case Icon::GridToggle:     return "Resources/Engine-Root/Editor Viewport Toolbar/2D and 3D Grid Toggle Icon.png";
+  case Icon::SnapToggle:     return "Resources/Engine-Root/Editor Viewport Toolbar/Snap Icon.png";
+  case Icon::LocalMode:      return "Resources/Engine-Root/Editor Viewport Toolbar/Local Icon.png";
+  case Icon::WorldMode:      return "Resources/Engine-Root/Editor Viewport Toolbar/World Icon.png";
+  case Icon::UiWorldToggle:  return "Resources/Engine-Root/Editor Viewport Toolbar/2D Toggle Icon.png";
+  case Icon::FreeformMode:   return "Resources/Engine-Root/Editor Viewport Toolbar/Freeform Mode Icon.png";
+  case Icon::AssemblageMode: return "Resources/Engine-Root/Editor Viewport Toolbar/Assemblage Mode Icon.png";
+  case Icon::Mesh:           break;  // Vector only - no authored art for the mesh-edit button.
+  }
+  return nullptr;
+}
 
 ImVec4 ScaleColor(const ImVec4 &c, float s) {
   return ImVec4(std::clamp(c.x * s, 0.0f, 1.0f),
@@ -926,6 +932,63 @@ static void DrawUiWorldToggleIcon(ImDrawList *drawList, const ImVec2 &min,
   }
 }
 
+// Fallback only; the authored PNG is what normally draws. Freeform = a frame nothing snaps
+// to (corner brackets, not a closed box) with a sprite placed freely inside it.
+static void DrawFreeformModeIcon(ImDrawList *drawList, const ImVec2 &min,
+                                 const ImVec2 &max, ImU32 lineColor,
+                                 ImU32 accentColor) {
+  (void)accentColor;
+  ImVec2 iconMin, iconMax;
+  GetIconBounds(min, max, iconMin, iconMax);
+  const float size = iconMax.x - iconMin.x;
+  const float thickness = std::max(1.0f, size * 0.07f);
+  const ImVec2 frameMin(iconMin.x + size * 0.14f, iconMin.y + size * 0.14f);
+  const ImVec2 frameMax(iconMax.x - size * 0.14f, iconMax.y - size * 0.14f);
+
+  const float arm = size * 0.18f;
+  const ImVec2 corners[4] = {frameMin, ImVec2(frameMax.x, frameMin.y), frameMax,
+                             ImVec2(frameMin.x, frameMax.y)};
+  const ImVec2 dirs[4] = {ImVec2(1.0f, 1.0f), ImVec2(-1.0f, 1.0f),
+                          ImVec2(-1.0f, -1.0f), ImVec2(1.0f, -1.0f)};
+  for (int i = 0; i < 4; ++i) {
+    drawList->AddLine(corners[i],
+                      ImVec2(corners[i].x + dirs[i].x * arm, corners[i].y),
+                      lineColor, thickness);
+    drawList->AddLine(corners[i],
+                      ImVec2(corners[i].x, corners[i].y + dirs[i].y * arm),
+                      lineColor, thickness);
+  }
+  drawList->AddRectFilled(
+      ImVec2(iconMin.x + size * 0.34f, iconMin.y + size * 0.40f),
+      ImVec2(iconMin.x + size * 0.66f, iconMin.y + size * 0.72f), lineColor,
+      size * 0.06f);
+}
+
+// Fallback only. Assemblage = tiles snapped to a grid, one of them painted.
+static void DrawAssemblageModeIcon(ImDrawList *drawList, const ImVec2 &min,
+                                   const ImVec2 &max, ImU32 lineColor,
+                                   ImU32 accentColor) {
+  ImVec2 iconMin, iconMax;
+  GetIconBounds(min, max, iconMin, iconMax);
+  const float size = iconMax.x - iconMin.x;
+  const float thickness = std::max(1.0f, size * 0.07f);
+  const float inset = size * 0.16f;
+  const float cell = (size - inset * 2.0f) * 0.5f;
+  for (int row = 0; row < 2; ++row) {
+    for (int col = 0; col < 2; ++col) {
+      const ImVec2 cellMin(iconMin.x + inset + cell * static_cast<float>(col),
+                           iconMin.y + inset + cell * static_cast<float>(row));
+      const ImVec2 cellMax(cellMin.x + cell, cellMin.y + cell);
+      if (row == 0 && col == 0) {
+        drawList->AddRectFilled(cellMin, cellMax, accentColor, size * 0.04f);
+      } else {
+        drawList->AddRect(cellMin, cellMax, lineColor, size * 0.04f, 0,
+                          thickness);
+      }
+    }
+  }
+}
+
 static void DrawIcon(Icon icon, ImDrawList *drawList, const ImVec2 &min,
                      const ImVec2 &max, ImU32 lineColor, ImU32 accentColor) {
   switch (icon) {
@@ -965,16 +1028,24 @@ static void DrawIcon(Icon icon, ImDrawList *drawList, const ImVec2 &min,
   case Icon::UiWorldToggle:
     DrawUiWorldToggleIcon(drawList, min, max, lineColor, accentColor);
     break;
+  case Icon::FreeformMode:
+    DrawFreeformModeIcon(drawList, min, max, lineColor, accentColor);
+    break;
+  case Icon::AssemblageMode:
+    DrawAssemblageModeIcon(drawList, min, max, lineColor, accentColor);
+    break;
   }
 }
 
 bool IconButton(const char *id, Icon icon, bool active,
                        const ImVec2 &size, ImU32 baseColor, ImU32 hoverColor,
-                       ImU32 activeColor, ImU32 accentColor, ImU32 iconColor) {
+                       ImU32 activeColor, ImU32 accentColor, ImU32 iconColor,
+                       const IconTexture &texture) {
   ImGui::PushID(id);
   ImGui::SetNextItemAllowOverlap();
   ImGui::InvisibleButton("##btn", size);
   bool hovered = ImGui::IsItemHovered();
+  bool held = ImGui::IsItemActive();
   bool pressed = ImGui::IsItemClicked();
   ImVec2 min = ImGui::GetItemRectMin();
   ImVec2 max = ImGui::GetItemRectMax();
@@ -983,19 +1054,57 @@ bool IconButton(const char *id, Icon icon, bool active,
   ImDrawList *drawList = ImGui::GetWindowDrawList();
   ImU32 bg = active ? activeColor : (hovered ? hoverColor : baseColor);
 
-  ImVec4 bgCol = ImGui::ColorConvertU32ToFloat4(bg);
-  ImU32 top = ImGui::GetColorU32(ScaleColor(bgCol, 1.07f));
-  ImU32 bottom = ImGui::GetColorU32(ScaleColor(bgCol, 0.93f));
-  drawList->AddRectFilledMultiColor(min, max, top, top, bottom, bottom);
+  // Shaded through the editor's shade theme rather than a hand-rolled gradient, so these
+  // buttons carry the same bevel and rounding as every other button in the editor.
+  ImGui::ShadeRect(drawList, min, max, bg, ImGuiShadeClass_Button,
+                   ImGui::ShadeStateFromInteraction(hovered, held, active), rounding);
   drawList->AddRect(min, max,
                     ImGui::GetColorU32(ImVec4(1, 1, 1, active ? 0.35f : 0.18f)),
                     rounding);
 
-  ImDrawListFlags prevFlags = drawList->Flags;
-  drawList->Flags |=
-      ImDrawListFlags_AntiAliasedLines | ImDrawListFlags_AntiAliasedFill;
-  DrawIcon(icon, drawList, min, max, iconColor, accentColor);
-  drawList->Flags = prevFlags;
+  // An unselected tool is the same icon, darker. Both the authored art and the vector
+  // fallback take the same factor so the toolbar reads identically either way.
+  const float iconDim = active ? 1.0f : (hovered ? 0.86f : 0.50f);
+  const float iconAlpha = active ? 1.0f : (hovered ? 0.96f : 0.82f);
+
+  if (texture.id != static_cast<ImTextureID>(0)) {
+    // Authored art is drawn at a whole-number scale on whole-pixel coordinates, and the
+    // texture itself is point-sampled by the caller, so the pixels stay crisp instead of
+    // being resampled into the button box.
+    const float available = std::min(max.x - min.x, max.y - min.y);
+    float drawW = available;
+    float drawH = available;
+    if (texture.nativeSize.x > 0.0f && texture.nativeSize.y > 0.0f) {
+      const float fit = std::min(available / texture.nativeSize.x,
+                                 available / texture.nativeSize.y);
+      // Whole multiples while it fits; only an oversized icon is scaled fractionally.
+      const float scale = fit >= 1.0f ? std::floor(fit) : fit;
+      drawW = texture.nativeSize.x * scale;
+      drawH = texture.nativeSize.y * scale;
+    }
+    const ImVec2 center((min.x + max.x) * 0.5f, (min.y + max.y) * 0.5f);
+    const ImVec2 iconMin(std::floor(center.x - drawW * 0.5f + 0.5f),
+                         std::floor(center.y - drawH * 0.5f + 0.5f));
+    const ImVec2 iconMax(iconMin.x + drawW, iconMin.y + drawH);
+    const ImVec2 uv0 = texture.flipY ? ImVec2(0.0f, 1.0f) : ImVec2(0.0f, 0.0f);
+    const ImVec2 uv1 = texture.flipY ? ImVec2(1.0f, 0.0f) : ImVec2(1.0f, 1.0f);
+    drawList->AddImage(texture.id, iconMin, iconMax, uv0, uv1,
+                       ImGui::GetColorU32(ImVec4(iconDim, iconDim, iconDim, iconAlpha)));
+  } else {
+    // ScaleColor keeps alpha, so fade it separately to match the textured path exactly.
+    auto dimVector = [&](ImU32 color) {
+      ImVec4 v = ScaleColor(ImGui::ColorConvertU32ToFloat4(color), iconDim);
+      v.w *= iconAlpha;
+      return ImGui::GetColorU32(v);
+    };
+    const ImU32 dimmedLine = dimVector(iconColor);
+    const ImU32 dimmedAccent = dimVector(accentColor);
+    ImDrawListFlags prevFlags = drawList->Flags;
+    drawList->Flags |=
+        ImDrawListFlags_AntiAliasedLines | ImDrawListFlags_AntiAliasedFill;
+    DrawIcon(icon, drawList, min, max, dimmedLine, dimmedAccent);
+    drawList->Flags = prevFlags;
+  }
 
   ImGui::PopID();
   return pressed;
@@ -1008,6 +1117,7 @@ bool TextButton(const char *id, const char *label, bool active,
   ImGui::SetNextItemAllowOverlap();
   ImGui::InvisibleButton("##btn", size);
   bool hovered = ImGui::IsItemHovered();
+  bool held = ImGui::IsItemActive();
   bool pressed = ImGui::IsItemClicked();
   ImVec2 min = ImGui::GetItemRectMin();
   ImVec2 max = ImGui::GetItemRectMax();
@@ -1016,10 +1126,8 @@ bool TextButton(const char *id, const char *label, bool active,
   ImDrawList *drawList = ImGui::GetWindowDrawList();
   ImU32 bg = active ? activeColor : (hovered ? hoverColor : baseColor);
 
-  ImVec4 bgCol = ImGui::ColorConvertU32ToFloat4(bg);
-  ImU32 top = ImGui::GetColorU32(ScaleColor(bgCol, 1.06f));
-  ImU32 bottom = ImGui::GetColorU32(ScaleColor(bgCol, 0.94f));
-  drawList->AddRectFilledMultiColor(min, max, top, top, bottom, bottom);
+  ImGui::ShadeRect(drawList, min, max, bg, ImGuiShadeClass_Button,
+                   ImGui::ShadeStateFromInteraction(hovered, held, active), rounding);
   drawList->AddRect(min, max, borderColor, rounding);
 
   ImVec2 textSize = ImGui::CalcTextSize(label);
@@ -1033,11 +1141,12 @@ bool TextButton(const char *id, const char *label, bool active,
 
 bool ModeButton(const char *label, bool active, const ImVec2 &size,
                        ImVec4 baseColor, ImVec4 activeColor, ImVec4 textColor) {
-  ImGui::PushStyleColor(ImGuiCol_Button, active ? activeColor : baseColor);
-  ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-                        active ? activeColor : baseColor);
-  ImGui::PushStyleColor(ImGuiCol_ButtonActive,
-                        active ? activeColor : baseColor);
+  // Hover and held used to reuse the resting fill, which left the button visibly flat next to
+  // the shaded icon buttons. Giving each state its own tone lets the shade theme shade it.
+  const ImVec4 restColor = active ? activeColor : baseColor;
+  ImGui::PushStyleColor(ImGuiCol_Button, restColor);
+  ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ScaleColor(restColor, 1.18f));
+  ImGui::PushStyleColor(ImGuiCol_ButtonActive, ScaleColor(restColor, 0.88f));
   ImGui::PushStyleColor(ImGuiCol_Text, textColor);
   ImGui::SetNextItemAllowOverlap();
   bool pressed = ImGui::Button(label, size);

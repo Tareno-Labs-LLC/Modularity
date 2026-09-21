@@ -271,15 +271,24 @@ static bool SaveScriptsConfig(const fs::path& path, const ScriptBuildConfig& con
     return true;
 }
 
-static float SmoothApproach(float current, float target, float speed, float dt) {
-    const float blend = 1.0f - std::exp(-speed * dt);
-    return current + (target - current) * blend;
+static float SmoothApproach(float current, float target, float speed, float dt,
+                            float durationScale) {
+    if (durationScale <= 0.0f) return target;
+    const float blend = 1.0f - std::exp(-speed * std::max(0.0f, dt) / durationScale);
+    const float value = current + (target - current) * blend;
+    return std::fabs(target - value) < 0.001f ? target : value;
 }
 
 static float EaseOutCubic(float t) {
     t = ImClamp(t, 0.0f, 1.0f);
     const float inv = 1.0f - t;
     return 1.0f - inv * inv * inv;
+}
+
+// Shared timing for launcher page reveals and the reversible New Project slide.
+static float LauncherPageProgress(double now, double started, float durationScale) {
+    if (durationScale <= 0.0f) return 1.0f;
+    return EaseOutCubic(static_cast<float>((now - started) / (0.24f * durationScale)));
 }
 
 static float EaseInOutCubic(float t) {
@@ -291,12 +300,60 @@ static float EaseInOutCubic(float t) {
     return 1.0f - (f * f * f) * 0.5f;
 }
 
-static float EaseOutBack(float t) {
-    t = ImClamp(t, 0.0f, 1.0f);
-    constexpr float c1 = 1.70158f;
-    constexpr float c3 = c1 + 1.0f;
-    const float p = t - 1.0f;
-    return 1.0f + c3 * p * p * p + c1 * p * p;
+// The click at the end of an intro letter's flight: zero until the glyph reaches
+// its slot, then one short lobe that carries it a little past the mark and pulls
+// it straight back. Position, spin and scale all ride this single curve so a
+// letter reads as one piece snapping home rather than three separate effects.
+// Skewed past the halfway point so the return is the quicker half of the lobe.
+static float LauncherSnapPulse(float t, float snapPoint) {
+    if (snapPoint >= 1.0f || t <= snapPoint || t >= 1.0f) return 0.0f;
+    const float u = (t - snapPoint) / (1.0f - snapPoint);
+    return std::sin(std::pow(u, 1.35f) * IM_PI);
+}
+
+// ImDrawList::AddText() can only place axis-aligned text, so the intro letters go
+// through the font atlas directly to pick up a rotation and a scale that both
+// pivot on the glyph itself (same approach as addRotatedText90CW() in
+// EditorWindows/Panels/DockDrawer.cpp).
+static void LauncherDrawIntroGlyph(ImDrawList* drawList, ImFont* font, float fontSize,
+                                   const ImVec2& pos, float angleRad, float scale,
+                                   ImU32 col, char ch) {
+    if (!drawList || !font || fontSize <= 0.0f || (col & IM_COL32_A_MASK) == 0) return;
+
+    if (std::fabs(angleRad) < 0.0008f && std::fabs(scale - 1.0f) < 0.0008f) {
+        // Resting frames take the normal text path so the last frame of the intro
+        // is pixel-identical to the static header brand it hands off to.
+        const char text[2] = { ch, 0 };
+        drawList->AddText(font, fontSize, pos, col, text);
+        return;
+    }
+
+    ImFontBaked* baked = font->GetFontBaked(fontSize);
+    if (!baked) return;
+    ImFontGlyph* glyph = baked->FindGlyph(static_cast<ImWchar>(static_cast<unsigned char>(ch)));
+    if (!glyph || !glyph->Visible) return;
+
+    const float bakeScale = (baked->Size > 0.0f) ? (fontSize / baked->Size) : 1.0f;
+    // Pivot on the glyph's own box so a letter spins in place instead of swinging
+    // around the text origin.
+    const ImVec2 pivot(pos.x + glyph->AdvanceX * bakeScale * 0.5f, pos.y + fontSize * 0.5f);
+    const float cs = std::cos(angleRad) * scale;
+    const float sn = std::sin(angleRad) * scale;
+    auto xf = [&](float x, float y) -> ImVec2 {
+        const float dx = x - pivot.x;
+        const float dy = y - pivot.y;
+        return ImVec2(pivot.x + dx * cs - dy * sn, pivot.y + dx * sn + dy * cs);
+    };
+
+    const float x0 = pos.x + glyph->X0 * bakeScale;
+    const float x1 = pos.x + glyph->X1 * bakeScale;
+    const float y0 = pos.y + glyph->Y0 * bakeScale;
+    const float y1 = pos.y + glyph->Y1 * bakeScale;
+    drawList->AddImageQuad(ImGui::GetIO().Fonts->TexRef,
+                           xf(x0, y0), xf(x1, y0), xf(x1, y1), xf(x0, y1),
+                           ImVec2(glyph->U0, glyph->V0), ImVec2(glyph->U1, glyph->V0),
+                           ImVec2(glyph->U1, glyph->V1), ImVec2(glyph->U0, glyph->V1),
+                           glyph->Colored ? (col | ~IM_COL32_A_MASK) : col);
 }
 
 namespace LauncherSkin {
@@ -427,21 +484,22 @@ static bool LauncherRailItem(const char* id,
                              const char* subtitle,
                              bool selected,
                              int badgeCount,
-                             float uiScale) {
+                             float uiScale,
+                             float animationScale) {
     ImGui::PushID(id);
     const float height = (subtitle && *subtitle ? 46.0f : 32.0f) * uiScale;
     const ImVec2 pos = ImGui::GetCursorScreenPos();
     const float width = std::max(48.0f * uiScale, ImGui::GetContentRegionAvail().x);
-    ImGui::InvisibleButton("##rail", ImVec2(width, height));
-    const bool hovered = ImGui::IsItemHovered();
-    const bool clicked = ImGui::IsItemClicked();
+    const bool clicked = ImGui::InvisibleButton("##rail", ImVec2(width, height),
+                                                ImGuiButtonFlags_EnableNav);
+    const bool hovered = ImGui::IsItemHovered() || ImGui::IsItemFocused();
     const ImVec2 max(pos.x + width, pos.y + height);
 
     ImGuiStorage* storage = ImGui::GetStateStorage();
     const ImGuiID key = ImGui::GetID("##railAnim");
     float anim = storage->GetFloat(key, selected ? 1.0f : 0.0f);
     anim = SmoothApproach(anim, selected ? 1.0f : (hovered ? 0.55f : 0.0f),
-                          14.0f, ImGui::GetIO().DeltaTime);
+                          14.0f, ImGui::GetIO().DeltaTime, animationScale);
     storage->SetFloat(key, anim);
 
     ImDrawList* drawList = ImGui::GetWindowDrawList();
@@ -477,8 +535,8 @@ static bool LauncherRailItem(const char* id,
     }
 
     const float textX = pos.x + 13.0f * uiScale;
-    const ImVec4 labelCol = selected ? LauncherSkin::kText
-                                     : (hovered ? LauncherSkin::kText : LauncherSkin::kTextDim);
+    const ImVec4 labelCol = ImLerp(LauncherSkin::kTextDim, LauncherSkin::kText,
+                                  ImClamp(anim * 2.0f, 0.0f, 1.0f));
     drawList->PushClipRect(ImVec2(textX, pos.y), ImVec2(std::max(textX, textRight), max.y), true);
     if (subtitle && *subtitle) {
         drawList->AddText(ImVec2(textX, pos.y + 7.0f * uiScale),
@@ -575,11 +633,20 @@ static std::string FormatBytesShort(std::uintmax_t bytes) {
 }
 
 struct LauncherIntroTimings {
-    float fadeIn = 0.16f;
-    float popIn = 0.44f;
-    float hold = 0.10f;
-    float drift = 0.64f;
+    float fadeIn = 0.16f;    // logo alone, before the first letter launches
+    float popIn = 0.38f;     // one letter's flight from offscreen to its slot
+    float stagger = 0.055f;  // gap between consecutive letter launches
+    float hold = 0.15f;      // assembled word sits still before it rolls away
+    float drift = 0.68f;     // roll from centre to the header brand
+    int letters = 10;        // "Modularity" - pieces the word is assembled from
 };
+
+// The word is built one letter at a time, so the assembly phase runs until the
+// last letter - launched after stagger * (letters - 1) - has flown its full path.
+static float LauncherAssembleSpan(const LauncherIntroTimings& timings) {
+    const int gaps = (timings.letters > 1) ? (timings.letters - 1) : 0;
+    return timings.stagger * static_cast<float>(gaps) + timings.popIn;
+}
 
 struct LauncherIntroState {
     float elapsed = 0.0f;
@@ -598,7 +665,8 @@ static LauncherIntroState EvaluateLauncherIntro(double now,
                                                 const LauncherIntroTimings& timings) {
     LauncherIntroState state;
     const float popStart = timings.fadeIn;
-    const float driftStart = popStart + timings.popIn + timings.hold;
+    const float assembleSpan = LauncherAssembleSpan(timings);
+    const float driftStart = popStart + assembleSpan + timings.hold;
     state.introTotal = driftStart + timings.drift;
     state.elapsed = forceFinished
         ? state.introTotal
@@ -610,9 +678,9 @@ static LauncherIntroState EvaluateLauncherIntro(double now,
         state.textAlpha = ImClamp(state.elapsed / timings.fadeIn, 0.0f, 1.0f);
     }
 
-    state.popT = timings.popIn <= 0.0001f
+    state.popT = assembleSpan <= 0.0001f
         ? 1.0f
-        : ImClamp((state.elapsed - popStart) / timings.popIn, 0.0f, 1.0f);
+        : ImClamp((state.elapsed - popStart) / assembleSpan, 0.0f, 1.0f);
     state.driftT = timings.drift <= 0.0001f
         ? 1.0f
         : ImClamp((state.elapsed - driftStart) / timings.drift, 0.0f, 1.0f);
@@ -1965,10 +2033,11 @@ void Engine::renderLauncher() {
         : (uiAnimationMode == UIAnimationMode::Snappy) ? 0.45f
                                                        : 1.0f;
     LauncherIntroTimings introTimings{};
-    introTimings.fadeIn *= launcherAnimScale;
-    introTimings.popIn  *= launcherAnimScale;
-    introTimings.hold   *= launcherAnimScale;
-    introTimings.drift  *= launcherAnimScale;
+    introTimings.fadeIn  *= launcherAnimScale;
+    introTimings.popIn   *= launcherAnimScale;
+    introTimings.stagger *= launcherAnimScale;
+    introTimings.hold    *= launcherAnimScale;
+    introTimings.drift   *= launcherAnimScale;
     LauncherIntroState introState = EvaluateLauncherIntro(now, launcherIntroStartTime, launcherIntroFinished, introTimings);
     if (!launcherIntroFinished && introState.finished) {
         launcherIntroFinished = true;
@@ -2037,6 +2106,9 @@ void Engine::renderLauncher() {
         static double launcherSectionSwitchTime = 0.0;
         static char launcherSearch[160] = "";
         static float projectsPanelVisual = 0.0f;
+        static float projectsPanelFrom = 0.0f;
+        static float projectsPanelTarget = 0.0f;
+        static double projectsPanelSwitchTime = 0.0;
         static float tabIndicatorVisualX = -1.0f;
         static float tabIndicatorVisualW = 0.0f;
         static std::string launcherSelectedProjectPath;
@@ -2051,11 +2123,16 @@ void Engine::renderLauncher() {
         }
 
         const float frameDt = ImGui::GetIO().DeltaTime;
-        const float projectsPanelTarget = projectManager.showNewProjectDialog ? 1.0f : 0.0f;
-        projectsPanelVisual = SmoothApproach(projectsPanelVisual, projectsPanelTarget, 12.0f, frameDt);
-        const float sectionAnimDuration = 0.26f;
-        const float sectionAnimT = ImClamp(static_cast<float>((glfwGetTime() - launcherSectionSwitchTime) / sectionAnimDuration), 0.0f, 1.0f);
-        const float sectionAnimEase = EaseOutCubic(sectionAnimT);
+        // Retarget from the current position so reversing midway never jumps.
+        projectsPanelVisual = ImLerp(projectsPanelFrom, projectsPanelTarget,
+                                    LauncherPageProgress(now, projectsPanelSwitchTime, launcherAnimScale));
+        const float requestedPanel = projectManager.showNewProjectDialog ? 1.0f : 0.0f;
+        if (requestedPanel != projectsPanelTarget) {
+            projectsPanelFrom = projectsPanelVisual;
+            projectsPanelTarget = requestedPanel;
+            projectsPanelSwitchTime = now;
+        }
+        if (launcherAnimScale <= 0.0f) projectsPanelVisual = projectsPanelTarget;
 
         const bool launcherBusy = projectLoadInProgress || sceneLoadInProgress ||
                                   launcherTransitionActive || launcherTransitionPendingHide;
@@ -2094,7 +2171,7 @@ void Engine::renderLauncher() {
             if (launcherSection == newSection) return;
             launcherSectionPrevious = launcherSection;
             launcherSection = newSection;
-            launcherSectionSwitchTime = glfwGetTime();
+            launcherSectionSwitchTime = now;
             playEditorFeedbackOneShot("Resources/Sounds/Selection Tick Main Editor.mp3", 0.85f,
                                       EditorFeedbackSoundCategory::Click);
             if (projectManager.preferences.launcherRememberLastTab &&
@@ -2317,9 +2394,9 @@ void Engine::renderLauncher() {
 
             ImGui::SetCursorScreenPos(tabMin);
             ImGui::PushID(tabs[i].index);
-            ImGui::InvisibleButton("##LauncherTab", ImVec2(tw, th));
-            const bool hovered = ImGui::IsItemHovered();
-            const bool pressed = ImGui::IsItemClicked();
+            const bool pressed = ImGui::InvisibleButton("##LauncherTab", ImVec2(tw, th),
+                                                         ImGuiButtonFlags_EnableNav);
+            const bool hovered = ImGui::IsItemHovered() || ImGui::IsItemFocused();
             ImGui::PopID();
             if (pressed) setLauncherSection(tabs[i].index);
 
@@ -2329,13 +2406,12 @@ void Engine::renderLauncher() {
             ImGuiStorage* tabStorage = ImGui::GetStateStorage();
             const ImGuiID tabAnimKey = ImGui::GetID("##tabAnim");
             float tabAnim = tabStorage->GetFloat(tabAnimKey, selected ? 1.0f : 0.0f);
-            tabAnim = SmoothApproach(tabAnim, selected ? 1.0f : (hovered ? 0.5f : 0.0f), 16.0f, frameDt);
+            tabAnim = SmoothApproach(tabAnim, selected ? 1.0f : (hovered ? 0.5f : 0.0f), 16.0f, frameDt, launcherAnimScale);
             tabStorage->SetFloat(tabAnimKey, tabAnim);
             ImGui::PopID();
 
-            const ImVec4 textCol = selected
-                ? LauncherSkin::kText
-                : (hovered ? LauncherSkin::kText : LauncherSkin::kTextDim);
+            const ImVec4 textCol = ImLerp(LauncherSkin::kTextDim, LauncherSkin::kText,
+                                          ImClamp(tabAnim * 2.0f, 0.0f, 1.0f));
             if (tabAnim > 0.004f) {
                 const ImVec2 fillMin(tabMin.x + 5.0f * uiScale, tabMin.y + 9.0f * uiScale);
                 const ImVec2 fillMax(tabMax.x - 5.0f * uiScale, tabMax.y - 6.0f * uiScale);
@@ -2356,8 +2432,8 @@ void Engine::renderLauncher() {
             const float targetX = tabXs[activeIdx] + 14.0f * uiScale;
             const float targetW = tabWidths[activeIdx] - 28.0f * uiScale;
             if (tabIndicatorVisualX < 0.0f) { tabIndicatorVisualX = targetX; tabIndicatorVisualW = targetW; }
-            tabIndicatorVisualX = SmoothApproach(tabIndicatorVisualX, targetX, 16.0f, frameDt);
-            tabIndicatorVisualW = SmoothApproach(tabIndicatorVisualW, targetW, 16.0f, frameDt);
+            tabIndicatorVisualX = SmoothApproach(tabIndicatorVisualX, targetX, 16.0f, frameDt, launcherAnimScale);
+            tabIndicatorVisualW = SmoothApproach(tabIndicatorVisualW, targetW, 16.0f, frameDt, launcherAnimScale);
 
             const float indH = 3.0f * uiScale;
             const float indY = windowPos.y + headerHeight - indH - 0.5f;
@@ -2369,7 +2445,8 @@ void Engine::renderLauncher() {
             const float motion = std::abs(targetX - tabIndicatorVisualX) +
                                  std::abs(targetW - tabIndicatorVisualW);
             const float motionT = ImClamp(motion / (48.0f * uiScale), 0.0f, 1.0f);
-            const float breathe = 0.5f + 0.5f * std::sin((float)ImGui::GetTime() * 2.0f);
+            const float breathe = launcherAnimScale <= 0.0f ? 1.0f
+                : 0.5f + 0.5f * std::sin((float)ImGui::GetTime() * 2.0f);
             const float restAlpha = ImLerp(0.62f, 0.92f, breathe);
             const float centerAlpha = ImLerp(restAlpha, 0.40f, motionT);
 
@@ -2392,17 +2469,22 @@ void Engine::renderLauncher() {
             const ImVec2 bMax(x + w, bMin.y + bh);
             ImGui::SetCursorScreenPos(bMin);
             ImGui::PushID(label);
-            ImGui::InvisibleButton("##HeaderLink", ImVec2(w, bh));
-            const bool hovered = ImGui::IsItemHovered();
-            const bool pressed = ImGui::IsItemClicked();
+            const bool pressed = ImGui::InvisibleButton("##HeaderLink", ImVec2(w, bh),
+                                                         ImGuiButtonFlags_EnableNav);
+            const bool hovered = ImGui::IsItemHovered() || ImGui::IsItemFocused();
+            ImGuiStorage* storage = ImGui::GetStateStorage();
+            const ImGuiID hoverKey = ImGui::GetID("##HeaderLinkHover");
+            const float hover = SmoothApproach(storage->GetFloat(hoverKey), hovered ? 1.0f : 0.0f,
+                                               18.0f, frameDt, launcherAnimScale);
+            storage->SetFloat(hoverKey, hover);
             ImGui::PopID();
-            if (hovered) {
+            if (hover > 0.004f) {
                 LauncherShadeRect(drawList, bMin, bMax, LauncherSkin::kCardHover,
                                   ImGuiShadeClass_Button, ImGuiShadeState_Hovered,
-                                  6.0f * uiScale);
+                                  6.0f * uiScale, hover);
             }
-            const ImU32 col = LauncherSkin::U32(hovered ? LauncherSkin::kText
-                                                        : LauncherSkin::kTextDim);
+            const ImU32 col = LauncherSkin::U32(ImLerp(LauncherSkin::kTextDim,
+                                                       LauncherSkin::kText, hover));
             const float tw = ImGui::GetFont()->CalcTextSizeA(linkFontSize, FLT_MAX, 0.0f, label).x;
             drawList->AddText(ImGui::GetFont(), linkFontSize,
                               ImVec2(x + (w - tw) * 0.5f, bMin.y + (bh - linkFontSize) * 0.5f),
@@ -2445,15 +2527,18 @@ void Engine::renderLauncher() {
         const float contentW    = windowSize.x - contentPadX * 2.0f;
         const float contentH    = windowSize.y - contentTopY - contentPadY - statusBarHeight;
 
-        // Slight slide-in offset for the active tab content during intro and tab switches.
+        // Evaluate after navigation input: the new page starts its reveal on the
+        // click frame instead of flashing fully visible and disappearing a frame later.
+        const float sectionAnimEase = LauncherPageProgress(now, launcherSectionSwitchTime, launcherAnimScale);
         const int sectionDirection = (launcherSection >= launcherSectionPrevious) ? 1 : -1;
-        const float sectionOffsetY = (1.0f - sectionAnimEase) * 24.0f * uiScale * (float)sectionDirection;
+        const float sectionOffsetX = (1.0f - sectionAnimEase) * 18.0f * uiScale * (float)sectionDirection;
         const float introContentOffset = launcherIntroFinished
             ? 0.0f
             : (1.0f - EaseOutCubic(introState.contentRevealT)) * 18.0f * uiScale;
 
-        ImGui::SetCursorPos(ImVec2(contentPadX, contentTopY + sectionOffsetY + introContentOffset));
-        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * sectionAnimEase);
+        ImGui::SetCursorPos(ImVec2(contentPadX + sectionOffsetX, contentTopY + introContentOffset));
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha,
+                            ImGui::GetStyle().Alpha * ImLerp(0.65f, 1.0f, sectionAnimEase));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, sectionInnerPadding);
         // Force transparent ChildBg for the section AND its subpanels so the rounded
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
@@ -2603,7 +2688,7 @@ void Engine::renderLauncher() {
                 for (const FilterDef& f : filters) {
                     if (LauncherRailItem(f.label, f.label, nullptr,
                                          launcherPipelineFilter == f.mode,
-                                         pipelineCounts[f.mode], uiScale)) {
+                                         pipelineCounts[f.mode], uiScale, launcherAnimScale)) {
                         launcherPipelineFilter = f.mode;
                     }
                 }
@@ -2767,7 +2852,7 @@ void Engine::renderLauncher() {
                     float rowAnim = rowStorage->GetFloat(rowAnimKey, isSelected ? 1.0f : 0.0f);
                     rowAnim = SmoothApproach(rowAnim,
                                              isSelected ? 1.0f : (hovered ? 0.62f : 0.0f),
-                                             15.0f, frameDt);
+                                             15.0f, frameDt, launcherAnimScale);
                     rowStorage->SetFloat(rowAnimKey, rowAnim);
 
                     const float radius = 6.0f * uiScale;
@@ -3200,7 +3285,7 @@ void Engine::renderLauncher() {
                 const ImGuiID tmplAnimKey = ImGui::GetID("##tmplAnim");
                 float tmplAnim = tmplStore->GetFloat(tmplAnimKey, selected ? 1.0f : 0.0f);
                 tmplAnim = SmoothApproach(tmplAnim, selected ? 1.0f : (hovered ? 0.6f : 0.0f),
-                                          15.0f, frameDt);
+                                          15.0f, frameDt, launcherAnimScale);
                 tmplStore->SetFloat(tmplAnimKey, tmplAnim);
 
                 if (tmplAnim > 0.004f) {
@@ -3292,7 +3377,7 @@ void Engine::renderLauncher() {
                 const ImGuiID tileAnimKey = ImGui::GetID("##tileAnim");
                 float tileAnim = tileStore->GetFloat(tileAnimKey, selected ? 1.0f : 0.0f);
                 tileAnim = SmoothApproach(tileAnim, selected ? 1.0f : (hovered ? 0.6f : 0.0f),
-                                          15.0f, frameDt);
+                                          15.0f, frameDt, launcherAnimScale);
                 tileStore->SetFloat(tileAnimKey, tileAnim);
 
                 LauncherShadeRect(list, tilePos, tileMax, LauncherSkin::kCard,
@@ -3764,7 +3849,7 @@ void Engine::renderLauncher() {
                 };
                 for (const CatDef& c : cats) {
                     if (LauncherRailItem(c.label, c.label, c.hint,
-                                         packageCategory == c.mode, counts[c.mode], uiScale)) {
+                                         packageCategory == c.mode, counts[c.mode], uiScale, launcherAnimScale)) {
                         packageCategory = c.mode;
                     }
                 }
@@ -3854,7 +3939,7 @@ void Engine::renderLauncher() {
                     const ImGuiID animKey = ImGui::GetID("##pkgAnim");
                     float anim = store->GetFloat(animKey, isSelected ? 1.0f : 0.0f);
                     anim = SmoothApproach(anim, isSelected ? 1.0f : (hovered ? 0.6f : 0.0f),
-                                          15.0f, frameDt);
+                                          15.0f, frameDt, launcherAnimScale);
                     store->SetFloat(animKey, anim);
 
                     LauncherShadeRect(rowDL, pos, max, LauncherSkin::kCard,
@@ -4082,7 +4167,7 @@ void Engine::renderLauncher() {
                 beginGroupPanel("##SettingsRail", ImVec2(railW, availH), "Settings");
                 for (int i = 0; i < catCount; ++i) {
                     if (LauncherRailItem(cats[i].label, cats[i].label, cats[i].hint,
-                                         settingsCategory == i, 0, uiScale)) {
+                                         settingsCategory == i, 0, uiScale, launcherAnimScale)) {
                         settingsCategory = i;
                     }
                 }
@@ -4109,9 +4194,22 @@ void Engine::renderLauncher() {
                 ImGui::Dummy(ImVec2(0.0f, 8.0f * uiScale));
             }
 
+            static int previousSettingsCategory = settingsCategory;
+            static double settingsSwitchTime = -1.0;
+            if (settingsCategory != previousSettingsCategory) {
+                previousSettingsCategory = settingsCategory;
+                settingsSwitchTime = now;
+            }
+            const float settingsReveal = LauncherPageProgress(now, settingsSwitchTime, launcherAnimScale);
+            ImGui::PushStyleVar(ImGuiStyleVar_Alpha,
+                                ImGui::GetStyle().Alpha * ImLerp(0.65f, 1.0f, settingsReveal));
+            // Each category keeps its own scroll position instead of inheriting
+            // the previous page's offset and opening halfway down its controls.
+            ImGui::PushID(settingsCategory);
             ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
             ImGui::BeginChild("##SettingsScroll", ImVec2(0.0f, -40.0f * uiScale), false);
             ImGui::PopStyleColor();
+            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (1.0f - settingsReveal) * 10.0f * uiScale);
 
             const float controlW = std::min(340.0f * uiScale,
                                             std::max(160.0f, ImGui::GetContentRegionAvail().x * 0.6f));
@@ -4675,6 +4773,8 @@ void Engine::renderLauncher() {
 
             ImGui::Dummy(ImVec2(0.0f, 8.0f * uiScale));
             ImGui::EndChild();
+            ImGui::PopID();
+            ImGui::PopStyleVar(); // settings page reveal
 
             ImGui::Separator();
             ImGui::Dummy(ImVec2(0.0f, 4.0f * uiScale));
@@ -4717,21 +4817,28 @@ void Engine::renderLauncher() {
             projectsDrawList->PushClipRect(projectsClipMin, projectsClipMax, true);
 
             auto beginProjectsSubpanel = [&](const char* id, float offsetUnits) {
-                const float eased = EaseOutCubic(projectsPanelVisual);
-                const float offsetX = (offsetUnits - eased) * projectsAvail.x;
+                const float offsetX = (offsetUnits - projectsPanelVisual) * projectsAvail.x;
                 ImGui::SetCursorPos(ImVec2(projectsRoot.x + offsetX, projectsRoot.y));
-                ImGui::BeginChild(id, projectsAvail, false,
-                                  ImGuiWindowFlags_NoScrollbar |
-                                  ImGuiWindowFlags_NoScrollWithMouse);
+                return ImGui::BeginChild(id, projectsAvail, false,
+                                         ImGuiWindowFlags_NoScrollbar |
+                                         ImGuiWindowFlags_NoScrollWithMouse);
             };
 
-            beginProjectsSubpanel("ProjectsListPanel", 0.0f);
-            renderProjectsView();
-            ImGui::EndChild();
+            // Render only visible panels. In particular, the hidden creation
+            // form must not scan templates or handle input on the project list.
+            if (projectsPanelVisual < 1.0f) {
+                ImGui::BeginDisabled(projectManager.showNewProjectDialog);
+                if (beginProjectsSubpanel("ProjectsListPanel", 0.0f)) renderProjectsView();
+                ImGui::EndChild();
+                ImGui::EndDisabled();
+            }
 
-            beginProjectsSubpanel("ProjectsNewPanel", 1.0f);
-            renderNewProjectView();
-            ImGui::EndChild();
+            if (projectsPanelVisual > 0.0f) {
+                ImGui::BeginDisabled(!projectManager.showNewProjectDialog);
+                if (beginProjectsSubpanel("ProjectsNewPanel", 1.0f)) renderNewProjectView();
+                ImGui::EndChild();
+                ImGui::EndDisabled();
+            }
 
             projectsDrawList->PopClipRect();
         } else if (launcherSection == 1) {
@@ -4829,17 +4936,32 @@ void Engine::renderLauncher() {
             }
 
             // Center layout: logo sits to the left of the text, group is centered.
+            // Laid out against the launcher window rect, not the raw viewport
+            // size: the overlay draws in absolute coordinates, so leaving out
+            // windowPos parks the whole group up and left of the window by
+            // however far the window sits from the desktop origin - invisible on
+            // a viewport pinned at 0,0, plainly wrong on a floating window.
             const float centerLogoSize = centerFontSize * 1.18f;
             const float centerLogoGap  = 18.0f * uiScale;
             const float centerGroupW   = centerLogoSize + centerLogoGap + centerTotalWidth;
-            const ImVec2 centerOrigin(displaySize.x * 0.5f - centerGroupW * 0.5f,
-                                      displaySize.y * 0.40f);
+            const ImVec2 centerOrigin(windowPos.x + windowSize.x * 0.5f - centerGroupW * 0.5f,
+                                      windowPos.y + windowSize.y * 0.40f);
             const ImVec2 centerLogoMin(centerOrigin.x,
                                        centerOrigin.y + (centerFontSize - centerLogoSize) * 0.5f);
             const ImVec2 centerTextPos (centerOrigin.x + centerLogoSize + centerLogoGap,
                                         centerOrigin.y);
 
-            // Logo: fades in during fadeIn phase (before letters pop in), then drifts to header pos.
+            // Rolling to the corner, for the logo and for every letter: the piece
+            // turns as if it were rolling along the path instead of sliding down
+            // it. Travel is leftward, so the turn count is negative (anticlockwise
+            // on screen) and is rounded to whole revolutions - that way a piece
+            // lands upright however far it had to come.
+            auto rollTurns = [](float travelX, float radius) -> float {
+                const float circumference = 2.0f * IM_PI * std::max(6.0f, radius);
+                return ImClamp(std::round(travelX / circumference), -3.0f, -1.0f);
+            };
+
+            // Logo: fades in during fadeIn phase (before letters fly in), then rolls to header pos.
             const float logoFadeT = ImClamp(introState.elapsed / std::max(0.0001f, introTimings.fadeIn), 0.0f, 1.0f);
             const float logoFadeAlpha = EaseOutCubic(logoFadeT);
             const float driftEase = introState.driftEase;
@@ -4848,56 +4970,155 @@ void Engine::renderLauncher() {
                 const ImVec2 lMin(
                     ImLerp(centerLogoMin.x, headerLogoPos.x, driftEase),
                     ImLerp(centerLogoMin.y, headerLogoPos.y, driftEase));
-                const ImVec2 lMax(lMin.x + logoSize, lMin.y + logoSize);
-                const float lAlpha = logoFadeAlpha * ImLerp(1.0f, 1.0f, driftEase);
-                overlay->AddImage(logoTexId, lMin, lMax, logoUvMin, logoUvMax,
-                                  ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, lAlpha)));
+                const ImVec2 lCenter(lMin.x + logoSize * 0.5f, lMin.y + logoSize * 0.5f);
+                const float lAlpha = logoFadeAlpha;
+                const float lAngle = rollTurns(headerLogoPos.x - centerLogoMin.x, centerLogoSize * 0.5f)
+                                   * 2.0f * IM_PI * driftEase;
+                const float lCos = std::cos(lAngle);
+                const float lSin = std::sin(lAngle);
+                const float lHalf = logoSize * 0.5f;
+                auto logoCorner = [&](float ox, float oy) -> ImVec2 {
+                    return ImVec2(lCenter.x + ox * lCos - oy * lSin,
+                                  lCenter.y + ox * lSin + oy * lCos);
+                };
+                overlay->AddImageQuad(logoTexId,
+                                      logoCorner(-lHalf, -lHalf), logoCorner(lHalf, -lHalf),
+                                      logoCorner(lHalf, lHalf), logoCorner(-lHalf, lHalf),
+                                      ImVec2(logoUvMin.x, logoUvMin.y), ImVec2(logoUvMax.x, logoUvMin.y),
+                                      ImVec2(logoUvMax.x, logoUvMax.y), ImVec2(logoUvMin.x, logoUvMax.y),
+                                      ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, lAlpha)));
             }
 
-            // Letters: each pops in beside the logo with a slight delay, then drifts to header text.
+            // Letters: the word assembles itself a piece at a time. Each glyph is
+            // thrown in from its own point offscreen, tumbling, snaps into its
+            // slot with a short overhit, and once the whole word stands it rolls
+            // off to the header brand alongside the logo.
+            //
+            // The table is in assembly order, so entry i is both the i-th letter
+            // of "Modularity" and the i-th piece to arrive.
+            //   spawn    - launch point in viewport fractions, pushed outside 0..1
+            //   approach - direction the letter is travelling when it touches
+            //              down. It doubles as the curve's control handle, so a
+            //              letter that lands moving left sweeps in from the right
+            //              rather than flying a straight line, and the overhit
+            //              carries along the same vector.
+            //   spin     - turns of tumble over the flight, unwound to upright.
+            struct LetterEntry { ImVec2 spawn; ImVec2 approach; float spin; };
+            static constexpr LetterEntry kEntries[] = {
+                /* M */ { ImVec2( 0.05f, -0.14f), ImVec2( 0.10f,  1.00f), -0.62f },
+                /* o */ { ImVec2( 0.24f,  1.14f), ImVec2( 0.18f, -1.00f),  0.48f },
+                /* d */ { ImVec2( 0.60f,  1.14f), ImVec2( 0.45f, -1.00f), -0.55f },
+                /* u */ { ImVec2( 1.14f,  0.33f), ImVec2(-0.85f,  0.55f),  0.70f },
+                /* l */ { ImVec2( 1.14f,  0.61f), ImVec2(-1.00f, -0.22f), -0.40f },
+                /* a */ { ImVec2( 0.64f, -0.14f), ImVec2(-0.12f,  1.00f),  0.58f },
+                /* r */ { ImVec2( 0.65f,  1.14f), ImVec2(-1.00f,  0.18f), -0.75f },
+                /* i */ { ImVec2(-0.14f,  0.72f), ImVec2( 0.62f, -1.00f),  0.50f },
+                /* t */ { ImVec2(-0.14f,  0.15f), ImVec2( 0.05f,  1.00f), -0.45f },
+                /* y */ { ImVec2( 1.14f, -0.14f), ImVec2(-0.45f,  1.00f),  0.66f },
+            };
+            constexpr int kEntryCount = IM_ARRAYSIZE(kEntries);
+            // Keeps LauncherIntroTimings::letters honest - it is what holds the
+            // roll-out back until the last entry here has finished its flight.
+            static_assert(kEntryCount == LauncherIntroTimings{}.letters,
+                          "intro entry table and LauncherIntroTimings::letters must agree");
+
+            const float flightDur    = std::max(0.0001f, introTimings.popIn);
+            const float snapPoint    = 0.76f;            // flight fraction spent reaching the slot
+            const float entryScale   = 1.55f;            // size a letter launches at; 1.0 is its final size
+            const float overhitPx    = 13.0f * uiScale;  // how far past the slot the snap carries
+            const float overhitSpin  = 0.055f;           // turns rolled past upright on the overhit
+            const float overhitScale = 0.04f;            // size pop on the snap, on top of entryScale
+            const float driftDelayStep = 0.022f;
+
             float centerAdvanceX = 0.0f;
             float headerAdvanceX = 0.0f;
             int index = 0;
             const int totalLetters = static_cast<int>(std::strlen(title));
-            const float popDelayStep = 0.055f;
-            const float driftDelayStep = 0.022f;
             for (const char* c = title; *c; ++c, ++index) {
                 char letter[2] = { *c, 0 };
-                const float popDelay = (totalLetters > 1) ? (popDelayStep * (float)index) : 0.0f;
-                const float popInput = ImClamp(
-                    (introState.elapsed - introTimings.fadeIn - popDelay) / std::max(0.0001f, introTimings.popIn),
-                    0.0f, 1.0f);
-                const float popEase  = EaseOutBack(popInput);
-                const float popAlpha = EaseOutCubic(popInput);
+                const float centerWidth = font->CalcTextSizeA(centerFontSize, FLT_MAX, 0.0f, letter).x;
+                const float headerWidth = font->CalcTextSizeA(headerFontSize, FLT_MAX, 0.0f, letter).x;
+                const ImVec2 centerLetterPos(centerTextPos.x + centerAdvanceX, centerTextPos.y);
+                const ImVec2 headerLetterPos(headerTextPos.x + headerAdvanceX, headerTextPos.y);
+                // Advance now so the not-yet-launched skip below cannot shift the
+                // letters that follow it.
+                centerAdvanceX += centerWidth;
+                headerAdvanceX += headerWidth;
 
+                const LetterEntry& entry = kEntries[index % kEntryCount];
+
+                // --- Flight in ---------------------------------------------------
+                const float launchDelay = (totalLetters > 1) ? (introTimings.stagger * (float)index) : 0.0f;
+                const float flightT = ImClamp(
+                    (introState.elapsed - introTimings.fadeIn - launchDelay) / flightDur, 0.0f, 1.0f);
+                if (flightT <= 0.0f) continue;  // this piece has not been thrown yet
+
+                const float approachT = ImClamp(flightT / snapPoint, 0.0f, 1.0f);
+                const float pathT = EaseOutCubic(approachT);
+                const float snapT = LauncherSnapPulse(flightT, snapPoint);
+
+                const ImVec2 spawnPos(windowPos.x + windowSize.x * entry.spawn.x,
+                                      windowPos.y + windowSize.y * entry.spawn.y);
+                const float travelX = centerLetterPos.x - spawnPos.x;
+                const float travelY = centerLetterPos.y - spawnPos.y;
+                const float travelLen = std::sqrt(travelX * travelX + travelY * travelY);
+                const float approachLen = std::sqrt(entry.approach.x * entry.approach.x +
+                                                    entry.approach.y * entry.approach.y);
+                const ImVec2 approachDir = (approachLen > 0.0001f)
+                    ? ImVec2(entry.approach.x / approachLen, entry.approach.y / approachLen)
+                    : ImVec2(0.0f, 1.0f);
+
+                // Quadratic Bezier whose control point sits back along the approach
+                // vector: that single handle both bends the path into an arc and
+                // fixes the heading at touchdown.
+                const ImVec2 ctrl(centerLetterPos.x - approachDir.x * travelLen * 0.34f,
+                                  centerLetterPos.y - approachDir.y * travelLen * 0.34f);
+                const float invT = 1.0f - pathT;
+                const ImVec2 flightPos(
+                    invT * invT * spawnPos.x + 2.0f * invT * pathT * ctrl.x + pathT * pathT * centerLetterPos.x,
+                    invT * invT * spawnPos.y + 2.0f * invT * pathT * ctrl.y + pathT * pathT * centerLetterPos.y);
+                // Overhit: a little past the slot along the approach, then straight back.
+                const ImVec2 snappedPos(flightPos.x + approachDir.x * overhitPx * snapT,
+                                        flightPos.y + approachDir.y * overhitPx * snapT);
+
+                // Unwind the tumble into the slot, then let the overhit carry the
+                // spin a touch past upright in the same direction before it settles.
+                const float flightSpin =
+                    (entry.spin * (1.0f - pathT) - ImSign(entry.spin) * overhitSpin * snapT) * 2.0f * IM_PI;
+                // Size: the piece comes in oversized and shrinks to fit, hitting
+                // exactly 1.0 as it lands, so it reads as a part being seated into
+                // its slot. Driven off the raw approach fraction rather than pathT,
+                // and squared: pathT is eased out and is already ~0.9 halfway
+                // through, which would spend the size long before the letter is
+                // anywhere near the slot. Squaring holds it large through the
+                // approach and does the shrinking at the end, where the slot is.
+                const float flightScale =
+                    ImLerp(entryScale, 1.0f, approachT * approachT) + overhitScale * snapT;
+                const float flightAlpha = ImClamp(flightT / (snapPoint * 0.45f), 0.0f, 1.0f);
+
+                // --- Roll out to the header --------------------------------------
                 const float driftDelay = (totalLetters > 1) ? (driftDelayStep * (float)index) : 0.0f;
                 const float driftInput = ImClamp(
                     (introState.driftT - driftDelay) / std::max(0.0001f, 1.0f - driftDelay),
                     0.0f, 1.0f);
                 const float driftL = EaseInOutCubic(driftInput);
+                const float rollAngle = rollTurns(headerLetterPos.x - centerLetterPos.x,
+                                                  centerFontSize * 0.5f) * 2.0f * IM_PI * driftL;
 
-                const float centerWidth = font->CalcTextSizeA(centerFontSize, FLT_MAX, 0.0f, letter).x;
-                const float headerWidth = font->CalcTextSizeA(headerFontSize, FLT_MAX, 0.0f, letter).x;
-                const ImVec2 centerLetterPos(centerTextPos.x + centerAdvanceX, centerTextPos.y);
-                const ImVec2 headerLetterPos(headerTextPos.x + headerAdvanceX, headerTextPos.y);
-
-                const float popScale = std::max(0.05f, 0.34f + 0.66f * popEase);
-                const float popSize  = centerFontSize * popScale;
-                const ImVec2 spawnPos(centerLetterPos.x, centerLetterPos.y + (1.0f - popAlpha) * 22.0f * uiScale);
-                const ImVec2 popPos(
-                    ImLerp(spawnPos.x, centerLetterPos.x, popAlpha),
-                    ImLerp(spawnPos.y, centerLetterPos.y, popAlpha));
-
-                const float letterSize = ImLerp(popSize, headerFontSize, driftL);
+                const float letterSize = ImLerp(centerFontSize, headerFontSize, driftL);
                 const ImVec2 letterPos(
-                    ImLerp(popPos.x, headerLetterPos.x, driftL),
-                    ImLerp(popPos.y, headerLetterPos.y, driftL));
-                const float letterAlpha = introState.textAlpha * popAlpha * ImLerp(0.92f, 1.0f, driftL);
+                    ImLerp(snappedPos.x, headerLetterPos.x, driftL),
+                    ImLerp(snappedPos.y, headerLetterPos.y, driftL));
+                // Wrapped because the roll is a whole number of revolutions: the
+                // angle comes out at exactly zero once the letter is parked, so
+                // the resting frames take the crisp AddText path.
+                const float letterAngle =
+                    std::fmod(flightSpin * (1.0f - driftL) + rollAngle, 2.0f * IM_PI);
+                const float letterScale = ImLerp(flightScale, 1.0f, driftL);
+                const float letterAlpha = introState.textAlpha * flightAlpha * ImLerp(0.92f, 1.0f, driftL);
                 const ImU32 textCol = ImGui::GetColorU32(ImVec4(baseCol.x, baseCol.y, baseCol.z, letterAlpha));
-                overlay->AddText(font, letterSize, letterPos, textCol, letter);
-
-                centerAdvanceX += centerWidth;
-                headerAdvanceX += headerWidth;
+                LauncherDrawIntroGlyph(overlay, font, letterSize, letterPos, letterAngle,
+                                       letterScale, textCol, *c);
             }
         }
 

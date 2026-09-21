@@ -8339,6 +8339,19 @@ void Engine::renderViewport() {
                         false, toolbarWindowFlags);
       ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
                           ImVec2(toolbarSpacing, toolbarSpacing));
+      // The custom buttons below flatten their fills over the panel tone; the stock widgets
+      // sharing this toolbar (the snap drag field, the settings arrow, the mode buttons) used
+      // the global style colors instead and read as unshaded holes next to them. Hand them
+      // the same palette so the shade theme draws them like every other button and frame.
+      ImGui::PushStyleColor(ImGuiCol_Button, baseCol);
+      ImGui::PushStyleColor(ImGuiCol_ButtonHovered, hoverCol);
+      ImGui::PushStyleColor(ImGuiCol_ButtonActive, activeCol);
+      // Input frames sit a shade below the buttons so they read as recessed, the way the
+      // rest of the editor's fields do.
+      ImGui::PushStyleColor(ImGuiCol_FrameBg, GizmoToolbar::ScaleColor(baseCol, 0.80f));
+      ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, GizmoToolbar::ScaleColor(hoverCol, 0.86f));
+      ImGui::PushStyleColor(ImGuiCol_FrameBgActive, GizmoToolbar::ScaleColor(activeCol, 0.92f));
+      ImGui::PushStyleColor(ImGuiCol_Text, textCol);
       ImGui::PushClipRect(imageMin, imageMax, false);
 
       ImDrawList *toolbarDrawList = ImGui::GetWindowDrawList();
@@ -8348,11 +8361,44 @@ void Engine::renderViewport() {
 
       ImGui::BeginGroup();
 
+      // Authored toolbar art, point-sampled so IconButton can draw it pixel-for-pixel.
+      // Anything without a PNG, or whose PNG fails to load, falls through to the vector
+      // drawing inside GizmoToolbar.
+      auto resolveToolbarIcon =
+          [&](GizmoToolbar::Icon icon) -> GizmoToolbar::IconTexture {
+        const char *iconPath = GizmoToolbar::IconTexturePath(icon);
+        if (!iconPath || !*iconPath) {
+          return {};
+        }
+        if (rendererInitialized) {
+          if (Texture *tex = renderer.getTexture(
+                  iconPath, MaterialProperties::TextureFilter::Point);
+              tex && tex->GetID()) {
+            return {static_cast<ImTextureID>(tex->GetID()),
+                    ImVec2(static_cast<float>(tex->GetWidth()),
+                           static_cast<float>(tex->GetHeight())),
+                    true};
+          }
+        }
+        if (hasVulkanSceneTexture && vulkanRenderer) {
+          ImTextureID vkIcon = vulkanRenderer->getOrCreateUIImage(iconPath);
+          if (vkIcon != static_cast<ImTextureID>(0)) {
+            return {vkIcon, ImVec2(0.0f, 0.0f), false};
+          }
+        }
+        return {};
+      };
+
+      auto toolbarIconButton = [&](const char *id, GizmoToolbar::Icon icon,
+                                   bool active) {
+        return GizmoToolbar::IconButton(id, icon, active, gizmoIconButtonSize,
+                                        baseBtn, hoverBtn, activeBtn, accent,
+                                        iconColor, resolveToolbarIcon(icon));
+      };
+
       auto gizmoButton = [&](const char *id, GizmoToolbar::Icon icon,
                              ImGuizmo::OPERATION op, const char *tooltip) {
-        if (GizmoToolbar::IconButton(id, icon, mCurrentGizmoOperation == op,
-                                     gizmoIconButtonSize, baseBtn, hoverBtn,
-                                     activeBtn, accent, iconColor)) {
+        if (toolbarIconButton(id, icon, mCurrentGizmoOperation == op)) {
           mCurrentGizmoOperation = op;
         }
         if (ImGui::IsItemHovered()) {
@@ -8605,20 +8651,16 @@ void Engine::renderViewport() {
                     ImGuizmo::UNIVERSAL, "Universal");
 
         ImGui::SameLine(0.0f, toolbarSpacing * 1.25f);
-        if (GizmoToolbar::IconButton(
-                "##mode_local", GizmoToolbar::Icon::LocalMode,
-                mCurrentGizmoMode == ImGuizmo::LOCAL, gizmoIconButtonSize,
-                baseBtn, hoverBtn, activeBtn, accent, iconColor)) {
+        if (toolbarIconButton("##mode_local", GizmoToolbar::Icon::LocalMode,
+                              mCurrentGizmoMode == ImGuizmo::LOCAL)) {
           mCurrentGizmoMode = ImGuizmo::LOCAL;
         }
         if (ImGui::IsItemHovered()) {
           ImGui::SetTooltip("Local");
         }
         ImGui::SameLine(0.0f, toolbarSpacing * 0.8f);
-        if (GizmoToolbar::IconButton(
-                "##mode_world", GizmoToolbar::Icon::WorldMode,
-                mCurrentGizmoMode == ImGuizmo::WORLD, gizmoIconButtonSize,
-                baseBtn, hoverBtn, activeBtn, accent, iconColor)) {
+        if (toolbarIconButton("##mode_world", GizmoToolbar::Icon::WorldMode,
+                              mCurrentGizmoMode == ImGuizmo::WORLD)) {
           mCurrentGizmoMode = ImGuizmo::WORLD;
         }
         if (ImGui::IsItemHovered()) {
@@ -8629,20 +8671,16 @@ void Engine::renderViewport() {
       if (use2DGizmos) {
         ImGui::SameLine(0.0f, toolbarSpacing * 1.25f);
         const bool freeform = world2DEditMode == World2DEditMode::Freeform;
-        if (GizmoToolbar::ModeButton("Freeform", freeform, ImVec2(72, 24),
-                                     ImGui::GetStyleColorVec4(ImGuiCol_Button),
-                                     ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive),
-                                     ImGui::GetStyleColorVec4(ImGuiCol_Text))) {
+        if (toolbarIconButton("##mode_freeform",
+                              GizmoToolbar::Icon::FreeformMode, freeform)) {
           world2DEditMode = World2DEditMode::Freeform;
         }
         if (ImGui::IsItemHovered()) {
           ImGui::SetTooltip("Freeform: place and transform sprites and SceneOBJs anywhere.");
         }
-        ImGui::SameLine(0.0f, 2.0f);
-        if (GizmoToolbar::ModeButton("Assemblage", !freeform, ImVec2(88, 24),
-                                     ImGui::GetStyleColorVec4(ImGuiCol_Button),
-                                     ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive),
-                                     ImGui::GetStyleColorVec4(ImGuiCol_Text))) {
+        ImGui::SameLine(0.0f, toolbarSpacing * 0.8f);
+        if (toolbarIconButton("##mode_assemblage",
+                              GizmoToolbar::Icon::AssemblageMode, !freeform)) {
           world2DEditMode = World2DEditMode::Assemblage;
           showAssemblageWindow = true;
         }
@@ -8653,10 +8691,8 @@ void Engine::renderViewport() {
 
       ImGui::SameLine(0.0f, toolbarSpacing);
       bool snapActive = use2DGizmos ? pixelGridSnapEnabled : useSnap;
-      if (GizmoToolbar::IconButton("##snap_toggle",
-                                   GizmoToolbar::Icon::SnapToggle, snapActive,
-                                   gizmoIconButtonSize, baseBtn, hoverBtn,
-                                   activeBtn, accent, iconColor)) {
+      if (toolbarIconButton("##snap_toggle", GizmoToolbar::Icon::SnapToggle,
+                            snapActive)) {
         if (use2DGizmos) {
           pixelGridSnapEnabled = !pixelGridSnapEnabled;
         } else {
@@ -8689,10 +8725,8 @@ void Engine::renderViewport() {
 
       bool toolbarEditorSettingsChanged = false;
       ImGui::SameLine(0.0f, toolbarSpacing * 1.25f);
-      if (GizmoToolbar::IconButton(
-              "##gizmo_toggle", GizmoToolbar::Icon::GizmoToggle,
-              showSceneGizmos, gizmoIconButtonSize, baseBtn, hoverBtn,
-              activeBtn, accent, iconColor)) {
+      if (toolbarIconButton("##gizmo_toggle", GizmoToolbar::Icon::GizmoToggle,
+                            showSceneGizmos)) {
         showSceneGizmos = !showSceneGizmos;
         toolbarEditorSettingsChanged = true;
       }
@@ -8780,10 +8814,9 @@ void Engine::renderViewport() {
       }
       ImGui::SameLine(0.0f, toolbarSpacing * 0.8f);
       if (use2DGizmos) {
-        if (GizmoToolbar::IconButton(
-                "##grid_toggle_2d", GizmoToolbar::Icon::GridToggle,
-                showUIWorldGrid, gizmoIconButtonSize, baseBtn, hoverBtn,
-                activeBtn, accent, iconColor)) {
+        if (toolbarIconButton("##grid_toggle_2d",
+                              GizmoToolbar::Icon::GridToggle,
+                              showUIWorldGrid)) {
           showUIWorldGrid = !showUIWorldGrid;
           toolbarEditorSettingsChanged = true;
         }
@@ -8791,10 +8824,8 @@ void Engine::renderViewport() {
           ImGui::SetTooltip("Toggle 2D grid");
         }
       } else {
-        if (GizmoToolbar::IconButton(
-                "##grid_toggle", GizmoToolbar::Icon::GridToggle,
-                showSceneGrid3D, gizmoIconButtonSize, baseBtn, hoverBtn,
-                activeBtn, accent, iconColor)) {
+        if (toolbarIconButton("##grid_toggle", GizmoToolbar::Icon::GridToggle,
+                              showSceneGrid3D)) {
           showSceneGrid3D = !showSceneGrid3D;
           toolbarEditorSettingsChanged = true;
         }
@@ -8806,11 +8837,9 @@ void Engine::renderViewport() {
       const bool uiWorldToggleActive =
           project2DPipeline ? uiCanvasPreviewEnabled
                             : (uiCanvasPreviewEnabled && uiWorldMode);
-      if (GizmoToolbar::IconButton("##ui_world_toggle",
-                                   GizmoToolbar::Icon::UiWorldToggle,
-                                   uiWorldToggleActive, gizmoIconButtonSize,
-                                   baseBtn, hoverBtn, activeBtn, accent,
-                                   iconColor)) {
+      if (toolbarIconButton("##ui_world_toggle",
+                            GizmoToolbar::Icon::UiWorldToggle,
+                            uiWorldToggleActive)) {
         if (project2DPipeline) {
           uiCanvasPreviewEnabled = !uiCanvasPreviewEnabled;
         } else {
@@ -8842,8 +8871,9 @@ void Engine::renderViewport() {
 
       splitter.SetCurrentChannel(toolbarDrawList, 0);
       float rounding = 10.0f;
-      toolbarDrawList->AddRectFilled(bgMin, bgMax, toolbarBg, rounding,
-                                     ImDrawFlags_RoundCornersAll);
+      ImGui::ShadeRect(toolbarDrawList, bgMin, bgMax, toolbarBg,
+                       ImGuiShadeClass_MenuBar, ImGuiShadeState_Normal, rounding,
+                       ImDrawFlags_RoundCornersAll);
       toolbarDrawList->AddRect(bgMin, bgMax, toolbarOutline, rounding,
                                ImDrawFlags_RoundCornersAll, 1.5f);
 
@@ -8859,6 +8889,7 @@ void Engine::renderViewport() {
         blockSelection = true;
       }
       ImGui::PopClipRect();
+      ImGui::PopStyleColor(7);
       ImGui::PopStyleVar();
       ImGui::EndChild();
       ImGui::PopStyleVar();
@@ -8909,8 +8940,9 @@ void Engine::renderViewport() {
       const ImVec2 modeBgMin = modeToolbarMin;
       const ImVec2 modeBgMax(modeToolbarMin.x + modeToolbarSize.x,
                              modeToolbarMin.y + modeToolbarSize.y);
-      modeDrawList->AddRectFilled(modeBgMin, modeBgMax, toolbarBg, 10.0f,
-                                  ImDrawFlags_RoundCornersAll);
+      ImGui::ShadeRect(modeDrawList, modeBgMin, modeBgMax, toolbarBg,
+                       ImGuiShadeClass_MenuBar, ImGuiShadeState_Normal, 10.0f,
+                       ImDrawFlags_RoundCornersAll);
       modeDrawList->AddRect(modeBgMin, modeBgMax, toolbarOutline, 10.0f,
                             ImDrawFlags_RoundCornersAll, 1.5f);
 
@@ -8926,13 +8958,9 @@ void Engine::renderViewport() {
         const ImVec2 max = ImGui::GetItemRectMax();
 
         const ImU32 bg = active ? activeBtn : (hovered ? hoverBtn : baseBtn);
-        const ImVec4 bgFloat = ImGui::ColorConvertU32ToFloat4(bg);
-        const ImU32 top =
-            ImGui::GetColorU32(GizmoToolbar::ScaleColor(bgFloat, 1.06f));
-        const ImU32 bottom =
-            ImGui::GetColorU32(GizmoToolbar::ScaleColor(bgFloat, 0.94f));
-        modeDrawList->AddRectFilledMultiColor(min, max, top, top, bottom,
-                                              bottom);
+        ImGui::ShadeRect(modeDrawList, min, max, bg, ImGuiShadeClass_Button,
+                         ImGui::ShadeStateFromInteraction(hovered, ImGui::IsItemActive(), active),
+                         8.0f);
         modeDrawList->AddRect(
             min, max,
             ImGui::GetColorU32(

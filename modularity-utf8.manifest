@@ -12,11 +12,20 @@
   With CP_ACP = UTF-8 the conversion is lossless and cannot fail, so those calls
   become safe, and the narrow *A Win32 entry points (plus fopen, which stb_image
   and other vendored libraries use) interpret the same bytes correctly.
+
+  Also opts into Win32 long paths (Windows 10 1607+). Without longPathAware the
+  file APIs stay capped at MAX_PATH (259 usable characters) even when the
+  LongPathsEnabled registry policy is on, and export staging copies Assets under
+  Builds/<name>-<version>-<platform>/_runtime_stage, which adds ~50 characters
+  to every asset path - deep asset-store packs cross the limit and copy_file fails
+  with ERROR_PATH_NOT_FOUND. Machines without the registry policy still get the
+  old limit; this only removes the process-side half of the opt-in.
 -->
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>
       <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
     </windowsSettings>
   </application>
 </assembly>

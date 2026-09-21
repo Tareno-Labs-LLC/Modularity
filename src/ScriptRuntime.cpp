@@ -13,6 +13,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <iterator>
 #include <sstream>
@@ -292,6 +293,241 @@ bool prepareShadowScriptBinary(const fs::path& binaryPath, fs::path& outShadowPa
 
     return true;
 }
+
+#if defined(_WIN32)
+template <typename T>
+bool readPeStruct(const std::vector<uint8_t>& bytes, size_t offset, T& out) {
+    if (offset > bytes.size() || sizeof(T) > bytes.size() - offset) return false;
+    std::memcpy(&out, bytes.data() + offset, sizeof(T));
+    return true;
+}
+
+template <typename T>
+void writePeStruct(std::vector<uint8_t>& bytes, size_t offset, const T& value) {
+    std::memcpy(bytes.data() + offset, &value, sizeof(T));
+}
+
+uint64_t alignPeValue(uint64_t value, uint64_t alignment) {
+    return alignment == 0 ? value : (value + alignment - 1) / alignment * alignment;
+}
+
+std::string lowerAscii(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value;
+}
+
+template <typename OptionalHeader>
+bool retargetHostImportsInImage(std::vector<uint8_t>& bytes,
+                                size_t fileHeaderOffset,
+                                const std::string& hostName,
+                                bool& changed,
+                                std::string& error) {
+    IMAGE_FILE_HEADER fileHeader{};
+    OptionalHeader optional{};
+    const size_t optionalOffset = fileHeaderOffset + sizeof(IMAGE_FILE_HEADER);
+    if (!readPeStruct(bytes, fileHeaderOffset, fileHeader) ||
+        fileHeader.SizeOfOptionalHeader < sizeof(OptionalHeader) ||
+        !readPeStruct(bytes, optionalOffset, optional)) {
+        error = "truncated PE headers";
+        return false;
+    }
+    if (optional.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT ||
+        optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress == 0) {
+        return true;
+    }
+
+    const size_t sectionTableOffset = optionalOffset + fileHeader.SizeOfOptionalHeader;
+    std::vector<IMAGE_SECTION_HEADER> sections(fileHeader.NumberOfSections);
+    for (size_t i = 0; i < sections.size(); ++i) {
+        if (!readPeStruct(bytes, sectionTableOffset + i * sizeof(IMAGE_SECTION_HEADER), sections[i])) {
+            error = "truncated section table";
+            return false;
+        }
+    }
+    auto rvaToOffset = [&](DWORD rva, size_t& out) {
+        for (const IMAGE_SECTION_HEADER& section : sections) {
+            const DWORD span = std::max(section.Misc.VirtualSize, section.SizeOfRawData);
+            if (rva < section.VirtualAddress || rva - section.VirtualAddress >= span) continue;
+            const DWORD delta = rva - section.VirtualAddress;
+            if (delta >= section.SizeOfRawData) return false;
+            out = static_cast<size_t>(section.PointerToRawData) + delta;
+            return out < bytes.size();
+        }
+        return false;
+    };
+
+    const std::string hostKey = lowerAscii(hostName);
+    std::vector<size_t> hostDescriptors;
+    size_t descriptorOffset = 0;
+    if (!rvaToOffset(optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress, descriptorOffset)) {
+        error = "import directory outside any section";
+        return false;
+    }
+    for (;; descriptorOffset += sizeof(IMAGE_IMPORT_DESCRIPTOR)) {
+        IMAGE_IMPORT_DESCRIPTOR descriptor{};
+        if (!readPeStruct(bytes, descriptorOffset, descriptor)) {
+            error = "truncated import directory";
+            return false;
+        }
+        if (descriptor.Name == 0 && descriptor.FirstThunk == 0) break;
+        size_t nameOffset = 0;
+        if (!rvaToOffset(descriptor.Name, nameOffset)) {
+            error = "import name outside any section";
+            return false;
+        }
+        std::string name;
+        for (size_t i = nameOffset; i < bytes.size() && bytes[i] != 0; ++i) {
+            name.push_back(static_cast<char>(bytes[i]));
+        }
+        const std::string key = lowerAscii(name);
+        // A DLL can only import from an .exe when that exe is its host, so any .exe import is the
+        // engine's - whichever executable the import library happened to come from.
+        if (key.size() > 4 && key.compare(key.size() - 4, 4, ".exe") == 0 && key != hostKey) {
+            hostDescriptors.push_back(descriptorOffset);
+        }
+    }
+    if (hostDescriptors.empty()) return true;
+
+    if (optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY].VirtualAddress != 0) {
+        error = "binary is signed; appending a section would invalidate it";
+        return false;
+    }
+    const size_t newHeaderOffset = sectionTableOffset + sections.size() * sizeof(IMAGE_SECTION_HEADER);
+    DWORD firstRawData = optional.SizeOfHeaders;
+    for (const IMAGE_SECTION_HEADER& section : sections) {
+        if (section.SizeOfRawData != 0 && section.PointerToRawData != 0) {
+            firstRawData = std::min(firstRawData, section.PointerToRawData);
+        }
+    }
+    if (newHeaderOffset + sizeof(IMAGE_SECTION_HEADER) > firstRawData) {
+        error = "no room in the PE headers for another section";
+        return false;
+    }
+    for (size_t i = newHeaderOffset; i < newHeaderOffset + sizeof(IMAGE_SECTION_HEADER); ++i) {
+        if (bytes[i] != 0) {
+            error = "PE header slack is not empty";
+            return false;
+        }
+    }
+
+    // The host name can be longer than the one it replaces, so it lives in its own section.
+    const std::string payload = hostName + '\0';
+    const uint64_t rawOffset = alignPeValue(bytes.size(), optional.FileAlignment);
+    const uint64_t rawSize = alignPeValue(payload.size(), optional.FileAlignment);
+    const uint64_t virtualAddress = alignPeValue(optional.SizeOfImage, optional.SectionAlignment);
+    const uint64_t imageSize = alignPeValue(virtualAddress + payload.size(), optional.SectionAlignment);
+    if (rawOffset + rawSize > 0xFFFFFFFFull || imageSize > 0xFFFFFFFFull) {
+        error = "image too large to extend";
+        return false;
+    }
+
+    IMAGE_SECTION_HEADER added{};
+    std::memcpy(added.Name, ".modhost", IMAGE_SIZEOF_SHORT_NAME);
+    added.Misc.VirtualSize = static_cast<DWORD>(payload.size());
+    added.VirtualAddress = static_cast<DWORD>(virtualAddress);
+    added.SizeOfRawData = static_cast<DWORD>(rawSize);
+    added.PointerToRawData = static_cast<DWORD>(rawOffset);
+    added.Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ;
+
+    bytes.resize(static_cast<size_t>(rawOffset + rawSize), 0);
+    std::memcpy(bytes.data() + rawOffset, payload.data(), payload.size());
+    writePeStruct(bytes, newHeaderOffset, added);
+
+    fileHeader.NumberOfSections = static_cast<WORD>(fileHeader.NumberOfSections + 1);
+    writePeStruct(bytes, fileHeaderOffset, fileHeader);
+    optional.SizeOfImage = static_cast<DWORD>(imageSize);
+    optional.SizeOfInitializedData += static_cast<DWORD>(rawSize);
+    optional.CheckSum = 0;
+    // Bound-import data records the old module name and timestamp; drop it so the loader binds fresh.
+    optional.DataDirectory[IMAGE_DIRECTORY_ENTRY_BOUND_IMPORT] = IMAGE_DATA_DIRECTORY{};
+    writePeStruct(bytes, optionalOffset, optional);
+
+    for (size_t offset : hostDescriptors) {
+        IMAGE_IMPORT_DESCRIPTOR descriptor{};
+        readPeStruct(bytes, offset, descriptor);
+        descriptor.Name = static_cast<DWORD>(virtualAddress);
+        descriptor.TimeDateStamp = 0;
+        descriptor.ForwarderChain = 0;
+        writePeStruct(bytes, offset, descriptor);
+    }
+    changed = true;
+    return true;
+}
+
+// Script DLLs link against the host's import library, which binds their engine imports to that
+// executable's file name - Modularity.exe for everything the editor compiles, export included.
+// An exported game renames the player (e.g. TheWakingSoul.exe), no loaded module has the old
+// name, and every script fails LoadLibrary with ERROR_MOD_NOT_FOUND. The editor never notices
+// because its name matches. Retarget the .exe imports in the shadow copy to the running
+// executable, which the loader then resolves to the already-loaded main module.
+bool retargetShadowHostImports(const fs::path& shadowPath, std::string& error) {
+    std::wstring exePath(MAX_PATH, L'\0');
+    for (;;) {
+        const DWORD length = GetModuleFileNameW(nullptr, exePath.data(), static_cast<DWORD>(exePath.size()));
+        if (length == 0) {
+            error = "GetModuleFileNameW failed";
+            return false;
+        }
+        if (length < exePath.size()) {
+            exePath.resize(length);
+            break;
+        }
+        exePath.resize(exePath.size() * 2);
+    }
+    std::string hostName;
+    for (wchar_t c : fs::path(exePath).filename().wstring()) {
+        if (c < 0x20 || c > 0x7E) {
+            error = "executable name is not ASCII, so script imports cannot be retargeted to it";
+            return false;
+        }
+        hostName.push_back(static_cast<char>(c));
+    }
+
+    std::vector<uint8_t> bytes;
+    {
+        std::ifstream in(shadowPath, std::ios::binary);
+        if (!in.is_open()) {
+            error = "cannot read shadow copy";
+            return false;
+        }
+        bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+
+    IMAGE_DOS_HEADER dosHeader{};
+    DWORD signature = 0;
+    WORD optionalMagic = 0;
+    if (!readPeStruct(bytes, 0, dosHeader) || dosHeader.e_magic != IMAGE_DOS_SIGNATURE || dosHeader.e_lfanew < 0 ||
+        !readPeStruct(bytes, static_cast<size_t>(dosHeader.e_lfanew), signature) || signature != IMAGE_NT_SIGNATURE) {
+        error = "not a PE image";
+        return false;
+    }
+    const size_t fileHeaderOffset = static_cast<size_t>(dosHeader.e_lfanew) + sizeof(DWORD);
+    if (!readPeStruct(bytes, fileHeaderOffset + sizeof(IMAGE_FILE_HEADER), optionalMagic)) {
+        error = "truncated PE headers";
+        return false;
+    }
+
+    bool changed = false;
+    bool ok = false;
+    if (optionalMagic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+        ok = retargetHostImportsInImage<IMAGE_OPTIONAL_HEADER64>(bytes, fileHeaderOffset, hostName, changed, error);
+    } else if (optionalMagic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+        ok = retargetHostImportsInImage<IMAGE_OPTIONAL_HEADER32>(bytes, fileHeaderOffset, hostName, changed, error);
+    } else {
+        error = "unknown PE optional header";
+    }
+    if (!ok || !changed) return ok;
+
+    std::ofstream out(shadowPath, std::ios::binary | std::ios::trunc);
+    out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    if (!out) {
+        error = "cannot write retargeted shadow copy";
+        return false;
+    }
+    return true;
+}
+#endif
 }
 
 SceneObject* ScriptContext::FindObjectByName(const std::string& name) {
@@ -2689,11 +2925,18 @@ ScriptRuntime::Module* ScriptRuntime::getModule(const fs::path& binaryPath) {
         return nullptr;
     }
 
+    std::string retargetError;
+    const bool retargeted = retargetShadowHostImports(loadPath, retargetError);
+
     mod.loadedPath = loadPath;
     mod.loadedFromShadowCopy = true;
     mod.handle = LoadLibraryA(loadPath.string().c_str());
     if (!mod.handle) {
-        lastError = "LoadLibrary failed";
+        const DWORD loadError = GetLastError();
+        lastError = "LoadLibrary failed (Win32 error " + std::to_string(loadError) + ")";
+        if (!retargeted) {
+            lastError += "; host import retarget failed: " + retargetError;
+        }
         lastFailure = ScriptLoadFailure::Unreadable;
         if (mod.loadedFromShadowCopy && !mod.loadedPath.empty()) {
             std::error_code removeEc;

@@ -16,6 +16,9 @@ namespace Loc = Modularity::Loc;
 #include <android/keycodes.h>
 #endif
 #include "SceneSerializationInternal.h"
+#include "DurableFile.h"
+#include "GLSyncProbe.h"
+#include "AudioExportCompression.h"
 #include "AnimationBindingHelpers.h"
 #include "CrashReporter.h"
 #include "DragPreviewOverlay.h"
@@ -29,7 +32,9 @@ namespace Loc = Modularity::Loc;
 #include "Render25D/MMeshConvert.h"
 #include "Render25D/MMeshLoader.h"
 #include "RuntimeContent.h"
+#include "SceneAssetReferences.h"
 #include <iostream>
+#include <map>
 #include <fstream>
 #include <functional>
 #include <chrono>
@@ -80,6 +85,32 @@ int AllocateNextRig25DNodeId(const std::vector<SceneObject>& objects) {
         nextNodeId = std::max(nextNodeId, obj.rig25DNode.nodeId + 1);
     }
     return nextNodeId;
+}
+
+// Console lines for a scene file that exists but did not load. When a default scene takes its
+// place, that scene is bound to the same path and the next save would overwrite a file that may
+// only need a newer engine or a hand fix, so its bytes are copied aside first.
+std::vector<std::pair<std::string, ConsoleMessageType>> DescribeUnreadableScene(
+    const std::string& sceneName, const fs::path& scenePath, bool defaultSceneTakesItsPlace) {
+    std::vector<std::pair<std::string, ConsoleMessageType>> lines;
+    if (Modularity::FileContainsNulBytes(scenePath)) {
+        lines.emplace_back("Error: Scene '" + sceneName + "' " + Modularity::kDamagedSceneFileMessage,
+                           ConsoleMessageType::Error);
+        return lines;
+    }
+    lines.emplace_back("Error: Failed to load scene: " + sceneName, ConsoleMessageType::Error);
+    if (!defaultSceneTakesItsPlace) return lines;
+
+    std::error_code ec;
+    if (!fs::is_regular_file(scenePath, ec) || fs::file_size(scenePath, ec) == 0 || ec) return lines;
+    fs::path keep = scenePath;
+    keep += ".unreadable";
+    fs::copy_file(scenePath, keep, fs::copy_options::skip_existing, ec);
+    if (!ec && fs::exists(keep, ec)) {
+        lines.emplace_back("A copy of the unreadable scene was kept at: " + keep.string(),
+                           ConsoleMessageType::Warning);
+    }
+    return lines;
 }
 
 ConsoleMessageType DiagnosticConsoleType(Modularity::ScriptDiagnosticSeverity severity) {
@@ -3703,16 +3734,44 @@ bool CopyFileIntoRuntimeRoot(const fs::path& sourcePath,
     fs::copy_file(sourcePath, destination, fs::copy_options::overwrite_existing, ec);
     if (ec) {
         error = "Failed to copy runtime file '" + sourcePath.string() +
-                "' to '" + destination.string() + "'.";
+                "' to '" + destination.string() + "': " + ec.message();
         return false;
     }
     return true;
 }
 
+struct RuntimeCopySkips {
+    uint64_t files = 0;
+    uint64_t bytes = 0;
+};
+
+// Files that are never runtime content but ride along when a whole folder is staged: Unity .meta
+// files from store packs, Blender's .blend1/.blend2 save backups, downloads that never finished
+// (.part, .crdownload, and the hidden ".xdp-*" temp files Chromium browsers leave while
+// downloading), and OS folder metadata. Nothing in the engine or player reads any of them.
+bool IsRuntimeExportJunk(const fs::path& path) {
+    std::string name = path.filename().string();
+    std::transform(name.begin(), name.end(), name.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (name == "thumbs.db" || name == "desktop.ini" || name == ".ds_store") return true;
+    if (name.rfind(".xdp-", 0) == 0) return true;
+
+    const size_t dot = name.find_last_of('.');
+    if (dot == std::string::npos) return false;
+    const std::string ext = name.substr(dot);
+    if (ext == ".meta" || ext == ".part" || ext == ".crdownload") return true;
+    if (ext.size() > 6 && ext.rfind(".blend", 0) == 0 &&
+        std::all_of(ext.begin() + 6, ext.end(), [](unsigned char c) { return std::isdigit(c) != 0; })) {
+        return true;
+    }
+    return false;
+}
+
 bool CopyDirectoryIntoRuntimeRoot(const fs::path& sourceDir,
                                   const fs::path& runtimeRoot,
                                   const fs::path& relativeDir,
-                                  std::string& error) {
+                                  std::string& error,
+                                  RuntimeCopySkips* skipped = nullptr) {
     if (sourceDir.empty() || relativeDir.empty()) {
         error = "Runtime directory copy received an empty path.";
         return false;
@@ -3752,14 +3811,181 @@ bool CopyDirectoryIntoRuntimeRoot(const fs::path& sourceDir,
             continue;
         }
         if (!it->is_regular_file()) continue;
+        if (IsRuntimeExportJunk(entryPath)) {
+            if (skipped) {
+                ++skipped->files;
+                std::error_code sizeEc;
+                const auto size = fs::file_size(entryPath, sizeEc);
+                if (!sizeEc) skipped->bytes += size;
+            }
+            continue;
+        }
         if (!EnsureDirectoryForFile(targetPath, error)) {
             return false;
         }
         fs::copy_file(entryPath, targetPath, fs::copy_options::overwrite_existing, ec);
         if (ec) {
-            error = "Failed to copy runtime directory file: " + entryPath.string();
+            error = "Failed to copy runtime directory file: " + entryPath.string() +
+                    " -> " + targetPath.string() + " (" + ec.message() + ")";
             return false;
         }
+    }
+    return true;
+}
+
+// Only what the player loads: resolveScriptBinary looks for <stem>.dll (or .so) and never enters
+// the dot directories. The compiler leaves far more beside them - the shared precompiled header
+// (~270 MB), per-script .obj and .pdb files, .cpp/.rsp/.buildsig inputs and import libraries -
+// which rebuilding needs and running does not.
+bool CopyCompiledScriptBinaries(const fs::path& sourceDir,
+                                const fs::path& runtimeRoot,
+                                const fs::path& relativeDir,
+                                std::string& error,
+                                RuntimeCopySkips* skipped) {
+    std::error_code ec;
+    for (auto it = fs::recursive_directory_iterator(sourceDir, ec);
+         it != fs::recursive_directory_iterator(); ++it) {
+        if (ec) {
+            error = "Failed while scanning compiled scripts: " + sourceDir.string();
+            return false;
+        }
+        const fs::path entryPath = it->path();
+        if (it->is_directory()) {
+            if (entryPath.filename().string().rfind('.', 0) == 0) {
+                it.disable_recursion_pending();
+            }
+            continue;
+        }
+        if (!it->is_regular_file()) continue;
+
+        std::string ext = entryPath.extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (ext != ".dll" && ext != ".so" && ext != ".dylib") {
+            if (skipped) {
+                ++skipped->files;
+                std::error_code sizeEc;
+                const auto size = fs::file_size(entryPath, sizeEc);
+                if (!sizeEc) skipped->bytes += size;
+            }
+            continue;
+        }
+
+        const fs::path rel = fs::relative(entryPath, sourceDir, ec);
+        if (ec) {
+            error = "Failed to relativize compiled script: " + entryPath.string();
+            return false;
+        }
+        if (!CopyFileIntoRuntimeRoot(entryPath, runtimeRoot, relativeDir / rel, error)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The FFmpeg libraries are LGPL: a game that ships them has to say so, carry the licence, and
+// point at the source its binaries were built from. av_version_info() names the exact upstream
+// revision ("n8.1.2-54-gc573a95381") and avcodec_configuration() the flags it was built with, so
+// the notice stays correct if the vendored build is ever swapped. Nothing is written when this
+// export ships no FFmpeg (Linux links the system libraries; Android has none).
+bool WriteShippedLibraryLicenses(const fs::path& exportRoot,
+                                 const fs::path& sourceRoot,
+                                 const std::function<void(const std::string&)>& appendLog) {
+    std::error_code ec;
+    bool shipsFfmpeg = false;
+    for (const auto& entry : fs::directory_iterator(exportRoot, ec)) {
+        const std::string name = entry.path().filename().string();
+        if (name.rfind("avcodec", 0) == 0 || name.rfind("libavcodec", 0) == 0) {
+            shipsFfmpeg = true;
+            break;
+        }
+    }
+    if (!shipsFfmpeg) return true;
+
+    const fs::path licensesDir = exportRoot / "licenses";
+    fs::create_directories(licensesDir, ec);
+    if (ec) {
+        appendLog("Warning: could not create the licenses folder in the export.");
+        return true;
+    }
+
+    const fs::path licenseSource = sourceRoot / "Resources" / "Licenses" / "FFmpeg-LICENSE.txt";
+    if (fs::exists(licenseSource, ec)) {
+        fs::copy_file(licenseSource, licensesDir / "FFmpeg-LICENSE.txt",
+                      fs::copy_options::overwrite_existing, ec);
+        if (ec) appendLog("Warning: could not copy FFmpeg-LICENSE.txt into the export.");
+    } else {
+        appendLog("Warning: Resources/Licenses/FFmpeg-LICENSE.txt is missing; the export ships "
+                  "FFmpeg without its licence text.");
+    }
+
+    std::ofstream notice(licensesDir / "FFmpeg-NOTICE.txt", std::ios::trunc);
+    if (notice.is_open()) {
+        const std::string version = Modularity::AudioExport::FfmpegVersion();
+        notice << "This program uses libraries from the FFmpeg project (libavcodec, libavformat,\n"
+                  "libavutil, libswresample, libswscale) under the GNU Lesser General Public\n"
+                  "License version 3 or later. The full licence is in FFmpeg-LICENSE.txt.\n\n";
+        notice << "FFmpeg version: " << (version.empty() ? "unknown" : version) << "\n";
+        const size_t revision = version.rfind("-g");
+        if (revision != std::string::npos) {
+            const size_t end = version.find('-', revision + 2);
+            notice << "Source code:    https://github.com/FFmpeg/FFmpeg/commit/"
+                   << version.substr(revision + 2, end == std::string::npos ? end : end - revision - 2)
+                   << "\n";
+        }
+        notice << "Also available from https://ffmpeg.org/download.html\n\n";
+        notice << "The libraries are unmodified upstream builds, configured with:\n"
+               << Modularity::AudioExport::FfmpegConfiguration() << "\n\n";
+        notice << "They ship as separate files beside the executable and may be replaced with\n"
+                  "compatible builds of the same versions.\n";
+    }
+    appendLog("Wrote FFmpeg LGPL licence and notice to the export's licenses folder.");
+    return true;
+}
+
+// Encoded clips are cached under the project's Library, which exports never ship.
+void CompressStagedAudioForExport(const fs::path& runtimeStageRoot,
+                                  const fs::path& projectRoot,
+                                  float quality,
+                                  const std::function<void(const std::string&)>& appendLog,
+                                  const std::function<bool()>& cancelled) {
+    if (!Modularity::AudioExport::EncoderAvailable()) {
+        appendLog("Warning: audio left uncompressed - this editor build has no Vorbis encoder (FFmpeg libvorbis).");
+        return;
+    }
+    const auto stats = Modularity::AudioExport::CompressStagedAudio(
+        runtimeStageRoot, projectRoot / "Library" / "ExportCache" / "Audio", quality, appendLog, cancelled);
+    if (stats.converted == 0 && stats.failed == 0 && stats.keptOriginal == 0) return;
+
+    char line[256];
+    std::snprintf(line, sizeof(line),
+                  "Compressed %d audio clips to Vorbis (quality %.1f): %.1f MB -> %.1f MB "
+                  "(%d reused from cache, %d kept as-is because Vorbis was not smaller, %d failed)",
+                  stats.converted, quality,
+                  static_cast<double>(stats.bytesBefore) / (1024.0 * 1024.0),
+                  static_cast<double>(stats.bytesAfter) / (1024.0 * 1024.0),
+                  stats.reusedFromCache, stats.keptOriginal, stats.failed);
+    appendLog(line);
+}
+
+bool FilesHaveSameContents(const fs::path& a, const fs::path& b) {
+    std::error_code ec;
+    const auto sizeA = fs::file_size(a, ec);
+    if (ec) return false;
+    const auto sizeB = fs::file_size(b, ec);
+    if (ec || sizeA != sizeB) return false;
+
+    std::ifstream inA(a, std::ios::binary);
+    std::ifstream inB(b, std::ios::binary);
+    if (!inA.is_open() || !inB.is_open()) return false;
+    std::vector<char> bufA(1 << 20);
+    std::vector<char> bufB(1 << 20);
+    while (inA && inB) {
+        inA.read(bufA.data(), static_cast<std::streamsize>(bufA.size()));
+        inB.read(bufB.data(), static_cast<std::streamsize>(bufB.size()));
+        const std::streamsize countA = inA.gcount();
+        if (countA != inB.gcount()) return false;
+        if (std::memcmp(bufA.data(), bufB.data(), static_cast<size_t>(countA)) != 0) return false;
     }
     return true;
 }
@@ -3770,15 +3996,28 @@ public:
         : projectRoot(std::move(projectRootPath)),
           runtimeRoot(std::move(runtimeRootPath)) {}
 
+    // Labels the reference being staged, for the missing-asset report: the owner is e.g.
+    // "Scene 'Main' > 'Tree (3)'" and the label "albedo texture".
+    void setReferenceOwner(std::string owner) { referenceOwner = std::move(owner); }
+    void setReferenceLabel(std::string label) { referenceLabel = std::move(label); }
+
+    // Missing path -> every place that referenced it, in first-seen order of owners.
+    const std::map<std::string, std::vector<std::string>>& missingReferences() const {
+        return missingRefs;
+    }
+
+    // Junk files left out of staged asset folders (see IsRuntimeExportJunk).
+    const RuntimeCopySkips& skippedJunk() const { return junkSkipped; }
+
     bool stageFileReference(std::string& value,
                             const std::string& externalCategory,
                             std::string& error) {
         if (value.empty()) return true;
-        const fs::path sourcePath = ResolveRuntimeSourcePath(value, projectRoot);
         std::error_code ec;
-        if (sourcePath.empty() || !fs::exists(sourcePath, ec) || ec) {
-            error = "Missing runtime asset: " + value;
-            return false;
+        const fs::path sourcePath = resolveSource(value);
+        if (sourcePath.empty()) {
+            recordMissing(value);
+            return true;
         }
 
         const std::string sourceKey = sourcePath.lexically_normal().string();
@@ -3816,11 +4055,11 @@ public:
                                        const std::string& externalCategory,
                                        std::string& error) {
         if (value.empty()) return true;
-        const fs::path sourcePath = ResolveRuntimeSourcePath(value, projectRoot);
         std::error_code ec;
-        if (sourcePath.empty() || !fs::exists(sourcePath, ec) || ec) {
-            error = "Missing runtime directory-backed asset: " + value;
-            return false;
+        const fs::path sourcePath = resolveSource(value);
+        if (sourcePath.empty()) {
+            recordMissing(value);
+            return true;
         }
 
         const fs::path sourceDir = sourcePath.parent_path();
@@ -3835,7 +4074,7 @@ public:
                 error = "Failed to resolve runtime directory relative path: " + sourceDir.string();
                 return false;
             }
-            if (!CopyDirectoryIntoRuntimeRoot(sourceDir, runtimeRoot, relativeDir, error)) {
+            if (!CopyDirectoryIntoRuntimeRoot(sourceDir, runtimeRoot, relativeDir, error, &junkSkipped)) {
                 return false;
             }
             stagedDirectoryRoots[sourceKey] = relativeDir;
@@ -3845,7 +4084,7 @@ public:
                 : sourceDir.filename().string();
             relativeDir = fs::path("Assets") / "RuntimeImported" / externalCategory /
                           (dirName + "_" + RuntimeHashHex(RuntimePathHash(sourceKey)));
-            if (!CopyDirectoryIntoRuntimeRoot(sourceDir, runtimeRoot, relativeDir, error)) {
+            if (!CopyDirectoryIntoRuntimeRoot(sourceDir, runtimeRoot, relativeDir, error, &junkSkipped)) {
                 return false;
             }
             stagedDirectoryRoots[sourceKey] = relativeDir;
@@ -3856,43 +4095,78 @@ public:
     }
 
 private:
+    // The project-relative lookup first, then the editor's foreign-project rescue, so anything the
+    // editor can load also ships. Empty when neither finds a file.
+    fs::path resolveSource(const std::string& value) const {
+        std::error_code ec;
+        const fs::path direct = ResolveRuntimeSourcePath(value, projectRoot);
+        if (!direct.empty() && fs::exists(direct, ec) && !ec) return direct;
+        ec.clear();
+        const fs::path rescued(Modularity::Platform::ResolveAssetPath(value));
+        if (fs::exists(rescued, ec) && !ec) {
+            fs::path absolute = fs::absolute(rescued, ec);
+            return (ec ? rescued : absolute).lexically_normal();
+        }
+        return {};
+    }
+
+    // Unity-style missing reference: the build keeps the object but drops what it pointed at,
+    // and the export reports it instead of failing on the first broken path.
+    void recordMissing(std::string& value) {
+        std::string where = referenceOwner.empty() ? std::string("unknown owner") : referenceOwner;
+        if (!referenceLabel.empty()) where += " " + referenceLabel;
+        missingRefs[value].push_back(std::move(where));
+        value.clear();
+    }
+
     fs::path projectRoot;
     fs::path runtimeRoot;
     std::unordered_map<std::string, std::string> stagedFileRefs;
     std::unordered_map<std::string, fs::path> stagedDirectoryRoots;
+    std::string referenceOwner;
+    std::string referenceLabel;
+    std::map<std::string, std::vector<std::string>> missingRefs;
+    RuntimeCopySkips junkSkipped;
 };
+
+// One log line per missing path, naming a few of the objects that used it.
+std::vector<std::string> DescribeMissingRuntimeAssets(const RuntimeExportStager& stager) {
+    std::vector<std::string> lines;
+    for (const auto& [path, owners] : stager.missingReferences()) {
+        std::string line = "Missing asset '" + path + "' was left out of the build; used by ";
+        const size_t shown = std::min<size_t>(owners.size(), 3);
+        for (size_t i = 0; i < shown; ++i) {
+            if (i > 0) line += ", ";
+            line += owners[i];
+        }
+        if (owners.size() > shown) {
+            line += " (+" + std::to_string(owners.size() - shown) + " more)";
+        }
+        lines.push_back(std::move(line));
+    }
+    return lines;
+}
 
 bool RemapSceneObjectForRuntime(SceneObject& obj,
                                 RuntimeExportStager& stager,
                                 std::string& error) {
-    if (!stager.stageFileReference(obj.materialPath, "Materials", error)) return false;
-    if (!stager.stageFileReference(obj.albedoTexturePath, "Textures", error)) return false;
-    if (!stager.stageFileReference(obj.overlayTexturePath, "Textures", error)) return false;
-    if (!stager.stageFileReference(obj.normalMapPath, "Textures", error)) return false;
-    if (!stager.stageFileReference(obj.shaderPackPath, "Shaders", error)) return false;
-    if (!stager.stageFileReference(obj.vertexShaderPath, "Shaders", error)) return false;
-    if (!stager.stageFileReference(obj.fragmentShaderPath, "Shaders", error)) return false;
-    if (!stager.stageDirectoryBackedReference(obj.meshPath, "Models", error)) return false;
-    if (obj.hasAudioSource && !stager.stageFileReference(obj.audioSource.clipPath, "Audio", error)) return false;
-    if (obj.hasVideoPlayer && !stager.stageFileReference(obj.videoPlayer.videoPath, "Video", error)) return false;
-    if (obj.hasLight2D && !stager.stageFileReference(obj.light2D.cookieTexturePath, "Textures", error)) return false;
-    if (obj.hasAnimation) {
-        if (!stager.stageFileReference(obj.animation.clipAssetPath, "Animations", error)) return false;
-        for (auto& clip : obj.animation.clips) {
-            if (!stager.stageFileReference(clip.assetPath, "Animations", error)) return false;
-        }
-    }
-    for (std::string& materialRef : obj.additionalMaterialPaths) {
-        if (!stager.stageFileReference(materialRef, "Materials", error)) return false;
-    }
-    return true;
+    return ForEachSceneObjectAssetReference(obj,
+        [&](std::string& value, SceneAssetRefKind kind, const char* category, const char* label) {
+            stager.setReferenceLabel(label);
+            return kind == SceneAssetRefKind::DirectoryBacked
+                ? stager.stageDirectoryBackedReference(value, category, error)
+                : stager.stageFileReference(value, category, error);
+        });
 }
 
 bool RemapSkyboxSettingsForRuntime(SkyboxSettings& settings,
                                    RuntimeExportStager& stager,
                                    std::string& error) {
+    stager.setReferenceLabel("sun texture");
     if (!stager.stageFileReference(settings.sunTexturePath, "Textures", error)) return false;
+    stager.setReferenceLabel("moon texture");
     if (!stager.stageFileReference(settings.moonTexturePath, "Textures", error)) return false;
+    stager.setReferenceLabel("scrolling texture");
     if (!stager.stageFileReference(settings.scrollingTexturePath, "Textures", error)) return false;
     return true;
 }
@@ -3913,11 +4187,13 @@ bool StageRuntimeScene(const fs::path& sourceScenePath,
     }
 
     for (SceneObject& obj : sceneObjects) {
+        stager.setReferenceOwner("Scene '" + sceneName + "' > '" + obj.name + "'");
         if (!RemapSceneObjectForRuntime(obj, stager, error)) {
             error = "Scene '" + sceneName + "': " + error;
             return false;
         }
     }
+    stager.setReferenceOwner("Scene '" + sceneName + "' skybox");
     if (!RemapSkyboxSettingsForRuntime(skyboxSettings, stager, error)) {
         error = "Scene '" + sceneName + "': " + error;
         return false;
@@ -5687,7 +5963,50 @@ bool Engine::init() {
         const fs::path bundlePath = fs::path(autoStartBundlePath);
         const fs::path runtimeCacheRoot = BuildRuntimeCacheRoot(projectManager.appDataPath, bundlePath);
         std::string bundleError;
-        if (!ExtractRuntimeContentBundle(bundlePath, runtimeCacheRoot, bundleError)) {
+        // First launch unpacks the whole bundle before ImGui or the renderer exist. Without pumping
+        // events here a multi-GB bundle sits on a white window that Windows reports as Not
+        // Responding, and players kill it mid-extract. Draw a bare progress bar with scissored
+        // clears (no shaders needed) and let closing the window cancel.
+        double lastProgressPump = -1.0;
+        auto extractionProgress = [&](uint64_t bytesDone, uint64_t bytesTotal) -> bool {
+            const double now = glfwGetTime();
+            if (lastProgressPump >= 0.0 && now - lastProgressPump < 0.05) return true;
+            lastProgressPump = now;
+            glfwPollEvents();
+            if (glfwWindowShouldClose(editorWindow)) return false;
+            if (graphicsBackend != Modularity::GraphicsBackend::OpenGL) return true;
+
+            int fbWidth = 0;
+            int fbHeight = 0;
+            glfwGetFramebufferSize(editorWindow, &fbWidth, &fbHeight);
+            if (fbWidth <= 0 || fbHeight <= 0) return true;
+            const float fraction = bytesTotal > 0
+                ? std::clamp(static_cast<float>(static_cast<double>(bytesDone) / static_cast<double>(bytesTotal)), 0.0f, 1.0f)
+                : 0.0f;
+            const int barWidth = fbWidth * 3 / 5;
+            const int barHeight = std::max(6, fbHeight / 90);
+            const int barX = (fbWidth - barWidth) / 2;
+            const int barY = fbHeight / 2 - barHeight / 2;
+
+            glViewport(0, 0, fbWidth, fbHeight);
+            glDisable(GL_SCISSOR_TEST);
+            glClearColor(0.06f, 0.06f, 0.08f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            glEnable(GL_SCISSOR_TEST);
+            glScissor(barX, barY, barWidth, barHeight);
+            glClearColor(0.18f, 0.18f, 0.22f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            const int filled = static_cast<int>(static_cast<float>(barWidth) * fraction);
+            if (filled > 0) {
+                glScissor(barX, barY, filled, barHeight);
+                glClearColor(0.62f, 0.52f, 0.95f, 1.0f);
+                glClear(GL_COLOR_BUFFER_BIT);
+            }
+            glDisable(GL_SCISSOR_TEST);
+            glfwSwapBuffers(editorWindow);
+            return true;
+        };
+        if (!ExtractRuntimeContentBundle(bundlePath, runtimeCacheRoot, bundleError, extractionProgress)) {
             addConsoleMessage("Failed to extract packaged runtime content: " + bundleError,
                               ConsoleMessageType::Error);
             autoStartRequested = false;
@@ -5701,6 +6020,12 @@ bool Engine::init() {
                 autoStartRequested = false;
                 showLauncher = true;
             } else {
+#ifndef __ANDROID__
+                // Opening the bundle created the desktop asset source, which roots relative lookups
+                // at the cwd of that moment - the exe folder. Drop it so the next lookup recreates it
+                // at the extracted content; otherwise Resources/Fonts and friends miss in every export.
+                Modularity::Platform::SetAssetSource(nullptr);
+#endif
                 PruneRuntimeCache(projectManager.appDataPath, runtimeCacheRoot);
                 fs::path projectPath = autoStartProjectPath.empty()
                     ? (runtimeCacheRoot / "project.modu")
@@ -6760,6 +7085,7 @@ void Engine::run() {
             } else {
                 presentBuffers();
             }
+            Modularity::GLSyncProbe::OnFramePresented();
             if (renderResumeLogPending) {
                 renderResumeLogPending = false;
                 int resumeFbW = 0, resumeFbH = 0;
@@ -6927,6 +7253,7 @@ void Engine::shutdown() {
     ) {
         saveCurrentScene(false);
     }
+    Modularity::FlushDurableWrites();
 
     for (auto& worker : compileWorkers) {
         if (worker.valid()) worker.wait();
@@ -11507,6 +11834,8 @@ void Engine::startProjectLoad(const std::string& path) {
             if (project.load(path)) {
                 result.success = true;
                 result.project = std::move(project);
+            } else if (Modularity::FileContainsNulBytes(path)) {
+                result.error = Modularity::kDamagedProjectFileMessage;
             } else {
                 result.error = "Failed to load project file";
             }
@@ -11587,11 +11916,16 @@ void Engine::beginDeferredSceneLoad(const std::string& sceneName) {
                                             &sceneLoadSkyboxSettings,
                                             &sceneLoadMetadata)) {
         sceneLoadInProgress = false;
-        addConsoleMessage("Error: Failed to load scene: " + sceneName, ConsoleMessageType::Error);
+        for (const auto& [message, type] : DescribeUnreadableScene(sceneName, scenePath, true)) {
+            addConsoleMessage(message, type);
+        }
         applySceneSkyboxSettings(SkyboxSettings{});
         applySceneTimeOfDay(0.5f);
         createPipelineDefaultSceneObjects();
         initializeNewSceneSerializationState(scenePath);
+        // The placeholder is not work to keep. Left dirty, closing the editor auto-saves it over
+        // the file that failed to load - including one the user restores while the editor is open.
+        projectManager.currentProject.hasUnsavedChanges = false;
         showLauncher = false;
         return;
     }
@@ -11739,6 +12073,36 @@ void Engine::finalizeDeferredSceneLoad() {
     projectLoadTraceActive = false;
 }
 
+#ifndef __ANDROID__
+// Project Settings > Player stores a startup size and fullscreen flag, but nothing applied them, so
+// every exported game opened at Window.cpp's hard-coded 1000x800. The size is the client area; it
+// is clamped so the window, frame included, fits the monitor's work area.
+static void ApplyPlayerStartupWindow(GLFWwindow* window, const ProjectPlayerSettings& player) {
+    if (!window) return;
+    GLFWmonitor* monitor = glfwGetPrimaryMonitor();
+    const GLFWvidmode* mode = monitor ? glfwGetVideoMode(monitor) : nullptr;
+    if (!monitor || !mode) return;
+
+    if (player.fullscreenStartup) {
+        glfwSetWindowMonitor(window, monitor, 0, 0, mode->width, mode->height, mode->refreshRate);
+        return;
+    }
+
+    int areaX = 0, areaY = 0, areaW = mode->width, areaH = mode->height;
+    glfwGetMonitorWorkarea(monitor, &areaX, &areaY, &areaW, &areaH);
+    int frameLeft = 0, frameTop = 0, frameRight = 0, frameBottom = 0;
+    glfwGetWindowFrameSize(window, &frameLeft, &frameTop, &frameRight, &frameBottom);
+    const int maxWidth = std::max(64, areaW - frameLeft - frameRight);
+    const int maxHeight = std::max(64, areaH - frameTop - frameBottom);
+    const int width = std::min(std::clamp(player.startupWidth, 64, 8192), maxWidth);
+    const int height = std::min(std::clamp(player.startupHeight, 64, 8192), maxHeight);
+    glfwSetWindowSize(window, width, height);
+    glfwSetWindowPos(window,
+                     areaX + frameLeft + (maxWidth - width) / 2,
+                     areaY + frameTop + (maxHeight - height) / 2);
+}
+#endif
+
 void Engine::finishProjectLoad(ProjectLoadResult& result) {
     const auto __fpStart = std::chrono::steady_clock::now();
     auto __fpDone = [&](const char* tag) {
@@ -11775,6 +12139,11 @@ void Engine::finishProjectLoad(ProjectLoadResult& result) {
     }
     applyProjectGraphicsToRenderer();
     traceProjectLoad("  textureOverrides + applyProjectGraphicsToRenderer");
+#ifndef __ANDROID__
+    if (playerMode) {
+        ApplyPlayerStartupWindow(editorWindow, projectManager.currentProject.playerSettings);
+    }
+#endif
     clampOptionalPackageState(true);
     traceProjectLoad("  clampOptionalPackageState");
     fs::path contentRoot = projectManager.currentProject.usesNewLayout
@@ -12119,6 +12488,8 @@ void Engine::resetBuildSettings() {
     buildSettings.runtimeOnly = true;
     buildSettings.leanRuntimeExport = false;
     buildSettings.shipScriptSdk = false;
+    buildSettings.compressAudio = true;
+    buildSettings.audioVorbisQuality = 5.0f;
     buildSettings.outputFolder = "Builds";
     buildSettings.outputName = "{buildName}-{version}-{platform}";
     buildSettings.moduleAssimp = "auto";
@@ -12262,6 +12633,13 @@ void Engine::loadBuildSettings() {
             buildSettings.leanRuntimeExport = line.substr(18) == "1";
         } else if (line.rfind("shipScriptSdk=", 0) == 0) {
             buildSettings.shipScriptSdk = line.substr(14) == "1";
+        } else if (line.rfind("compressAudio=", 0) == 0) {
+            buildSettings.compressAudio = line.substr(14) == "1";
+        } else if (line.rfind("audioVorbisQuality=", 0) == 0) {
+            try {
+                buildSettings.audioVorbisQuality = std::clamp(std::stof(line.substr(19)), 0.0f, 10.0f);
+            } catch (...) {
+            }
         } else if (line.rfind("output.folder=", 0) == 0) {
             buildSettings.outputFolder = line.substr(14);
             trim(buildSettings.outputFolder);
@@ -12463,6 +12841,8 @@ void Engine::saveBuildSettings() {
         file << "runtimeOnly=" << (buildSettings.runtimeOnly ? "1" : "0") << "\n";
         file << "leanRuntimeExport=" << (buildSettings.leanRuntimeExport ? "1" : "0") << "\n";
         file << "shipScriptSdk=" << (buildSettings.shipScriptSdk ? "1" : "0") << "\n";
+        file << "compressAudio=" << (buildSettings.compressAudio ? "1" : "0") << "\n";
+        file << "audioVorbisQuality=" << buildSettings.audioVorbisQuality << "\n";
         file << "output.folder=" << buildSettings.outputFolder << "\n";
         file << "output.name=" << buildSettings.outputName << "\n";
         file << "module=assimp," << buildSettings.moduleAssimp << "\n";
@@ -12569,6 +12949,8 @@ void Engine::startExportBuild(const fs::path& outputDir, bool runAfter) {
         projectManager.currentProject.saveProjectFile();
     }
     saveBuildSettings();
+    // The export copies project.modu from disk; land any settings save still being coalesced.
+    Modularity::FlushDurableWrites();
 
     std::error_code ec;
     fs::path normalizedOut = fs::absolute(outputDir, ec);
@@ -12666,6 +13048,8 @@ void Engine::startExportBuild(const fs::path& outputDir, bool runAfter) {
     }
     bool packageStandaloneArchive = buildSettings.packageStandaloneArchive;
     bool leanRuntimeExport = buildSettings.leanRuntimeExport;
+    bool compressAudio = buildSettings.compressAudio;
+    float audioVorbisQuality = buildSettings.audioVorbisQuality;
     bool includeEditorInExport = buildSettings.includeEditor;
     bool shipScriptSdk = buildSettings.shipScriptSdk || buildSettings.developmentBuild;
     std::string buildConfiguration = buildSettings.configuration == "Debug" ? "Debug" : "Release";
@@ -12756,6 +13140,7 @@ void Engine::startExportBuild(const fs::path& outputDir, bool runAfter) {
              packageStem, androidAbi, androidApkPath, androidPackageName,
              buildNameDisplay, buildVersionDisplay, androidDebuggable,
              androidAssimpImporters, buildConfiguration, leanRuntimeExport,
+             compressAudio, audioVorbisQuality,
              appendCMakeModuleFlags, moduleAssimp, androidXrOptions]() {
             ExportJobResult result;
             result.outputDir = normalizedOut;
@@ -12983,10 +13368,16 @@ void Engine::startExportBuild(const fs::path& outputDir, bool runAfter) {
 
             std::string stagedSplashPath = exportSplashImagePath;
             if (!stagedSplashPath.empty()) {
+                runtimeStager.setReferenceOwner("Build settings");
+                runtimeStager.setReferenceLabel("splash image");
                 if (!runtimeStager.stageFileReference(stagedSplashPath, "Splash", copyError)) {
                     result.message = copyError;
                     return result;
                 }
+            }
+            const std::vector<std::string> missingAssetReport = DescribeMissingRuntimeAssets(runtimeStager);
+            for (const std::string& line : missingAssetReport) {
+                appendLog("Warning: " + line);
             }
 
             {
@@ -13105,6 +13496,17 @@ void Engine::startExportBuild(const fs::path& outputDir, bool runAfter) {
                 }
             }
 
+            if (compressAudio) {
+                setStatus(0.74f, "Compressing audio...");
+                CompressStagedAudioForExport(runtimeStageRoot, projectRoot, audioVorbisQuality, appendLog,
+                                             [this]() { return exportCancelRequested.load(); });
+                if (exportCancelRequested.load()) {
+                    result.message = "Export cancelled.";
+                    result.success = false;
+                    return result;
+                }
+            }
+
             setStatus(0.76f, "Packing Android runtime content...");
             std::vector<RuntimeBundleEntry> bundleEntries = CollectRuntimeBundleEntries(runtimeStageRoot);
             if (bundleEntries.empty()) {
@@ -13187,6 +13589,10 @@ void Engine::startExportBuild(const fs::path& outputDir, bool runAfter) {
             setStatus(1.0f, "APK export complete.");
             result.success = true;
             result.message = "Android APK export complete: " + androidApkPath.string();
+            if (!missingAssetReport.empty()) {
+                result.message += " (" + std::to_string(missingAssetReport.size()) +
+                                  " missing asset(s) left out - see log)";
+            }
             return result;
         });
 
@@ -13203,6 +13609,7 @@ void Engine::startExportBuild(const fs::path& outputDir, bool runAfter) {
          assignedNativeScriptSources,
          packageStandaloneArchive, executableStem, executableFileName, packageStem,
          buildConfiguration, includeEditorInExport, shipScriptSdk, leanRuntimeExport,
+         compressAudio, audioVorbisQuality,
          appendCMakeModuleFlags]() {
         ExportJobResult result;
         result.outputDir = exportRoot;
@@ -13373,6 +13780,8 @@ void Engine::startExportBuild(const fs::path& outputDir, bool runAfter) {
             }
         }
 #endif
+
+        WriteShippedLibraryLicenses(exportRoot, sourceRoot, appendLog);
 
         {
             fs::path scriptSdkSource = sourceRoot / "Resources" / "ScriptSDK";
@@ -13633,10 +14042,16 @@ void Engine::startExportBuild(const fs::path& outputDir, bool runAfter) {
 
         std::string stagedSplashPath = exportSplashImagePath;
         if (!stagedSplashPath.empty()) {
+            runtimeStager.setReferenceOwner("Build settings");
+            runtimeStager.setReferenceLabel("splash image");
             if (!runtimeStager.stageFileReference(stagedSplashPath, "Splash", copyError)) {
                 result.message = copyError;
                 return result;
             }
+        }
+        const std::vector<std::string> missingAssetReport = DescribeMissingRuntimeAssets(runtimeStager);
+        for (const std::string& line : missingAssetReport) {
+            appendLog("Warning: " + line);
         }
 
         {
@@ -13735,12 +14150,33 @@ void Engine::startExportBuild(const fs::path& outputDir, bool runAfter) {
             compiledScriptsSrc = projectRoot / "Library" / "CompiledScripts";
             compiledScriptsDstRelative = fs::path("Library") / "CompiledScripts";
         }
-        if (fs::exists(compiledScriptsSrc)) {
-            if (!CopyDirectoryIntoRuntimeRoot(compiledScriptsSrc, exportRoot, compiledScriptsDstRelative, copyError)) {
-                result.message = copyError;
-                return result;
+        RuntimeCopySkips scriptBuildLeftovers;
+        {
+            // Exports do not clear their folder, so remove the loose copy an older export left.
+            // Only a real subfolder that still looks like one (compiler dot-folders inside) - an
+            // outDir of the project root itself would otherwise make this the export folder.
+            const fs::path relative = compiledScriptsDstRelative.lexically_normal();
+            const fs::path staleLooseScripts = exportRoot / relative;
+            std::error_code staleEc;
+            const bool isSubfolder = !relative.empty() && relative != "." &&
+                                     *relative.begin() != "..";
+            const bool looksLikeScriptOutput =
+                fs::is_directory(staleLooseScripts / ".pch", staleEc) ||
+                fs::is_directory(staleLooseScripts / ".staging", staleEc);
+            if (isSubfolder && looksLikeScriptOutput) {
+                fs::remove_all(staleLooseScripts, staleEc);
+                if (!staleEc) {
+                    appendLog("Removed stale loose script folder from a previous export: " +
+                              staleLooseScripts.string());
+                }
             }
-            if (!CopyDirectoryIntoRuntimeRoot(compiledScriptsSrc, runtimeStageRoot, compiledScriptsDstRelative, copyError)) {
+        }
+        if (fs::exists(compiledScriptsSrc)) {
+            // Scripts load from the extracted bundle, so only the staged copy is used. A second,
+            // loose copy next to the exe (from before scripts loaded in builds at all) shipped
+            // every compiler leftover twice.
+            if (!CopyCompiledScriptBinaries(compiledScriptsSrc, runtimeStageRoot, compiledScriptsDstRelative,
+                                            copyError, &scriptBuildLeftovers)) {
                 result.message = copyError;
                 return result;
             }
@@ -13779,8 +14215,61 @@ void Engine::startExportBuild(const fs::path& outputDir, bool runAfter) {
             }
         }
 
+        if (compressAudio) {
+            setStatus(0.90f, "Compressing audio...");
+            CompressStagedAudioForExport(runtimeStageRoot, projectRoot, audioVorbisQuality, appendLog,
+                                         [this]() { return exportCancelRequested.load(); });
+            if (exportCancelRequested.load()) {
+                result.message = "Export cancelled.";
+                result.success = false;
+                return result;
+            }
+        }
+
         setStatus(0.92f, "Packing runtime content...");
         std::vector<RuntimeBundleEntry> bundleEntries = CollectRuntimeBundleEntries(runtimeStageRoot);
+        {
+            // copyPrecompiledPackages gathers every binary in the player build tree, and the same
+            // files are already copied next to the exe, which is where they load from - nothing
+            // adds Packages/ to a library search path. Bundling them again doubled ~260 MB of
+            // ffmpeg. Only exact duplicates are dropped.
+            RuntimeCopySkips duplicatePackages;
+            bundleEntries.erase(
+                std::remove_if(bundleEntries.begin(), bundleEntries.end(),
+                               [&](const RuntimeBundleEntry& entry) {
+                                   if (entry.archivePath.generic_string().rfind("Packages/", 0) != 0) {
+                                       return false;
+                                   }
+                                   const fs::path loose = exportRoot / entry.archivePath.filename();
+                                   if (!FilesHaveSameContents(entry.sourcePath, loose)) return false;
+                                   ++duplicatePackages.files;
+                                   std::error_code sizeEc;
+                                   const auto size = fs::file_size(loose, sizeEc);
+                                   if (!sizeEc) duplicatePackages.bytes += size;
+                                   return true;
+                               }),
+                bundleEntries.end());
+
+            auto describe = [](const RuntimeCopySkips& skips) {
+                char text[64];
+                std::snprintf(text, sizeof(text), "%llu files, %.1f MB",
+                              static_cast<unsigned long long>(skips.files),
+                              static_cast<double>(skips.bytes) / (1024.0 * 1024.0));
+                return std::string(text);
+            };
+            if (scriptBuildLeftovers.files > 0) {
+                appendLog("Left out script build leftovers (precompiled header, objects, debug symbols): " +
+                          describe(scriptBuildLeftovers));
+            }
+            if (runtimeStager.skippedJunk().files > 0) {
+                appendLog("Left out non-runtime files from asset folders (.meta, unfinished downloads, "
+                          "Blender backups): " + describe(runtimeStager.skippedJunk()));
+            }
+            if (duplicatePackages.files > 0) {
+                appendLog("Left out package binaries already shipped next to the executable: " +
+                          describe(duplicatePackages));
+            }
+        }
         if (bundleEntries.empty()) {
             result.message = "Runtime bundle staging produced no files.";
             return result;
@@ -13853,6 +14342,10 @@ void Engine::startExportBuild(const fs::path& outputDir, bool runAfter) {
             result.message = "Export complete. Archive: " + result.archivePath.string();
         } else {
             result.message = "Export complete.";
+        }
+        if (!missingAssetReport.empty()) {
+            result.message += " " + std::to_string(missingAssetReport.size()) +
+                              " missing asset(s) were left out - see the log.";
         }
         return result;
     });
@@ -13997,6 +14490,68 @@ int Engine::buildAndroidApkHeadless(const AndroidBuildRequest& request, std::str
     } else {
         std::fprintf(stdout, "Android APK: %s\n", producedApk.string().c_str());
     }
+    return 0;
+}
+
+int Engine::buildDesktopHeadless(const std::string& projectPath, const std::string& outputDir, std::string& error) {
+    std::error_code ec;
+    fs::path projectFile = fs::absolute(projectPath, ec);
+    if (ec) projectFile = projectPath;
+    if (projectPath.empty() || !fs::exists(projectFile, ec) || ec) {
+        error = "Project file not found: " + projectFile.string();
+        return 2;
+    }
+    if (!projectManager.loadProject(projectFile.string())) {
+        error = projectManager.errorMessage.empty()
+            ? ("Failed to load project: " + projectFile.string())
+            : projectManager.errorMessage;
+        return 2;
+    }
+    loadBuildSettings();
+#ifdef _WIN32
+    buildSettings.platform = BuildPlatform::Windows;
+#else
+    buildSettings.platform = BuildPlatform::Linux;
+#endif
+
+    fs::path output = outputDir.empty()
+        ? (projectManager.currentProject.projectPath / "Builds")
+        : fs::path(outputDir);
+    fs::create_directories(output, ec);
+    std::fprintf(stderr, "[Build] Exporting project '%s' to %s...\n",
+                 projectManager.currentProject.name.c_str(), output.string().c_str());
+
+    startExportBuild(output, false);
+    bool active = true;
+    while (active) {
+        pollExportBuild();
+        {
+            std::lock_guard<std::mutex> lock(exportMutex);
+            active = exportJob.active;
+        }
+        if (active) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    bool ok = false;
+    std::string status;
+    std::string log;
+    {
+        std::lock_guard<std::mutex> lock(exportMutex);
+        ok = exportJob.success;
+        status = exportJob.status;
+        log = exportJob.log;
+    }
+    if (!log.empty()) std::fprintf(stderr, "%s\n", log.c_str());
+    {
+        // Modularity.exe is a GUI-subsystem program, so a shell usually shows none of stderr.
+        std::ofstream logFile(output / "export-log.txt", std::ios::trunc);
+        logFile << log << "\n" << (ok ? "Export succeeded: " : "Export failed: ") << status << "\n";
+    }
+    if (!ok) {
+        error = status.empty() ? "Desktop export failed." : status;
+        return 1;
+    }
+    std::fprintf(stdout, "Export complete: %s\n", status.c_str());
     return 0;
 }
 
@@ -14856,7 +15411,9 @@ void Engine::performLoadScene(const std::string& sceneName) {
         applySceneSkyboxSettings(loadedSkyboxSettings);
         applySceneTimeOfDay(loadedTimeOfDay >= 0.0f ? loadedTimeOfDay : 0.5f);
     } else {
-        addConsoleMessage("Error: Failed to load scene: " + sceneName, ConsoleMessageType::Error);
+        for (const auto& [message, type] : DescribeUnreadableScene(sceneName, scenePath, false)) {
+            addConsoleMessage(message, type);
+        }
     }
 }
 

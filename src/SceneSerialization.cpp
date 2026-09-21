@@ -1,4 +1,5 @@
 #include "SceneSerializationInternal.h"
+#include "DurableFile.h"
 
 #include <algorithm>
 #include <cctype>
@@ -2227,12 +2228,15 @@ bool SceneSerializer::saveScene(const fs::path& filePath,
     }
 
     try {
-        std::ofstream out(filePath);
-        if (!out.is_open()) return false;
+        std::ostringstream out;
         if (!WriteModularScene(out, objects, nextId, timeOfDay, skyboxSettings)) {
             return false;
         }
-        out.close();
+        std::string writeError;
+        if (!Modularity::WriteFileDurably(filePath, out.str(), writeError, Modularity::DurableFileMode::Text)) {
+            std::cerr << "Failed to save modular scene: " << writeError << std::endl;
+            return false;
+        }
         if (options.metadata) {
             const bool wasLegacy = options.metadata->loadedFromLegacyLayout ||
                                    options.metadata->fileFormat == FileFormat::LegacyFlat;
@@ -2259,6 +2263,10 @@ bool SceneSerializer::loadScene(const fs::path& filePath,
     try {
         std::ifstream in(filePath);
         if (!in.is_open()) return false;
+        if (Modularity::FileContainsNulBytes(filePath)) {
+            std::cerr << "Refusing to load damaged scene (contains NUL bytes): " << filePath.string() << std::endl;
+            return false;
+        }
 
         if (DetectModularFormat(in)) {
             return LoadModularScene(in,
@@ -2296,6 +2304,10 @@ bool SceneSerializer::loadSceneDeferred(const fs::path& filePath,
     try {
         std::ifstream in(filePath);
         if (!in.is_open()) return false;
+        if (Modularity::FileContainsNulBytes(filePath)) {
+            std::cerr << "Refusing to load damaged scene (contains NUL bytes): " << filePath.string() << std::endl;
+            return false;
+        }
 
         if (DetectModularFormat(in)) {
             return LoadModularScene(in,

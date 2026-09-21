@@ -190,7 +190,8 @@ struct SceneGraphBridge {
 
 enum class AnimationTab {
     Dopesheet = 0,
-    Curves
+    Curves,
+    ClipManager
 };
 
 struct CopiedKey {
@@ -862,8 +863,12 @@ static void AutoBindHierarchyTransformTracks(AnimationEditorState& state,
         const std::string relPath = BuildRelativePathToRoot(*obj, rootId, byId);
         if (obj->id == rootId || !relPath.empty()) {
             AnimBinding& binding = EnsureBinding(state.clip, relPath, "Transform");
-            const std::vector<std::string> properties = BuildAnimatablePropertiesForObject(*obj);
-            for (const std::string& property : properties) {
+            // Transforms only. This used to bind every animatable property the object had,
+            // which silently included ScriptSetting.* - and a bound script setting is rewritten
+            // from the clip on every frame it plays, so a looping clip pinned a script's own
+            // state and the script could never act on it. Non-transform channels come from
+            // Record, which only creates a track for a value that actually changed.
+            for (const std::string& property : AnimationBinding::EnumerateTransformProperties()) {
                 EnsureTrack(binding, property);
             }
         }
@@ -1504,7 +1509,11 @@ static void DrawDopesheet(AnimationEditorState& state,
 
     ImDrawList* draw = ImGui::GetWindowDrawList();
     const float width = ImMax(ImGui::GetContentRegionAvail().x, 100.0f);
-    const float contentHeight = kRulerHeight + kRowHeight * static_cast<float>(rows.size());
+    // Grow the canvas to fill the pane when there are fewer rows than fit. Sizing it to the
+    // rows alone left everything below the last one unpainted - no background, no grid, no
+    // playhead - which is the empty band that opened up as the window got taller.
+    const float rowsHeight = kRulerHeight + kRowHeight * static_cast<float>(rows.size());
+    const float contentHeight = ImMax(rowsHeight, ImGui::GetContentRegionAvail().y);
     const float minLabelWidth = 180.0f;
     const float minTimelineWidth = 220.0f;
     const float maxLabelWidth = std::max(minLabelWidth, width - minTimelineWidth - kLabelSplitterWidth);
@@ -1817,6 +1826,46 @@ static void DrawDopesheet(AnimationEditorState& state,
             PasteKeysAt(state, state.contextTime);
         }
         DrawInterpolationPresetMenu(state);
+
+        ImGui::Separator();
+        // Unbinding was missing entirely, so a clip that picked up tracks it should not drive
+        // could not be repaired from the editor at all.
+        const bool hasContextTrack =
+            state.contextTrack.has_value() &&
+            state.contextTrack->binding >= 0 &&
+            state.contextTrack->binding < static_cast<int>(state.clip.bindings.size()) &&
+            state.contextTrack->track >= 0 &&
+            state.contextTrack->track <
+                static_cast<int>(state.clip.bindings[state.contextTrack->binding].tracks.size());
+
+        // Erasing shifts every index after it, so any handle held by the selection, the focus
+        // or the context menu would silently start pointing at a neighbouring track.
+        auto dropTrackHandles = [&]() {
+            state.selection.keys.clear();
+            state.selection.lastClicked.reset();
+            state.selection.rangeAnchor.reset();
+            state.focusedTrack.reset();
+            state.contextTrack.reset();
+            state.clipDirty = true;
+        };
+
+        if (ImGui::MenuItem("Remove Track", nullptr, false, hasContextTrack)) {
+            AnimBinding& binding = state.clip.bindings[state.contextTrack->binding];
+            binding.tracks.erase(binding.tracks.begin() + state.contextTrack->track);
+            dropTrackHandles();
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip("Unbind this property. The clip stops driving it entirely -\n"
+                              "this is how you stop a clip from overwriting a property\n"
+                              "something else owns, such as a script setting.");
+        }
+        if (ImGui::MenuItem("Remove Binding", nullptr, false, hasContextTrack)) {
+            state.clip.bindings.erase(state.clip.bindings.begin() + state.contextTrack->binding);
+            dropTrackHandles();
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip("Unbind every property on this object.");
+        }
 
         ImGui::EndPopup();
     }
@@ -2410,7 +2459,7 @@ void Engine::renderAnimationWindow() {
         }
     }
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Bind Hierarchy\nAuto-bind transform tracks for the root and all children.");
+        ImGui::SetTooltip("Bind Hierarchy\nBind position, rotation and scale tracks for the root and all children.\nOther properties are bound by recording a change to them.");
     }
     ImGui::SameLine();
     bool requestKeyAll = drawAnimationIconButton("##anim_key_all", iconKeyAll, "Key All",
@@ -2437,6 +2486,45 @@ void Engine::renderAnimationWindow() {
         ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.42f, 1.0f), "*unsaved");
     }
 
+    // The clip selector sits on the toolbar next to Save, so switching between a root's clips
+    // never means opening another panel.
+    if (rootObject) {
+        ImGui::SameLine();
+        const int toolbarActiveIndex = AnimationGetActiveClipIndex(rootObject->animation);
+        const bool hasClipSlots = !rootObject->animation.clips.empty();
+        const char* toolbarPreview =
+            (hasClipSlots && toolbarActiveIndex >= 0 &&
+             toolbarActiveIndex < static_cast<int>(rootObject->animation.clips.size()))
+                ? rootObject->animation.clips[toolbarActiveIndex].name.c_str()
+                : "<none>";
+        ImGui::SetNextItemWidth(200.0f);
+        ImGui::BeginDisabled(!hasClipSlots);
+        if (ImGui::BeginCombo("Animation", toolbarPreview)) {
+            for (int i = 0; i < static_cast<int>(rootObject->animation.clips.size()); ++i) {
+                const bool selected = (i == toolbarActiveIndex);
+                const char* clipName = rootObject->animation.clips[i].name.empty()
+                    ? "<unnamed>"
+                    : rootObject->animation.clips[i].name.c_str();
+                if (ImGui::Selectable(clipName, selected)) {
+                    rootObject->animation.activeClipIndex = i;
+                    NormalizeAnimationClipSlots(rootObject->animation);
+                    state.loadedRootObjectId = -1;
+                    projectManager.currentProject.hasUnsavedChanges = true;
+                }
+                if (selected) {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip(hasClipSlots
+                ? "Active animation clip for this root."
+                : "No clips on this root yet - add one in the Clip Manager tab.");
+        }
+    }
+
     if (!rootObject) {
         ImGui::Separator();
         ImGui::TextDisabled("Select a root object first.");
@@ -2444,35 +2532,37 @@ void Engine::renderAnimationWindow() {
         return;
     }
 
-    if (ImGui::CollapsingHeader("Clip Manager", ImGuiTreeNodeFlags_DefaultOpen)) {
-        if (!rootObject->animation.clips.empty()) {
-            int activeIndex = AnimationGetActiveClipIndex(rootObject->animation);
-            const char* activePreview = (activeIndex >= 0 && activeIndex < static_cast<int>(rootObject->animation.clips.size()))
-                ? rootObject->animation.clips[activeIndex].name.c_str()
-                : "<none>";
-            ImGui::SetNextItemWidth(260.0f);
-            if (ImGui::BeginCombo("Animation", activePreview)) {
-                for (int i = 0; i < static_cast<int>(rootObject->animation.clips.size()); ++i) {
-                    const bool selected = (i == activeIndex);
-                    const char* clipName = rootObject->animation.clips[i].name.empty()
-                        ? "<unnamed>"
-                        : rootObject->animation.clips[i].name.c_str();
-                    if (ImGui::Selectable(clipName, selected)) {
-                        rootObject->animation.activeClipIndex = i;
-                        NormalizeAnimationClipSlots(rootObject->animation);
-                        state.loadedRootObjectId = -1;
-                        projectManager.currentProject.hasUnsavedChanges = true;
-                    }
-                    if (selected) {
-                        ImGui::SetItemDefaultFocus();
-                    }
-                }
-                ImGui::EndCombo();
+    // A ScriptSetting track rewrites a value the script itself owns on every frame the clip
+    // plays, so the script can never act on its own state. Clips saved before Bind Hierarchy
+    // was narrowed to transforms are full of them, and the symptom - a script that simply
+    // stops responding while its object animates - gives no hint where to look.
+    int scriptSettingTrackCount = 0;
+    for (const AnimBinding& warnBinding : state.clip.bindings) {
+        for (const AnimTrack& warnTrack : warnBinding.tracks) {
+            if (warnTrack.propertyId.rfind("ScriptSetting.", 0) == 0) {
+                ++scriptSettingTrackCount;
             }
-        } else {
-            ImGui::TextDisabled("Animation: <none>");
         }
+    }
+    if (scriptSettingTrackCount > 0) {
+        ImGui::TextColored(ImVec4(1.0f, 0.73f, 0.35f, 1.0f),
+                           "This clip drives %d script setting%s.",
+                           scriptSettingTrackCount,
+                           scriptSettingTrackCount == 1 ? "" : "s");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(
+                "While this clip plays, those values are rewritten from the clip every frame,\n"
+                "so the script cannot change them - a script that owns one of them will look\n"
+                "like it has stopped working.\n\n"
+                "Right-click the track in the Dopesheet and choose Remove Track to hand the\n"
+                "value back to the script.");
+        }
+    }
 
+    // Clip Manager is a tab alongside Dopesheet and Curves now. It is defined here and drawn
+    // down with the other tab bodies; the clip selector it used to open with lives on the
+    // toolbar instead.
+    auto drawClipManagerTab = [&]() {
         if (state.newClipNameInput[0] == '\0') {
             std::snprintf(state.newClipNameInput, sizeof(state.newClipNameInput), "%s.moduanimate", rootObject->name.c_str());
         }
@@ -2575,16 +2665,11 @@ void Engine::renderAnimationWindow() {
                 }
             }
         }
-    }
+    };
 
-    if (AnimationGetActiveClipAssetPath(rootObject->animation).empty()) {
-        ImGui::Separator();
-        ImGui::TextColored(ImVec4(1.0f, 0.73f, 0.35f, 1.0f),
-                           "No .moduanimate asset assigned for this root.");
-        ImGui::TextDisabled("Create or load a .moduanimate file to enable timeline editing.");
-        ImGui::End();
-        return;
-    }
+    // No early-out here any more: the Clip Manager tab is exactly what you need when a root
+    // has no clip yet, so the tab bar below has to be reachable either way.
+    const bool hasClipAsset = !AnimationGetActiveClipAssetPath(rootObject->animation).empty();
 
     SceneNode* clipRoot = nullptr;
     if (state.clip.rootObjectId >= 0) {
@@ -2627,11 +2712,25 @@ void Engine::renderAnimationWindow() {
             state.activeTab = AnimationTab::Curves;
             ImGui::EndTabItem();
         }
+        if (ImGui::BeginTabItem("Clip Manager")) {
+            state.activeTab = AnimationTab::ClipManager;
+            ImGui::EndTabItem();
+        }
         ImGui::EndTabBar();
     }
 
     const float timelineContentHeight = std::max(120.0f, ImGui::GetContentRegionAvail().y);
-    if (state.activeTab == AnimationTab::Dopesheet) {
+    if (state.activeTab == AnimationTab::ClipManager) {
+        ImGui::BeginChild("AnimClipManagerPane", ImVec2(0.0f, timelineContentHeight), true);
+        drawClipManagerTab();
+        ImGui::EndChild();
+    } else if (!hasClipAsset) {
+        ImGui::BeginChild("AnimNoClipPane", ImVec2(0.0f, timelineContentHeight), true);
+        ImGui::TextColored(ImVec4(1.0f, 0.73f, 0.35f, 1.0f),
+                           "No .moduanimate asset assigned for this root.");
+        ImGui::TextDisabled("Open the Clip Manager tab to create or load a .moduanimate file.");
+        ImGui::EndChild();
+    } else if (state.activeTab == AnimationTab::Dopesheet) {
         DrawDopesheet(state, rows, timelineContentHeight, consumedWheel);
     } else {
         DrawCurves(state, rows, timelineContentHeight, consumedWheel);
@@ -2732,7 +2831,7 @@ void Engine::renderAnimationWindow() {
         RecordChangedProperties(state, state.clip.rootObjectId, objectById);
     }
 
-    if (state.previewEnabled && clipRoot) {
+    if (state.previewEnabled && clipRoot && hasClipAsset) {
         EvaluateClipAtTime(state.clip, state.currentTime, clipRoot);
         ApplySceneGraphToObjects(graph, objectById);
         EvaluateNonTransformTracksAtTime(state.clip, state.currentTime, objectById);

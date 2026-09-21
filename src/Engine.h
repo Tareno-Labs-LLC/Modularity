@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 #include "Common.h"
 #include "SceneObject.h"
 #include "Camera.h"
@@ -1070,6 +1071,8 @@ private:
         bool runtimeOnly = true;
         bool leanRuntimeExport = false;
         bool shipScriptSdk = false;
+        bool compressAudio = true;       // lossless clips ship as Vorbis (AudioExportCompression.h)
+        float audioVorbisQuality = 5.0f; // libvorbis 0-10; 5 is ~160 kbps stereo
         std::string outputFolder = "Builds";
         std::string outputName = "{buildName}-{version}-{platform}";
         std::string moduleAssimp = "auto";
@@ -1471,7 +1474,10 @@ private:
     void renderOpenProjectDialog();
     void renderMainMenuBar();
     void refreshEditorWindowIcons();
-    void renderSceneObjectCreateMenu();
+    // The shared "create a SceneOBJ" menu. Pass a parentId and everything the menu creates at
+    // the root this frame is parented to it, which is what the Hierarchy's right-click
+    // "Create Child" submenu uses.
+    void renderSceneObjectCreateMenu(int parentId = -1);
     void renderPlayControlsBar();
     void togglePlayMode();
     void toggleSpecMode();
@@ -1517,6 +1523,29 @@ private:
     void renderFileBrowserPanel();
     void renderMeshBuilderPanel();
     void renderInspectorPanel();
+
+    // Unified drag-and-drop reference slots, shared by every panel that assigns an asset or a
+    // SceneOBJ. The row shows a type icon (a live thumbnail for images, the Hierarchy's
+    // component icon for SceneOBJs) and the reference name, reads "None (<typeName>)" when
+    // empty, and carries Clear / Use Selection / Reveal in its right-click menu - which is why
+    // the old inline "Use Selection" and "Clear" buttons are gone.
+    // Pass FileCategory::Unknown to accept any regular file.
+    // Returns true when the user assigned or cleared the reference; `outAssigned` is the new
+    // path and is empty when the slot was cleared.
+    // `customFilter` overrides the category test for slots whose accepted set is not one
+    // FileCategory - a script slot takes .moducpp sources or a prebuilt .dll, for instance.
+    // Directories and missing files are rejected before it is consulted.
+    using ReferenceSlotFilter = std::function<bool(const fs::path&)>;
+    bool drawAssetReferenceSlot(const char* id, const char* label, const std::string& currentPath,
+                                FileCategory expectedCategory, const char* typeName,
+                                fs::path& outAssigned,
+                                const ReferenceSlotFilter& customFilter = {});
+    // Same slot, writing straight into `path` for the common case.
+    bool drawAssetReferenceSlot(const char* id, const char* label, std::string& path,
+                                FileCategory expectedCategory, const char* typeName);
+    // SceneOBJ reference. `disallowId` keeps an object out of its own slot.
+    bool drawObjectReferenceSlot(const char* id, const char* label, int& targetId,
+                                 int disallowId, const char* typeName);
     void renderConsolePanel();
     void renderLatestErrorBar();
     void renderEditorToast();
@@ -1753,6 +1782,8 @@ public:
         bool editor = false;
     };
     int buildAndroidApkHeadless(const AndroidBuildRequest& request, std::string& error);
+    // --build-desktop: exports the project for the platform the editor runs on, without a window.
+    int buildDesktopHeadless(const std::string& projectPath, const std::string& outputDir, std::string& error);
     int buildBareAndroidApk(const AndroidBuildRequest& request, std::string& error);
 private:
 

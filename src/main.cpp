@@ -19,6 +19,13 @@
 extern int __argc;
 extern char** __argv;
 #endif
+// Hybrid-graphics laptops run an executable on the integrated GPU unless the executable itself
+// exports these (NVIDIA Optimus and AMD PowerXpress). GLFW can emit them, but only when built with
+// GLFW_USE_HYBRID_HPG, which this build does not enable.
+extern "C" {
+__declspec(dllexport) unsigned long NvOptimusEnablement = 0x00000001;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+}
 #else
 #include <sys/prctl.h>
 #include <unistd.h>
@@ -125,6 +132,22 @@ static int ModularityMain(int argc, char** argv) {
     int rc = engine.buildAndroidApkHeadless(req, error);
     if (rc != 0 && !error.empty()) {
       std::cerr << "[Android] Build failed: " << error << std::endl;
+    }
+    return rc;
+  }
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg = (argv && argv[i]) ? argv[i] : "";
+    if (arg != "--build-desktop") continue;
+    std::string outDir;
+    for (int j = 1; j < argc; ++j) {
+      const std::string a = (argv && argv[j]) ? argv[j] : "";
+      if (a.rfind("--out-dir=", 0) == 0) outDir = a.substr(10);
+    }
+    Engine engine;
+    std::string error;
+    int rc = engine.buildDesktopHeadless(startupProjectPathFromArgs(argc, argv), outDir, error);
+    if (rc != 0 && !error.empty()) {
+      std::cerr << "[Build] Export failed: " << error << std::endl;
     }
     return rc;
   }

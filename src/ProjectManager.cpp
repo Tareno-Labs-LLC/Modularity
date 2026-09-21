@@ -1,6 +1,7 @@
 #include "ProjectManager.h"
 #include "../include/Platform/AssetSource.h"
 #include "SceneSerializationInternal.h"
+#include "DurableFile.h"
 #include "EditorLocalization.h"
 #include "ModuCPPLanguagePack.h"
 #include "Rendering.h"
@@ -393,10 +394,26 @@ bool Project::load(const fs::path& projectFilePath) {
             scriptsPath = oldScripts;
             scriptsConfigPath = hasOldConfig ? oldConfig : (hasNewConfig ? newConfig : oldConfig);
         }
+        // The layout vote above counts Scripts/ and Scripts.modu too, so a project can be judged
+        // old-layout while its scenes live in Assets/Scenes. Exported runtimes hit this: export
+        // always stages scenes to Assets/Scenes but also ships Scripts/Managed at the root, and the
+        // player then fell back to a blank default scene. Follow the scenes that actually exist.
+        if (!useNewLayout && !hasOldScenes && hasNewScenes) {
+            scenesPath = newScenes;
+        }
         usesNewLayout = useNewLayout;
 
+        Modularity::FlushDurableWrites();
         std::ifstream file(projectFilePath);
         if (!file.is_open()) return false;
+        // A crash right after a save used to leave project.modu the right size but all zero
+        // bytes. Parsing that "succeeds" with every setting at its default, and the next save
+        // makes the reset permanent, so say so instead of opening quietly with the wrong settings.
+        if (Modularity::FileContainsNulBytes(projectFilePath)) {
+            std::cerr << "Refusing to load damaged project file (contains NUL bytes): "
+                      << projectFilePath.string() << std::endl;
+            return false;
+        }
 
         struct LegacyOpenXRSettings {
             bool sawAnyLegacyKey = false;
@@ -703,7 +720,7 @@ bool Project::load(const fs::path& projectFilePath) {
 }
 
 void Project::saveProjectFile() const {
-    std::ofstream file(projectPath / "project.modu");
+    std::ostringstream file;
     file << "name=" << name << "\n";
     file << "lastScene=" << currentSceneName << "\n";
     file << "pipeline=" << SerializeProjectPipeline(pipeline) << "\n";
@@ -820,7 +837,10 @@ void Project::saveProjectFile() const {
             }
         }
     }
-    file.close();
+
+    // Coalesced: Project Settings sliders and script gravity changes save here every frame.
+    Modularity::WriteFileDurablyCoalesced(projectPath / "project.modu", file.str(),
+                                          Modularity::DurableFileMode::Text);
 }
 
 std::vector<std::string> Project::getSceneList() const {
@@ -1124,7 +1144,8 @@ bool ProjectManager::loadProject(const std::string& path) {
         addToRecentProjects(currentProject.name, path);
         return true;
     }
-    errorMessage = "Failed to load project file";
+    errorMessage = Modularity::FileContainsNulBytes(path) ? Modularity::kDamagedProjectFileMessage
+                                                          : "Failed to load project file";
     return false;
 }
 
@@ -2327,14 +2348,16 @@ bool SceneSerializationInternal::SaveLegacyScene(const fs::path& filePath,
                                                  const SkyboxSettings& skyboxSettings,
                                                  SceneSerializer::Metadata* metadata) {
     try {
-        std::ofstream file(filePath);
-        if (!file.is_open()) return false;
         std::ostringstream buffer;
         if (!WriteLegacySceneStream(buffer, objects, nextId, timeOfDay, skyboxSettings)) {
             return false;
         }
-        file << MakeSceneTextPathsPortable(buffer.str());
-        file.close();
+        std::string writeError;
+        if (!Modularity::WriteFileDurably(filePath, MakeSceneTextPathsPortable(buffer.str()), writeError,
+                                          Modularity::DurableFileMode::Text)) {
+            std::cerr << "Failed to save legacy scene: " << writeError << std::endl;
+            return false;
+        }
         if (metadata) {
             metadata->version = SceneSerializationInternal::kLegacySceneFormatVersion;
             metadata->fileFormat = SceneSerializer::FileFormat::LegacyFlat;

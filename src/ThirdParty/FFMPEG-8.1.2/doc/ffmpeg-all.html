@@ -59726,6 +59726,13 @@ frame-consumer that exhausts the limited decoder frame pool.
 parameters. This is the default behaviour.
 </p>
 </dd>
+<dt><samp class="option">use_filters</samp></dt>
+<dd><p>If set to 1, filter with a generic weight LUT instead of using fixed-function
+shader kernels. May be faster or slower depending on the hardware. A value
+of <code class="code">auto</code> (the default) enables this automatically when required for
+correct anti-aliasing when downscaling.
+</p>
+</dd>
 <dt><samp class="option">param</samp></dt>
 <dd><p>Algorithm-Specific parameter.
 </p>

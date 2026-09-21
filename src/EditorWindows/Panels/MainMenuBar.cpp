@@ -1087,8 +1087,9 @@ void Engine::buildWorkspaceLayout(WorkspaceMode mode) {
   workspaceLayoutStabilizeUntil = glfwGetTime() + 0.75;
 }
 
-void Engine::renderSceneObjectCreateMenu() {
+void Engine::renderSceneObjectCreateMenu(int parentId) {
   // TODO: "Search SceneOBJ..." quick-create filter, once the editor has a
+  const size_t objectCountBeforeMenu = sceneObjects.size();
   auto lastCreated = [&]() -> SceneObject * {
     return sceneObjects.empty() ? nullptr : &sceneObjects.back();
   };
@@ -1132,7 +1133,20 @@ void Engine::renderSceneObjectCreateMenu() {
   };
   auto createUIWithCanvas = [&](ObjectType type, const std::string &baseName) {
     int canvasId = -1;
+    // Right-clicking a Canvas should build into that Canvas, not into whichever one happens
+    // to come first in the scene.
+    if (parentId >= 0) {
+      if (SceneObject *requestedParent = findObjectById(parentId)) {
+        if (requestedParent->hasUI &&
+            requestedParent->ui.type == UIElementType::Canvas) {
+          canvasId = requestedParent->id;
+        }
+      }
+    }
     for (const auto &obj : sceneObjects) {
+      if (canvasId >= 0) {
+        break;
+      }
       if (obj.hasUI && obj.ui.type == UIElementType::Canvas) {
         canvasId = obj.id;
         break;
@@ -1545,6 +1559,23 @@ void Engine::renderSceneObjectCreateMenu() {
     if (has2DWorldPackage() && ImGui::MenuItem("Sprite2D"))
       createUIWithCanvas(ObjectType::Sprite2D, "Sprite2D");
     ImGui::EndMenu();
+  }
+
+  // Anything the menu just created that is still sitting at the root becomes a child of the
+  // object the menu was opened on. Entries that build their own hierarchy - a UI element under
+  // a Canvas, a sector under the map root - already parented themselves, so only their roots
+  // move. ids are collected first because setParent() reorders sceneObjects.
+  if (parentId >= 0 && sceneObjects.size() > objectCountBeforeMenu) {
+    std::vector<int> createdRootIds;
+    createdRootIds.reserve(sceneObjects.size() - objectCountBeforeMenu);
+    for (size_t i = objectCountBeforeMenu; i < sceneObjects.size(); ++i) {
+      if (sceneObjects[i].parentId == -1 && sceneObjects[i].id != parentId) {
+        createdRootIds.push_back(sceneObjects[i].id);
+      }
+    }
+    for (int createdId : createdRootIds) {
+      setParent(createdId, parentId);
+    }
   }
 }
 

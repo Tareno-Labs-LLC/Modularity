@@ -181,7 +181,8 @@ bool WriteRuntimeContentBundle(const fs::path& bundlePath,
 
 bool ExtractRuntimeContentBundle(const fs::path& bundlePath,
                                  const fs::path& outputRoot,
-                                 std::string& error) {
+                                 std::string& error,
+                                 const RuntimeBundleProgress& progress) {
     auto stream = Modularity::Platform::GetAssetSource().Open(bundlePath.string());
     if (!stream) {
         error = "Failed to open runtime bundle: " + bundlePath.string();
@@ -216,6 +217,8 @@ bool ExtractRuntimeContentBundle(const fs::path& bundlePath,
         return false;
     }
 
+    const uint64_t bundleSize = static_cast<uint64_t>(std::max<int64_t>(stream->Size(), 0));
+    uint64_t bytesDone = 0;
     std::vector<char> buffer(64 * 1024);
     for (uint32_t entryIndex = 0; entryIndex < entryCount; ++entryIndex) {
         uint32_t pathLength = 0;
@@ -268,6 +271,11 @@ bool ExtractRuntimeContentBundle(const fs::path& bundlePath,
                 return false;
             }
             remaining -= static_cast<uint64_t>(chunk);
+            bytesDone += static_cast<uint64_t>(chunk);
+            if (progress && !progress(bytesDone, bundleSize)) {
+                error = "Runtime content extraction cancelled.";
+                return false;
+            }
         }
     }
 
