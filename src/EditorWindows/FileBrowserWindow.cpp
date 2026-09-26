@@ -1749,7 +1749,10 @@ namespace {
         ofn.lpstrFile = fileBuffer.data();
         ofn.nMaxFile = static_cast<DWORD>(fileBuffer.size());
         ofn.lpstrInitialDir = initialDirWide.empty() ? nullptr : initialDirWide.c_str();
-        ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_EXPLORER;
+        // OFN_NOCHANGEDIR: without it Windows moves the process working directory to wherever
+        // the file was picked, and every cwd-relative path ("Resources/...") breaks for the rest
+        // of the session - editor sounds went silent after one Import.
+        ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_EXPLORER | OFN_NOCHANGEDIR;
         if (GetOpenFileNameW(&ofn) == TRUE) {
             return fs::path(fileBuffer.data());
         }
@@ -1906,8 +1909,12 @@ void Engine::renderFileBrowserPanel() {
 
     auto openEntry = [&](const fs::directory_entry& entry) {
         if (entry.is_directory()) {
-            fileBrowser.navigateTo(entry.path());
+            fileBrowser.navigateTo(entry.path());  // slides on its own
             return;
+        }
+        // Opening a file commits to it. Videos have no open action below, so they stay quiet.
+        if (fileBrowser.getFileCategory(entry) != FileCategory::Video) {
+            playEditorSound(EditorSoundCue::Confirm);
         }
         if (fileBrowser.isTextureFile(entry)) {
             if (hasSpriteEditorPackage()) {
@@ -3144,7 +3151,9 @@ void Engine::renderFileBrowserPanel() {
                         ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
                         if (ImGui::InvisibleButton("##cell", ImVec2(cellWidth, cellHeight))) {
                             selectFileEntry(i);
+                            if (ImGui::GetIO().MouseClickedLastCount[0] < 2) ImGui::ReportWidgetFeedback(ImGuiWidgetFeedback_Select);  // 2nd click of a double click opens instead
                         }
+                        ImGui::ReportItemHoverFeedback();
                         ImGui::PopItemFlag();
                         const bool hovered = ImGui::IsItemHovered() && !navSuppressHover;
                         const bool doubleClicked = hovered && ImGui::IsMouseDoubleClicked(0);
@@ -3467,6 +3476,7 @@ void Engine::renderFileBrowserPanel() {
                 ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
                 if (ImGui::Selectable("##row", isSelected, ImGuiSelectableFlags_AllowDoubleClick, ImVec2(0, rowHeight))) {
                     selectFileEntry(i);
+                    if (ImGui::GetIO().MouseClickedLastCount[0] < 2) ImGui::ReportWidgetFeedback(ImGuiWidgetFeedback_Select);  // 2nd click of a double click opens instead
 
                     if (ImGui::IsMouseDoubleClicked(0)) {
                         openEntry(entry);
@@ -3951,7 +3961,7 @@ void Engine::renderFileBrowserPanel() {
     };
 
     if (triggerDeletePopup) {
-        playEditorFeedbackPreview("Resources/Sounds/Info.mp3", 0.95f, false, EditorFeedbackSoundCategory::Other);
+        playEditorSound(EditorSoundCue::DialogOpen, 0.95f);
         ImGui::OpenPopup("Delete this item?");
         triggerDeletePopup = false;
     }
@@ -3989,7 +3999,7 @@ void Engine::renderFileBrowserPanel() {
     }
 
     if (triggerReloadScriptsPopup) {
-        playEditorFeedbackPreview("Resources/Sounds/Info.mp3", 0.95f, false, EditorFeedbackSoundCategory::Other);
+        playEditorSound(EditorSoundCue::DialogOpen, 0.95f);
         ImGui::OpenPopup("Reload scripts from scratch?");
         triggerReloadScriptsPopup = false;
     }
@@ -4015,7 +4025,7 @@ void Engine::renderFileBrowserPanel() {
     }
 
     if (triggerRenamePopup) {
-        playEditorFeedbackPreview("Resources/Sounds/Info.mp3", 0.95f, false, EditorFeedbackSoundCategory::Other);
+        playEditorSound(EditorSoundCue::DialogOpen, 0.95f);
         ImGui::OpenPopup("Rename Item");
         triggerRenamePopup = false;
     }

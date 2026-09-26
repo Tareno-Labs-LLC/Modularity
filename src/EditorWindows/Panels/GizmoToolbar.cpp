@@ -1047,6 +1047,8 @@ bool IconButton(const char *id, Icon icon, bool active,
   bool hovered = ImGui::IsItemHovered();
   bool held = ImGui::IsItemActive();
   bool pressed = ImGui::IsItemClicked();
+  if (pressed) ImGui::ReportWidgetFeedback(ImGuiWidgetFeedback_Button);
+  ImGui::ReportItemHoverFeedback();
   ImVec2 min = ImGui::GetItemRectMin();
   ImVec2 max = ImGui::GetItemRectMax();
   float rounding = 9.0f;
@@ -1119,6 +1121,8 @@ bool TextButton(const char *id, const char *label, bool active,
   bool hovered = ImGui::IsItemHovered();
   bool held = ImGui::IsItemActive();
   bool pressed = ImGui::IsItemClicked();
+  if (pressed) ImGui::ReportWidgetFeedback(ImGuiWidgetFeedback_Button);
+  ImGui::ReportItemHoverFeedback();
   ImVec2 min = ImGui::GetItemRectMin();
   ImVec2 max = ImGui::GetItemRectMax();
   float rounding = 8.0f;

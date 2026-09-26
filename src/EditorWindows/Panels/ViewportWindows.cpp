@@ -262,6 +262,292 @@ bool IsPointWithinRadius(const ImVec2 &point, const ImVec2 &center,
 
 } // namespace
 
+// Scene view object picking: the ray under a screen point against every enabled object's
+// pickable shape, nearest hit wins. Click selection and the asset-drop raycast both use it, so
+// what a drop lands on is always what a click there would select. `filter` skips objects the
+// caller cannot use (a material drop passes objects without a renderer through to what is
+// behind them). Returns -1 on a miss.
+int Engine::pickSceneObjectAtScreen(const glm::mat4 &view, const glm::mat4 &proj,
+                                    const ImVec2 &imageMin, const ImVec2 &imageMax,
+                                    const ImVec2 &screenPos,
+                                    const std::function<bool(const SceneObject &)> &filter) {
+  glm::mat4 invViewProj = glm::inverse(proj * view);
+  const ImVec2 mousePos = screenPos;
+
+  auto makeRay = [&](const ImVec2 &pos) {
+    float x = (pos.x - imageMin.x) / (imageMax.x - imageMin.x);
+    float y = (pos.y - imageMin.y) / (imageMax.y - imageMin.y);
+    x = x * 2.0f - 1.0f;
+    y = 1.0f - y * 2.0f;
+
+    glm::vec4 nearPt = invViewProj * glm::vec4(x, y, -1.0f, 1.0f);
+    glm::vec4 farPt = invViewProj * glm::vec4(x, y, 1.0f, 1.0f);
+    nearPt /= nearPt.w;
+    farPt /= farPt.w;
+
+    glm::vec3 origin = glm::vec3(nearPt);
+    glm::vec3 dir = glm::normalize(glm::vec3(farPt - nearPt));
+    return std::make_pair(origin, dir);
+  };
+
+  auto rayAabb = [](const glm::vec3 &orig, const glm::vec3 &dir,
+                    const glm::vec3 &bmin, const glm::vec3 &bmax,
+                    float &tHit) {
+    float tmin = -FLT_MAX;
+    float tmax = FLT_MAX;
+    for (int i = 0; i < 3; ++i) {
+      if (std::abs(dir[i]) < 1e-6f) {
+        if (orig[i] < bmin[i] || orig[i] > bmax[i])
+          return false;
+        continue;
+      }
+      float invD = 1.0f / dir[i];
+      float t1 = (bmin[i] - orig[i]) * invD;
+      float t2 = (bmax[i] - orig[i]) * invD;
+      if (t1 > t2)
+        std::swap(t1, t2);
+      tmin = std::max(tmin, t1);
+      tmax = std::min(tmax, t2);
+      if (tmin > tmax)
+        return false;
+    }
+    tHit = (tmin >= 0.0f) ? tmin : tmax;
+    return tmax >= 0.0f;
+  };
+
+  auto raySphere = [](const glm::vec3 &orig, const glm::vec3 &dir,
+                      float radius, float &tHit) {
+    float b = glm::dot(dir, orig);
+    float c = glm::dot(orig, orig) - radius * radius;
+    float disc = b * b - c;
+    if (disc < 0.0f)
+      return false;
+    float sqrtDisc = sqrtf(disc);
+    float t0 = -b - sqrtDisc;
+    float t1 = -b + sqrtDisc;
+    float t = (t0 >= 0.0f) ? t0 : t1;
+    if (t < 0.0f)
+      return false;
+    tHit = t;
+    return true;
+  };
+
+  auto rayTriangle = [](const glm::vec3 &orig, const glm::vec3 &dir,
+                        const glm::vec3 &v0, const glm::vec3 &v1,
+                        const glm::vec3 &v2, float &tHit) {
+    const float EPSILON = 1e-6f;
+    glm::vec3 e1 = v1 - v0;
+    glm::vec3 e2 = v2 - v0;
+    glm::vec3 pvec = glm::cross(dir, e2);
+    float det = glm::dot(e1, pvec);
+    if (fabs(det) < EPSILON)
+      return false;
+    float invDet = 1.0f / det;
+    glm::vec3 tvec = orig - v0;
+    float u = glm::dot(tvec, pvec) * invDet;
+    if (u < 0.0f || u > 1.0f)
+      return false;
+    glm::vec3 qvec = glm::cross(tvec, e1);
+    float v = glm::dot(dir, qvec) * invDet;
+    if (v < 0.0f || u + v > 1.0f)
+      return false;
+    float t = glm::dot(e2, qvec) * invDet;
+    if (t < 0.0f)
+      return false;
+    tHit = t;
+    return true;
+  };
+
+  auto ray = makeRay(mousePos);
+  float closest = FLT_MAX;
+  int hitId = -1;
+  glm::mat4 invView = glm::inverse(view);
+  glm::vec3 cameraPos = glm::vec3(invView[3]);
+  glm::vec3 cameraUp = glm::normalize(glm::vec3(invView[1]));
+
+  for (const auto &obj : sceneObjects) {
+    if (!IsObjectEnabledInHierarchy(obj))
+      continue;
+    if (filter && !filter(obj))
+      continue;
+    if (obj.hasLight && !obj.light.enabled &&
+        (obj.type == ObjectType::DirectionalLight ||
+         obj.type == ObjectType::PointLight ||
+         obj.type == ObjectType::SpotLight ||
+         obj.type == ObjectType::AreaLight))
+      continue;
+
+    glm::vec3 aabbMin(-0.5f);
+    glm::vec3 aabbMax(0.5f);
+
+    glm::mat4 model(1.0f);
+    model = glm::translate(model, obj.position);
+    if (obj.type == ObjectType::Sprite25D ||
+        (obj.renderType == RenderType::Sprite && obj.faceCamera)) {
+      glm::vec3 forward = cameraPos - obj.position;
+      if (glm::dot(forward, forward) < 1e-6f)
+        forward = glm::vec3(0.0f, 0.0f, 1.0f);
+      else
+        forward = glm::normalize(forward);
+      glm::vec3 right = glm::cross(cameraUp, forward);
+      if (glm::dot(right, right) < 1e-6f) {
+        right = glm::cross(glm::vec3(0.0f, 0.0f, 1.0f), forward);
+      }
+      right = glm::normalize(right);
+      glm::vec3 up = glm::normalize(glm::cross(forward, right));
+      glm::vec3 scale = glm::max(glm::abs(obj.scale), glm::vec3(0.0001f));
+      model[0] = glm::vec4(
+          right * scale.x * (obj.scale.x < 0.0f ? -1.0f : 1.0f), 0.0f);
+      model[1] = glm::vec4(
+          up * scale.y * (obj.scale.y < 0.0f ? -1.0f : 1.0f), 0.0f);
+      model[2] = glm::vec4(
+          forward * scale.z * (obj.scale.z < 0.0f ? -1.0f : 1.0f), 0.0f);
+    } else {
+      model = glm::rotate(model, glm::radians(obj.rotation.x),
+                          glm::vec3(1, 0, 0));
+      model = glm::rotate(model, glm::radians(obj.rotation.y),
+                          glm::vec3(0, 1, 0));
+      model = glm::rotate(model, glm::radians(obj.rotation.z),
+                          glm::vec3(0, 0, 1));
+      model = glm::scale(model, obj.scale);
+    }
+
+    glm::mat4 invModel = glm::inverse(model);
+    glm::vec3 localOrigin =
+        glm::vec3(invModel * glm::vec4(ray.first, 1.0f));
+    glm::vec3 localDir =
+        glm::normalize(glm::vec3(invModel * glm::vec4(ray.second, 0.0f)));
+
+    float hitT = 0.0f;
+    bool hit = false;
+    switch (obj.type) {
+    case ObjectType::Cube:
+      hit = rayAabb(localOrigin, localDir, glm::vec3(-0.5f),
+                    glm::vec3(0.5f), hitT);
+      break;
+    case ObjectType::Sphere:
+      hit = raySphere(localOrigin, localDir, 0.5f, hitT);
+      break;
+    case ObjectType::Capsule:
+      hit = rayAabb(localOrigin, localDir, glm::vec3(-0.35f, -0.9f, -0.35f),
+                    glm::vec3(0.35f, 0.9f, 0.35f), hitT);
+      break;
+    case ObjectType::Plane:
+      hit = rayAabb(localOrigin, localDir, glm::vec3(-0.5f, -0.5f, -0.02f),
+                    glm::vec3(0.5f, 0.5f, 0.02f), hitT);
+      break;
+    case ObjectType::Mirror:
+      hit = rayAabb(localOrigin, localDir, glm::vec3(-0.5f, -0.5f, -0.02f),
+                    glm::vec3(0.5f, 0.5f, 0.02f), hitT);
+      break;
+    case ObjectType::Sprite:
+    case ObjectType::Sprite25D:
+    case ObjectType::ParticleSystem2D:
+      hit = rayAabb(localOrigin, localDir, glm::vec3(-0.5f, -0.5f, -0.02f),
+                    glm::vec3(0.5f, 0.5f, 0.02f), hitT);
+      break;
+    case ObjectType::Torus:
+      hit = raySphere(localOrigin, localDir, 0.5f, hitT);
+      break;
+    case ObjectType::Sprite2D:
+    case ObjectType::Canvas:
+    case ObjectType::UIImage:
+    case ObjectType::UISlider:
+    case ObjectType::UIButton:
+    case ObjectType::UIText:
+      hit = false;
+      break;
+    case ObjectType::OBJMesh: {
+      const auto *info = g_objLoader.getMeshInfo(obj.meshId);
+      if (info && info->boundsMin.x < info->boundsMax.x) {
+        aabbMin = info->boundsMin;
+        aabbMax = info->boundsMax;
+      }
+      bool aabbHit = rayAabb(localOrigin, localDir, aabbMin, aabbMax, hitT);
+      if (aabbHit && info && !info->triangleVertices.empty()) {
+        float triBest = FLT_MAX;
+        for (size_t i = 0; i + 2 < info->triangleVertices.size(); i += 3) {
+          float triT = 0.0f;
+          if (rayTriangle(localOrigin, localDir, info->triangleVertices[i],
+                          info->triangleVertices[i + 1],
+                          info->triangleVertices[i + 2], triT)) {
+            if (triT < triBest && triT >= 0.0f)
+              triBest = triT;
+          }
+        }
+        if (triBest < FLT_MAX) {
+          hit = true;
+          hitT = triBest;
+        } else {
+          hit = false;
+        }
+      } else {
+        hit = aabbHit;
+      }
+      break;
+    }
+    case ObjectType::Model: {
+      const auto *info = getModelLoader().getMeshInfo(obj.meshId);
+      if (info && info->boundsMin.x < info->boundsMax.x) {
+        aabbMin = info->boundsMin;
+        aabbMax = info->boundsMax;
+      }
+      bool aabbHit = rayAabb(localOrigin, localDir, aabbMin, aabbMax, hitT);
+      if (aabbHit && info && !info->triangleVertices.empty()) {
+        float triBest = FLT_MAX;
+        for (size_t i = 0; i + 2 < info->triangleVertices.size(); i += 3) {
+          float triT = 0.0f;
+          if (rayTriangle(localOrigin, localDir, info->triangleVertices[i],
+                          info->triangleVertices[i + 1],
+                          info->triangleVertices[i + 2], triT)) {
+            if (triT < triBest && triT >= 0.0f)
+              triBest = triT;
+          }
+        }
+        if (triBest < FLT_MAX) {
+          hit = true;
+          hitT = triBest;
+        } else {
+          hit = false;
+        }
+      } else {
+        hit = aabbHit;
+      }
+      break;
+    }
+    case ObjectType::Camera:
+      hit = raySphere(localOrigin, localDir, 0.3f, hitT);
+      break;
+    case ObjectType::DirectionalLight:
+    case ObjectType::PointLight:
+    case ObjectType::SpotLight:
+    case ObjectType::AreaLight:
+      hit = raySphere(localOrigin, localDir, 0.3f, hitT);
+      break;
+    case ObjectType::PostFXNode:
+      hit = false;
+      break;
+    case ObjectType::Empty:
+      hit = false;
+      break;
+    default:
+      break;
+    }
+
+    if (hit && hitT >= 0.0f) {
+      const glm::vec3 localHit = localOrigin + localDir * hitT;
+      const glm::vec3 worldHit =
+          glm::vec3(model * glm::vec4(localHit, 1.0f));
+      const float worldT = glm::dot(worldHit - ray.first, ray.second);
+      if (worldT < closest && worldT >= 0.0f) {
+        closest = worldT;
+        hitId = obj.id;
+      }
+    }
+  }
+  return hitId;
+}
+
 #pragma region Scene Viewport
 // Final scene output for the editor viewport.
 void Engine::renderViewport() {
@@ -539,12 +825,18 @@ void Engine::renderViewport() {
           for (int id : selectedObjectIds) {if (shouldPreview(id)) return true;}
           return selectedObjectIds.empty() && selectedObjectId >= 0 && shouldPreview(selectedObjectId);
         }();
+        // While a material, script or audio clip is dragged over an object - here, in the
+        // Hierarchy or on the Inspector - that object wears the selection outline instead of the
+        // selection, so it is clear where the drop will land.
+        static std::vector<int> dropHoverOutlineIds(1, -1);
+        const int dropHoverId = activeAssetDropHover();
+        dropHoverOutlineIds[0] = dropHoverId;
         renderer.beginRender(view, proj, camera.position);
         renderer.renderScene(
             camera, sceneObjects, selectedObjectId,
             editorFov, buildSettings.editorCameraNear,
-            buildSettings.editorCameraFar, showSelected3DColliderPreview,
-            &selectedObjectIds, sceneViewportRenderMode);
+            buildSettings.editorCameraFar, showSelected3DColliderPreview && dropHoverId < 0,
+            dropHoverId >= 0 ? &dropHoverOutlineIds : &selectedObjectIds, sceneViewportRenderMode);
         tex = renderer.getViewportTexture();
       }
       ImGui::SetNextItemAllowOverlap();
@@ -761,10 +1053,67 @@ void Engine::renderViewport() {
       }
     };
 
+    // Materials, scripts and audio clips go onto the object under the cursor rather than into
+    // the scene. The 3D view raycasts here; the 2D world view hit-tests its sprite rects further
+    // down, once they are laid out for this frame.
+    std::string viewportDragPath;
+    const ObjectAssetDropKind viewportDragKind = activeObjectAssetDragKind(&viewportDragPath);
+    if (viewportDragKind != ObjectAssetDropKind::None && mouseOverViewportImage && !pure2DSceneView) {
+      // The raycast walks mesh triangles, so it only reruns when the cursor or camera moved.
+      static ImVec2 lastDropPickMouse(-FLT_MAX, -FLT_MAX);
+      static glm::mat4 lastDropPickViewProj(0.0f);
+      static ObjectAssetDropKind lastDropPickKind = ObjectAssetDropKind::None;
+      static int lastDropPickHit = -1;
+      const ImVec2 mouse = ImGui::GetIO().MousePos;
+      const glm::mat4 viewProj = proj * view;
+      if (mouse.x != lastDropPickMouse.x || mouse.y != lastDropPickMouse.y ||
+          viewProj != lastDropPickViewProj || viewportDragKind != lastDropPickKind) {
+        lastDropPickHit = pickSceneObjectAtScreen(
+            view, proj, imageMin, imageMax, mouse,
+            [&](const SceneObject &candidate) { return canApplyAssetDrop(candidate, viewportDragKind); });
+        lastDropPickMouse = mouse;
+        lastDropPickViewProj = viewProj;
+        lastDropPickKind = viewportDragKind;
+      }
+      setAssetDropHover(lastDropPickHit);
+    }
+    if (viewportDragKind != ObjectAssetDropKind::None && mouseOverViewportImage) {
+      if (const SceneObject *hoverTarget = findObjectById(activeAssetDropHover())) {
+        // Lights, cameras and empties have no mesh to outline, so the target is also named at the
+        // cursor. Foreground list: the 2D world overlay is a child window drawn over this one.
+        const char *action = viewportDragKind == ObjectAssetDropKind::Material ? "Assign material to "
+                           : viewportDragKind == ObjectAssetDropKind::Script   ? "Add script to "
+                                                                               : "Assign clip to ";
+        const std::string tag = action + (hoverTarget->name.empty() ? std::string("Object") : hoverTarget->name);
+        const ImVec2 textSize = ImGui::CalcTextSize(tag.c_str());
+        const ImVec2 mouse = ImGui::GetIO().MousePos;
+        const ImVec2 tagMin(mouse.x + 16.0f, mouse.y - textSize.y - 14.0f);
+        const ImVec2 tagMax(tagMin.x + textSize.x + 12.0f, tagMin.y + textSize.y + 6.0f);
+        ImDrawList *tagDrawList = ImGui::GetForegroundDrawList(ImGui::GetWindowViewport());
+        tagDrawList->PushClipRect(sceneLayout.panelMin, sceneLayout.panelMax, true);
+        tagDrawList->AddRectFilled(tagMin, tagMax, IM_COL32(20, 22, 32, 220), 4.0f);
+        tagDrawList->AddRect(tagMin, tagMax, ImGui::GetColorU32(ImGuiCol_DragDropTarget), 4.0f, 0, 1.5f);
+        tagDrawList->AddText(ImVec2(tagMin.x + 6.0f, tagMin.y + 3.0f), IM_COL32(236, 240, 246, 255), tag.c_str());
+        tagDrawList->PopClipRect();
+      }
+    }
+
     if (ImGui::BeginDragDropTarget()) {
-      if (const ImGuiPayload *payload = ImGui::AcceptDragDropPayload("FILE_PATH")) {
+      // An object drop draws its own highlight (the outline), not a rectangle round the view.
+      const ImGuiDragDropFlags fileDropFlags =
+          viewportDragKind != ObjectAssetDropKind::None ? ImGuiDragDropFlags_AcceptNoDrawDefaultRect : 0;
+      if (const ImGuiPayload *payload = ImGui::AcceptDragDropPayload("FILE_PATH", fileDropFlags)) {
         const char *path = static_cast<const char *>(payload->Data);
-        importDroppedModel(fs::path(path));
+        if (viewportDragKind != ObjectAssetDropKind::None) {
+          if (SceneObject *dropTarget = findObjectById(activeAssetDropHover())) {
+            applyAssetDropToObject(*dropTarget, fs::path(path), true);
+          } else {
+            showEditorToast("Drop " + fs::path(path).filename().string() + " onto an object to assign it.",
+                            ConsoleMessageType::Info, 1.8);
+          }
+        } else {
+          importDroppedModel(fs::path(path));
+        }
       }
       ImGui::EndDragDropTarget();
     }
@@ -2544,6 +2893,42 @@ void Engine::renderViewport() {
         }
       };
       drawSelectedCollider2DWorldOutlines();
+
+      // Asset drag over the 2D world: the topmost sprite under the cursor is the drop target
+      // (the same order click selection uses), glowing in the 3D selection outline's colour.
+      if (viewportDragKind != ObjectAssetDropKind::None) {
+        int dropHit = -1;
+        if (uiWorldHover) {
+          const ImVec2 mouse = ImGui::GetIO().MousePos;
+          for (auto it = drawnUiObjects.rbegin(); it != drawnUiObjects.rend(); ++it) {
+            const SceneObject &candidate = *(*it);
+            if (candidate.ui.type == UIElementType::Canvas) continue;
+            if (!canApplyAssetDrop(candidate, viewportDragKind)) continue;
+            auto rectIt = resolvedUiRects.find(candidate.id);
+            if (rectIt == resolvedUiRects.end()) continue;
+            const ImVec2 &rectMin = rectIt->second.min;
+            const ImVec2 &rectMax = rectIt->second.max;
+            if (mouse.x >= rectMin.x && mouse.x <= rectMax.x &&
+                mouse.y >= rectMin.y && mouse.y <= rectMax.y) {
+              dropHit = candidate.id;
+              break;
+            }
+          }
+        }
+        setAssetDropHover(dropHit);
+        auto glowIt = dropHit >= 0 ? resolvedUiRects.find(dropHit) : resolvedUiRects.end();
+        if (glowIt != resolvedUiRects.end()) {
+          ImDrawList *glowList = ImGui::GetWindowDrawList();
+          const ImVec2 &glowMin = glowIt->second.min;
+          const ImVec2 &glowMax = glowIt->second.max;
+          for (int ring = 3; ring >= 1; --ring) {
+            const float pad = 2.0f * static_cast<float>(ring);
+            glowList->AddRect(ImVec2(glowMin.x - pad, glowMin.y - pad), ImVec2(glowMax.x + pad, glowMax.y + pad),
+                              IM_COL32(122, 110, 255, 40 * (4 - ring)), 3.0f + pad, 0, 2.0f);
+          }
+          glowList->AddRect(glowMin, glowMax, IM_COL32(122, 110, 255, 255), 2.0f, 0, 2.0f);
+        }
+      }
 
       const bool assemblageEditing =
           worldUiEditing && world2DEditMode == World2DEditMode::Assemblage;
@@ -8954,6 +9339,8 @@ void Engine::renderViewport() {
         ImGui::InvisibleButton("##btn", modeButtonSize);
         const bool hovered = ImGui::IsItemHovered();
         const bool pressed = ImGui::IsItemClicked();
+        if (pressed) ImGui::ReportWidgetFeedback(ImGuiWidgetFeedback_Button);
+        ImGui::ReportItemHoverFeedback();
         const ImVec2 min = ImGui::GetItemRectMin();
         const ImVec2 max = ImGui::GetItemRectMax();
 
@@ -9064,6 +9451,8 @@ void Engine::renderViewport() {
       ImGui::InvisibleButton("##btn", actionsButtonSize);
       const bool actionsHovered = ImGui::IsItemHovered();
       const bool actionsPressed = ImGui::IsItemClicked();
+      if (actionsPressed) ImGui::ReportWidgetFeedback(ImGuiWidgetFeedback_Button);
+      ImGui::ReportItemHoverFeedback();
       const ImVec2 actionsMin = ImGui::GetItemRectMin();
       const ImVec2 actionsMax = ImGui::GetItemRectMax();
       const ImU32 actionsBg =
@@ -9164,278 +9553,7 @@ void Engine::renderViewport() {
       }
     }
     if (leftPickClick || rightPickRelease) {
-      glm::mat4 invViewProj = glm::inverse(proj * view);
-      ImVec2 mousePos = ImGui::GetMousePos();
-
-      auto makeRay = [&](const ImVec2 &pos) {
-        float x = (pos.x - imageMin.x) / (imageMax.x - imageMin.x);
-        float y = (pos.y - imageMin.y) / (imageMax.y - imageMin.y);
-        x = x * 2.0f - 1.0f;
-        y = 1.0f - y * 2.0f;
-
-        glm::vec4 nearPt = invViewProj * glm::vec4(x, y, -1.0f, 1.0f);
-        glm::vec4 farPt = invViewProj * glm::vec4(x, y, 1.0f, 1.0f);
-        nearPt /= nearPt.w;
-        farPt /= farPt.w;
-
-        glm::vec3 origin = glm::vec3(nearPt);
-        glm::vec3 dir = glm::normalize(glm::vec3(farPt - nearPt));
-        return std::make_pair(origin, dir);
-      };
-
-      auto rayAabb = [](const glm::vec3 &orig, const glm::vec3 &dir,
-                        const glm::vec3 &bmin, const glm::vec3 &bmax,
-                        float &tHit) {
-        float tmin = -FLT_MAX;
-        float tmax = FLT_MAX;
-        for (int i = 0; i < 3; ++i) {
-          if (std::abs(dir[i]) < 1e-6f) {
-            if (orig[i] < bmin[i] || orig[i] > bmax[i])
-              return false;
-            continue;
-          }
-          float invD = 1.0f / dir[i];
-          float t1 = (bmin[i] - orig[i]) * invD;
-          float t2 = (bmax[i] - orig[i]) * invD;
-          if (t1 > t2)
-            std::swap(t1, t2);
-          tmin = std::max(tmin, t1);
-          tmax = std::min(tmax, t2);
-          if (tmin > tmax)
-            return false;
-        }
-        tHit = (tmin >= 0.0f) ? tmin : tmax;
-        return tmax >= 0.0f;
-      };
-
-      auto raySphere = [](const glm::vec3 &orig, const glm::vec3 &dir,
-                          float radius, float &tHit) {
-        float b = glm::dot(dir, orig);
-        float c = glm::dot(orig, orig) - radius * radius;
-        float disc = b * b - c;
-        if (disc < 0.0f)
-          return false;
-        float sqrtDisc = sqrtf(disc);
-        float t0 = -b - sqrtDisc;
-        float t1 = -b + sqrtDisc;
-        float t = (t0 >= 0.0f) ? t0 : t1;
-        if (t < 0.0f)
-          return false;
-        tHit = t;
-        return true;
-      };
-
-      auto rayTriangle = [](const glm::vec3 &orig, const glm::vec3 &dir,
-                            const glm::vec3 &v0, const glm::vec3 &v1,
-                            const glm::vec3 &v2, float &tHit) {
-        const float EPSILON = 1e-6f;
-        glm::vec3 e1 = v1 - v0;
-        glm::vec3 e2 = v2 - v0;
-        glm::vec3 pvec = glm::cross(dir, e2);
-        float det = glm::dot(e1, pvec);
-        if (fabs(det) < EPSILON)
-          return false;
-        float invDet = 1.0f / det;
-        glm::vec3 tvec = orig - v0;
-        float u = glm::dot(tvec, pvec) * invDet;
-        if (u < 0.0f || u > 1.0f)
-          return false;
-        glm::vec3 qvec = glm::cross(tvec, e1);
-        float v = glm::dot(dir, qvec) * invDet;
-        if (v < 0.0f || u + v > 1.0f)
-          return false;
-        float t = glm::dot(e2, qvec) * invDet;
-        if (t < 0.0f)
-          return false;
-        tHit = t;
-        return true;
-      };
-
-      auto ray = makeRay(mousePos);
-      float closest = FLT_MAX;
-      int hitId = -1;
-      glm::mat4 invView = glm::inverse(view);
-      glm::vec3 cameraPos = glm::vec3(invView[3]);
-      glm::vec3 cameraUp = glm::normalize(glm::vec3(invView[1]));
-
-      for (const auto &obj : sceneObjects) {
-        if (!IsObjectEnabledInHierarchy(obj))
-          continue;
-        if (obj.hasLight && !obj.light.enabled &&
-            (obj.type == ObjectType::DirectionalLight ||
-             obj.type == ObjectType::PointLight ||
-             obj.type == ObjectType::SpotLight ||
-             obj.type == ObjectType::AreaLight))
-          continue;
-
-        glm::vec3 aabbMin(-0.5f);
-        glm::vec3 aabbMax(0.5f);
-
-        glm::mat4 model(1.0f);
-        model = glm::translate(model, obj.position);
-        if (obj.type == ObjectType::Sprite25D ||
-            (obj.renderType == RenderType::Sprite && obj.faceCamera)) {
-          glm::vec3 forward = cameraPos - obj.position;
-          if (glm::dot(forward, forward) < 1e-6f)
-            forward = glm::vec3(0.0f, 0.0f, 1.0f);
-          else
-            forward = glm::normalize(forward);
-          glm::vec3 right = glm::cross(cameraUp, forward);
-          if (glm::dot(right, right) < 1e-6f) {
-            right = glm::cross(glm::vec3(0.0f, 0.0f, 1.0f), forward);
-          }
-          right = glm::normalize(right);
-          glm::vec3 up = glm::normalize(glm::cross(forward, right));
-          glm::vec3 scale = glm::max(glm::abs(obj.scale), glm::vec3(0.0001f));
-          model[0] = glm::vec4(
-              right * scale.x * (obj.scale.x < 0.0f ? -1.0f : 1.0f), 0.0f);
-          model[1] = glm::vec4(
-              up * scale.y * (obj.scale.y < 0.0f ? -1.0f : 1.0f), 0.0f);
-          model[2] = glm::vec4(
-              forward * scale.z * (obj.scale.z < 0.0f ? -1.0f : 1.0f), 0.0f);
-        } else {
-          model = glm::rotate(model, glm::radians(obj.rotation.x),
-                              glm::vec3(1, 0, 0));
-          model = glm::rotate(model, glm::radians(obj.rotation.y),
-                              glm::vec3(0, 1, 0));
-          model = glm::rotate(model, glm::radians(obj.rotation.z),
-                              glm::vec3(0, 0, 1));
-          model = glm::scale(model, obj.scale);
-        }
-
-        glm::mat4 invModel = glm::inverse(model);
-        glm::vec3 localOrigin =
-            glm::vec3(invModel * glm::vec4(ray.first, 1.0f));
-        glm::vec3 localDir =
-            glm::normalize(glm::vec3(invModel * glm::vec4(ray.second, 0.0f)));
-
-        float hitT = 0.0f;
-        bool hit = false;
-        switch (obj.type) {
-        case ObjectType::Cube:
-          hit = rayAabb(localOrigin, localDir, glm::vec3(-0.5f),
-                        glm::vec3(0.5f), hitT);
-          break;
-        case ObjectType::Sphere:
-          hit = raySphere(localOrigin, localDir, 0.5f, hitT);
-          break;
-        case ObjectType::Capsule:
-          hit = rayAabb(localOrigin, localDir, glm::vec3(-0.35f, -0.9f, -0.35f),
-                        glm::vec3(0.35f, 0.9f, 0.35f), hitT);
-          break;
-        case ObjectType::Plane:
-          hit = rayAabb(localOrigin, localDir, glm::vec3(-0.5f, -0.5f, -0.02f),
-                        glm::vec3(0.5f, 0.5f, 0.02f), hitT);
-          break;
-        case ObjectType::Mirror:
-          hit = rayAabb(localOrigin, localDir, glm::vec3(-0.5f, -0.5f, -0.02f),
-                        glm::vec3(0.5f, 0.5f, 0.02f), hitT);
-          break;
-        case ObjectType::Sprite:
-        case ObjectType::Sprite25D:
-        case ObjectType::ParticleSystem2D:
-          hit = rayAabb(localOrigin, localDir, glm::vec3(-0.5f, -0.5f, -0.02f),
-                        glm::vec3(0.5f, 0.5f, 0.02f), hitT);
-          break;
-        case ObjectType::Torus:
-          hit = raySphere(localOrigin, localDir, 0.5f, hitT);
-          break;
-        case ObjectType::Sprite2D:
-        case ObjectType::Canvas:
-        case ObjectType::UIImage:
-        case ObjectType::UISlider:
-        case ObjectType::UIButton:
-        case ObjectType::UIText:
-          hit = false;
-          break;
-        case ObjectType::OBJMesh: {
-          const auto *info = g_objLoader.getMeshInfo(obj.meshId);
-          if (info && info->boundsMin.x < info->boundsMax.x) {
-            aabbMin = info->boundsMin;
-            aabbMax = info->boundsMax;
-          }
-          bool aabbHit = rayAabb(localOrigin, localDir, aabbMin, aabbMax, hitT);
-          if (aabbHit && info && !info->triangleVertices.empty()) {
-            float triBest = FLT_MAX;
-            for (size_t i = 0; i + 2 < info->triangleVertices.size(); i += 3) {
-              float triT = 0.0f;
-              if (rayTriangle(localOrigin, localDir, info->triangleVertices[i],
-                              info->triangleVertices[i + 1],
-                              info->triangleVertices[i + 2], triT)) {
-                if (triT < triBest && triT >= 0.0f)
-                  triBest = triT;
-              }
-            }
-            if (triBest < FLT_MAX) {
-              hit = true;
-              hitT = triBest;
-            } else {
-              hit = false;
-            }
-          } else {
-            hit = aabbHit;
-          }
-          break;
-        }
-        case ObjectType::Model: {
-          const auto *info = getModelLoader().getMeshInfo(obj.meshId);
-          if (info && info->boundsMin.x < info->boundsMax.x) {
-            aabbMin = info->boundsMin;
-            aabbMax = info->boundsMax;
-          }
-          bool aabbHit = rayAabb(localOrigin, localDir, aabbMin, aabbMax, hitT);
-          if (aabbHit && info && !info->triangleVertices.empty()) {
-            float triBest = FLT_MAX;
-            for (size_t i = 0; i + 2 < info->triangleVertices.size(); i += 3) {
-              float triT = 0.0f;
-              if (rayTriangle(localOrigin, localDir, info->triangleVertices[i],
-                              info->triangleVertices[i + 1],
-                              info->triangleVertices[i + 2], triT)) {
-                if (triT < triBest && triT >= 0.0f)
-                  triBest = triT;
-              }
-            }
-            if (triBest < FLT_MAX) {
-              hit = true;
-              hitT = triBest;
-            } else {
-              hit = false;
-            }
-          } else {
-            hit = aabbHit;
-          }
-          break;
-        }
-        case ObjectType::Camera:
-          hit = raySphere(localOrigin, localDir, 0.3f, hitT);
-          break;
-        case ObjectType::DirectionalLight:
-        case ObjectType::PointLight:
-        case ObjectType::SpotLight:
-        case ObjectType::AreaLight:
-          hit = raySphere(localOrigin, localDir, 0.3f, hitT);
-          break;
-        case ObjectType::PostFXNode:
-          hit = false;
-          break;
-        case ObjectType::Empty:
-          hit = false;
-          break;
-        default:
-          break;
-        }
-
-        if (hit && hitT >= 0.0f) {
-          const glm::vec3 localHit = localOrigin + localDir * hitT;
-          const glm::vec3 worldHit =
-              glm::vec3(model * glm::vec4(localHit, 1.0f));
-          const float worldT = glm::dot(worldHit - ray.first, ray.second);
-          if (worldT < closest && worldT >= 0.0f) {
-            closest = worldT;
-            hitId = obj.id;
-          }
-        }
-      }
+      const int hitId = pickSceneObjectAtScreen(view, proj, imageMin, imageMax, ImGui::GetMousePos());
 
       viewportController.setFocused(true);
       if (hitId != -1) {

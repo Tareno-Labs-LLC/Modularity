@@ -96,6 +96,13 @@ void ApplyGlobalPreferenceKey(EditorGlobalPreferences& prefs,
     else if (key == "feedbackClickSounds")       prefs.feedbackClickSounds = ParseBoolToken(value);
     else if (key == "feedbackErrorSounds")       prefs.feedbackErrorSounds = ParseBoolToken(value);
     else if (key == "feedbackOtherSounds")       prefs.feedbackOtherSounds = ParseBoolToken(value);
+    else if (key == "feedbackButtonSounds")      prefs.feedbackButtonSounds = ParseBoolToken(value);
+    else if (key == "feedbackToggleSounds")      prefs.feedbackToggleSounds = ParseBoolToken(value);
+    else if (key == "feedbackSlideSounds")       prefs.feedbackSlideSounds = ParseBoolToken(value);
+    else if (key == "feedbackTransitionSounds")  prefs.feedbackTransitionSounds = ParseBoolToken(value);
+    else if (key == "feedbackHoverSounds")       prefs.feedbackHoverSounds = ParseBoolToken(value);
+    else if (key == "feedbackSoundVolume")       readFloat(prefs.feedbackSoundVolume, 0.0f, 1.0f);
+    else if (key == "feedbackSoundTheme")        prefs.feedbackSoundTheme = value;
     else if (key == "reopenLastProject")         prefs.reopenLastProject = ParseBoolToken(value);
     else if (key == "hierarchyTexturePreviews")  prefs.hierarchyTexturePreviews = ParseBoolToken(value);
     else if (key == "sceneGizmos")               prefs.sceneGizmos = ParseBoolToken(value);
@@ -525,6 +532,31 @@ bool Project::load(const fs::path& projectFilePath) {
             } else if (key == "graphicsMaxTextureSize") {
                 const int parsed = std::stoi(value);
                 graphicsSettings.maxTextureSize = (parsed <= 0) ? 0 : std::clamp(parsed, 64, 16384);
+            } else if (key == "graphicsCanvas3DAutoResolution") {
+                graphicsSettings.canvas3DAutoResolution = ParseProjectBool(value);
+            } else if (key == "graphicsCanvas3DMaxResolution") {
+                const int parsed = std::stoi(value);
+                graphicsSettings.canvas3DMaxResolution = (parsed <= 0) ? 0 : std::clamp(parsed, 16, 4096);
+            } else if (key == "graphicsOptimizationStrategy") {
+                graphicsSettings.optimizationStrategy = std::stoi(value) == 1
+                    ? ProjectOptimizationStrategy::Automatic
+                    : ProjectOptimizationStrategy::Manual;
+            } else if (key == "graphicsOptCpuFrustumCulling") {
+                graphicsSettings.optCpuFrustumCulling = ParseProjectBool(value);
+            } else if (key == "graphicsOptMultiDrawIndirect") {
+                graphicsSettings.optMultiDrawIndirect = ParseProjectBool(value);
+            } else if (key == "graphicsOptGpuDrivenCulling") {
+                graphicsSettings.optGpuDrivenCulling = ParseProjectBool(value);
+            } else if (key == "graphicsOptLod") {
+                graphicsSettings.optLod = ParseProjectBool(value);
+            } else if (key == "graphicsOptLodMinScreenSize") {
+                graphicsSettings.optLodMinScreenSize = std::clamp(std::stof(value), 0.1f, 64.0f);
+            } else if (key == "graphicsOptHiZOcclusionCulling") {
+                graphicsSettings.optHiZOcclusionCulling = ParseProjectBool(value);
+            } else if (key == "graphicsOptMaterialSorting") {
+                graphicsSettings.optMaterialSorting = ParseProjectBool(value);
+            } else if (key == "graphicsOptStaticObjectCaching") {
+                graphicsSettings.optStaticObjectCaching = ParseProjectBool(value);
             } else if (key == "lightingMainLightEnabled") {
                 graphicsSettings.mainLightEnabled = ParseProjectBool(value);
             } else if (key == "lightingMainLightCastShadows") {
@@ -764,6 +796,17 @@ void Project::saveProjectFile() const {
     file << "graphicsColorResolution=" << static_cast<int>(graphicsSettings.colorResolution) << "\n";
     file << "graphicsDefaultTextureFormat=" << (graphicsSettings.defaultTextureFormat.empty() ? "Auto" : graphicsSettings.defaultTextureFormat) << "\n";
     file << "graphicsMaxTextureSize=" << graphicsSettings.maxTextureSize << "\n";
+    file << "graphicsCanvas3DAutoResolution=" << (graphicsSettings.canvas3DAutoResolution ? 1 : 0) << "\n";
+    file << "graphicsCanvas3DMaxResolution=" << graphicsSettings.canvas3DMaxResolution << "\n";
+    file << "graphicsOptimizationStrategy=" << static_cast<int>(graphicsSettings.optimizationStrategy) << "\n";
+    file << "graphicsOptCpuFrustumCulling=" << (graphicsSettings.optCpuFrustumCulling ? 1 : 0) << "\n";
+    file << "graphicsOptMultiDrawIndirect=" << (graphicsSettings.optMultiDrawIndirect ? 1 : 0) << "\n";
+    file << "graphicsOptGpuDrivenCulling=" << (graphicsSettings.optGpuDrivenCulling ? 1 : 0) << "\n";
+    file << "graphicsOptLod=" << (graphicsSettings.optLod ? 1 : 0) << "\n";
+    file << "graphicsOptLodMinScreenSize=" << graphicsSettings.optLodMinScreenSize << "\n";
+    file << "graphicsOptHiZOcclusionCulling=" << (graphicsSettings.optHiZOcclusionCulling ? 1 : 0) << "\n";
+    file << "graphicsOptMaterialSorting=" << (graphicsSettings.optMaterialSorting ? 1 : 0) << "\n";
+    file << "graphicsOptStaticObjectCaching=" << (graphicsSettings.optStaticObjectCaching ? 1 : 0) << "\n";
     file << "graphicsShadowFilterQuality=" << graphicsSettings.shadowFilterQuality << "\n";
     file << "graphicsShadowLodDistance=" << graphicsSettings.shadowLodDistance << "\n";
     file << "graphicsShadowContactHardening=" << (graphicsSettings.shadowContactHardening ? 1 : 0) << "\n";
@@ -1064,6 +1107,13 @@ void ProjectManager::saveLauncherSettings() const {
     file << "pref.feedbackClickSounds=" << boolToken(p.feedbackClickSounds) << "\n";
     file << "pref.feedbackErrorSounds=" << boolToken(p.feedbackErrorSounds) << "\n";
     file << "pref.feedbackOtherSounds=" << boolToken(p.feedbackOtherSounds) << "\n";
+    file << "pref.feedbackButtonSounds=" << boolToken(p.feedbackButtonSounds) << "\n";
+    file << "pref.feedbackToggleSounds=" << boolToken(p.feedbackToggleSounds) << "\n";
+    file << "pref.feedbackSlideSounds=" << boolToken(p.feedbackSlideSounds) << "\n";
+    file << "pref.feedbackTransitionSounds=" << boolToken(p.feedbackTransitionSounds) << "\n";
+    file << "pref.feedbackHoverSounds=" << boolToken(p.feedbackHoverSounds) << "\n";
+    file << "pref.feedbackSoundVolume=" << p.feedbackSoundVolume << "\n";
+    file << "pref.feedbackSoundTheme=" << p.feedbackSoundTheme << "\n";
     file << "pref.reopenLastProject=" << boolToken(p.reopenLastProject) << "\n";
     file << "pref.hierarchyTexturePreviews=" << boolToken(p.hierarchyTexturePreviews) << "\n";
     file << "pref.sceneGizmos=" << boolToken(p.sceneGizmos) << "\n";

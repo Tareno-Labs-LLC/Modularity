@@ -1,4 +1,5 @@
 #include "../EditorLocalization.h"
+#include "BuildSettingsHints.h"
 #include "Engine.h"
 
 namespace Loc = Modularity::Loc;
@@ -28,15 +29,37 @@ std::vector<fs::path> GatherBuildProfiles(const fs::path& projectRoot) {
     return profiles;
 }
 
-bool DrawModuleStateCombo(const char* label, std::string& value) {
+bool DrawModuleStateCombo(const char* id, std::string& value) {
     const char* states[] = {"Auto", "On", "Off"};
     int index = value == "on" ? 1 : (value == "off" ? 2 : 0);
-    ImGui::SetNextItemWidth(120.0f);
-    if (ImGui::Combo(label, &index, states, 3)) {
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::Combo(id, &index, states, 3)) {
         value = index == 1 ? "on" : (index == 2 ? "off" : "auto");
         return true;
     }
     return false;
+}
+
+// Hover text for the previous item, wrapped so a long hint stays a readable column.
+void DrawHint(const char* text) {
+    if (text && *text && ImGui::BeginItemTooltip()) {
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30.0f);
+        ImGui::TextUnformatted(text);
+        ImGui::PopTextWrapPos();
+        ImGui::EndTooltip();
+    }
+}
+
+bool HintedCheckbox(const char* label, bool* value, const char* hint) {
+    const bool changed = ImGui::Checkbox(label, value);
+    DrawHint(hint);
+    return changed;
+}
+
+// Fits the label instead of a hard-coded width, which clipped "Bake + Run" and "Add Open Scene".
+float ButtonWidthFor(const char* label, float minWidth = 0.0f) {
+    const float textWidth = ImGui::CalcTextSize(label, nullptr, true).x;
+    return std::max(minWidth, textWidth + ImGui::GetStyle().FramePadding.x * 2.0f + 12.0f);
 }
 } // namespace
 
@@ -48,6 +71,7 @@ void Engine::renderBuildSettingsWindow() {
         ImGui::End();
         return;
     }
+    const bool buildWindowAppearing = ImGui::IsWindowAppearing();
 
     if (!projectManager.currentProject.isLoaded) {
         ImGui::TextDisabled("No project loaded.");
@@ -156,8 +180,8 @@ void Engine::renderBuildSettingsWindow() {
     ImGui::EndChild();
 
     {
-        float removeW = 85.0f;
-        float addW    = 130.0f;
+        float removeW = ButtonWidthFor("Remove", 85.0f);
+        float addW    = ButtonWidthFor("Add Open Scene", 130.0f);
         float total   = removeW + addW + buttonSpacing;
         float startX  = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - total;
         if (startX > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(startX);
@@ -176,6 +200,8 @@ void Engine::renderBuildSettingsWindow() {
                 changed = true;
         }
     }
+    // The build scene list decides which meshes and C# scripts the export needs.
+    const bool sceneListChanged = changed;
 
     ImGui::Spacing();
     ImGui::Spacing();
@@ -230,72 +256,162 @@ void Engine::renderBuildSettingsWindow() {
     ImGui::SameLine();
 
     ImGui::BeginChild("BuildRightCol", ImVec2(rightColW, 0.0f), false);
-    ImGui::Text("Build Options");
-    const char* configurations[] = {"Release", "Debug"};
-    int configurationIndex = buildSettings.configuration == "Debug" ? 1 : 0;
-    ImGui::SetNextItemWidth(-1);
-    if (ImGui::Combo("Configuration", &configurationIndex, configurations, 2)) {
-        buildSettings.configuration = configurations[configurationIndex];
-        changed = true;
-    }
-    if (ImGui::Checkbox("Runtime Only", &buildSettings.runtimeOnly)) changed = true;
-    if (ImGui::Checkbox("Include Editor Target", &buildSettings.includeEditor)) changed = true;
-    if (ImGui::Checkbox("Lean Runtime Export", &buildSettings.leanRuntimeExport)) changed = true;
-    if (ImGui::Checkbox("Ship ScriptSDK", &buildSettings.shipScriptSdk)) changed = true;
-    if (ImGui::Checkbox("Compress Audio (Vorbis)", &buildSettings.compressAudio)) changed = true;
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("WAV, AIFF and FLAC clips ship as Ogg Vorbis. MP3 and OGG are left as they are.\n"
-                          "Scenes and scripts keep using the original file names.");
-    }
-    if (buildSettings.compressAudio) {
-        ImGui::SetNextItemWidth(-1);
-        if (ImGui::SliderFloat("##AudioVorbisQuality", &buildSettings.audioVorbisQuality, 0.0f, 10.0f,
-                               "Vorbis quality %.1f")) {
-            changed = true;
+    // The module scan is refreshed out here, not inside the Modules tab, so opening the window or
+    // editing the scene list updates it whichever tab happens to be showing.
+    static bool rescanRequested = false;
+    {
+        const fs::path projectRoot = projectManager.currentProject.projectPath;
+        if (rescanRequested || sceneListChanged || buildWindowAppearing ||
+            !buildModuleScan.valid || buildModuleScan.projectRoot != projectRoot) {
+            buildModuleScan = scanProjectForBuildModules();
+            rescanRequested = false;
         }
     }
-    if (ImGui::Checkbox("Development Build",  &buildSettings.developmentBuild))  changed = true;
-    if (ImGui::Checkbox("Server Build",       &buildSettings.serverBuild))       changed = true;
-    if (ImGui::Checkbox("Script Debugging",   &buildSettings.scriptDebugging))   changed = true;
-    if (ImGui::Checkbox("Scripts Only",       &buildSettings.scriptsOnlyBuild))  changed = true;
-    ImGui::Spacing();
-    ImGui::Text("Profiling");
-    ImGui::Separator();
-    if (ImGui::Checkbox("Autoconnect Profiler", &buildSettings.autoConnectProfiler)) changed = true;
-    if (ImGui::Checkbox("Deep Profiling",        &buildSettings.deepProfiling))       changed = true;
-    ImGui::Spacing();
-    ImGui::Text("Compression & Packaging");
-    ImGui::Separator();
-    const char* compressionOptions[] = {"Default", "None", "LZ4", "LZ4HC"};
-    int compressionIndex = 0;
-    for (int i = 0; i < 4; ++i) {
-        if (buildSettings.compressionMethod == compressionOptions[i]) {
-            compressionIndex = i;
-            break;
+    if (ImGui::BeginTabBar("##BuildOptionTabs")) {
+        if (ImGui::BeginTabItem("Build")) {
+            const char* configurations[] = {"Release", "Debug"};
+            int configurationIndex = buildSettings.configuration == "Debug" ? 1 : 0;
+            ImGui::SetNextItemWidth(-ImGui::CalcTextSize("Configuration").x - ImGui::GetStyle().ItemInnerSpacing.x);
+            if (ImGui::Combo("Configuration", &configurationIndex, configurations, 2)) {
+                buildSettings.configuration = configurations[configurationIndex];
+                changed = true;
+            }
+            DrawHint(BuildSettingsHints::kConfiguration);
+            if (HintedCheckbox("Runtime Only", &buildSettings.runtimeOnly, BuildSettingsHints::kRuntimeOnly)) changed = true;
+            if (HintedCheckbox("Include Editor Target", &buildSettings.includeEditor, BuildSettingsHints::kIncludeEditor)) changed = true;
+            if (HintedCheckbox("Lean Runtime Export", &buildSettings.leanRuntimeExport, BuildSettingsHints::kLeanRuntimeExport)) changed = true;
+            if (HintedCheckbox("Ship ScriptSDK", &buildSettings.shipScriptSdk, BuildSettingsHints::kShipScriptSdk)) changed = true;
+            if (HintedCheckbox("Server Build", &buildSettings.serverBuild, BuildSettingsHints::kServerBuild)) changed = true;
+            if (HintedCheckbox("Scripts Only", &buildSettings.scriptsOnlyBuild, BuildSettingsHints::kScriptsOnly)) changed = true;
+            ImGui::EndTabItem();
         }
+
+        if (ImGui::BeginTabItem("Modules")) {
+            std::vector<BuildModuleDecision> modules = resolveBuildModules(buildModuleScan);
+            const bool allAutomatic = std::all_of(modules.begin(), modules.end(),
+                                                  [](const BuildModuleDecision& d) { return d.automatic; });
+            bool automaticModules = allAutomatic;
+            if (ImGui::Checkbox("Automatic Module Selection", &automaticModules)) {
+                // Turning automatic off pins every module to what auto had picked, so nothing
+                // changes until a row is edited by hand.
+                for (const BuildModuleDecision& d : modules) {
+                    *d.setting = automaticModules ? "auto" : (d.enabled ? "on" : "off");
+                }
+                modules = resolveBuildModules(buildModuleScan);
+                changed = true;
+            }
+            DrawHint(BuildSettingsHints::kAutomaticModules);
+            {
+                const float rescanW = ButtonWidthFor("Rescan");
+                ImGui::SameLine();
+                const float slack = ImGui::GetContentRegionAvail().x - rescanW;
+                if (slack > 0.0f) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + slack);
+                if (ImGui::Button("Rescan", ImVec2(rescanW, 0.0f))) rescanRequested = true;
+                DrawHint("Look through Assets and the build scenes again, e.g. after adding models, audio or C# scripts.");
+            }
+
+            const ImGuiTableFlags moduleTableFlags =
+                ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_SizingFixedFit;
+            if (ImGui::BeginTable("##BuildModules", 3, moduleTableFlags)) {
+                ImGui::TableSetupColumn("Module", ImGuiTableColumnFlags_WidthFixed, ImGui::CalcTextSize("OpenGL ES").x + 8.0f);
+                ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthFixed, allAutomatic ? ImGui::CalcTextSize("Off").x + 12.0f : 78.0f);
+                ImGui::TableSetupColumn("Why", ImGuiTableColumnFlags_WidthStretch);
+                for (BuildModuleDecision& d : modules) {
+                    ImGui::PushID(d.label);
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::TextUnformatted(d.label);
+                    ImGui::TableSetColumnIndex(1);
+                    if (allAutomatic) {
+                        ImGui::AlignTextToFramePadding();
+                        if (d.enabled) {
+                            ImGui::TextColored(ImVec4(0.55f, 0.85f, 0.60f, 1.0f), "On");
+                        } else {
+                            ImGui::TextDisabled("Off");
+                        }
+                    } else if (DrawModuleStateCombo("##state", *d.setting)) {
+                        changed = true;
+                    }
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::AlignTextToFramePadding();
+                    if (!d.automatic && !d.enabled && d.autoEnabled) {
+                        // Forced off, but the project uses it: the export would build and the
+                        // game would then fail at runtime.
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.72f, 0.35f, 1.0f));
+                        ImGui::TextWrapped("Forced off, but the project needs it: %s", d.autoReason.c_str());
+                        ImGui::PopStyleColor();
+                    } else if (!d.automatic) {
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+                        ImGui::TextWrapped("%s Auto would be %s: %s", d.reason.c_str(),
+                                           d.autoEnabled ? "on" : "off", d.autoReason.c_str());
+                        ImGui::PopStyleColor();
+                    } else {
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+                        ImGui::TextWrapped("%s", d.reason.c_str());
+                        ImGui::PopStyleColor();
+                    }
+                    ImGui::PopID();
+                }
+                ImGui::EndTable();
+            }
+            const auto moduleEnabled = [&](const char* option) {
+                for (const BuildModuleDecision& d : modules) {
+                    if (std::strcmp(d.cmakeOption, option) == 0) return d.enabled;
+                }
+                return false;
+            };
+            if (!moduleEnabled("MODULARITY_ENABLE_JOLT") && !moduleEnabled("MODULARITY_ENABLE_PHYSX")) {
+                ImGui::TextColored(ImVec4(0.95f, 0.45f, 0.40f, 1.0f),
+                                   "No physics backend: rigidbodies and colliders will not simulate.");
+            }
+            ImGui::EndTabItem();
+        }
+
+        if (ImGui::BeginTabItem("Compression")) {
+            if (HintedCheckbox("Compress Audio (Vorbis)", &buildSettings.compressAudio, BuildSettingsHints::kCompressAudio)) changed = true;
+            ImGui::BeginDisabled(!buildSettings.compressAudio);
+            ImGui::SetNextItemWidth(-ImGui::CalcTextSize("Vorbis Quality").x - ImGui::GetStyle().ItemInnerSpacing.x);
+            if (ImGui::SliderFloat("Vorbis Quality", &buildSettings.audioVorbisQuality, 0.0f, 10.0f, "%.1f")) {
+                changed = true;
+            }
+            DrawHint(BuildSettingsHints::kVorbisQuality);
+            ImGui::EndDisabled();
+
+            ImGui::Spacing();
+            ImGui::SeparatorText("Packaging");
+            const char* compressionOptions[] = {"Default", "None", "LZ4", "LZ4HC"};
+            int compressionIndex = 0;
+            for (int i = 0; i < 4; ++i) {
+                if (buildSettings.compressionMethod == compressionOptions[i]) {
+                    compressionIndex = i;
+                    break;
+                }
+            }
+            ImGui::SetNextItemWidth(-ImGui::CalcTextSize("Content Compression").x - ImGui::GetStyle().ItemInnerSpacing.x);
+            if (ImGui::Combo("Content Compression", &compressionIndex, compressionOptions, 4)) {
+                buildSettings.compressionMethod = compressionOptions[compressionIndex];
+                changed = true;
+            }
+            DrawHint(BuildSettingsHints::kCompressionMethod);
+            if (HintedCheckbox("Export as Archive (.tar.gz)", &buildSettings.packageStandaloneArchive,
+                               BuildSettingsHints::kExportArchive)) {
+                changed = true;
+            }
+            ImGui::EndTabItem();
+        }
+
+        if (ImGui::BeginTabItem("Debug")) {
+            if (HintedCheckbox("Development Build", &buildSettings.developmentBuild, BuildSettingsHints::kDevelopmentBuild)) changed = true;
+            if (HintedCheckbox("Script Debugging", &buildSettings.scriptDebugging, BuildSettingsHints::kScriptDebugging)) changed = true;
+            ImGui::Spacing();
+            ImGui::SeparatorText("Profiling");
+            if (HintedCheckbox("Autoconnect Profiler", &buildSettings.autoConnectProfiler, BuildSettingsHints::kAutoconnectProfiler)) changed = true;
+            if (HintedCheckbox("Deep Profiling", &buildSettings.deepProfiling, BuildSettingsHints::kDeepProfiling)) changed = true;
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
     }
-    ImGui::SetNextItemWidth(-1);
-    if (ImGui::Combo("##compression", &compressionIndex, compressionOptions, 4)) {
-        buildSettings.compressionMethod = compressionOptions[compressionIndex];
-        changed = true;
-    }
-    if (ImGui::Checkbox("Export as Archive (.tar.gz)", &buildSettings.packageStandaloneArchive))
-        changed = true;
-    ImGui::Spacing();
-    ImGui::Text("Modules");
-    ImGui::Separator();
-    if (DrawModuleStateCombo("Assimp", buildSettings.moduleAssimp)) changed = true;
-    ImGui::SameLine();
-    if (DrawModuleStateCombo("Vulkan", buildSettings.moduleVulkan)) changed = true;
-    if (DrawModuleStateCombo("PhysX", buildSettings.modulePhysX)) changed = true;
-    ImGui::SameLine();
-    if (DrawModuleStateCombo("Jolt", buildSettings.moduleJolt)) changed = true;
-    if (DrawModuleStateCombo("sndfile", buildSettings.moduleSndfile)) changed = true;
-    ImGui::SameLine();
-    if (DrawModuleStateCombo("opusfile", buildSettings.moduleOpusfile)) changed = true;
-    if (DrawModuleStateCombo("Mono", buildSettings.moduleMono)) changed = true;
-    ImGui::SameLine();
-    if (DrawModuleStateCombo("OpenGL ES", buildSettings.moduleOpenGLES)) changed = true;
     ImGui::EndChild(); // BuildRightCol
     ImGui::EndChild(); // BuildTopSection
 
@@ -305,12 +421,10 @@ void Engine::renderBuildSettingsWindow() {
     char companyBuf[256];
     char buildNameBuf[256];
     char versionBuf[128];
-    char splashBuf[512];
     char outputFolderBuf[512];
     std::snprintf(companyBuf,   sizeof(companyBuf),   "%s", buildSettings.companyName.c_str());
     std::snprintf(buildNameBuf, sizeof(buildNameBuf), "%s", buildSettings.buildName.c_str());
     std::snprintf(versionBuf,   sizeof(versionBuf),   "%s", buildSettings.version.c_str());
-    std::snprintf(splashBuf,    sizeof(splashBuf),    "%s", buildSettings.splashImagePath.c_str());
     std::snprintf(outputFolderBuf, sizeof(outputFolderBuf), "%s", buildSettings.outputFolder.c_str());
 
     // Three-column row: Company | Build Name | Version
@@ -357,22 +471,19 @@ void Engine::renderBuildSettingsWindow() {
     ImGui::Spacing();
 
     // Splash settings
-    if (ImGui::Checkbox("Enable Startup Splash", &buildSettings.splashEnabled)) changed = true;
+    if (HintedCheckbox("Enable Startup Splash", &buildSettings.splashEnabled, BuildSettingsHints::kSplash)) changed = true;
     ImGui::BeginDisabled(!buildSettings.splashEnabled);
     {
-        float availW  = ImGui::GetContentRegionAvail().x;
-        float btn1W   = 112.0f;
-        float btn2W   = 50.0f;
-        float inputW  = availW - btn1W - btn2W - buttonSpacing * 2;
-        ImGui::SetNextItemWidth(inputW > 40.0f ? inputW : 40.0f);
-        if (ImGui::InputText("##splash", splashBuf, sizeof(splashBuf))) {
-            buildSettings.splashImagePath = splashBuf;
-            changed = true;
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Use Selected", ImVec2(btn1W, 0))) {
-            if (!fileBrowser.selectedFile.empty() && fs::is_regular_file(fileBrowser.selectedFile)) {
-                fs::path splashPath = fs::absolute(fileBrowser.selectedFile);
+        // The editor's drag-drop reference slot: drop an image, click to pick, and Clear / Use
+        // Project Selection live in its right-click menu.
+        fs::path assignedSplash;
+        if (drawAssetReferenceSlot("##SplashImage", "Splash Image", buildSettings.splashImagePath,
+                                   FileCategory::Texture, "Image", assignedSplash)) {
+            if (assignedSplash.empty()) {
+                buildSettings.splashImagePath.clear();
+            } else {
+                // Kept project-relative when it can be, so the profile survives moving the project.
+                fs::path splashPath = fs::absolute(assignedSplash);
                 std::error_code relEc;
                 fs::path rel = fs::relative(splashPath, projectManager.currentProject.projectPath, relEc);
                 bool outsideProject = static_cast<bool>(relEc);
@@ -382,12 +493,7 @@ void Engine::renderBuildSettingsWindow() {
                     }
                 }
                 buildSettings.splashImagePath = outsideProject ? splashPath.string() : rel.generic_string();
-                changed = true;
             }
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Clear", ImVec2(btn2W, 0))) {
-            buildSettings.splashImagePath.clear();
             changed = true;
         }
         float splashDuration = buildSettings.splashDurationSeconds;
@@ -403,8 +509,8 @@ void Engine::renderBuildSettingsWindow() {
 
     ImGui::Separator();
     {
-        float bakeW    = 70.0f;
-        float bakeRunW = 100.0f;
+        float bakeW    = ButtonWidthFor("Bake", 70.0f);
+        float bakeRunW = ButtonWidthFor("Bake + Run", 110.0f);
         float total    = bakeW + bakeRunW + buttonSpacing;
         float startX   = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - total;
         if (startX > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(startX);

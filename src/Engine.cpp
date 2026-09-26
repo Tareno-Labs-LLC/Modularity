@@ -2487,9 +2487,59 @@ void scanTextForAndroidModelImporters(const std::string& text, std::set<std::str
         if (line.rfind("meshPath=", 0) != 0) continue;
         std::string value = line.substr(9);
         trim(value);
+        // The modular scene format quotes its values (meshPath="...fbx"); the legacy flat one
+        // does not. Left quoted, the extension reads `.fbx"` and matches no importer.
+        if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
+            value = value.substr(1, value.size() - 2);
+        }
         if (value.empty()) continue;
         appendAssimpImporterForExtension(lowerExtension(value), importers);
     }
+}
+
+// A C# script a build scene (or a packaged object) runs is what needs Mono in the player. A .cs
+// file merely sitting in Assets does not: Unity leftovers and the managed project's generated
+// sources live there too. Scripts are `path=` lines in both scene formats.
+bool textReferencesManagedScript(const std::string& text, std::string& firstScript) {
+    std::istringstream stream(text);
+    std::string line;
+    while (std::getline(stream, line)) {
+        const size_t start = line.find_first_not_of(" \t");
+        if (start == std::string::npos || line.compare(start, 5, "path=") != 0) continue;
+        std::string value = line.substr(start + 5);
+        const size_t end = value.find_last_not_of(" \t\r\n");
+        value = end == std::string::npos ? std::string() : value.substr(0, end + 1);
+        if (value.size() >= 2 && value.front() == '"' && value.back() == '"') {
+            value = value.substr(1, value.size() - 2);
+        }
+        if (!value.empty() && lowerExtension(value) == ".cs") {
+            firstScript = value;
+            return true;
+        }
+    }
+    return false;
+}
+
+// An .ogg is usually Vorbis, which stb_vorbis decodes; only Opus inside Ogg needs libopusfile.
+// The Opus identification header sits in the first page, so a short read settles it.
+bool isOggOpusFile(const fs::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open()) return false;
+    char header[96] = {};
+    in.read(header, sizeof(header));
+    const std::string bytes(header, static_cast<size_t>(in.gcount()));
+    return bytes.find("OpusHead") != std::string::npos;
+}
+
+// Containers miniaudio cannot open, so AudioSystem falls back to libsndfile for them.
+bool isSndfileOnlyAudioExtension(const std::string& ext) {
+    static const char* const kExtensions[] = {
+        ".aif", ".aiff", ".aifc", ".au", ".snd", ".caf", ".w64", ".rf64", ".voc", ".paf",
+        ".svx", ".8svx", ".sd2", ".xi", ".htk", ".wve", ".avr", ".ircam", ".nist", ".sph"};
+    for (const char* candidate : kExtensions) {
+        if (ext == candidate) return true;
+    }
+    return false;
 }
 
 std::vector<std::string> detectAndroidAssimpImporters(const fs::path& projectRoot,
@@ -5739,6 +5789,20 @@ void Engine::applyProjectGraphicsToRenderer() {
     renderer.setShadowQuality(graphics.shadowFilterQuality, graphics.shadowLodDistance,
                               graphics.shadowContactHardening);
 
+    RenderOptimizationSettings optimization;
+    optimization.strategy = graphics.optimizationStrategy == ProjectOptimizationStrategy::Automatic
+        ? RenderOptimizationStrategy::Automatic
+        : RenderOptimizationStrategy::Manual;
+    optimization.cpuFrustumCulling = graphics.optCpuFrustumCulling;
+    optimization.multiDrawIndirect = graphics.optMultiDrawIndirect;
+    optimization.gpuDrivenCulling = graphics.optGpuDrivenCulling;
+    optimization.lodOptimization = graphics.optLod;
+    optimization.lodMinScreenSizePx = graphics.optLodMinScreenSize;
+    optimization.hiZOcclusionCulling = graphics.optHiZOcclusionCulling;
+    optimization.materialSorting = graphics.optMaterialSorting;
+    optimization.staticObjectCaching = graphics.optStaticObjectCaching;
+    renderer.setOptimizationSettings(optimization);
+
     applyPresentationSettings();
 }
 
@@ -6044,6 +6108,7 @@ bool Engine::init() {
 
 #if !MODULARITY_RUNTIME_ONLY
     applyGlobalEditorPreferences(true);
+    applyEditorSoundTheme(projectManager.preferences.feedbackSoundTheme);
 #endif
 
     if (usingVulkan()) {
@@ -6768,6 +6833,10 @@ void Engine::run() {
             if (__preMs > Modularity::HardwareProfile::TimingBudget(100.0)) std::fprintf(stderr, "[ModuTimer] preImGuiWork %.1f ms\n", __preMs);
             [[maybe_unused]] const auto __dispatchStart = std::chrono::steady_clock::now();
             uiCanvas3DInputs.clear();
+#if !MODULARITY_RUNTIME_ONLY
+            // Runs on the launcher too, so Clone from Git can finish there.
+            if (!playerMode) updateVersionControl();
+#endif
 
             if (showLauncher) {
                 mainDockspaceId = 0;
@@ -6822,6 +6891,9 @@ void Engine::run() {
                     if (showProjectBrowser) MODU_TIME_PANEL("ProjectBrowser", renderProjectBrowserPanel());
                     if (showGameProfilerWindow) MODU_TIME_PANEL("Profiler", renderGameProfilerWindow());
                     if (showModularityDoctorWindow) MODU_TIME_PANEL("Doctor", renderModularityDoctorWindow());
+#if !MODULARITY_RUNTIME_ONLY
+                    if (showVersionControlWindow) MODU_TIME_PANEL("VersionControl", renderVersionControlWindow());
+#endif
                     if (showRegistryPackagesWindow) MODU_TIME_PANEL("Registry", renderRegistryPackagesWindow());
                 }
 
@@ -6883,6 +6955,7 @@ void Engine::run() {
 #if !MODULARITY_RUNTIME_ONLY
         if (!playerMode) {
             DragPreview::UpdateAndRender();
+            flushWidgetFeedbackSounds();
         }
 #endif
         const auto __renderImGuiStart = std::chrono::steady_clock::now();
@@ -8180,29 +8253,122 @@ bool Engine::saveDirtyMeshEditAssetForSceneSave() {
 #pragma endregion
 
 #pragma region Material IO
+void Engine::applyMaterialFileData(SceneObject& obj, const MaterialFileData& data) {
+    obj.material = data.props;
+    obj.albedoTexturePath = data.albedo;
+    obj.overlayTexturePath = data.overlay;
+    obj.normalMapPath = data.normal;
+    obj.metallicRoughnessMapPath = data.metallicRoughness;
+    obj.metallicMapPath = data.metallicMap;
+    obj.roughnessMapPath = data.roughnessMap;
+    obj.opacityMapPath = data.opacityMap;
+    obj.emissiveMapPath = data.emissive;
+    obj.occlusionMapPath = data.occlusion;
+    obj.heightMapPath = data.height;
+    obj.useOverlay = data.useOverlay;
+    obj.shaderPackPath = data.shaderPack;
+    obj.vertexShaderPath = data.vertexShader;
+    obj.fragmentShaderPath = data.fragmentShader;
+}
+
+MaterialFileData Engine::materialFileDataFromObject(const SceneObject& obj) {
+    MaterialFileData data;
+    data.props = obj.material;
+    data.albedo = obj.albedoTexturePath;
+    data.overlay = obj.overlayTexturePath;
+    data.normal = obj.normalMapPath;
+    data.metallicRoughness = obj.metallicRoughnessMapPath;
+    data.metallicMap = obj.metallicMapPath;
+    data.roughnessMap = obj.roughnessMapPath;
+    data.opacityMap = obj.opacityMapPath;
+    data.emissive = obj.emissiveMapPath;
+    data.occlusion = obj.occlusionMapPath;
+    data.height = obj.heightMapPath;
+    data.useOverlay = obj.useOverlay;
+    data.shaderPack = obj.shaderPackPath;
+    data.vertexShader = obj.vertexShaderPath;
+    data.fragmentShader = obj.fragmentShaderPath;
+    return data;
+}
+
+// materialPath holds whatever the assigning panel had: absolute from the Project panel,
+// project-relative from older scenes. Both are resolved lexically - no stat - because this runs
+// on every frame a material slider is dragged.
+bool Engine::materialPathsMatch(const std::string& a, const std::string& b) const {
+    if (a.empty() || b.empty()) return false;
+    auto lower = [](std::string text) {
+        std::transform(text.begin(), text.end(), text.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return text;
+    };
+    const fs::path pathA(a);
+    const fs::path pathB(b);
+    // Cheap reject first: most objects use some other material.
+    if (lower(pathA.filename().string()) != lower(pathB.filename().string())) return false;
+    auto key = [&](const fs::path& path) {
+        fs::path resolved = path;
+        if (!resolved.is_absolute() && projectManager.currentProject.isLoaded) {
+            resolved = projectManager.currentProject.projectPath / resolved;
+        }
+        std::string text = resolved.lexically_normal().generic_string();
+#ifdef _WIN32
+        text = lower(text);
+#endif
+        return text;
+    };
+    return key(pathA) == key(pathB);
+}
+
+int Engine::propagateMaterialAsset(const std::string& materialPath, const MaterialFileData& data,
+                                   int skipObjectId) {
+    if (materialPath.empty()) return 0;
+    int updated = 0;
+    for (SceneObject& obj : sceneObjects) {
+        if (obj.id == skipObjectId || !materialPathsMatch(obj.materialPath, materialPath)) continue;
+        applyMaterialFileData(obj, data);
+        ++updated;
+    }
+    if (updated > 0) {
+        projectManager.currentProject.hasUnsavedChanges = true;
+    }
+    return updated;
+}
+
+int Engine::countMaterialAssetUsers(const std::string& materialPath) const {
+    int users = 0;
+    for (const SceneObject& obj : sceneObjects) {
+        if (materialPathsMatch(obj.materialPath, materialPath)) ++users;
+    }
+    return users;
+}
+
+fs::path Engine::resolveMaterialAssetPath(const std::string& rawPath) const {
+    if (rawPath.empty()) return {};
+    const fs::path path(rawPath);
+    if (path.is_absolute()) return path;
+    // Saved scenes hold project-relative material paths. Opened as-is they resolve against the
+    // working directory (the editor's build folder): reads fail, and a write could leave a
+    // stray copy there. The working directory only wins for a file that exists there and not
+    // in the project, like a material shipped under Resources.
+    if (projectManager.currentProject.isLoaded && !projectManager.currentProject.projectPath.empty()) {
+        const fs::path inProject = projectManager.currentProject.projectPath / path;
+        std::error_code ec;
+        if (fs::exists(inProject, ec) || !fs::exists(path, ec)) {
+            return inProject.lexically_normal();
+        }
+    }
+    return path;
+}
+
 void Engine::loadMaterialFromFile(SceneObject& obj) {
     if (obj.materialPath.empty()) return;
     try {
         MaterialFileData data;
-        if (!readMaterialFile(obj.materialPath, data)) {
+        if (!readMaterialFile(resolveMaterialAssetPath(obj.materialPath).string(), data)) {
             addConsoleMessage("Failed to open material: " + obj.materialPath, ConsoleMessageType::Error);
             return;
         }
-        obj.material = data.props;
-        obj.albedoTexturePath = data.albedo;
-        obj.overlayTexturePath = data.overlay;
-        obj.normalMapPath = data.normal;
-        obj.metallicRoughnessMapPath = data.metallicRoughness;
-        obj.metallicMapPath = data.metallicMap;
-        obj.roughnessMapPath = data.roughnessMap;
-        obj.opacityMapPath = data.opacityMap;
-        obj.emissiveMapPath = data.emissive;
-        obj.occlusionMapPath = data.occlusion;
-        obj.heightMapPath = data.height;
-        obj.useOverlay = data.useOverlay;
-        obj.shaderPackPath = data.shaderPack;
-        obj.vertexShaderPath = data.vertexShader;
-        obj.fragmentShaderPath = data.fragmentShader;
+        applyMaterialFileData(obj, data);
         addConsoleMessage("Applied material: " + obj.materialPath, ConsoleMessageType::Success);
         projectManager.currentProject.hasUnsavedChanges = true;
     } catch (...) {
@@ -8225,7 +8391,7 @@ bool Engine::loadMaterialData(const std::string& path, MaterialProperties& props
                               std::string* heightOut)
 {
     MaterialFileData data;
-    if (!readMaterialFile(path, data)) {
+    if (!readMaterialFile(resolveMaterialAssetPath(path).string(), data)) {
         return false;
     }
     props = data.props;
@@ -8260,8 +8426,9 @@ bool Engine::saveMaterialData(const std::string& path, const MaterialProperties&
                               const std::string* occlusion,
                               const std::string* height)
 {
+    const std::string filePath = resolveMaterialAssetPath(path).string();
     MaterialFileData data;
-    readMaterialFile(path, data);
+    readMaterialFile(filePath, data);
     data.props = props;
     data.albedo = albedo;
     data.overlay = overlay;
@@ -8277,7 +8444,7 @@ bool Engine::saveMaterialData(const std::string& path, const MaterialProperties&
     if (emissive) data.emissive = *emissive;
     if (occlusion) data.occlusion = *occlusion;
     if (height) data.height = *height;
-    return writeMaterialFile(data, path);
+    return writeMaterialFile(data, filePath);
 }
 
 int Engine::autoAssignProjectMaterialMaps() {
@@ -8460,25 +8627,10 @@ void Engine::saveMaterialToFile(const SceneObject& obj) {
         return;
     }
     try {
-        MaterialFileData data;
-        data.props = obj.material;
-        data.albedo = obj.albedoTexturePath;
-        data.overlay = obj.overlayTexturePath;
-        data.normal = obj.normalMapPath;
-        data.metallicRoughness = obj.metallicRoughnessMapPath;
-        data.metallicMap = obj.metallicMapPath;
-        data.roughnessMap = obj.roughnessMapPath;
-        data.opacityMap = obj.opacityMapPath;
-        data.emissive = obj.emissiveMapPath;
-        data.occlusion = obj.occlusionMapPath;
-        data.height = obj.heightMapPath;
-        data.useOverlay = obj.useOverlay;
-        data.shaderPack = obj.shaderPackPath;
-        data.vertexShader = obj.vertexShaderPath;
-        data.fragmentShader = obj.fragmentShaderPath;
-
-        if (!writeMaterialFile(data, obj.materialPath)) {
-            addConsoleMessage("Failed to open material for writing: " + obj.materialPath, ConsoleMessageType::Error);
+        const MaterialFileData data = materialFileDataFromObject(obj);
+        const std::string filePath = resolveMaterialAssetPath(obj.materialPath).string();
+        if (!writeMaterialFile(data, filePath)) {
+            addConsoleMessage("Failed to open material for writing: " + filePath, ConsoleMessageType::Error);
             return;
         }
         addConsoleMessage("Saved material: " + obj.materialPath, ConsoleMessageType::Success);
@@ -9220,7 +9372,7 @@ void Engine::startQueuedCompileJobs() {
 }
 
 void Engine::playCompileStartSound() {
-    playEditorFeedbackOneShot("Resources/Sounds/Notification.mp3", 0.95f, EditorFeedbackSoundCategory::Other);
+    playEditorSound(EditorSoundCue::CompileStart, 0.95f);
 }
 
 bool Engine::isEditorFeedbackSoundEnabled(EditorFeedbackSoundCategory category) const {
@@ -9237,20 +9389,20 @@ bool Engine::isEditorFeedbackSoundEnabled(EditorFeedbackSoundCategory category) 
             return feedbackErrorSoundsEnabled;
         case EditorFeedbackSoundCategory::Other:
             return feedbackOtherSoundsEnabled;
+        case EditorFeedbackSoundCategory::Button:
+            return feedbackButtonSoundsEnabled;
+        case EditorFeedbackSoundCategory::Toggle:
+            return feedbackToggleSoundsEnabled;
+        case EditorFeedbackSoundCategory::Slide:
+            return feedbackSlideSoundsEnabled;
+        case EditorFeedbackSoundCategory::Transition:
+            return feedbackTransitionSoundsEnabled;
+        case EditorFeedbackSoundCategory::Hover:
+            return feedbackHoverSoundsEnabled;
         case EditorFeedbackSoundCategory::Boot:
         default:
             return true;
     }
-}
-
-bool Engine::playEditorFeedbackPreview(const std::string& path,
-                                       float volume,
-                                       bool loop,
-                                       EditorFeedbackSoundCategory category) {
-    if (!audio.isReady() || !isEditorFeedbackSoundEnabled(category)) {
-        return false;
-    }
-    return audio.playPreview(path, volume, loop);
 }
 
 bool Engine::playEditorFeedbackOneShot(const std::string& path,
@@ -9261,6 +9413,148 @@ bool Engine::playEditorFeedbackOneShot(const std::string& path,
     }
     audio.playOneShot(path, volume);
     return true;
+}
+
+Engine::EditorFeedbackSoundCategory Engine::feedbackCategoryForCue(EditorSoundCue cue) {
+    switch (cue) {
+        case EditorSoundCue::Tick:
+        case EditorSoundCue::SectionSwitch:
+        case EditorSoundCue::Confirm:
+            return EditorFeedbackSoundCategory::Click;
+        // The launcher labels this toggle "Errors and warnings".
+        case EditorSoundCue::Error:
+        case EditorSoundCue::Warning:
+            return EditorFeedbackSoundCategory::Error;
+        case EditorSoundCue::Button:
+        case EditorSoundCue::ButtonDisabled:
+        case EditorSoundCue::Tab:
+        case EditorSoundCue::ItemSelect:
+            return EditorFeedbackSoundCategory::Button;
+        case EditorSoundCue::Hover:
+            return EditorFeedbackSoundCategory::Hover;
+        case EditorSoundCue::ToggleOn:
+        case EditorSoundCue::ToggleOff:
+            return EditorFeedbackSoundCategory::Toggle;
+        case EditorSoundCue::SlideOpen:
+        case EditorSoundCue::SlideClose:
+            return EditorFeedbackSoundCategory::Slide;
+        // A dialog a call site announces is the same event as a modal the widgets report.
+        case EditorSoundCue::DialogOpen:
+        case EditorSoundCue::PopupOpen:
+        case EditorSoundCue::PopupClose:
+            return EditorFeedbackSoundCategory::Transition;
+        case EditorSoundCue::CompileStart:
+        case EditorSoundCue::CompileSuccess:
+        case EditorSoundCue::ScriptAssigned:
+        case EditorSoundCue::PackageInstalled:
+        default:
+            return EditorFeedbackSoundCategory::Other;
+    }
+}
+
+// The same cue again within this window is dropped. Interface sounds layer rather than restart,
+// so without it a burst of console errors would stack, a sweep across the menu bar would open a
+// menu per frame, and a double click would machine-gun.
+static constexpr double kEditorCueRepeatWindowSeconds = 0.06;
+
+// Every themed cue plays through AudioSystem's interface lane, never the preview slot, so none of
+// them can cut off the asset or Inspector audio player.
+bool Engine::playThemedCue(EditorSoundCue cue, float volume) {
+    if (!audio.isReady() || !isEditorFeedbackSoundEnabled(feedbackCategoryForCue(cue))) {
+        return false;
+    }
+    const double now = glfwGetTime();
+    double& last = lastCueTime[static_cast<size_t>(cue)];
+    if (now - last < kEditorCueRepeatWindowSeconds) {
+        return false;
+    }
+    Modularity::EditorSounds::ResolvedSound sound;
+    if (!editorSoundThemes.resolve(cue, sound) || sound.gain <= 0.0f) {
+        return false;
+    }
+    const float level = volume * sound.gain * std::clamp(feedbackSoundVolume, 0.0f, 1.0f);
+    if (!audio.playUiSound(sound.path, level)) {
+        return false;
+    }
+    last = now;
+    return true;
+}
+
+// Call-site cues say more than the generic widget sound for the same click (the Install button
+// plays "package installed", not "button"), so one that plays mutes this frame's widget sounds.
+bool Engine::playEditorSound(EditorSoundCue cue, float volume) {
+    const bool played = playThemedCue(cue, volume);
+    if (played) explicitFeedbackCueTime = glfwGetTime();
+    return played;
+}
+
+void Engine::onWidgetFeedback(ImGuiWidgetFeedback event, void* userData) {
+    Engine* engine = static_cast<Engine*>(userData);
+    if (!engine || engine->playerMode || event <= ImGuiWidgetFeedback_None || event >= ImGuiWidgetFeedback_COUNT) {
+        return;
+    }
+    engine->pendingWidgetFeedback[static_cast<size_t>(event)] = true;
+}
+
+void Engine::flushWidgetFeedbackSounds() {
+    std::array<bool, ImGuiWidgetFeedback_COUNT> pending{};
+    std::swap(pending, pendingWidgetFeedback);
+
+    // Muted for a moment after a call-site cue, not just its frame: a modal opened after its
+    // Begin() reports a frame late, and a double-clicked file opens on the second press but its
+    // cell still reports the select on release.
+    constexpr double kAfterCallSiteCueSeconds = 0.15;
+    if (glfwGetTime() - explicitFeedbackCueTime < kAfterCallSiteCueSeconds) {
+        return;
+    }
+
+    // One sound per frame, the most telling event first: a button that opens a modal is heard
+    // as the modal, a menu command as the command rather than its menu closing.
+    struct Mapping {
+        ImGuiWidgetFeedback event;
+        EditorSoundCue cue;
+    };
+    static constexpr Mapping kByPriority[] = {
+        {ImGuiWidgetFeedback_ModalOpen, EditorSoundCue::PopupOpen},
+        {ImGuiWidgetFeedback_ModalClose, EditorSoundCue::PopupClose},
+        {ImGuiWidgetFeedback_ToggleOn, EditorSoundCue::ToggleOn},
+        {ImGuiWidgetFeedback_ToggleOff, EditorSoundCue::ToggleOff},
+        {ImGuiWidgetFeedback_SlideOpen, EditorSoundCue::SlideOpen},
+        {ImGuiWidgetFeedback_ButtonDisabled, EditorSoundCue::ButtonDisabled},
+        {ImGuiWidgetFeedback_Button, EditorSoundCue::Button},
+        {ImGuiWidgetFeedback_Select, EditorSoundCue::ItemSelect},
+        {ImGuiWidgetFeedback_Tab, EditorSoundCue::Tab},
+        {ImGuiWidgetFeedback_SlideClose, EditorSoundCue::SlideClose},
+        {ImGuiWidgetFeedback_Hover, EditorSoundCue::Hover},  // only when nothing else happened
+    };
+
+    const double now = glfwGetTime();
+    for (const Mapping& mapping : kByPriority) {
+        if (!pending[static_cast<size_t>(mapping.event)]) continue;
+        // Skip a disabled or silent group and let the next event speak: turning Transitions off
+        // should leave the button that opened the dialog audible.
+        if (!isEditorFeedbackSoundEnabled(feedbackCategoryForCue(mapping.cue))) continue;
+        // A throttled winner ends the frame rather than handing over to a lower event, or a menu
+        // bar sweep would trade its dropped slide-open for a slide-close.
+        if (now - lastCueTime[static_cast<size_t>(mapping.cue)] < kEditorCueRepeatWindowSeconds) return;
+        if (playThemedCue(mapping.cue, 0.95f)) return;
+    }
+}
+
+void Engine::applyEditorSoundTheme(const std::string& themeId) {
+    editorSoundThemes.refresh();
+    editorSoundThemes.setActive(themeId);
+    for (const std::string& warning : editorSoundThemes.warnings()) {
+        addConsoleMessage("Sound theme: " + warning, ConsoleMessageType::Warning);
+    }
+}
+
+void Engine::selectEditorSoundTheme(std::string themeId) {
+    projectManager.preferences.feedbackSoundTheme = themeId;
+    applyEditorSoundTheme(themeId);
+    projectManager.saveLauncherSettings();
+    // Let the user hear what they picked. One-shot, so it does not cut off an asset preview.
+    playEditorSound(EditorSoundCue::Confirm, 0.95f);
 }
 
 Engine::ScriptAutoCompileScanResult
@@ -12934,6 +13228,184 @@ bool Engine::deleteBuildSettingsProfile(const std::string& profileName) {
     return !ec;
 }
 
+Engine::BuildModuleProjectScan Engine::scanProjectForBuildModules() const {
+    BuildModuleProjectScan scan;
+    const auto& project = projectManager.currentProject;
+    if (!project.isLoaded) return scan;
+    scan.valid = true;
+    scan.projectRoot = project.projectPath;
+
+    auto readText = [](const fs::path& path, std::string& out) {
+        std::ifstream in(path, std::ios::binary);
+        if (!in.is_open()) return false;
+        std::ostringstream text;
+        text << in.rdbuf();
+        out = text.str();
+        return true;
+    };
+
+    // Build scenes: meshes they place and the C# scripts they run.
+    std::vector<std::string> sceneNames;
+    for (const auto& scene : buildSettings.scenes) {
+        if (scene.enabled && !scene.name.empty()) sceneNames.push_back(scene.name);
+    }
+    if (!project.currentSceneName.empty() &&
+        std::find(sceneNames.begin(), sceneNames.end(), project.currentSceneName) == sceneNames.end()) {
+        sceneNames.push_back(project.currentSceneName);
+    }
+    for (const std::string& sceneName : sceneNames) {
+        std::string text;
+        if (!readText(project.scenesPath / (sceneName + ".scene"), text)) continue;
+        if (scan.modelAsset.empty()) {
+            std::set<std::string> importers;
+            scanTextForAndroidModelImporters(text, importers);
+            if (!importers.empty()) scan.modelAsset = "a mesh in scene " + sceneName;
+        }
+        if (scan.managedScript.empty()) {
+            std::string script;
+            if (textReferencesManagedScript(text, script)) scan.managedScript = fs::path(script).filename().string();
+        }
+    }
+    // The open scene may hold a C# script that has not been saved yet.
+    for (const auto& obj : sceneObjects) {
+        if (!scan.managedScript.empty()) break;
+        for (const auto& sc : obj.scripts) {
+            if (sc.language == ScriptLanguage::CSharp && !sc.path.empty()) {
+                scan.managedScript = fs::path(sc.path).filename().string();
+                break;
+            }
+        }
+    }
+
+    // Assets: scripts can load any model or clip by path at runtime, so every file counts, not
+    // only the ones a scene names.
+    std::error_code ec;
+    const fs::path assetsRoot = project.projectPath / "Assets";
+    if (fs::is_directory(assetsRoot, ec)) {
+        for (auto it = fs::recursive_directory_iterator(assetsRoot, fs::directory_options::skip_permission_denied, ec);
+             !ec && it != fs::recursive_directory_iterator();
+             it.increment(ec)) {
+            std::error_code fileEc;
+            if (!it->is_regular_file(fileEc) || fileEc) continue;
+            const fs::path& path = it->path();
+            const std::string ext = lowerExtension(path);
+            if (scan.modelAsset.empty()) {
+                std::set<std::string> importers;
+                if (appendAssimpImporterForExtension(ext, importers)) scan.modelAsset = path.filename().string();
+            }
+            if (scan.sndfileClip.empty() && isSndfileOnlyAudioExtension(ext)) {
+                scan.sndfileClip = path.filename().string();
+            }
+            if (scan.opusClip.empty() &&
+                (ext == ".opus" || ((ext == ".ogg" || ext == ".oga") && isOggOpusFile(path)))) {
+                scan.opusClip = path.filename().string();
+            }
+            if (scan.managedScript.empty() && ext == ".moduobj") {
+                std::string text;
+                std::string script;
+                if (readText(path, text) && textReferencesManagedScript(text, script)) {
+                    scan.managedScript = fs::path(script).filename().string();
+                }
+            }
+        }
+    }
+    return scan;
+}
+
+std::vector<Engine::BuildModuleDecision> Engine::resolveBuildModules(const BuildModuleProjectScan& scan) {
+    const auto& project = projectManager.currentProject;
+    const bool android = buildSettings.platform == BuildPlatform::Android;
+    const bool usesPhysX = project.physicsSettings.backend == PhysicsBackendType::PhysX;
+    const bool usesVulkan = project.rendererBackend == Modularity::GraphicsBackend::Vulkan;
+
+    std::vector<BuildModuleDecision> decisions;
+    decisions.reserve(8);
+    auto add = [&](const char* label, const char* option, std::string& setting,
+                   bool autoEnabled, std::string autoReason) {
+        BuildModuleDecision decision;
+        decision.label = label;
+        decision.cmakeOption = option;
+        decision.setting = &setting;
+        std::string state = setting;
+        std::transform(state.begin(), state.end(), state.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        decision.automatic = state != "on" && state != "off";
+        decision.autoEnabled = autoEnabled;
+        decision.autoReason = autoReason;
+        if (!decision.automatic) {
+            decision.enabled = state == "on";
+            decision.reason = decision.enabled ? "Forced on in this build profile."
+                                               : "Forced off in this build profile.";
+        } else {
+            decision.enabled = autoEnabled;
+            decision.reason = std::move(autoReason);
+        }
+        decisions.push_back(std::move(decision));
+    };
+    const std::string unscanned = "Project not scanned yet; kept on to be safe.";
+
+    if (android) {
+        add("Jolt", "MODULARITY_ENABLE_JOLT", buildSettings.moduleJolt, true,
+            usesPhysX ? "PhysX has no Android build yet, so the player falls back to Jolt."
+                      : "Project physics backend is Jolt.");
+        add("PhysX", "MODULARITY_ENABLE_PHYSX", buildSettings.modulePhysX, false,
+            "PhysX has no Android build yet.");
+    } else {
+        add("Jolt", "MODULARITY_ENABLE_JOLT", buildSettings.moduleJolt, !usesPhysX,
+            usesPhysX ? "Project physics backend is PhysX, so Jolt is left out."
+                      : "Project physics backend is Jolt.");
+        add("PhysX", "MODULARITY_ENABLE_PHYSX", buildSettings.modulePhysX, usesPhysX,
+            usesPhysX ? "Project physics backend is PhysX."
+                      : "Project physics backend is Jolt, so PhysX is left out.");
+    }
+
+    if (!scan.valid) {
+        add("Assimp", "MODULARITY_ENABLE_ASSIMP", buildSettings.moduleAssimp, true, unscanned);
+    } else if (!scan.modelAsset.empty()) {
+        add("Assimp", "MODULARITY_ENABLE_ASSIMP", buildSettings.moduleAssimp, true,
+            "Loads model files at runtime (" + scan.modelAsset + ").");
+    } else {
+        add("Assimp", "MODULARITY_ENABLE_ASSIMP", buildSettings.moduleAssimp, false,
+            "No model files in Assets or the build scenes.");
+    }
+
+    if (android) {
+        add("Vulkan", "MODULARITY_ENABLE_VULKAN", buildSettings.moduleVulkan, false,
+            "Android renders with OpenGL ES.");
+    } else {
+        add("Vulkan", "MODULARITY_ENABLE_VULKAN", buildSettings.moduleVulkan, usesVulkan,
+            usesVulkan ? "Project renderer is Vulkan." : "Project renders with OpenGL.");
+    }
+
+    if (android) {
+        add("sndfile", "MODULARITY_ENABLE_SNDFILE", buildSettings.moduleSndfile, false,
+            "libsndfile is not built for Android yet.");
+        add("opusfile", "MODULARITY_ENABLE_OPUSFILE", buildSettings.moduleOpusfile, false,
+            "libopusfile is not built for Android yet.");
+        add("Mono", "MODULARITY_USE_MONO", buildSettings.moduleMono, false,
+            "C# scripts are not supported on Android.");
+    } else if (!scan.valid) {
+        add("sndfile", "MODULARITY_ENABLE_SNDFILE", buildSettings.moduleSndfile, true, unscanned);
+        add("opusfile", "MODULARITY_ENABLE_OPUSFILE", buildSettings.moduleOpusfile, true, unscanned);
+        add("Mono", "MODULARITY_USE_MONO", buildSettings.moduleMono, true, unscanned);
+    } else {
+        add("sndfile", "MODULARITY_ENABLE_SNDFILE", buildSettings.moduleSndfile, !scan.sndfileClip.empty(),
+            scan.sndfileClip.empty()
+                ? "Every clip is WAV, FLAC, MP3 or Vorbis, which the built-in decoder reads."
+                : "Needed to decode " + scan.sndfileClip + ".");
+        add("opusfile", "MODULARITY_ENABLE_OPUSFILE", buildSettings.moduleOpusfile, !scan.opusClip.empty(),
+            scan.opusClip.empty() ? "No Opus clips in Assets."
+                                  : "Needed to decode Opus clip " + scan.opusClip + ".");
+        add("Mono", "MODULARITY_USE_MONO", buildSettings.moduleMono, !scan.managedScript.empty(),
+            scan.managedScript.empty() ? "No build scene runs a C# script."
+                                       : "A build scene runs C# script " + scan.managedScript + ".");
+    }
+
+    add("OpenGL ES", "MODULARITY_USE_OPENGL_ES", buildSettings.moduleOpenGLES, android,
+        android ? "Android renders with OpenGL ES." : "Desktop renders with desktop OpenGL.");
+    return decisions;
+}
+
 void Engine::startExportBuild(const fs::path& outputDir, bool runAfter) {
     if (!projectManager.currentProject.isLoaded) {
         addConsoleMessage("No project loaded for export", ConsoleMessageType::Warning);
@@ -13059,29 +13531,22 @@ void Engine::startExportBuild(const fs::path& outputDir, bool runAfter) {
         return (state == "on" || state == "off" || state == "auto") ? state : std::string("auto");
     };
     std::string moduleAssimp = moduleState(buildSettings.moduleAssimp);
-    std::string modulePhysX = moduleState(buildSettings.modulePhysX);
-    std::string moduleJolt = moduleState(buildSettings.moduleJolt);
-    std::string moduleVulkan = moduleState(buildSettings.moduleVulkan);
-    std::string moduleSndfile = moduleState(buildSettings.moduleSndfile);
-    std::string moduleOpusfile = moduleState(buildSettings.moduleOpusfile);
-    std::string moduleMono = moduleState(buildSettings.moduleMono);
-    std::string moduleOpenGLES = moduleState(buildSettings.moduleOpenGLES);
-    auto appendCMakeModuleFlags = [moduleAssimp, modulePhysX, moduleJolt, moduleVulkan,
-                                   moduleSndfile, moduleOpusfile, moduleMono, moduleOpenGLES]
-                                  (std::string& command, bool androidTarget) {
-        auto appendBool = [&](const char* key, const std::string& state) {
-            if (state == "on") command += std::string(" -D") + key + "=ON";
-            if (state == "off") command += std::string(" -D") + key + "=OFF";
-        };
-        appendBool("MODULARITY_ENABLE_PHYSX", modulePhysX);
-        appendBool("MODULARITY_ENABLE_JOLT", moduleJolt);
-        appendBool("MODULARITY_ENABLE_VULKAN", moduleVulkan);
-        appendBool("MODULARITY_ENABLE_SNDFILE", moduleSndfile);
-        appendBool("MODULARITY_ENABLE_OPUSFILE", moduleOpusfile);
-        appendBool("MODULARITY_USE_MONO", moduleMono);
-        appendBool("MODULARITY_USE_OPENGL_ES", moduleOpenGLES);
-        if (!androidTarget) {
-            appendBool("MODULARITY_ENABLE_ASSIMP", moduleAssimp);
+    // Every module is passed explicitly, "auto" included. Leaving an auto module off the command
+    // line meant CMake's cached value won: the shared player-cache tree kept a module OFF from an
+    // earlier export even after the project started needing it.
+    buildModuleScan = scanProjectForBuildModules();
+    std::vector<std::pair<std::string, bool>> moduleFlags;
+    std::string moduleSummary = "Engine modules:\n";
+    for (const BuildModuleDecision& decision : resolveBuildModules(buildModuleScan)) {
+        moduleFlags.emplace_back(decision.cmakeOption, decision.enabled);
+        moduleSummary += std::string("  ") + decision.label + ": " + (decision.enabled ? "on" : "off") +
+                         (decision.automatic ? " (auto) - " : " - ") + decision.reason + "\n";
+    }
+    auto appendCMakeModuleFlags = [moduleFlags](std::string& command, bool androidTarget) {
+        for (const auto& flag : moduleFlags) {
+            // The Android configure line sets Assimp itself, from the importers it detected.
+            if (androidTarget && flag.first == "MODULARITY_ENABLE_ASSIMP") continue;
+            command += " -D" + flag.first + (flag.second ? "=ON" : "=OFF");
         }
     };
     const bool androidExport = buildSettings.platform == BuildPlatform::Android;
@@ -13107,6 +13572,7 @@ void Engine::startExportBuild(const fs::path& outputDir, bool runAfter) {
         exportJob.runAfter = androidExport ? false : runAfter;
         exportJob.progress = 0.02f;
         exportJob.status = "Preparing export...";
+        exportJob.log = moduleSummary;
         exportJob.outputDir = androidExport ? normalizedOut : exportRoot;
         exportJob.executableName = exportOutputName;
         exportJob.archivePath = androidExport
@@ -15922,7 +16388,7 @@ void Engine::setParent(int childId, int parentId, int beforeSiblingId) {
 #pragma region Console Logging
 void Engine::addConsoleMessage(const std::string& message, ConsoleMessageType type) {
     if (type == ConsoleMessageType::Error) {
-        playEditorFeedbackPreview("Resources/Sounds/Script Error.mp3", 0.95f, false, EditorFeedbackSoundCategory::Error);
+        playEditorSound(EditorSoundCue::Error, 0.95f);
     }
 
     auto now = std::chrono::system_clock::now();
@@ -18702,7 +19168,7 @@ void Engine::updateCompileJob() {
                     logDiagnostic(diagnostic);
                 }
             }
-            playEditorFeedbackOneShot("Resources/Sounds/Script Error.mp3", 0.95f, EditorFeedbackSoundCategory::Error);
+            playEditorSound(EditorSoundCue::Error, 0.95f);
         } else {
             if (!result.isManaged && !result.stagedBinaryPath.empty() &&
                 result.stagedBinaryPath != result.binaryPath) {
@@ -18756,14 +19222,14 @@ void Engine::updateCompileJob() {
                         logDiagnostic(diagnostic);
                     }
                 }
-                playEditorFeedbackOneShot("Resources/Sounds/Script Error.mp3", 0.95f, EditorFeedbackSoundCategory::Error);
+                playEditorSound(EditorSoundCue::Error, 0.95f);
             } else {
             lastCompileSuccess = true;
             lastCompileLog = result.compileLog + result.linkLog;
             lastCompileStatus = finishedWithWarnings
                 ? "Finished compiling (" + displayLabel + ") with warnings"
                 : "Finished compiling (" + displayLabel + ")";
-            playEditorFeedbackOneShot("Resources/Sounds/Success Script.mp3", 0.95f, EditorFeedbackSoundCategory::Other);
+            playEditorSound(EditorSoundCue::CompileSuccess, 0.95f);
             addConsoleMessage(
                 finishedWithWarnings
                     ? "Finished compiling (" + displayLabel + ") with warnings"
@@ -19140,6 +19606,13 @@ void Engine::setupImGui() {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
+#if !MODULARITY_RUNTIME_ONLY
+    // Interface sounds: widgets report interactions, flushWidgetFeedbackSounds() plays them.
+    // Never in the player, where the ImGui on screen is the game's own UI.
+    if (!playerMode) {
+        ImGui::SetWidgetFeedbackCallback(&Engine::onWidgetFeedback, this);
+    }
+#endif
 
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 #if !MODULARITY_RUNTIME_ONLY
@@ -19946,6 +20419,8 @@ void Engine::loadEditorUserSettings() {
             showGameViewport = (value == "1" || value == "true" || value == "yes");
         } else if (key == "showXRPreviewWindow") {
             showXRPreviewWindow = (value == "1" || value == "true" || value == "yes");
+        } else if (key == "showVersionControlWindow") {
+            showVersionControlWindow = (value == "1" || value == "true" || value == "yes");
         } else if (key == "xrPreviewPreset") {
             xrPreview.presetIndex = std::clamp(std::atoi(value.c_str()), 0, 5);
         } else if (key == "xrPreviewRenderScale") {
@@ -20216,6 +20691,18 @@ void Engine::loadEditorUserSettings() {
             feedbackErrorSoundsEnabled = (value == "1" || value == "true" || value == "yes");
         } else if (key == "feedbackOtherSoundsEnabled") {
             feedbackOtherSoundsEnabled = (value == "1" || value == "true" || value == "yes");
+        } else if (key == "feedbackButtonSoundsEnabled") {
+            feedbackButtonSoundsEnabled = (value == "1" || value == "true" || value == "yes");
+        } else if (key == "feedbackToggleSoundsEnabled") {
+            feedbackToggleSoundsEnabled = (value == "1" || value == "true" || value == "yes");
+        } else if (key == "feedbackSlideSoundsEnabled") {
+            feedbackSlideSoundsEnabled = (value == "1" || value == "true" || value == "yes");
+        } else if (key == "feedbackTransitionSoundsEnabled") {
+            feedbackTransitionSoundsEnabled = (value == "1" || value == "true" || value == "yes");
+        } else if (key == "feedbackHoverSoundsEnabled") {
+            feedbackHoverSoundsEnabled = (value == "1" || value == "true" || value == "yes");
+        } else if (key == "feedbackSoundVolume") {
+            try { feedbackSoundVolume = std::clamp(std::stof(value), 0.0f, 1.0f); } catch (...) {}
         } else if (key == "themeVersion") {
             try { loadedThemeVersion = std::stoi(value); } catch (...) {}
         } else if (key.rfind("stylePreset", 0) == 0) {
@@ -20487,6 +20974,7 @@ void Engine::saveEditorUserSettings() const {
     file << "showViewport=" << (showViewport ? "1" : "0") << "\n";
     file << "showGameViewport=" << (showGameViewport ? "1" : "0") << "\n";
     file << "showXRPreviewWindow=" << (showXRPreviewWindow ? "1" : "0") << "\n";
+    file << "showVersionControlWindow=" << (showVersionControlWindow ? "1" : "0") << "\n";
     file << "xrPreviewPreset=" << xrPreview.presetIndex << "\n";
     file << "xrPreviewRenderScale=" << xrPreview.renderScale << "\n";
     file << "xrPreviewTargetHz=" << xrPreview.targetHz << "\n";
@@ -20612,6 +21100,12 @@ void Engine::saveEditorUserSettings() const {
     file << "feedbackClickSoundsEnabled=" << (feedbackClickSoundsEnabled ? "1" : "0") << "\n";
     file << "feedbackErrorSoundsEnabled=" << (feedbackErrorSoundsEnabled ? "1" : "0") << "\n";
     file << "feedbackOtherSoundsEnabled=" << (feedbackOtherSoundsEnabled ? "1" : "0") << "\n";
+    file << "feedbackButtonSoundsEnabled=" << (feedbackButtonSoundsEnabled ? "1" : "0") << "\n";
+    file << "feedbackToggleSoundsEnabled=" << (feedbackToggleSoundsEnabled ? "1" : "0") << "\n";
+    file << "feedbackSlideSoundsEnabled=" << (feedbackSlideSoundsEnabled ? "1" : "0") << "\n";
+    file << "feedbackTransitionSoundsEnabled=" << (feedbackTransitionSoundsEnabled ? "1" : "0") << "\n";
+    file << "feedbackHoverSoundsEnabled=" << (feedbackHoverSoundsEnabled ? "1" : "0") << "\n";
+    file << "feedbackSoundVolume=" << std::clamp(feedbackSoundVolume, 0.0f, 1.0f) << "\n";
     file << "stylePresetCount=" << uiStylePresets.size() << "\n";
     for (size_t i = 0; i < uiStylePresets.size(); ++i) {
         const UIStylePreset& preset = uiStylePresets[i];
@@ -20680,6 +21174,13 @@ void Engine::applyGlobalEditorPreferences(bool applyAppearance) {
     feedbackClickSoundsEnabled = p.feedbackClickSounds;
     feedbackErrorSoundsEnabled = p.feedbackErrorSounds;
     feedbackOtherSoundsEnabled = p.feedbackOtherSounds;
+    feedbackButtonSoundsEnabled = p.feedbackButtonSounds;
+    feedbackToggleSoundsEnabled = p.feedbackToggleSounds;
+    feedbackSlideSoundsEnabled = p.feedbackSlideSounds;
+    feedbackTransitionSoundsEnabled = p.feedbackTransitionSounds;
+    feedbackHoverSoundsEnabled = p.feedbackHoverSounds;
+    feedbackSoundVolume = std::clamp(p.feedbackSoundVolume, 0.0f, 1.0f);
+    editorSoundThemes.setActive(p.feedbackSoundTheme);
 
     hierarchyShowTexturePreview = p.hierarchyTexturePreviews;
     showSceneGizmos = p.sceneGizmos;
@@ -20732,6 +21233,12 @@ void Engine::captureGlobalEditorPreferences() {
     p.feedbackClickSounds = feedbackClickSoundsEnabled;
     p.feedbackErrorSounds = feedbackErrorSoundsEnabled;
     p.feedbackOtherSounds = feedbackOtherSoundsEnabled;
+    p.feedbackButtonSounds = feedbackButtonSoundsEnabled;
+    p.feedbackToggleSounds = feedbackToggleSoundsEnabled;
+    p.feedbackSlideSounds = feedbackSlideSoundsEnabled;
+    p.feedbackTransitionSounds = feedbackTransitionSoundsEnabled;
+    p.feedbackHoverSounds = feedbackHoverSoundsEnabled;
+    p.feedbackSoundVolume = feedbackSoundVolume;
 
     p.hierarchyTexturePreviews = hierarchyShowTexturePreview;
     p.sceneGizmos = showSceneGizmos;

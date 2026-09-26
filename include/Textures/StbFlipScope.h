@@ -4,8 +4,8 @@
 
 // Scoped control over stb_image's vertical flip.
 //
-// stb compiles with STBI_THREAD_LOCAL here, which makes its two flip setters
-// behave very differently. stbi_set_flip_vertically_on_load_thread latches the
+// stb's implementation compiles with thread locals here, which makes its two flip
+// setters behave very differently. stbi_set_flip_vertically_on_load_thread latches the
 // calling thread into "ignore the global from now on", and stb exposes no way
 // to clear that latch. Any site that later used the global setter on that same
 // thread silently kept the latched value instead, so whether an image decoded
@@ -34,9 +34,15 @@ private:
         return flip;
     }
 
+    // Not `#ifdef STBI_THREAD_LOCAL`: stb defines that macro inside its implementation
+    // block, which no file compiles ahead of this header (Texture.cpp includes it before
+    // STB_IMAGE_IMPLEMENTATION on purpose). That test was therefore always false, every
+    // scope wrote the one process-wide flag, and the file browser's icon atlas - decoded
+    // on a std::async worker - came out upside down whenever a scene texture or thumbnail
+    // flipped that flag mid-decode. STBI_NO_THREAD_LOCALS is the switch stb itself reads.
     static void Apply(bool flipVertically) {
         CurrentFlip() = flipVertically;
-#ifdef STBI_THREAD_LOCAL
+#ifndef STBI_NO_THREAD_LOCALS
         stbi_set_flip_vertically_on_load_thread(flipVertically ? 1 : 0);
 #else
         stbi_set_flip_vertically_on_load(flipVertically ? 1 : 0);

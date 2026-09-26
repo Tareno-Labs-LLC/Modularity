@@ -103,6 +103,8 @@ void Engine::renderPlayControlsBar() {
     const ImVec2 slotSize(slotSide, slotSide);
     const ImVec2 slotPos = ImGui::GetCursorScreenPos();
     bool pressed = ImGui::InvisibleButton(id, slotSize);
+    if (pressed) ImGui::ReportWidgetFeedback(ImGuiWidgetFeedback_Button);
+    ImGui::ReportItemHoverFeedback();
     bool hovered = ImGui::IsItemHovered();
     bool active = ImGui::IsItemActive();
     ImGuiID buttonId = ImGui::GetID(id);

@@ -66,6 +66,26 @@ namespace {
         return ext == ".so" || ext == ".dll" || ext == ".dylib";
     }
 
+    std::string LowerExtension(const fs::path& path) {
+        std::string ext = path.extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return ext;
+    }
+
+    // Sources a native Script component compiles: ModuCPP (and the ModuMako front end that
+    // lowers to it), C++ and C. The Script slot's filter and asset drops both use this.
+    // (4eb6f8ef deleted the lambdas these replace but kept their call sites in the Script slot.)
+    bool isNativeScriptSourcePath(const fs::path& path) {
+        const std::string ext = LowerExtension(path);
+        return ext == ".moducpp" || ext == ".mko" || ext == ".modumako" ||
+               ext == ".cpp" || ext == ".cc" || ext == ".cxx" || ext == ".c";
+    }
+
+    ScriptLanguage inferNativeLanguageFromPath(const fs::path& path) {
+        return LowerExtension(path) == ".c" ? ScriptLanguage::C : ScriptLanguage::Cpp;
+    }
+
     bool IsSpriteSheetSidecarPath(const fs::path& path) {
         return path.extension() == ".spritesheet";
     }
@@ -976,6 +996,140 @@ bool Engine::drawObjectReferenceSlot(const char* id,
 }
 #pragma endregion
 
+#pragma region Asset Drops
+// Materials, scripts and audio clips dropped straight onto a SceneOBJ. One implementation for
+// the Scene view, the Hierarchy and the Inspector, so the three can never disagree on what a
+// drop does.
+Engine::ObjectAssetDropKind Engine::classifyObjectAssetDrop(const char* rawPath) {
+    if (!rawPath || !*rawPath) return ObjectAssetDropKind::None;
+    // A drag reports the same path every frame and classifying it stats the file, so the last
+    // answer is kept.
+    if (assetDropKindCachePath == rawPath) return assetDropKindCache;
+    assetDropKindCachePath = rawPath;
+    assetDropKindCache = ObjectAssetDropKind::None;
+
+    const fs::path path(rawPath);
+    std::error_code ec;
+    fs::directory_entry entry(path, ec);
+    if (ec || !entry.is_regular_file(ec) || ec) return assetDropKindCache;
+
+    const FileCategory category = fileBrowser.getFileCategory(entry);
+    if (category == FileCategory::Material) {
+        assetDropKindCache = ObjectAssetDropKind::Material;
+    } else if (category == FileCategory::Audio) {
+        assetDropKindCache = ObjectAssetDropKind::Audio;
+    } else if (isNativeScriptSourcePath(path) || LowerExtension(path) == ".cs") {
+        // Only what a Script component can run; a .h or .py is "Script" to the Project panel
+        // but would just be a broken component here.
+        assetDropKindCache = ObjectAssetDropKind::Script;
+    }
+    return assetDropKindCache;
+}
+
+Engine::ObjectAssetDropKind Engine::activeObjectAssetDragKind(std::string* outPath) {
+    const ImGuiPayload* payload = ImGui::GetDragDropPayload();
+    if (!payload || !payload->IsDataType("FILE_PATH") || !payload->Data) {
+        return ObjectAssetDropKind::None;
+    }
+    const char* path = static_cast<const char*>(payload->Data);
+    if (outPath) *outPath = path;
+    return classifyObjectAssetDrop(path);
+}
+
+bool Engine::canApplyAssetDrop(const SceneObject& obj, ObjectAssetDropKind kind) const {
+    switch (kind) {
+        case ObjectAssetDropKind::Material:
+            // Only what draws with obj.material. A UI Image keeps its picture in
+            // albedoTexturePath, which loading a material would overwrite.
+            return HasRendererComponent(obj);
+        case ObjectAssetDropKind::Script:
+        case ObjectAssetDropKind::Audio:
+            return true;
+        case ObjectAssetDropKind::None:
+        default:
+            return false;
+    }
+}
+
+bool Engine::applyAssetDropToObject(SceneObject& obj, const fs::path& path, bool recordUndo) {
+    const std::string pathString = path.string();
+    const ObjectAssetDropKind kind = classifyObjectAssetDrop(pathString.c_str());
+    if (!canApplyAssetDrop(obj, kind)) return false;
+
+    const std::string targetName = obj.name.empty() ? std::string("Object") : obj.name;
+    const std::string assetName = path.filename().string();
+    switch (kind) {
+        case ObjectAssetDropKind::Material: {
+            if (materialPathsMatch(obj.materialPath, pathString)) return false;
+            if (recordUndo) recordState("Assign Material");
+            obj.materialPath = pathString;
+            loadMaterialFromFile(obj);
+            showEditorToast(assetName + " assigned to " + targetName + ".", ConsoleMessageType::Success, 1.65);
+            break;
+        }
+        case ObjectAssetDropKind::Script: {
+            const bool alreadyAssigned = std::any_of(obj.scripts.begin(), obj.scripts.end(),
+                [&](const ScriptComponent& sc) { return sc.path == pathString; });
+            if (alreadyAssigned) {
+                showEditorToast(targetName + " already has " + assetName + ".", ConsoleMessageType::Info, 1.65);
+                return false;
+            }
+            if (recordUndo) recordState("Add Script");
+            ScriptComponent sc;
+            sc.path = pathString;
+            sc.lastBinaryPath.clear();
+            sc.lastBinaryVerified = false;
+            if (LowerExtension(path) == ".cs") {
+                sc.language = ScriptLanguage::CSharp;
+                sc.managedType = InferManagedTypeFromFile(path).value_or(path.stem().string());
+            } else {
+                sc.language = inferNativeLanguageFromPath(path);
+            }
+            obj.scripts.push_back(sc);
+            EnsureInspectorComponentMetadata(obj);
+            markRuntimeScriptBindingsDirty();
+            playEditorSound(EditorSoundCue::ScriptAssigned, 0.95f);
+            showEditorToast("Script assigned to " + targetName + " Successful.", ConsoleMessageType::Success, 1.65);
+            addConsoleMessage("Assigned script to " + obj.name, ConsoleMessageType::Success);
+            break;
+        }
+        case ObjectAssetDropKind::Audio: {
+            if (obj.hasAudioSource && obj.audioSource.clipPath == pathString) return false;
+            if (recordUndo) recordState("Assign Audio Clip");
+            const bool addedSource = !obj.hasAudioSource;
+            if (addedSource) {
+                obj.hasAudioSource = true;
+                obj.audioSource = AudioSourceComponent{};
+                EnsureInspectorComponentMetadata(obj);
+            }
+            obj.audioSource.clipPath = pathString;
+            showEditorToast(addedSource ? "Audio Source with " + assetName + " added to " + targetName + "."
+                                        : assetName + " assigned to " + targetName + "'s Audio Source.",
+                            ConsoleMessageType::Success, 1.65);
+            addConsoleMessage("Assigned audio clip to " + obj.name, ConsoleMessageType::Success);
+            break;
+        }
+        case ObjectAssetDropKind::None:
+        default:
+            return false;
+    }
+    projectManager.currentProject.hasUnsavedChanges = true;
+    return true;
+}
+
+void Engine::setAssetDropHover(int objectId) {
+    assetDropHoverObjectId = objectId;
+    assetDropHoverFrame = ImGui::GetFrameCount();
+}
+
+// The Scene view renders before the panels that track the cursor run, so a hover set on the
+// previous frame is still current. Anything older is a drag that has left every drop target.
+int Engine::activeAssetDropHover() const {
+    if (assetDropHoverObjectId < 0 || ImGui::GetDragDropPayload() == nullptr) return -1;
+    return (ImGui::GetFrameCount() - assetDropHoverFrame) <= 1 ? assetDropHoverObjectId : -1;
+}
+#pragma endregion
+
 #pragma region Inspector Panel
 void Engine::renderInspectorPanel() {
     const auto __ipStart = std::chrono::steady_clock::now();
@@ -1373,6 +1527,8 @@ void Engine::renderInspectorPanel() {
 
         const ImVec2 pos = ImGui::GetCursorScreenPos();
         const bool pressed = ImGui::InvisibleButton(id, size);
+        if (pressed) ImGui::ReportWidgetFeedback(ImGuiWidgetFeedback_Button);
+        ImGui::ReportItemHoverFeedback();
         const bool hovered = ImGui::IsItemHovered();
         const bool held = ImGui::IsItemActive();
         const ImVec2 max(pos.x + size.x, pos.y + size.y);
@@ -2564,7 +2720,8 @@ void Engine::renderInspectorPanel() {
                                          const std::string& normalPath,
                                          bool useOverlay,
                                          bool shaderEditable,
-                                         int previewSlot) {
+                                         int previewSlot,
+                                         const std::function<void()>& headerMenu = {}) {
         ImGui::PushID(idSuffix);
         ImGuiStyle& style = ImGui::GetStyle();
         ImGui::SetNextItemAllowOverlap();
@@ -2589,6 +2746,11 @@ void Engine::renderInspectorPanel() {
                                                   ImGuiTreeNodeFlags_SpanAvailWidth);
         ImGui::PopStyleColor(3);
         ImGui::PopStyleVar();
+        // Right-click on the header: the rarely needed file actions, kept out of the body.
+        if (headerMenu && ImGui::BeginPopupContextItem("##MaterialHeaderMenu")) {
+            headerMenu();
+            ImGui::EndPopup();
+        }
 
         const ImVec2 headerMin = ImGui::GetItemRectMin();
         const ImVec2 headerMax = ImGui::GetItemRectMax();
@@ -3030,25 +3192,40 @@ void Engine::renderInspectorPanel() {
         if (InspectorReveal _fs = drawInspectorSubsectionFoldout("Texture Maps", nullptr, true)) {
             changed |= drawMaterialTextureField("Base Map", (std::string(idPrefix) + "Albedo").c_str(), albedoPath);
             changed |= drawMaterialTextureField("Normal Map", (std::string(idPrefix) + "Normal").c_str(), normalPath);
-            changed |= drawMaterialTextureField("Metallic", (std::string(idPrefix) + "MetallicMap").c_str(), metallicMapPath);
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Single-channel metalness, read from red.\n"
-                                  "Replaces the Metallic slider. Wins over Metal/Rough.\n"
-                                  "Only read while Physically Based is on.");
-            }
-            changed |= drawMaterialTextureField("Roughness", (std::string(idPrefix) + "RoughnessMap").c_str(), roughnessMapPath);
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Single-channel roughness, read from red.\n"
-                                  "Replaces the Smoothness slider. Wins over Metal/Rough.\n"
-                                  "Only read while Physically Based is on.");
-            }
-            changed |= drawMaterialTextureField("Metal/Rough", (std::string(idPrefix) + "MetallicRoughness").c_str(), metallicRoughnessPath);
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Packed glTF ORM: roughness in green, metallic in blue.\n"
-                                  "Use this only for a genuinely packed texture - a\n"
-                                  "greyscale metalness file dropped here also overwrites\n"
-                                  "roughness. Separate files go in the two slots above.\n"
-                                  "Only read while Physically Based is on.");
+            // frag.glsl reads these three only on its PBR branch; the legacy branch takes
+            // metalness and smoothness from the sliders alone. The height/parallax rows
+            // further down are PBR-only too (both fragment shaders gate parallax on
+            // usePbr). Occlusion, opacity and normal are read by both branches.
+            if (materialValue.pbrEnabled) {
+                changed |= drawMaterialTextureField("Metallic", (std::string(idPrefix) + "MetallicMap").c_str(), metallicMapPath);
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Single-channel metalness, read from red.\n"
+                                      "Replaces the Metallic slider. Wins over Metal/Rough.");
+                }
+                changed |= drawMaterialTextureField("Roughness", (std::string(idPrefix) + "RoughnessMap").c_str(), roughnessMapPath);
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Single-channel roughness, read from red.\n"
+                                      "Replaces the Smoothness slider. Wins over Metal/Rough.");
+                }
+                changed |= drawMaterialTextureField("Metal/Rough", (std::string(idPrefix) + "MetallicRoughness").c_str(), metallicRoughnessPath);
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Packed glTF ORM: roughness in green, metallic in blue.\n"
+                                      "Use this only for a genuinely packed texture - a\n"
+                                      "greyscale metalness file dropped here also overwrites\n"
+                                      "roughness. Separate files go in the two slots above.");
+                }
+            } else {
+                // Hidden, not cleared: say so, or an assigned map looks like it vanished.
+                const int hiddenPbrMaps = (metallicMapPath.empty() ? 0 : 1) +
+                                          (roughnessMapPath.empty() ? 0 : 1) +
+                                          (metallicRoughnessPath.empty() ? 0 : 1) +
+                                          (heightPath.empty() ? 0 : 1);
+                if (hiddenPbrMaps > 0) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+                    ImGui::TextWrapped("%d PBR map%s (metallic, roughness or height) kept for Physically Based.",
+                                       hiddenPbrMaps, hiddenPbrMaps == 1 ? "" : "s");
+                    ImGui::PopStyleColor();
+                }
             }
             changed |= drawMaterialTextureField("Opacity", (std::string(idPrefix) + "OpacityMap").c_str(), opacityMapPath);
             if (ImGui::IsItemHovered()) {
@@ -3075,37 +3252,39 @@ void Engine::renderInspectorPanel() {
                 materialValue.occlusionStrength = std::clamp(materialValue.occlusionStrength, 0.0f, 1.0f);
                 changed = true;
             }
-            changed |= drawMaterialTextureField("Height Map", (std::string(idPrefix) + "Height").c_str(), heightPath);
-            drawMaterialInlineLabel("Height Scale");
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(-1.0f);
-            if (ImGui::SliderFloat("##HeightScale", &materialValue.heightScale, 0.0f, 0.2f, "%.3f")) {
-                materialValue.heightScale = std::clamp(materialValue.heightScale, 0.0f, 1.0f);
-                changed = true;
+            if (materialValue.pbrEnabled) {
+                changed |= drawMaterialTextureField("Height Map", (std::string(idPrefix) + "Height").c_str(), heightPath);
+                drawMaterialInlineLabel("Height Scale");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(-1.0f);
+                if (ImGui::SliderFloat("##HeightScale", &materialValue.heightScale, 0.0f, 0.2f, "%.3f")) {
+                    materialValue.heightScale = std::clamp(materialValue.heightScale, 0.0f, 1.0f);
+                    changed = true;
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Parallax occlusion depth, in the material's UV space, so it\n"
+                                      "scales with UV Tiling. 0 turns the ray march off entirely.\n"
+                                      "Past about 0.1 the silhouette stops selling the illusion.");
+                }
+                ImGui::BeginDisabled(materialValue.heightScale <= 0.0f);
+                drawMaterialInlineLabel("Parallax Steps");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(-1.0f);
+                if (ImGui::SliderInt("##ParallaxSteps", &materialValue.parallaxSteps, 4, 256)) {
+                    materialValue.parallaxSteps = std::clamp(materialValue.parallaxSteps, 4, 256);
+                    changed = true;
+                }
+                drawMaterialInlineLabel("Invert Height");
+                ImGui::SameLine();
+                if (ImGui::Checkbox("##ParallaxInvert", &materialValue.parallaxInvertHeight)) {
+                    changed = true;
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("On if the map stores white as the pits rather than the peaks.\n"
+                                      "If the surface looks inverted, this is the switch.");
+                }
+                ImGui::EndDisabled();
             }
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Parallax occlusion depth, in the material's UV space, so it\n"
-                                  "scales with UV Tiling. 0 turns the ray march off entirely.\n"
-                                  "Past about 0.1 the silhouette stops selling the illusion.");
-            }
-            ImGui::BeginDisabled(materialValue.heightScale <= 0.0f);
-            drawMaterialInlineLabel("Parallax Steps");
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(-1.0f);
-            if (ImGui::SliderInt("##ParallaxSteps", &materialValue.parallaxSteps, 4, 256)) {
-                materialValue.parallaxSteps = std::clamp(materialValue.parallaxSteps, 4, 256);
-                changed = true;
-            }
-            drawMaterialInlineLabel("Invert Height");
-            ImGui::SameLine();
-            if (ImGui::Checkbox("##ParallaxInvert", &materialValue.parallaxInvertHeight)) {
-                changed = true;
-            }
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("On if the map stores white as the pits rather than the peaks.\n"
-                                  "If the surface looks inverted, this is the switch.");
-            }
-            ImGui::EndDisabled();
             drawMaterialInlineLabel("Normal Strength");
             ImGui::SameLine();
             ImGui::SetNextItemWidth(-1.0f);
@@ -3399,16 +3578,38 @@ void Engine::renderInspectorPanel() {
             );
         }
 
-        ImGui::Spacing();
-        ImGui::BeginDisabled(vertShaderPath.empty() && fragShaderPath.empty());
-        if (ImGui::Button("Reload Shader")) {
-            renderer.forceReloadShader(vertShaderPath, fragShaderPath);
-        }
-        ImGui::EndDisabled();
+        // Reload Shader used to sit here, greyed out on every material without a custom
+        // shader. It now lives in the Material header's right-click menu (and on the asset
+        // panel, shown only when the material has a custom shader).
 
         ImGui::PopID();
         return changed;
     };
+
+    // The asset panel edits the .mat itself, so the values are gathered back into file form to
+    // push to every object using it.
+    auto inspectedMaterialFileData = [&]() {
+        MaterialFileData data;
+        data.props = inspectedMaterial;
+        data.albedo = inspectedAlbedo;
+        data.overlay = inspectedOverlay;
+        data.normal = inspectedNormal;
+        data.metallicRoughness = inspectedMetallicRoughness;
+        data.metallicMap = inspectedMetallicMap;
+        data.roughnessMap = inspectedRoughnessMap;
+        data.opacityMap = inspectedOpacityMap;
+        data.emissive = inspectedEmissive;
+        data.occlusion = inspectedOcclusion;
+        data.height = inspectedHeight;
+        data.useOverlay = inspectedUseOverlay;
+        data.shaderPack = inspectedShaderPack;
+        data.vertexShader = inspectedVertShader;
+        data.fragmentShader = inspectedFragShader;
+        return data;
+    };
+    // Material edits save themselves once the drag or text entry that made them ends, so the
+    // file on disk and every object using it never disagree.
+    static std::string pendingMaterialAssetSavePath;
 
     auto renderMaterialAssetPanel = [&](const char* headerTitle, bool allowApply) {
         if (!browserHasMaterial) return;
@@ -3419,6 +3620,13 @@ void Engine::renderInspectorPanel() {
         } else {
             ImGui::TextDisabled("%s", selectedMaterialPath.filename().string().c_str());
             ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "%s", selectedMaterialPath.string().c_str());
+            const int materialUsers = countMaterialAssetUsers(selectedMaterialPath.string());
+            if (materialUsers > 0) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+                ImGui::TextWrapped("Used by %d object%s in this scene. Edits apply to all of them.",
+                                   materialUsers, materialUsers == 1 ? "" : "s");
+                ImGui::PopStyleColor();
+            }
             ImGui::Spacing();
 
             const bool matChanged = renderMaterialEditorBody(
@@ -3443,6 +3651,20 @@ void Engine::renderInspectorPanel() {
                 1001
             );
 
+            const std::string materialAssetPath = selectedMaterialPath.string();
+            if (matChanged) {
+                propagateMaterialAsset(materialAssetPath, inspectedMaterialFileData());
+                pendingMaterialAssetSavePath = materialAssetPath;
+            }
+            if (!pendingMaterialAssetSavePath.empty() && pendingMaterialAssetSavePath == materialAssetPath &&
+                !ImGui::IsAnyItemActive()) {
+                if (!writeMaterialFile(inspectedMaterialFileData(),
+                                       resolveMaterialAssetPath(materialAssetPath).string())) {
+                    addConsoleMessage("Failed to save material: " + materialAssetPath, ConsoleMessageType::Error);
+                }
+                pendingMaterialAssetSavePath.clear();
+            }
+
             if (ImGui::Button("Reload")) {
                 inspectedMaterialValid = loadMaterialData(
                     selectedMaterialPath.string(),
@@ -3462,9 +3684,17 @@ void Engine::renderInspectorPanel() {
                     &inspectedOcclusion,
                     &inspectedHeight
                 );
+                if (inspectedMaterialValid) {
+                    // Picks up edits made to the file outside the editor.
+                    propagateMaterialAsset(materialAssetPath, inspectedMaterialFileData());
+                    pendingMaterialAssetSavePath.clear();
+                }
             }
+            ImGui::SetItemTooltip("Re-read the file from disk and apply it to every object using it.");
             ImGui::SameLine();
             if (ImGui::Button("Save")) {
+                pendingMaterialAssetSavePath.clear();
+                propagateMaterialAsset(materialAssetPath, inspectedMaterialFileData());
                 if (saveMaterialData(
                         selectedMaterialPath.string(),
                         inspectedMaterial,
@@ -3496,20 +3726,23 @@ void Engine::renderInspectorPanel() {
                 ImGui::BeginDisabled(!canApply);
                 if (ImGui::Button("Apply to Selection")) {
                     if (target) {
-                        target->material = inspectedMaterial;
-                        target->albedoTexturePath = inspectedAlbedo;
-                        target->overlayTexturePath = inspectedOverlay;
-                        target->normalMapPath = inspectedNormal;
-                        target->useOverlay = inspectedUseOverlay;
+                        // Every map slot, not only albedo/normal: the old field-by-field copy
+                        // dropped the PBR maps a material carries.
+                        applyMaterialFileData(*target, inspectedMaterialFileData());
                         target->materialPath = selectedMaterialPath.string();
-                        target->shaderPackPath = inspectedShaderPack;
-                        target->vertexShaderPath = inspectedVertShader;
-                        target->fragmentShaderPath = inspectedFragShader;
                         projectManager.currentProject.hasUnsavedChanges = true;
                         addConsoleMessage("Applied material to " + target->name, ConsoleMessageType::Success);
                     }
                 }
                 ImGui::EndDisabled();
+            }
+            // Only offered when there is a custom shader to reload, instead of a button that
+            // is greyed out on nearly every material.
+            if (!inspectedVertShader.empty() || !inspectedFragShader.empty()) {
+                ImGui::SameLine();
+                if (ImGui::Button("Reload Shader")) {
+                    renderer.forceReloadShader(inspectedVertShader, inspectedFragShader);
+                }
             }
 
             if (matChanged) {
@@ -4183,6 +4416,13 @@ void Engine::renderInspectorPanel() {
                                       componentGetter, componentSetter, clearValue);
             ImGui::PopID();
             ImGui::PopItemWidth();
+        }
+        // The per-component widgets are all "##v", so the visible label has to be drawn here,
+        // the way DragFloatN does; without it "Position (px)" and "Size (px)" had no label column.
+        const char* labelEnd = ImGui::FindRenderedTextEnd(id);
+        if (labelEnd != id) {
+            ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x);
+            ImGui::TextUnformatted(id, labelEnd);
         }
         ImGui::PopID();
         return changed;
@@ -5411,6 +5651,13 @@ void Engine::renderInspectorPanel() {
                         obj.ui.renderTargetSize.x = std::max(16, size[0]);
                         obj.ui.renderTargetSize.y = std::max(16, size[1]);
                         changed = true;
+                    }
+                    const Renderer::UiTargetInfo liveTarget = renderer.getUiTargetInfo(obj.id);
+                    if (liveTarget.texture != 0 &&
+                        (liveTarget.width != obj.ui.renderTargetSize.x ||
+                         liveTarget.height != obj.ui.renderTargetSize.y)) {
+                        ImGui::TextDisabled("Rendering at %d x %d (Project Settings > 3D Canvas)",
+                                            liveTarget.width, liveTarget.height);
                     }
                     const char* renderFilterOptions[] = { "Bilinear", "No Filter" };
                     int renderFilter = (obj.ui.renderTargetFilter == MaterialProperties::TextureFilter::Point) ? 1 : 0;
@@ -12653,6 +12900,105 @@ void Engine::renderInspectorPanel() {
             }
         }
 
+        // The selected extra slot's material, gathered back into file form so it can be saved and
+        // pushed to objects that use the same .mat as their primary material.
+        auto slotMaterialFileData = [&]() {
+            MaterialFileData data;
+            data.props = slotInspectedMaterial;
+            data.albedo = slotInspectedAlbedo;
+            data.overlay = slotInspectedOverlay;
+            data.normal = slotInspectedNormal;
+            data.metallicRoughness = slotInspectedMetallicRoughness;
+            data.metallicMap = slotInspectedMetallicMap;
+            data.roughnessMap = slotInspectedRoughnessMap;
+            data.opacityMap = slotInspectedOpacityMap;
+            data.emissive = slotInspectedEmissive;
+            data.occlusion = slotInspectedOcclusion;
+            data.height = slotInspectedHeight;
+            data.useOverlay = slotInspectedUseOverlay;
+            data.shaderPack = slotInspectedShaderPack;
+            data.vertexShader = slotInspectedVertShader;
+            data.fragmentShader = slotInspectedFragShader;
+            return data;
+        };
+        auto saveSlotMaterial = [&](const std::string& slotPath) {
+            const std::string filePath = resolveMaterialAssetPath(slotPath).string();
+            if (!writeMaterialFile(slotMaterialFileData(), filePath)) {
+                addConsoleMessage("Failed to save material: " + filePath, ConsoleMessageType::Error);
+                return false;
+            }
+            return true;
+        };
+        auto reloadSlotMaterial = [&](const std::string& slotPath) {
+            slotMaterialInspectorValid = loadMaterialData(
+                slotPath,
+                slotInspectedMaterial,
+                slotInspectedAlbedo,
+                slotInspectedOverlay,
+                slotInspectedNormal,
+                slotInspectedUseOverlay,
+                &slotInspectedShaderPack,
+                &slotInspectedVertShader,
+                &slotInspectedFragShader,
+                &slotInspectedMetallicRoughness,
+                &slotInspectedMetallicMap,
+                &slotInspectedRoughnessMap,
+                &slotInspectedOpacityMap,
+                &slotInspectedEmissive,
+                &slotInspectedOcclusion,
+                &slotInspectedHeight
+            );
+            slotMaterialInspectorPath = slotPath;
+            if (slotMaterialInspectorValid) {
+                propagateMaterialAsset(slotPath, slotMaterialFileData());
+            }
+        };
+        const std::string* menuSlotPath =
+            (!editingPrimaryMaterial && selectedAdditionalSlotIndex < obj.additionalMaterialPaths.size() &&
+             !obj.additionalMaterialPaths[selectedAdditionalSlotIndex].empty())
+                ? &obj.additionalMaterialPaths[selectedAdditionalSlotIndex]
+                : nullptr;
+
+        // Right-click menu on the Material header. Edits already save themselves and reach
+        // every object sharing the .mat, so reloading/saving by hand is rare enough to live
+        // here instead of as a permanent row of buttons (and a greyed Reload Shader).
+        auto materialHeaderMenu = [&]() {
+            const std::string* assetPath = editingPrimaryMaterial
+                ? (obj.materialPath.empty() ? nullptr : &obj.materialPath)
+                : menuSlotPath;
+            if (assetPath) {
+                const int users = countMaterialAssetUsers(*assetPath);
+                if (users > 1) {
+                    ImGui::TextDisabled("Shared by %d objects", users);
+                } else {
+                    ImGui::TextDisabled("Material asset");
+                }
+                ImGui::Separator();
+            }
+            if (ImGui::MenuItem("Reload Material", nullptr, false, assetPath != nullptr)) {
+                if (editingPrimaryMaterial) {
+                    loadMaterialFromFile(obj);
+                    propagateMaterialAsset(obj.materialPath, materialFileDataFromObject(obj), obj.id);
+                    rendererSectionChanged = true;
+                } else {
+                    reloadSlotMaterial(*menuSlotPath);
+                }
+            }
+            if (ImGui::MenuItem("Save Material", nullptr, false,
+                                assetPath != nullptr && (editingPrimaryMaterial || slotMaterialInspectorValid))) {
+                if (editingPrimaryMaterial) {
+                    saveMaterialToFile(obj);
+                } else if (saveSlotMaterial(*menuSlotPath)) {
+                    addConsoleMessage("Saved material: " + *menuSlotPath, ConsoleMessageType::Success);
+                }
+            }
+            const std::string& menuVert = editingPrimaryMaterial ? obj.vertexShaderPath : slotInspectedVertShader;
+            const std::string& menuFrag = editingPrimaryMaterial ? obj.fragmentShaderPath : slotInspectedFragShader;
+            if (ImGui::MenuItem("Reload Shader", nullptr, false, !menuVert.empty() || !menuFrag.empty())) {
+                renderer.forceReloadShader(menuVert, menuFrag);
+            }
+        };
+
         std::string materialHeaderName = "Material";
         const MaterialProperties* headerMaterial = &obj.material;
         const std::string* headerAlbedoPath = &obj.albedoTexturePath;
@@ -12689,7 +13035,8 @@ void Engine::renderInspectorPanel() {
                                                              *headerNormalPath,
                                                              headerUseOverlay,
                                                              editingPrimaryMaterial || slotMaterialInspectorValid,
-                                                             1100 + selectedMaterialSlot);
+                                                             1100 + selectedMaterialSlot,
+                                                             materialHeaderMenu);
         if (materialHeaderState.second) {
             rendererSectionChanged = true;
             projectManager.currentProject.hasUnsavedChanges = true;
@@ -12723,21 +13070,31 @@ void Engine::renderInspectorPanel() {
                     1002
                 );
 
+                // Reload / Save / Reload Shader and the shared-by count are in the Material
+                // header's right-click menu.
                 const bool hasMaterialAsset = !obj.materialPath.empty();
-                ImGui::BeginDisabled(!hasMaterialAsset);
-                if (ImGui::Button("Reload Material")) {
-                    loadMaterialFromFile(obj);
-                    rendererSectionChanged = true;
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("Save Material")) {
-                    saveMaterialToFile(obj);
-                }
-                ImGui::EndDisabled();
 
+                // The object's material section edits the asset it names, so the change goes to
+                // every object using that asset and to the file once the edit settles.
+                static int pendingObjectMaterialSaveId = -1;
                 if (primaryMaterialChanged) {
                     rendererSectionChanged = true;
                     projectManager.currentProject.hasUnsavedChanges = true;
+                    if (hasMaterialAsset) {
+                        propagateMaterialAsset(obj.materialPath, materialFileDataFromObject(obj), obj.id);
+                        pendingObjectMaterialSaveId = obj.id;
+                    }
+                }
+                if (pendingObjectMaterialSaveId == obj.id && !ImGui::IsAnyItemActive()) {
+                    pendingObjectMaterialSaveId = -1;
+                    if (hasMaterialAsset) {
+                        // Scenes store this path project-relative; resolve it, or the write
+                        // lands against the editor's working directory and fails.
+                        const std::string filePath = resolveMaterialAssetPath(obj.materialPath).string();
+                        if (!writeMaterialFile(materialFileDataFromObject(obj), filePath)) {
+                            addConsoleMessage("Failed to save material: " + filePath, ConsoleMessageType::Error);
+                        }
+                    }
                 }
             } else {
                 const size_t slotIndex = static_cast<size_t>(selectedMaterialSlot - 1);
@@ -12774,56 +13131,18 @@ void Engine::renderInspectorPanel() {
                                 1003
                             );
 
-                            if (ImGui::Button("Reload Material")) {
-                                slotMaterialInspectorValid = loadMaterialData(
-                                    slotPath,
-                                    slotInspectedMaterial,
-                                    slotInspectedAlbedo,
-                                    slotInspectedOverlay,
-                                    slotInspectedNormal,
-                                    slotInspectedUseOverlay,
-                                    &slotInspectedShaderPack,
-                                    &slotInspectedVertShader,
-                                    &slotInspectedFragShader,
-                                    &slotInspectedMetallicRoughness,
-                                    &slotInspectedMetallicMap,
-                                    &slotInspectedRoughnessMap,
-                                    &slotInspectedOpacityMap,
-                                    &slotInspectedEmissive,
-                                    &slotInspectedOcclusion,
-                                    &slotInspectedHeight
-                                );
-                                slotMaterialInspectorPath = slotPath;
-                            }
-                            ImGui::SameLine();
-                            if (ImGui::Button("Save Material")) {
-                                if (saveMaterialData(
-                                        slotPath,
-                                        slotInspectedMaterial,
-                                        slotInspectedAlbedo,
-                                        slotInspectedOverlay,
-                                        slotInspectedNormal,
-                                        slotInspectedUseOverlay,
-                                        slotInspectedShaderPack,
-                                        slotInspectedVertShader,
-                                        slotInspectedFragShader,
-                                        &slotInspectedMetallicRoughness,
-                                        &slotInspectedMetallicMap,
-                                        &slotInspectedRoughnessMap,
-                                        &slotInspectedOpacityMap,
-                                        &slotInspectedEmissive,
-                                        &slotInspectedOcclusion,
-                                        &slotInspectedHeight))
-                                {
-                                    addConsoleMessage("Saved material: " + slotPath, ConsoleMessageType::Success);
-                                } else {
-                                    addConsoleMessage("Failed to save material: " + slotPath,
-                                                      ConsoleMessageType::Error);
-                                }
-                            }
-
+                            // Reload / Save moved to the Material header's right-click menu, so
+                            // slot edits save themselves like the primary material's do -
+                            // otherwise nothing would ever write them.
+                            static std::string pendingSlotMaterialSavePath;
                             if (slotMaterialChanged) {
                                 slotMaterialInspectorValid = true;
+                                propagateMaterialAsset(slotPath, slotMaterialFileData());
+                                pendingSlotMaterialSavePath = slotPath;
+                            }
+                            if (pendingSlotMaterialSavePath == slotPath && !ImGui::IsAnyItemActive()) {
+                                pendingSlotMaterialSavePath.clear();
+                                saveSlotMaterial(slotPath);
                             }
                         }
                     }
@@ -13704,6 +14023,58 @@ void Engine::renderInspectorPanel() {
     }
     if (componentChanged) {
         projectManager.currentProject.hasUnsavedChanges = true;
+    }
+
+    // A material, script or audio clip dropped anywhere on the Inspector applies to the objects it
+    // shows. This target spans the whole panel and is submitted after every field; ImGui hands a
+    // drop to the smallest target under the cursor, so a reference slot still takes a drop that
+    // lands on it. Runs before the undo bookkeeping below, which records it like any edit.
+    {
+        std::string inspectorDragPath;
+        const ObjectAssetDropKind inspectorDragKind = activeObjectAssetDragKind(&inspectorDragPath);
+        bool anyApplicable = false;
+        for (const SceneObject* selectedObj : selectedObjects) {
+            anyApplicable = anyApplicable || (selectedObj && canApplyAssetDrop(*selectedObj, inspectorDragKind));
+        }
+        ImGuiWindow* inspectorWindow = ImGui::GetCurrentWindow();
+        if (anyApplicable && inspectorWindow &&
+            ImGui::BeginDragDropTargetCustom(inspectorWindow->InnerRect, ImGui::GetID("##InspectorAssetDrop"))) {
+            const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(
+                "FILE_PATH", ImGuiDragDropFlags_AcceptBeforeDelivery | ImGuiDragDropFlags_AcceptNoDrawDefaultRect);
+            if (payload && payload->IsPreview()) {
+                // Glow round the panel here, and the object's outline in the Scene view.
+                setAssetDropHover(obj.id);
+                ImDrawList* glowList = ImGui::GetForegroundDrawList(ImGui::GetWindowViewport());
+                const ImRect& glowRect = inspectorWindow->InnerRect;
+                glowList->PushClipRect(inspectorWindow->Rect().Min, inspectorWindow->Rect().Max, true);
+                for (int ring = 3; ring >= 1; --ring) {
+                    const float inset = 2.0f * static_cast<float>(ring);
+                    glowList->AddRect(ImVec2(glowRect.Min.x + inset, glowRect.Min.y + inset),
+                                      ImVec2(glowRect.Max.x - inset, glowRect.Max.y - inset),
+                                      IM_COL32(122, 110, 255, 40 * (4 - ring)), 6.0f, 0, 2.0f);
+                }
+                glowList->AddRect(glowRect.Min, glowRect.Max, IM_COL32(122, 110, 255, 255), 6.0f, 0, 2.0f);
+                const char* action = inspectorDragKind == ObjectAssetDropKind::Material ? "Drop to assign the material"
+                                   : inspectorDragKind == ObjectAssetDropKind::Script   ? "Drop to add the script"
+                                                                                        : "Drop to assign the audio clip";
+                const ImVec2 textSize = ImGui::CalcTextSize(action);
+                const ImVec2 labelMin(glowRect.Min.x + (glowRect.GetWidth() - textSize.x) * 0.5f - 8.0f,
+                                      glowRect.Max.y - textSize.y - 18.0f);
+                const ImVec2 labelMax(labelMin.x + textSize.x + 16.0f, labelMin.y + textSize.y + 8.0f);
+                glowList->AddRectFilled(labelMin, labelMax, IM_COL32(20, 22, 32, 230), 4.0f);
+                glowList->AddRect(labelMin, labelMax, IM_COL32(122, 110, 255, 255), 4.0f, 0, 1.5f);
+                glowList->AddText(ImVec2(labelMin.x + 8.0f, labelMin.y + 4.0f), IM_COL32(236, 240, 246, 255), action);
+                glowList->PopClipRect();
+            }
+            if (payload && payload->IsDelivery()) {
+                for (SceneObject* selectedObj : selectedObjects) {
+                    if (selectedObj && applyAssetDropToObject(*selectedObj, fs::path(inspectorDragPath), false)) {
+                        componentChanged = true;
+                    }
+                }
+            }
+            ImGui::EndDragDropTarget();
+        }
     }
 
     const bool inspectorChanged =

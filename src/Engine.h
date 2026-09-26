@@ -21,6 +21,7 @@
 #include "PhysicsSystem.h"
 #include "PhysicsBackendFactory.h"
 #include "AudioSystem.h"
+#include "EditorSoundThemes.h"
 #include "Network/NetworkSession.h"
 #include "PackageManager.h"
 #include "ModuPak.h"
@@ -31,9 +32,11 @@
 #if !MODULARITY_RUNTIME_ONLY
 #include "ThirdParty/ImGuiColorTextEdit/TextEditor.h"
 #include "Nebula/NebulaLightmap.h"
+#include "VersionControl.h"
 #endif
 #include "Vulkan/VulkanRenderer.h"
 #include "XR/XRSystem.h"
+#include "EngineMaterialIO.h"
 #include "../include/Window/Window.h"
 #include <array>
 #include <unordered_map>
@@ -282,6 +285,7 @@ private:
     bool projectSettingsCompactSidebar = true;
     bool showRegistryPackagesWindow = false;
     bool showModularityDoctorWindow = false;
+    bool showVersionControlWindow = false;
     bool showMeshBuilder = false;
     bool showBuildSettings = false;
     bool showStyleEditor = false;
@@ -584,12 +588,33 @@ private:
         Click = 0,
         Error = 1,
         Other = 2,
-        Boot = 3
+        Boot = 3,
+        // Interface sounds the widgets report themselves (see flushWidgetFeedbackSounds).
+        Button = 4,
+        Toggle = 5,
+        Slide = 6,
+        Transition = 7,
+        Hover = 8
     };
     bool feedbackSoundsEnabled = true;
     bool feedbackClickSoundsEnabled = true;
     bool feedbackErrorSoundsEnabled = true;
     bool feedbackOtherSoundsEnabled = true;
+    bool feedbackButtonSoundsEnabled = true;
+    bool feedbackToggleSoundsEnabled = true;
+    bool feedbackSlideSoundsEnabled = true;
+    bool feedbackTransitionSoundsEnabled = true;
+    bool feedbackHoverSoundsEnabled = true;
+    float feedbackSoundVolume = 0.5f;  // UI volume: scales every themed sound (not the boot or crash sounds)
+    // UI sounds are requested by cue; the active theme (a user preference, never per project)
+    // decides the file. See EditorSoundThemes.h.
+    using EditorSoundCue = Modularity::EditorSounds::Cue;
+    Modularity::EditorSounds::ThemeLibrary editorSoundThemes;
+    // ModuGUI reports widget interactions as they happen (ImGuiWidgetFeedback). They are only
+    // collected here; flushWidgetFeedbackSounds() turns a frame's worth into at most one sound.
+    std::array<bool, ImGuiWidgetFeedback_COUNT> pendingWidgetFeedback{};
+    double explicitFeedbackCueTime = -1.0;  // glfwGetTime() a call-site cue (compile, dialog...) last played
+    std::array<double, static_cast<size_t>(Modularity::EditorSounds::Cue::Count)> lastCueTime{};
     enum class AudioPreviewContext {
         None = 0,
         AssetBrowser,
@@ -886,13 +911,37 @@ private:
     bool light2DShapeEditMode = false;
     int light2DShapeEditingObjectId = -1;
     int light2DShapeEditingPointIndex = -1;
+    // What one canvas element drew into the target last redraw. Partial
+    // redraws compare these per element and repaint only the pixels that
+    // changed elements covered before and after.
+    struct UiCanvas3DElementRecord {
+        int id = -1;
+        uint64_t signature = 0;
+        bool hasBounds = false;
+        // GL framebuffer pixels (origin bottom-left), max exclusive.
+        int boundsMinX = 0, boundsMinY = 0, boundsMaxX = 0, boundsMaxY = 0;
+    };
     struct UiCanvas3DContext {
         ImGuiContext* context = nullptr;
         bool backendReady = false;
         bool hadInputLastFrame = false;
         uint64_t lastContentSignature = 0;
+        uint64_t lastCanvasSignature = 0;
         bool hasRenderedTarget = false;
+        std::vector<UiCanvas3DElementRecord> elementRecords;
+        // Auto resolution: target scale in eighths of the (capped) Render
+        // Target. Grows at once, shrinks only after staying smaller a while.
+        int autoResolutionEighths = 8;
+        float autoResolutionShrinkSeconds = 0.0f;
     };
+    struct UiCanvas3DFrameStats {
+        int active = 0;
+        int cached = 0;
+        int partialRedraws = 0;
+        int fullRedraws = 0;
+        double redrawnPixels = 0.0;
+    };
+    UiCanvas3DFrameStats uiCanvas3DStatsLastFrame;
     struct UiCanvas3DInput {
         ImVec2 mousePos = ImVec2(-FLT_MAX, -FLT_MAX);
         bool mouseDown[3] = { false, false, false };
@@ -1112,6 +1161,36 @@ private:
     BuildSettings buildSettings;
     int buildSettingsSelectedIndex = -1;
     bool buildSettingsDirty = false;
+
+    // What the project actually uses, for resolving "auto" modules. Walking Assets is too slow to
+    // repeat every frame, so Build Settings keeps one scan and refreshes it when the window opens
+    // or on Rescan; the export always takes a fresh one.
+    struct BuildModuleProjectScan {
+        bool valid = false;
+        fs::path projectRoot;         // the project this scan describes
+        std::string modelAsset;       // first model file found -> Assimp
+        std::string managedScript;    // first C# script a build scene runs -> Mono
+        std::string opusClip;         // first Ogg/Opus clip -> opusfile
+        std::string sndfileClip;      // first clip only libsndfile decodes (AIFF, CAF, ...) -> sndfile
+    };
+    // One optional engine module as the export will build it. A profile stores "auto", "on" or
+    // "off" per module; "auto" is resolved here from the project instead of CMake's defaults, so
+    // a Jolt project stops compiling PhysX and a project without C# stops embedding Mono.
+    struct BuildModuleDecision {
+        const char* label = "";
+        const char* cmakeOption = "";
+        std::string* setting = nullptr;  // the profile field this row edits
+        bool automatic = true;
+        bool enabled = false;
+        std::string reason;
+        // What "auto" would pick, kept for forced rows so the window can warn when a forced-off
+        // module is one the project needs.
+        bool autoEnabled = false;
+        std::string autoReason;
+    };
+    BuildModuleProjectScan buildModuleScan;
+    BuildModuleProjectScan scanProjectForBuildModules() const;
+    std::vector<BuildModuleDecision> resolveBuildModules(const BuildModuleProjectScan& scan);
     struct ExportJobResult {
         bool success = false;
         std::string message;
@@ -1443,13 +1522,24 @@ private:
     void queueScriptCompileBatch(const std::vector<fs::path>& scriptPaths);
     void playCompileStartSound();
     bool isEditorFeedbackSoundEnabled(EditorFeedbackSoundCategory category) const;
-    bool playEditorFeedbackPreview(const std::string& path,
-                                   float volume,
-                                   bool loop,
-                                   EditorFeedbackSoundCategory category);
+    // Unthemed sounds by path: the launcher's boot intro and project-load wind.
     bool playEditorFeedbackOneShot(const std::string& path,
                                    float volume,
                                    EditorFeedbackSoundCategory category);
+    // Themed UI sounds. `volume` is the call site's level; the theme's per-cue gain and the UI
+    // volume setting scale it. They play on AudioSystem's interface lane, so they layer and never
+    // stop the asset / Inspector audio player.
+    static EditorFeedbackSoundCategory feedbackCategoryForCue(EditorSoundCue cue);
+    bool playEditorSound(EditorSoundCue cue, float volume = 0.95f);
+    bool playThemedCue(EditorSoundCue cue, float volume);
+    static void onWidgetFeedback(ImGuiWidgetFeedback event, void* userData);
+    void flushWidgetFeedbackSounds();
+    // Rescans the theme folders and activates `themeId`, logging manifest problems.
+    void applyEditorSoundTheme(const std::string& themeId);
+    // UI entry point: stores the choice globally, applies it and plays a sample of it.
+    // Takes the id by value because the rescan frees editorSoundThemes.themes(); callers
+    // iterating that list must finish the loop before calling this.
+    void selectEditorSoundTheme(std::string themeId);
 
     void importOBJToScene(const std::string& filepath, const std::string& objectName);
     void importModelToScene(const std::string& filepath, const std::string& objectName);  // Assimp import
@@ -1546,6 +1636,31 @@ private:
     // SceneOBJ reference. `disallowId` keeps an object out of its own slot.
     bool drawObjectReferenceSlot(const char* id, const char* label, int& targetId,
                                  int disallowId, const char* typeName);
+
+    // Assets that can be dropped straight onto a SceneOBJ - in the Scene view (under the cursor),
+    // on a Hierarchy row, or anywhere on the Inspector. A material becomes the primary material,
+    // a script is added as a Script component, and an audio clip becomes the Audio Source's clip
+    // (adding the component when the object has none).
+    enum class ObjectAssetDropKind { None, Material, Script, Audio };
+    ObjectAssetDropKind classifyObjectAssetDrop(const char* path);
+    // The kind of the asset being dragged right now, or None.
+    ObjectAssetDropKind activeObjectAssetDragKind(std::string* outPath = nullptr);
+    bool canApplyAssetDrop(const SceneObject& obj, ObjectAssetDropKind kind) const;
+    // `recordUndo` is false when the caller's own undo capture already covers the change.
+    bool applyAssetDropToObject(SceneObject& obj, const fs::path& path, bool recordUndo);
+    // The object an in-flight drag would land on. The Scene view outlines it the way it outlines
+    // a selection. Set every frame by whichever panel the cursor is over.
+    void setAssetDropHover(int objectId);
+    int activeAssetDropHover() const;
+    int assetDropHoverObjectId = -1;
+    int assetDropHoverFrame = -1;
+    std::string assetDropKindCachePath;
+    ObjectAssetDropKind assetDropKindCache = ObjectAssetDropKind::None;
+    // The Scene view's click picking, shared with the asset-drop raycast. Returns -1 on a miss.
+    int pickSceneObjectAtScreen(const glm::mat4& view, const glm::mat4& proj,
+                                const ImVec2& imageMin, const ImVec2& imageMax,
+                                const ImVec2& screenPos,
+                                const std::function<bool(const SceneObject&)>& filter = {});
     void renderConsolePanel();
     void renderLatestErrorBar();
     void renderEditorToast();
@@ -1729,6 +1844,23 @@ private:
     void renderXRPreviewWindow();
     void renderXRPreviewEyes(int eyeWidth, int eyeHeight);
 
+#if !MODULARITY_RUNTIME_ONLY
+    // Git backup of the open project; see VersionControl.h and EditorWindows/VersionControlWindow.cpp.
+    VersionControl versionControl;
+    void updateVersionControl();
+    void applyVersionControlFileChanges(const VcResult& result);
+    std::string versionControlStatusText() const;
+    void renderVersionControlWindow();
+    void renderVersionControlSetup();
+    void renderVersionControlPending();
+    void renderVersionControlDiscardModal();
+    void renderVersionControlIncoming();
+    void renderVersionControlHistory();
+    void renderVersionControlBranches();
+    void renderVersionControlSettings();
+    void renderCloneProjectDialog();
+#endif
+
     fs::path getWorkspaceLayoutPath(WorkspaceMode mode) const;
     void loadEditorUserSettings();
     void saveEditorUserSettings() const;
@@ -1844,6 +1976,18 @@ private:
     void setParent(int childId, int parentId, int beforeSiblingId = -1);
     void loadMaterialFromFile(SceneObject& obj);
     void saveMaterialToFile(const SceneObject& obj);
+    // A .mat is a shared asset: every SceneOBJ whose materialPath names it shows its values.
+    // These keep the open scene in step when the asset is edited from either inspector.
+    static void applyMaterialFileData(SceneObject& obj, const MaterialFileData& data);
+    static MaterialFileData materialFileDataFromObject(const SceneObject& obj);
+    // Copies `data` onto every object using `materialPath`, except `skipObjectId`. Returns how many.
+    int propagateMaterialAsset(const std::string& materialPath, const MaterialFileData& data,
+                               int skipObjectId = -1);
+    int countMaterialAssetUsers(const std::string& materialPath) const;
+    bool materialPathsMatch(const std::string& a, const std::string& b) const;
+    // Where a material path actually lives on disk. Scenes store project-relative paths, and
+    // the editor's working directory is its build folder, so opening one as-is fails.
+    fs::path resolveMaterialAssetPath(const std::string& rawPath) const;
     SceneSnapshot captureSceneSnapshot() const;
     void restoreSceneSnapshot(SceneSnapshot snap);
     void pushUndoSnapshot(SceneSnapshot snap, const char* reason = "");

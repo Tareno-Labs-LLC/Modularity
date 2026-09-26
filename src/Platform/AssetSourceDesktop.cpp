@@ -145,6 +145,16 @@ std::mutex& globalMutex() {
     static std::mutex m;
     return m;
 }
+// The folder the desktop source was rooted at, kept so ResolveAssetPath() can anchor relative
+// paths there too instead of trusting whatever the working directory has become since.
+fs::path& desktopRootStorage() {
+    static fs::path root;
+    return root;
+}
+fs::path DesktopRoot() {
+    std::lock_guard<std::mutex> lock(globalMutex());
+    return globalSource() ? desktopRootStorage() : fs::path();
+}
 
 } // namespace
 
@@ -152,7 +162,8 @@ AssetSource& GetAssetSource() {
     std::lock_guard<std::mutex> lock(globalMutex());
     auto& src = globalSource();
     if (!src) {
-        src = std::make_unique<DesktopAssetSource>(fs::current_path());
+        desktopRootStorage() = fs::current_path();
+        src = std::make_unique<DesktopAssetSource>(desktopRootStorage());
     }
     return *src;
 }
@@ -160,6 +171,7 @@ AssetSource& GetAssetSource() {
 void SetAssetSource(std::unique_ptr<AssetSource> source) {
     std::lock_guard<std::mutex> lock(globalMutex());
     globalSource() = std::move(source);
+    desktopRootStorage().clear();  // not a desktop source any more; GetAssetSource() re-roots one
 }
 
 void SetPortableAssetRoot(const std::string& projectRoot) {
@@ -171,6 +183,18 @@ std::string ResolveAssetPath(const std::string& path) {
     if (path.empty()) return path;
     std::error_code ec;
     if (fs::exists(fs::path(path), ec) && !ec) return path;
+
+    // A relative path means "under the asset source's root", which Exists()/ReadAll() honour but
+    // callers that open the returned path themselves (miniaudio) resolve against the working
+    // directory. When something has moved that (a native file dialog), anchor it at the root.
+    const fs::path relative(path);
+    if (relative.is_relative()) {
+        const fs::path root = DesktopRoot();
+        if (!root.empty()) {
+            const fs::path anchored = root / relative;
+            if (fs::exists(anchored, ec) && !ec) return anchored.string();
+        }
+    }
 
     const fs::path rescued = RescueForeignProjectPath(path);
     return rescued.empty() ? path : rescued.string();

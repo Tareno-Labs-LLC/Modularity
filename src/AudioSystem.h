@@ -35,6 +35,9 @@ public:
     void update(const std::vector<SceneObject>& objects, const Camera& listenerCamera, bool playing);
     bool playPreview(const std::string& path, float volume = 1.0f, bool loop = false);
     bool playOneShot(const std::string& path, float volume = 1.0f, float pitch = 1.0f);
+    // Editor interface sounds. Dry (never through the scene's reverb), never in the preview slot
+    // the asset / Inspector audio player uses, and not cut when Play mode starts or stops.
+    bool playUiSound(const std::string& path, float volume);
     void stopPreview();
     bool playWeatherAmbience(const std::string& path, float volume);
     void stopWeatherAmbience();
@@ -134,6 +137,7 @@ private:
     bool initialized = false;
     std::unordered_map<int, std::unique_ptr<ActiveSound>> activeSounds;
     std::vector<std::unique_ptr<OneShotSound>> oneShotSounds;
+    std::vector<std::unique_ptr<OneShotSound>> uiSounds;  // playUiSound(); only shutdown clears it
     std::unordered_map<int, std::unique_ptr<VideoStreamSound>> videoStreams;
     std::unordered_map<std::string, AudioClipPreview> previewCache;
     std::unordered_set<std::string> missingClips;
@@ -163,6 +167,7 @@ private:
     void destroyOneShotSounds();
     void destroyVideoStreams();
     void cleanupFinishedOneShots();
+    void cleanupFinishedUiSounds(bool destroyAll);
     bool ensureSoundFor(const SceneObject& obj);
     void refreshSoundParams(const SceneObject& obj, ActiveSound& snd);
     void applyAudioSourceParams(const SceneObject& obj, ma_sound& sound, float baseGain, bool loop);

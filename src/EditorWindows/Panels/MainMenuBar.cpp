@@ -424,12 +424,41 @@ void Engine::renderMainMenuBar() {
         }
         ImGui::Separator();
         if (ImGui::BeginMenu(Loc::T("MENU_WORKFLOW_FEEDBACK_SOUNDS", "Feedback Sounds"))) {
+          ImGui::TextDisabled("%s", Loc::T("MENU_WORKFLOW_SOUND_THEME", "Sound Theme"));
+          // Selecting rescans the theme folders, which frees the list being drawn, so the
+          // pick is applied after the loop. Re-selecting the current theme reloads its theme.ini.
+          std::string pickedSoundTheme;
+          const std::string activeSoundTheme = editorSoundThemes.activeId();
+          for (const auto& theme : editorSoundThemes.themes()) {
+            if (ImGui::MenuItem(theme.displayName.c_str(), nullptr, theme.id == activeSoundTheme)) {
+              pickedSoundTheme = theme.id;
+            }
+            if (!theme.description.empty() && ImGui::IsItemHovered()) {
+              ImGui::SetTooltip("%s", theme.description.c_str());
+            }
+          }
+          if (!pickedSoundTheme.empty()) {
+            selectEditorSoundTheme(pickedSoundTheme);
+          }
+          ImGui::Separator();
           bool feedbackSettingsChanged = false;
+          ImGui::SetNextItemWidth(140.0f);
+          feedbackSettingsChanged |= ImGui::SliderFloat(Loc::T("MENU_WORKFLOW_SOUNDS_VOLUME", "UI Volume"), &feedbackSoundVolume, 0.0f, 1.0f, "%.2f");
+          if (ImGui::IsItemDeactivatedAfterEdit()) {
+            playEditorSound(EditorSoundCue::Confirm);  // hear the new level on release
+          }
           feedbackSettingsChanged |= ImGui::MenuItem(Loc::T("MENU_WORKFLOW_SOUNDS_ENABLE_ALL", "Enable All Feedback Sounds"), nullptr, &feedbackSoundsEnabled);
           ImGui::Separator();
           feedbackSettingsChanged |= ImGui::MenuItem(Loc::T("MENU_WORKFLOW_SOUNDS_CLICK", "Click Sounds"), nullptr, &feedbackClickSoundsEnabled);
           feedbackSettingsChanged |= ImGui::MenuItem(Loc::T("MENU_WORKFLOW_SOUNDS_ERROR", "Error Sounds"), nullptr, &feedbackErrorSoundsEnabled);
           feedbackSettingsChanged |= ImGui::MenuItem(Loc::T("MENU_WORKFLOW_SOUNDS_OTHER", "Other Feedback Sounds"), nullptr, &feedbackOtherSoundsEnabled);
+          ImGui::Separator();
+          ImGui::TextDisabled("%s", Loc::T("MENU_WORKFLOW_SOUNDS_INTERFACE", "Interface Sounds"));
+          feedbackSettingsChanged |= ImGui::MenuItem(Loc::T("MENU_WORKFLOW_SOUNDS_BUTTONS", "Button & Tab Sounds"), nullptr, &feedbackButtonSoundsEnabled);
+          feedbackSettingsChanged |= ImGui::MenuItem(Loc::T("MENU_WORKFLOW_SOUNDS_TOGGLES", "Toggle Sounds"), nullptr, &feedbackToggleSoundsEnabled);
+          feedbackSettingsChanged |= ImGui::MenuItem(Loc::T("MENU_WORKFLOW_SOUNDS_SLIDES", "Slide-out Sounds"), nullptr, &feedbackSlideSoundsEnabled);
+          feedbackSettingsChanged |= ImGui::MenuItem(Loc::T("MENU_WORKFLOW_SOUNDS_TRANSITIONS", "Transition Sounds"), nullptr, &feedbackTransitionSoundsEnabled);
+          feedbackSettingsChanged |= ImGui::MenuItem(Loc::T("MENU_WORKFLOW_SOUNDS_HOVER", "Hover Sounds"), nullptr, &feedbackHoverSoundsEnabled);
           ImGui::Separator();
           ImGui::TextDisabled("%s", Loc::T("MENU_WORKFLOW_SOUNDS_BOOT_NOTE", "Boot intro sound is always enabled."));
           if (feedbackSettingsChanged) {
@@ -475,6 +504,17 @@ void Engine::renderMainMenuBar() {
 
     if (ImGui::BeginMenu(Loc::T("MENU_TOOLS", "Tools"))) {
       ImGui::MenuItem(Loc::Window("WINDOW_DOCTOR", "Modularity Doctor"), nullptr, &showModularityDoctorWindow);
+#if !MODULARITY_RUNTIME_ONLY
+      bool prevVersionControl = showVersionControlWindow;
+      ImGui::MenuItem(Loc::Window("WINDOW_VERSION_CONTROL", "Version Control"), nullptr,
+                      &showVersionControlWindow);
+      if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Back the project up with Git and open it on other computers");
+      }
+      if (prevVersionControl != showVersionControlWindow) {
+        saveEditorUserSettings();
+      }
+#endif
       bool prevProfilerWindow = showGameProfilerWindow;
       ImGui::MenuItem("Profiler", nullptr, &showGameProfilerWindow);
       if (prevProfilerWindow != showGameProfilerWindow) {
@@ -599,8 +639,7 @@ void Engine::renderMainMenuBar() {
   }
 
   if (triggerAboutModularityPopup) {
-    playEditorFeedbackPreview("Resources/Sounds/Info.mp3", 0.95f, false,
-                              EditorFeedbackSoundCategory::Other);
+    playEditorSound(EditorSoundCue::DialogOpen, 0.95f);
     ImGui::OpenPopup("Modularity Engine##AboutModularity");
     triggerAboutModularityPopup = false;
   }
@@ -623,6 +662,7 @@ void Engine::renderMainMenuBar() {
                        moduLogo)) {
       ImGui::PushFont(nullptr, ImGui::GetFontSize() * 0.90f);
       cardModalText("aka ModuEngine");
+      cardModalText("V7.0 Beta");
       ImGui::PopFont();
       ImGui::Spacing();
       cardModalText("Modularity™ is a trademark of Tareno Labs™");
@@ -1023,6 +1063,7 @@ void Engine::buildWorkspaceLayout(WorkspaceMode mode) {
     ImGui::DockBuilderDockWindow(Loc::WindowRef("Inspector"), dockRight);
     ImGui::DockBuilderDockWindow(Loc::WindowRef("Environment"), dockRight);
     ImGui::DockBuilderDockWindow(Loc::WindowRef("Project"), dockBottom);
+    ImGui::DockBuilderDockWindow(Loc::WindowRef("Version Control"), dockBottom);
     ImGui::DockBuilderDockWindow(Loc::WindowRef("Project Settings"), dockUtility);
     ImGui::DockBuilderDockWindow(Loc::WindowRef("Modupak Manager"), dockUtility);
     if (hasSpriteEditorPackage()) {
@@ -1048,6 +1089,7 @@ void Engine::buildWorkspaceLayout(WorkspaceMode mode) {
     ImGui::DockBuilderDockWindow(Loc::WindowRef("Animation"), dockBottom);
     ImGui::DockBuilderDockWindow(Loc::WindowRef("AI Pathfinding"), dockBottom);
     ImGui::DockBuilderDockWindow(Loc::WindowRef("Project"), dockBottom);
+    ImGui::DockBuilderDockWindow(Loc::WindowRef("Version Control"), dockBottom);
     ImGui::DockBuilderDockWindow(Loc::WindowRef("Project Settings"), dockUtility);
     ImGui::DockBuilderDockWindow(Loc::WindowRef("Modupak Manager"), dockUtility);
     if (hasSpriteEditorPackage()) {
@@ -1064,6 +1106,7 @@ void Engine::buildWorkspaceLayout(WorkspaceMode mode) {
         dockRight, ImGuiDir_Down, 0.42f, nullptr, &dockRight);
 
     ImGui::DockBuilderDockWindow(Loc::WindowRef("Project"), dockLeft);
+    ImGui::DockBuilderDockWindow(Loc::WindowRef("Version Control"), dockLeft);
     ImGui::DockBuilderDockWindow(Loc::WindowRef("Hierarchy"), dockLeft);
     ImGui::DockBuilderDockWindow(Loc::WindowRef("Camera"), dockLeft);
     if (hasScriptingWindowPackage()) {

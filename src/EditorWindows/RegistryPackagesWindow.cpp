@@ -224,6 +224,7 @@ bool drawPackageRow(const PackageInfo& pkg,
     const float height = showBadges ? expandedHeight : collapsedHeight;
 
     ImGui::InvisibleButton((pkg.id + "##row").c_str(), ImVec2(width, height));
+    ImGui::ReportItemHoverFeedback();
     const bool hovered = ImGui::IsItemHovered();
     const bool clicked = ImGui::IsItemClicked();
     const ImRect rect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
@@ -441,9 +442,11 @@ void Engine::renderRegistryPackagesWindow() {
         ImGui::SetCursorScreenPos(tabMin);
         ImGui::PushID(static_cast<int>(i));
         ImGui::InvisibleButton("##ModupakTab", ImVec2(tabWidth, tabHeight));
+        ImGui::ReportItemHoverFeedback();
         const bool hovered = ImGui::IsItemHovered();
         const bool clicked = ImGui::IsItemClicked();
         ImGui::PopID();
+        if (clicked && !selected) ImGui::ReportWidgetFeedback(ImGuiWidgetFeedback_Tab);
         if (clicked) registryPackageView = static_cast<int>(tab.view);
 
         if (hovered && !selected) {
@@ -801,7 +804,7 @@ void Engine::renderRegistryPackagesWindow() {
             if (packageManager.installRegistryPackageGlobally(selectedPackage->id)) {
                 registryPackageFeedback = "Installed " + selectedPackage->id + " into the global package store.";
                 registryPackageLastActionSucceeded = true;
-                playEditorFeedbackPreview("Resources/Sounds/Modupak Success installed.mp3", 0.95f, false, EditorFeedbackSoundCategory::Other);
+                playEditorSound(EditorSoundCue::PackageInstalled, 0.95f);
                 addConsoleMessage(registryPackageFeedback, ConsoleMessageType::Success);
             } else {
                 registryPackageFeedback = packageManager.getLastError();
@@ -916,7 +919,7 @@ void Engine::renderRegistryPackagesWindow() {
                     clampOptionalPackageState(false);
                     registryPackageFeedback = (gUnpackPreview.isUpdate ? "Updated " : "Unpacked ") + id + " into the current project.";
                     registryPackageLastActionSucceeded = true;
-                    playEditorFeedbackPreview("Resources/Sounds/Modupak Success installed.mp3", 0.95f, false, EditorFeedbackSoundCategory::Other);
+                    playEditorSound(EditorSoundCue::PackageInstalled, 0.95f);
                     addConsoleMessage(registryPackageFeedback, ConsoleMessageType::Success);
                 } else {
                     registryPackageFeedback = packageManager.getLastError();

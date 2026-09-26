@@ -37,6 +37,9 @@ private:
     int strideFloats = 8;
     bool dynamic = false;
     bool hasBones = false;
+    // Unique per constructed mesh and never reused, so a cache keyed on a mesh
+    // can tell a re-imported mesh from the one it replaced, even at the same address.
+    uint64_t serial = 0;
 
 public:
     Mesh(const float* vertexData, size_t dataSizeBytes);
@@ -49,6 +52,8 @@ public:
     int getVertexCount() const { return vertexCount; }
     bool isDynamic() const { return dynamic; }
     bool usesBones() const { return hasBones; }
+    unsigned int getVertexBuffer() const { return VBO; }
+    uint64_t getSerial() const { return serial; }
 };
 
 class OBJLoader {
@@ -103,12 +108,73 @@ glm::mat4 BuildCameraProjection(const Camera& camera, int width, int height,
 
 const std::vector<float>* GetObjectTriangleVertexStream(const SceneObject& obj);
 
+// Project Settings > Graphics Manager > Optimization. Everything defaults to off, and
+// with nothing enabled renderSceneInternal takes the path it always took, so a project
+// can A/B these against the renderer it shipped with.
+enum class RenderOptimizationStrategy { Manual = 0, Automatic = 1 };
+
+struct RenderOptimizationSettings {
+    bool cpuFrustumCulling = false;
+    bool multiDrawIndirect = false;
+    bool gpuDrivenCulling = false;
+    bool lodOptimization = false;
+    bool hiZOcclusionCulling = false;
+    bool materialSorting = false;
+    bool staticObjectCaching = false;
+    // Manual runs exactly the flags above. Automatic treats them as the allowed set
+    // and picks which to run from the scene's size and measured cost.
+    RenderOptimizationStrategy strategy = RenderOptimizationStrategy::Manual;
+    // LOD: objects whose bounding sphere projects smaller than this are skipped.
+    float lodMinScreenSizePx = 1.5f;
+};
+
+// What the current GL context can run. A reason is empty when the feature is supported.
+struct RenderOptimizationSupport {
+    bool multiDrawIndirect = false;
+    bool computeCulling = false;
+    bool indirectCount = false;
+    bool hiZ = false;
+    std::string multiDrawIndirectReason;
+    std::string computeCullingReason;
+    std::string hiZReason;
+};
+
+// RenderStats::optimizationFeatures: which optimizations actually ran in a pass.
+enum RenderOptimizationFeature : uint32_t {
+    kRenderOptCpuCulling = 1u << 0,
+    kRenderOptStaticCache = 1u << 1,
+    kRenderOptSorting = 1u << 2,
+    kRenderOptLod = 1u << 3,
+    kRenderOptMultiDraw = 1u << 4,
+    kRenderOptGpuCulling = 1u << 5,
+    kRenderOptHiZ = 1u << 6,
+};
+
 class Renderer {
 public:
     struct RenderStats {
         int drawCalls = 0;
         int meshDraws = 0;
         int fullscreenDraws = 0;
+        long long triangles = 0;
+        // Filled by the optimized path. The legacy path only fills visibleRenderables.
+        int objectsSubmitted = 0;    // renderables that reached culling
+        int objectsCulled = 0;       // rejected by the CPU frustum test
+        int objectsLodCulled = 0;    // rejected by LOD screen size on the CPU
+        int visibleRenderables = 0;  // drawn per object or as a CPU-visible MDI command
+        int mdiObjects = 0;          // objects owned by multi-draw batches
+        int mdiBatches = 0;
+        int multiDrawCalls = 0;
+        int indirectDrawCommands = 0;
+        float cpuCullingMs = 0.0f;
+        float queueBuildMs = 0.0f;
+        float sortingMs = 0.0f;
+        // GPU culling results come back asynchronously, a few frames old, and are
+        // -1 until the first one lands. Nothing waits on the GPU for them.
+        float gpuCullingMs = -1.0f;
+        int gpuVisible = -1;
+        uint32_t optimizationFeatures = 0;  // RenderOptimizationFeature bits
+        bool optimizationAutomatic = false;
     };
     struct StaticMergeBatch {
         std::unique_ptr<Mesh> mesh;
@@ -314,6 +380,54 @@ private:
         bool wantsGpuSkinning = false;
         bool doubleSided = false;
     };
+    // One draw in renderSceneInternal. It used to be local to that function; it lives
+    // here so the optimized path can keep its item buffers between frames.
+    struct SceneRenderItem {
+        const SceneObject* obj = nullptr;
+        const StaticMergeBatch* staticBatch = nullptr;
+        Mesh* mesh = nullptr;
+        glm::mat4 model = glm::mat4(1.0f);
+        glm::vec3 sortCenter = glm::vec3(0.0f);
+        glm::vec3 depthSortCenter = glm::vec3(0.0f);
+        const std::string* vertPath = nullptr;
+        const std::string* fragPath = nullptr;
+        MaterialProperties material = MaterialProperties{};
+        const std::string* materialPath = nullptr;
+        const std::string* albedoTexturePath = nullptr;
+        const std::string* overlayTexturePath = nullptr;
+        const std::string* normalMapPath = nullptr;
+        const std::string* metallicRoughnessMapPath = nullptr;
+        const std::string* metallicMapPath = nullptr;
+        const std::string* roughnessMapPath = nullptr;
+        const std::string* opacityMapPath = nullptr;
+        const std::string* emissiveMapPath = nullptr;
+        const std::string* occlusionMapPath = nullptr;
+        const std::string* heightMapPath = nullptr;
+        bool useOverlay = false;
+        int boneLimit = 0;
+        int availableBones = 0;
+        bool wantsGpuSkinning = false;
+        bool isUiCanvas3D = false;
+        int uiSortingOrder = 0;
+        bool requiresBlending = false;
+        bool sortOpaque = false;
+        bool unlit = false;
+        bool doubleSided = false;
+        float cameraDepth = 0.0f;
+        float cameraDistanceSq = 0.0f;
+        uint64_t opaqueSortKey = 0;
+        // Set only by the optimized path; the legacy path leaves the defaults.
+        Shader* shader = nullptr;         // resolved once per shader pair per pass
+        int multiDrawBatch = -1;          // >= 0: this item draws a whole multi-draw batch
+        bool reflectionResolved = false;  // reflectionCube/Intensity already looked up
+        unsigned int reflectionCube = 0;
+        float reflectionIntensity = 0.0f;
+    };
+    // Everything behind Project Settings > Optimization: per-object caches, pass
+    // buffers, multi-draw and GPU culling resources. RenderOptimizationInternal.h.
+    struct OptimizationState;
+    std::unique_ptr<OptimizationState> optState;
+    RenderOptimizationSettings optimizationSettings;
     struct UiAtlasSlot {
         int contentWidth = 0;
         int contentHeight = 0;
@@ -425,6 +539,9 @@ private:
     bool historyValid = false;
     size_t textureCacheBudgetBytes = 384ull * 1024ull * 1024ull;
     size_t textureCacheUsageBytes = 0;
+    // Bumped whenever a texture is loaded, fails, or leaves the cache, so answers
+    // derived from texture contents (alpha blending) can be cached until it moves.
+    uint64_t textureCacheGeneration = 0;
     WeatherDrive weatherDrive;
     float weatherTime = 0.0f;
 
@@ -455,6 +572,14 @@ private:
     std::unordered_map<uint64_t, UiAtlasTarget> uiTargetAtlases;
     int uiAtlasMaxSize = 4096;
     std::vector<std::array<glm::vec4, 6>> capturedSceneFrustums;
+    // Parallel to capturedSceneFrustums: the camera and pixel size of each view.
+    struct CapturedSceneView {
+        glm::mat4 view{1.0f};
+        glm::mat4 proj{1.0f};
+        int width = 0;
+        int height = 0;
+    };
+    std::vector<CapturedSceneView> capturedSceneViews;
     std::vector<StaticMergeBatch> staticMergeBatches;
     std::unordered_set<int> staticMergeSourceIds;
     RenderStats viewportStats;
@@ -516,7 +641,8 @@ private:
     void logPostFxDebug(const PostProcessStats& stats, bool allowHistory) const;
 
 public:
-    Renderer() = default;
+    // Out of line: optState's type is only complete in the renderer's own sources.
+    Renderer();
     ~Renderer();
 
     void initialize();
@@ -572,12 +698,24 @@ public:
     void setShadowQuality(int filterQuality, float lodDistance, bool contactHardening);
     void setShaderAutoReload(bool enabled) { autoReloadShaders = enabled; }
     bool isShaderAutoReloadEnabled() const { return autoReloadShaders; }
+    void setOptimizationSettings(const RenderOptimizationSettings& settings);
+    const RenderOptimizationSettings& getOptimizationSettings() const { return optimizationSettings; }
+    RenderOptimizationSupport getOptimizationSupport() const;
     void resize(int w, int h);
     int getWidth() const { return currentWidth; }
     int getHeight() const { return currentHeight; }
-    void setFrameSerial(uint64_t serial) { frameSerial = serial; capturedSceneFrustums.clear(); }
+    void setFrameSerial(uint64_t serial) {
+        frameSerial = serial;
+        capturedSceneFrustums.clear();
+        capturedSceneViews.clear();
+    }
     bool hasCapturedSceneFrustums() const { return !capturedSceneFrustums.empty(); }
     bool isObjectVisibleInCapturedFrustums(const SceneObject& obj, float radiusMargin = 1.0f) const;
+    // Largest face-on size, in pixels, of a sprite-quad object across this
+    // frame's scene views (oblique views over-estimate, never under). False when
+    // no view saw it. outUnbounded when a view sits too close to measure.
+    bool measureObjectScreenSizePx(const SceneObject& obj, glm::vec2& outSizePx,
+                                   bool& outUnbounded) const;
 
     void beginRender(const glm::mat4& view, const glm::mat4& proj, const glm::vec3& cameraPos);
     void renderSkybox(const glm::mat4& view, const glm::mat4& proj);

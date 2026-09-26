@@ -1041,6 +1041,8 @@ void Engine::renderPixelSpriteEditorWindow() {
 
         const ImVec2 pos = ImGui::GetCursorScreenPos();
         const bool pressed = ImGui::InvisibleButton(id, size);
+        if (pressed) ImGui::ReportWidgetFeedback(ImGuiWidgetFeedback_Button);
+        ImGui::ReportItemHoverFeedback();
         const bool hovered = ImGui::IsItemHovered();
         const ImVec2 max(pos.x + size.x, pos.y + size.y);
         ImDrawList* drawList = ImGui::GetWindowDrawList();
@@ -1237,7 +1239,7 @@ void Engine::renderPixelSpriteEditorWindow() {
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.09f, 0.10f, 0.16f, 0.96f));
     if (ImGui::BeginChild("PixelSpriteTopBar", ImVec2(0.0f, 84.0f), true)) {
         auto playToolbarTick = [&]() {
-            playEditorFeedbackPreview("Resources/Sounds/Selection Tick Main Editor.mp3", 0.95f, false, EditorFeedbackSoundCategory::Click);
+            playEditorSound(EditorSoundCue::Tick, 0.95f);
         };
         const float sectionSpacing = 12.0f;
         const float totalWidth = ImGui::GetContentRegionAvail().x;
@@ -1678,11 +1680,14 @@ void Engine::renderPixelSpriteEditorWindow() {
                 ImGui::InvisibleButton("##PixelSpriteRecentSwatch",
                                        ImVec2(swatchSize, swatchSize),
                                        ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
+                ImGui::ReportItemHoverFeedback();
                 if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
                     setPrimaryColor(swatch);
+                    ImGui::ReportWidgetFeedback(ImGuiWidgetFeedback_Button);
                 }
                 if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
                     setSecondaryColor(swatch);
+                    ImGui::ReportWidgetFeedback(ImGuiWidgetFeedback_Button);
                 }
                 if (ImGui::IsItemHovered()) {
                     ImGui::SetTooltip("Left: primary\nRight: secondary");

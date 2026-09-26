@@ -1288,49 +1288,26 @@ void Engine::renderObjectNode(SceneObject& obj, const std::string& filter,
                 }
             }
         }
-        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("FILE_PATH")) {
+        // Accepted before delivery for object assets so the row can light up the object's
+        // outline in the Scene view while the drag hovers it; everything else acts on delivery.
+        const ObjectAssetDropKind rowDragKind = activeObjectAssetDragKind();
+        const ImGuiDragDropFlags rowDropFlags =
+            rowDragKind != ObjectAssetDropKind::None ? ImGuiDragDropFlags_AcceptBeforeDelivery : 0;
+        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("FILE_PATH", rowDropFlags)) {
             const char* path = static_cast<const char*>(payload->Data);
+            if (payload->IsPreview() && canApplyAssetDrop(obj, rowDragKind)) {
+                setAssetDropHover(obj.id);
+            }
             std::error_code ec;
-            fs::directory_entry entry(path, ec);
-            if (!ec) {
+            fs::directory_entry entry;
+            if (payload->IsDelivery()) entry.assign(path, ec);
+            if (payload->IsDelivery() && !ec) {
                 if (fileBrowser.isModelFile(entry)) {
                     importDroppedModel(fs::path(path), obj.id);
                 } else if (fileBrowser.getFileCategory(entry) == FileCategory::Texture) {
                     applyTextureAssetToObject(obj, entry.path());
-                } else if (fileBrowser.getFileCategory(entry) == FileCategory::Material) {
-                    obj.materialPath = entry.path().string();
-                    loadMaterialFromFile(obj);
-                    projectManager.currentProject.hasUnsavedChanges = true;
-                    addConsoleMessage("Applied material to " + obj.name, ConsoleMessageType::Success);
-                } else if (fileBrowser.getFileCategory(entry) == FileCategory::Script) {
-                    auto alreadyAssigned = std::any_of(obj.scripts.begin(), obj.scripts.end(),
-                        [&](const ScriptComponent& sc) { return sc.path == path; });
-                    if (!alreadyAssigned) {
-                        ScriptComponent sc;
-                        sc.path = path;
-                        sc.lastBinaryPath.clear();
-                        sc.lastBinaryVerified = false;
-                        std::string ext = fs::path(path).extension().string();
-                        std::transform(ext.begin(), ext.end(), ext.begin(),
-                                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                        if (ext == ".cs") {
-                            sc.language = ScriptLanguage::CSharp;
-                            sc.managedType = fs::path(path).stem().string();
-                        } else if (ext == ".c") {
-                            sc.language = ScriptLanguage::C;
-                        } else {
-                            sc.language = ScriptLanguage::Cpp;
-                        }
-                        obj.scripts.push_back(sc);
-                        markRuntimeScriptBindingsDirty();
-                        projectManager.currentProject.hasUnsavedChanges = true;
-                        playEditorFeedbackPreview("Resources/Sounds/Drag Script Assign Check Successful.mp3", 0.95f, false, EditorFeedbackSoundCategory::Other);
-                        const std::string targetName = obj.name.empty() ? "Object" : obj.name;
-                        showEditorToast("Script assigned to " + targetName + " Successful.",
-                                        ConsoleMessageType::Success,
-                                        1.65);
-                        addConsoleMessage("Assigned script to " + obj.name, ConsoleMessageType::Success);
-                    }
+                } else if (rowDragKind != ObjectAssetDropKind::None) {
+                    applyAssetDropToObject(obj, entry.path(), true);
                 }
             }
         }
@@ -2051,7 +2028,20 @@ void Engine::renderLatestErrorBar() {
     draw->AddText(ImVec2(cursorX, fontY), accentU32, labelText.c_str());
     cursorX += ImGui::CalcTextSize(labelText.c_str()).x + chrome.consoleMargin * 0.5f;
 
-    draw->PushClipRect(ImVec2(cursorX, barMin.y + 1.0f), ImVec2(barMax.x - chrome.consoleMargin * 0.5f, barMax.y - 1.0f), true);
+    float bodyRight = barMax.x - chrome.consoleMargin * 0.5f;
+#if !MODULARITY_RUNTIME_ONLY
+    // Branch and sync state on the right, like "main@My project" in Unity's status bar.
+    const std::string vcText = versionControlStatusText();
+    if (!vcText.empty()) {
+        const float vcX = bodyRight - ImGui::CalcTextSize(vcText.c_str()).x;
+        if (vcX > cursorX + 120.0f) {
+            draw->AddText(ImVec2(vcX, fontY), ImGui::GetColorU32(ImGuiCol_TextDisabled), vcText.c_str());
+            bodyRight = vcX - chrome.consoleMargin;
+        }
+    }
+#endif
+
+    draw->PushClipRect(ImVec2(cursorX, barMin.y + 1.0f), ImVec2(bodyRight, barMax.y - 1.0f), true);
     draw->AddText(ImVec2(cursorX, fontY), textU32, bodyText.c_str());
     draw->PopClipRect();
 
@@ -2096,56 +2086,29 @@ void Engine::renderEditorToast() {
         return;
     }
 
-    auto accentColor = [](ConsoleMessageType type) -> ImVec4 {
-        switch (type) {
-            case ConsoleMessageType::Warning: return ImVec4(0.98f, 0.82f, 0.32f, 1.0f);
-            case ConsoleMessageType::Error: return ImVec4(0.98f, 0.46f, 0.46f, 1.0f);
-            case ConsoleMessageType::Success: return ImVec4(0.47f, 0.91f, 0.57f, 1.0f);
-            case ConsoleMessageType::Info:
-            default: return ImVec4(0.70f, 0.88f, 1.0f, 1.0f);
-        }
-    };
-
-    auto backgroundColor = [](ConsoleMessageType type) -> ImVec4 {
-        switch (type) {
-            case ConsoleMessageType::Warning: return ImVec4(0.20f, 0.15f, 0.05f, 0.94f);
-            case ConsoleMessageType::Error: return ImVec4(0.24f, 0.08f, 0.08f, 0.94f);
-            case ConsoleMessageType::Success: return ImVec4(0.08f, 0.19f, 0.10f, 0.94f);
-            case ConsoleMessageType::Info:
-            default: return ImVec4(0.08f, 0.16f, 0.22f, 0.94f);
-        }
-    };
-
-    auto borderColor = [](ConsoleMessageType type) -> ImVec4 {
-        switch (type) {
-            case ConsoleMessageType::Warning: return ImVec4(0.80f, 0.62f, 0.18f, 0.90f);
-            case ConsoleMessageType::Error: return ImVec4(0.84f, 0.24f, 0.24f, 0.92f);
-            case ConsoleMessageType::Success: return ImVec4(0.23f, 0.72f, 0.35f, 0.92f);
-            case ConsoleMessageType::Info:
-            default: return ImVec4(0.30f, 0.55f, 0.76f, 0.90f);
-        }
-    };
-
     ImDrawList* draw = ImGui::GetForegroundDrawList(const_cast<ImGuiViewport*>(viewport));
-    if (!draw) {
-        return;
-    }
-
     ImFont* font = ImGui::GetFont();
-    if (!font) {
+    if (!draw || !font) {
         return;
     }
 
-    const float scale = 0.86f + 0.14f * appearT - 0.12f * disappearT;
-    const float fontSize = ImGui::GetFontSize() * scale;
+    // Drawn like the rest of the chrome: the theme's Popup shading (gradient, bevel,
+    // border) with a hard offset shadow, and a message-box style icon for the type.
+    // Everything fades together, bevel included, through style alpha + bevel intensity.
+    const ImGuiStyle& style = ImGui::GetStyle();
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, style.Alpha * visibility);
+
+    const float fontSize = ImGui::GetFontSize();
     const float detailFontSize = fontSize * 0.88f;
     const ImVec2 textSize = font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, editorToast.message.c_str());
-    const float padX = 16.0f * scale;
-    const float padY = 10.0f * scale;
+    const float padX = ImFloor(fontSize * 0.85f);
+    const float padY = ImFloor(fontSize * 0.60f);
+    const float iconSize = ImFloor(fontSize * 1.25f);
+    const float iconGap = ImFloor(fontSize * 0.60f);
 
     const bool progressCard = editorToast.progressMode;
-    const float barHeight = progressCard ? ImMax(6.0f, 7.0f * scale) : 0.0f;
-    const float barGap = progressCard ? 7.0f * scale : 0.0f;
+    const float barHeight = progressCard ? ImFloor(fontSize * 0.85f) : 0.0f;
+    const float barGap = progressCard ? ImFloor(fontSize * 0.50f) : 0.0f;
     ImVec2 detailSize(0.0f, 0.0f);
     if (progressCard && !editorToast.detail.empty()) {
         detailSize = font->CalcTextSizeA(detailFontSize, FLT_MAX, 0.0f, editorToast.detail.c_str());
@@ -2155,93 +2118,117 @@ void Engine::renderEditorToast() {
     float contentHeight = textSize.y;
     if (progressCard) {
         contentWidth = ImMax(contentWidth, detailSize.x);
-        contentWidth = ImMax(contentWidth, 240.0f * scale);
-        if (detailSize.y > 0.0f) contentHeight += 3.0f * scale + detailSize.y;
+        contentWidth = ImMax(contentWidth, fontSize * 18.0f);
+        if (detailSize.y > 0.0f) contentHeight += ImFloor(fontSize * 0.2f) + detailSize.y;
         contentHeight += barGap + barHeight;
     }
 
-    const float width = contentWidth + padX * 2.0f;
-    const float height = contentHeight + padY * 2.0f;
-    const float slideY = (1.0f - appearT) * 26.0f + disappearT * 22.0f;
+    Texture* icon = nullptr;
+    if (rendererInitialized) {
+        switch (editorToast.type) {
+            case ConsoleMessageType::Warning: icon = renderer.getTexture("Resources/Engine-Root/Warning Logo.png"); break;
+            case ConsoleMessageType::Error: icon = renderer.getTexture("Resources/Engine-Root/Error Logo.png"); break;
+            case ConsoleMessageType::Success: icon = renderer.getTexture("Resources/Engine-Root/Modu-Logo.png"); break;
+            case ConsoleMessageType::Info:
+            default: icon = renderer.getTexture("Resources/Engine-Root/Info Logo.png"); break;
+        }
+        if (icon && !icon->GetID()) icon = nullptr;
+    }
+    const float iconSpan = iconSize + iconGap;
+    contentHeight = ImMax(contentHeight, iconSize);
+
+    const float width = ImFloor(contentWidth + iconSpan + padX * 2.0f);
+    const float height = ImFloor(contentHeight + padY * 2.0f);
+    const float slideY = ImFloor((1.0f - appearT) * 14.0f + disappearT * 10.0f);
 
     const float bottomY = viewport->WorkPos.y + viewport->WorkSize.y - getEditorBottomStatusReserveHeight(uiChromeScale) - 16.0f;
     const float originX = progressCard
                               ? (viewport->WorkPos.x + viewport->WorkSize.x - width - 18.0f)
                               : (viewport->WorkPos.x + viewport->WorkSize.x * 0.5f - width * 0.5f);
-    const ImVec2 min(originX, bottomY - height - slideY);
+    const ImVec2 min(ImFloor(originX), ImFloor(bottomY - height - slideY));
     const ImVec2 max(min.x + width, min.y + height);
+    const float rounding = style.PopupRounding;
 
-    ImVec4 bg = backgroundColor(editorToast.type);
-    ImVec4 border = borderColor(editorToast.type);
-    ImVec4 accent = accentColor(editorToast.type);
-    bg.w *= visibility;
-    border.w *= visibility;
-    accent.w *= visibility;
-    ImVec4 textColor = ImVec4(0.96f, 0.98f, 1.0f, visibility);
+    // Hard offset shadow, the way programs of that era lifted a balloon off the window.
+    draw->AddRectFilled(ImVec2(min.x + 3.0f, min.y + 3.0f), ImVec2(max.x + 3.0f, max.y + 3.0f),
+                        ImGui::GetColorU32(ImVec4(0.0f, 0.0f, 0.0f, 0.38f)), rounding);
 
-    draw->AddRectFilled(ImVec2(min.x + 1.0f, min.y + 3.0f),
-                        ImVec2(max.x + 1.0f, max.y + 3.0f),
-                        ImGui::GetColorU32(ImVec4(0.0f, 0.0f, 0.0f, 0.20f * visibility)),
-                        12.0f);
-    draw->AddRectFilled(min, max, ImGui::GetColorU32(bg), 12.0f);
-    draw->AddRect(min, max, ImGui::GetColorU32(border), 12.0f, 0, 1.5f);
-    draw->AddRectFilled(min,
-                        ImVec2(min.x + ImMax(4.0f * scale, 3.0f), max.y),
-                        ImGui::GetColorU32(accent),
-                        12.0f,
-                        ImDrawFlags_RoundCornersLeft);
-    draw->AddText(font,
-                  fontSize,
-                  ImVec2(min.x + padX, min.y + padY),
-                  ImGui::GetColorU32(textColor),
+    ImVec4 bodyColor = style.Colors[ImGuiCol_PopupBg];
+    bodyColor.w = ImMax(bodyColor.w, 0.97f);  // a solid card, not a see-through overlay
+    ImGuiShadeParams bodyShade = ImGui::GetShadeParams(ImGuiShadeClass_Popup, ImGuiShadeState_Normal);
+    bodyShade.BevelIntensity *= visibility;
+    ImGui::ShadeRectEx(draw, min, max, ImGui::GetColorU32(bodyColor), bodyShade, rounding);
+
+    const float textX = min.x + padX + iconSpan;
+    const float iconY = min.y + padY + ImFloor((textSize.y - iconSize) * 0.5f);
+    if (icon) {
+        const ImVec2 iconMin(min.x + padX, ImMax(min.y + padY, iconY));
+        draw->AddImage((ImTextureID)(intptr_t)icon->GetID(), iconMin,
+                       ImVec2(iconMin.x + iconSize, iconMin.y + iconSize),
+                       ImVec2(0, 1), ImVec2(1, 0), ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 1.0f)));
+    }
+    const float textY = min.y + padY + ImMax(0.0f, ImFloor((iconSize - textSize.y) * 0.5f));
+    draw->AddText(font, fontSize, ImVec2(textX, textY), ImGui::GetColorU32(ImGuiCol_Text),
                   editorToast.message.c_str());
 
     if (!progressCard) {
+        ImGui::PopStyleVar();
         return;
     }
 
-    float cursorY = min.y + padY + textSize.y;
+    float cursorY = textY + textSize.y;
     if (detailSize.y > 0.0f) {
-        cursorY += 3.0f * scale;
-        ImVec4 detailColor = ImVec4(0.80f, 0.86f, 0.94f, 0.85f * visibility);
-        draw->AddText(font,
-                      detailFontSize,
-                      ImVec2(min.x + padX, cursorY),
-                      ImGui::GetColorU32(detailColor),
+        cursorY += ImFloor(fontSize * 0.2f);
+        draw->AddText(font, detailFontSize, ImVec2(textX, cursorY), ImGui::GetColorU32(ImGuiCol_TextDisabled),
                       editorToast.detail.c_str());
         cursorY += detailSize.y;
     }
 
-    cursorY += barGap;
+    // Recessed track with a block fill: the segmented progress bar of the time.
+    cursorY = ImMax(cursorY, min.y + padY + iconSize) + barGap;
     const ImVec2 trackMin(min.x + padX, cursorY);
     const ImVec2 trackMax(max.x - padX, cursorY + barHeight);
-    if (trackMax.x <= trackMin.x) {
-        return;
-    }
+    if (trackMax.x - trackMin.x > 8.0f) {
+        ImGuiShadeParams trackShade = ImGui::GetShadeParams(ImGuiShadeClass_Frame, ImGuiShadeState_Normal);
+        trackShade.BevelIntensity *= visibility;
+        const float trackRounding = ImMin(style.FrameRounding, barHeight * 0.5f);
+        ImGui::ShadeRectEx(draw, trackMin, trackMax, ImGui::GetColorU32(ImGuiCol_FrameBg), trackShade, trackRounding);
 
-    const float radius = barHeight * 0.5f;
-    draw->AddRectFilled(trackMin, trackMax,
-                        ImGui::GetColorU32(ImVec4(0.0f, 0.0f, 0.0f, 0.35f * visibility)),
-                        radius);
+        const float inset = 2.0f;
+        const float innerMinX = trackMin.x + inset;
+        const float innerMaxX = trackMax.x - inset;
+        const float blockHeight = barHeight - inset * 2.0f;
+        const float blockWidth = ImMax(4.0f, ImFloor(blockHeight * 0.75f));
+        const float blockGap = 2.0f;
+        const float step = blockWidth + blockGap;
+        ImGuiShadeParams blockShade = ImGui::GetShadeParams(ImGuiShadeClass_Grab, ImGuiShadeState_Normal);
+        blockShade.BevelIntensity *= visibility;
+        const ImU32 blockColor = ImGui::GetColorU32(ImGuiCol_PlotHistogram);
+        auto drawBlock = [&](float x) {
+            const float x0 = ImMax(x, innerMinX);
+            const float x1 = ImMin(x + blockWidth, innerMaxX);
+            if (x1 - x0 < 1.0f) return;
+            ImGui::ShadeRectEx(draw, ImVec2(x0, trackMin.y + inset), ImVec2(x1, trackMax.y - inset),
+                               blockColor, blockShade, ImMin(2.0f, trackRounding));
+        };
 
-    const float trackWidth = trackMax.x - trackMin.x;
-    if (editorToast.progress < 0.0f) {
-        const float chunk = trackWidth * 0.32f;
-        const float period = 1.4f;
-        const float phase = static_cast<float>(std::fmod(now, period)) / period;
-        const float travel = trackWidth - chunk;
-        const float pos = (phase < 0.5f) ? (phase * 2.0f) : (2.0f - phase * 2.0f);
-        const float sweepX = trackMin.x + travel * smoothstep(pos);
-        draw->AddRectFilled(ImVec2(sweepX, trackMin.y),
-                            ImVec2(sweepX + chunk, trackMax.y),
-                            ImGui::GetColorU32(accent), radius);
-    } else {
-        const float filled = trackWidth * std::clamp(editorToast.progress, 0.0f, 1.0f);
-        if (filled > 0.5f) {
-            draw->AddRectFilled(trackMin, ImVec2(trackMin.x + filled, trackMax.y),
-                                ImGui::GetColorU32(accent), radius);
+        if (editorToast.progress < 0.0f) {
+            // Unknown length: three blocks marching across and wrapping, like a marquee bar.
+            const float innerWidth = innerMaxX - innerMinX;
+            const float span = step * 3.0f;
+            const float travel = innerWidth + span;
+            const float phase = static_cast<float>(std::fmod(now * 0.9, 1.0));
+            const float head = innerMinX - span + travel * phase;
+            for (int b = 0; b < 3; ++b) drawBlock(head + step * static_cast<float>(b));
+        } else {
+            const float filledX = innerMinX + (innerMaxX - innerMinX) * std::clamp(editorToast.progress, 0.0f, 1.0f);
+            for (float x = innerMinX; x + 1.0f < filledX; x += step) {
+                drawBlock(x);
+                if (x + blockWidth > filledX) break;
+            }
         }
     }
+    ImGui::PopStyleVar();
 }
 
 #pragma endregion

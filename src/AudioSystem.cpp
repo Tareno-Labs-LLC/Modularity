@@ -637,6 +637,7 @@ void AudioSystem::shutdown() {
     destroyVideoStreams();
     destroyActiveSounds();
     destroyOneShotSounds();
+    cleanupFinishedUiSounds(true);
     shutdownReverbGraph();
     if (initialized) {
         ma_engine_uninit(&engine);
@@ -699,6 +700,50 @@ void AudioSystem::cleanupFinishedOneShots() {
             ++it;
         }
     }
+}
+
+void AudioSystem::cleanupFinishedUiSounds(bool destroyAll) {
+    for (auto it = uiSounds.begin(); it != uiSounds.end(); ) {
+        if (destroyAll || !(*it) || !ma_sound_is_playing(&(*it)->sound)) {
+            if (*it) {
+                ma_sound_uninit(&(*it)->sound);
+                releaseDecodedAudio((*it)->decodedData);
+            }
+            it = uiSounds.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+bool AudioSystem::playUiSound(const std::string& path, float volume) {
+    if (path.empty()) return false;
+    if (!initialized && !init()) return false;
+    cleanupFinishedUiSounds(false);
+    if (!AudioClipExists(path)) {
+        if (missingClips.insert(path).second) {
+            std::cerr << "AudioSystem: clip not found " << path << "\n";
+        }
+        return false;
+    }
+    missingClips.erase(path);
+
+    auto snd = std::make_unique<OneShotSound>();
+    // No group: straight to the engine endpoint, like the preview slot, so scene reverb never
+    // colours a click.
+    if (!initSoundFromPath(path, 0, nullptr, snd->sound, snd->decodedData)) {
+        return false;
+    }
+    ma_sound_set_looping(&snd->sound, MA_FALSE);
+    ma_sound_set_volume(&snd->sound, std::max(0.0f, volume));
+    ma_sound_set_spatialization_enabled(&snd->sound, MA_FALSE);
+    if (ma_sound_start(&snd->sound) != MA_SUCCESS) {
+        ma_sound_uninit(&snd->sound);
+        releaseDecodedAudio(snd->decodedData);
+        return false;
+    }
+    uiSounds.emplace_back(std::move(snd));
+    return true;
 }
 
 void AudioSystem::onPlayStart(const std::vector<SceneObject>& objects) {

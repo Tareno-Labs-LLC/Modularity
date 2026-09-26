@@ -1,4 +1,5 @@
 #include "Rendering.h"
+#include "RenderOptimizationInternal.h"
 #include "Profiler.h"
 #include "Modu2DStats.h"
 #include "Camera.h"
@@ -8,8 +9,10 @@
 #include "../include/Textures/TextureTranscode.h"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <future>
+#include <optional>
 #include <limits>
 #include <thread>
 #include <unordered_map>
@@ -678,31 +681,12 @@ const std::vector<float>& GetPrimitiveTriangleVertices(RenderType type) {
     }
 }
 
-// Every field that decides whether two objects can share a static merge batch. The batch key
-// string and the per-frame change signature both walk this list, so they cannot drift apart.
+// The MaterialProperties half of the static merge key, shared with the multi-draw batch key.
 template <typename Visitor>
-void VisitStaticMergeMaterialKey(const SceneObject& obj, Visitor& visitor) {
-    const MaterialProperties& m = obj.material;
+void VisitMaterialPropertiesKey(const MaterialProperties& m, Visitor& visitor) {
     auto num = [&](float v) { visitor.num(v); };
     auto integer = [&](int v) { visitor.integer(v); };
     auto flag = [&](bool v) { visitor.flag(v); };
-    auto str = [&](const std::string& v) { visitor.str(v); };
-
-    integer(static_cast<int>(obj.renderType));
-    str(obj.vertexShaderPath);
-    str(obj.fragmentShaderPath);
-    str(obj.materialPath);
-    str(obj.albedoTexturePath);
-    str(obj.overlayTexturePath);
-    str(obj.normalMapPath);
-    str(obj.metallicRoughnessMapPath);
-    str(obj.metallicMapPath);
-    str(obj.roughnessMapPath);
-    str(obj.opacityMapPath);
-    str(obj.emissiveMapPath);
-    str(obj.occlusionMapPath);
-    str(obj.heightMapPath);
-    flag(obj.useOverlay);
 
     integer(static_cast<int>(m.textureFilter));
     num(m.color.r); num(m.color.g); num(m.color.b);
@@ -739,6 +723,33 @@ void VisitStaticMergeMaterialKey(const SceneObject& obj, Visitor& visitor) {
     flag(m.parallaxInvertHeight);
 }
 
+// Every field that decides whether two objects can share a static merge batch. The batch key
+// string and the per-frame change signature both walk this list, so they cannot drift apart.
+template <typename Visitor>
+void VisitStaticMergeMaterialKey(const SceneObject& obj, Visitor& visitor) {
+    auto integer = [&](int v) { visitor.integer(v); };
+    auto flag = [&](bool v) { visitor.flag(v); };
+    auto str = [&](const std::string& v) { visitor.str(v); };
+
+    integer(static_cast<int>(obj.renderType));
+    str(obj.vertexShaderPath);
+    str(obj.fragmentShaderPath);
+    str(obj.materialPath);
+    str(obj.albedoTexturePath);
+    str(obj.overlayTexturePath);
+    str(obj.normalMapPath);
+    str(obj.metallicRoughnessMapPath);
+    str(obj.metallicMapPath);
+    str(obj.roughnessMapPath);
+    str(obj.opacityMapPath);
+    str(obj.emissiveMapPath);
+    str(obj.occlusionMapPath);
+    str(obj.heightMapPath);
+    flag(obj.useOverlay);
+
+    VisitMaterialPropertiesKey(obj.material, visitor);
+}
+
 void AppendStaticMergeMaterialKey(const SceneObject& obj, std::string& out) {
     struct StringKeyVisitor {
         std::string& out;
@@ -753,14 +764,16 @@ void AppendStaticMergeMaterialKey(const SceneObject& obj, std::string& out) {
 // Hashes the same fields as AppendStaticMergeMaterialKey without formatting them. The signature
 // is rebuilt every frame to notice scene edits, and std::to_string on ~45 floats per object was a
 // measurable share of a frame on low-end CPUs.
+struct HashKeyVisitor {
+    uint64_t hash;
+    void num(float v) { hash = HashCombine64(hash, HashFloat64(v == 0.0f ? 0.0f : v)); }
+    void integer(int v) { hash = HashCombine64(hash, static_cast<uint64_t>(static_cast<int64_t>(v))); }
+    void flag(bool v) { hash = HashCombine64(hash, v ? 2u : 1u); }
+    void str(const std::string& v) { hash = HashCombine64(hash, HashString64(v)); }
+};
+
 uint64_t HashStaticMergeMaterialKey(const SceneObject& obj, uint64_t seed) {
-    struct HashKeyVisitor {
-        uint64_t hash;
-        void num(float v) { hash = HashCombine64(hash, HashFloat64(v == 0.0f ? 0.0f : v)); }
-        void integer(int v) { hash = HashCombine64(hash, static_cast<uint64_t>(static_cast<int64_t>(v))); }
-        void flag(bool v) { hash = HashCombine64(hash, v ? 2u : 1u); }
-        void str(const std::string& v) { hash = HashCombine64(hash, HashString64(v)); }
-    } visitor{seed};
+    HashKeyVisitor visitor{seed};
     VisitStaticMergeMaterialKey(obj, visitor);
     return visitor.hash;
 }
@@ -1184,9 +1197,14 @@ std::vector<float> generateTorus(int segments, int sides) {
 }
 
 // Mesh implementation
+namespace {
+std::atomic<uint64_t> gNextMeshSerial{1};
+}
+
 Mesh::Mesh(const float* vertexData, size_t dataSizeBytes) {
     vertexCount = dataSizeBytes / (8 * sizeof(float));
     strideFloats = 8;
+    serial = gNextMeshSerial.fetch_add(1, std::memory_order_relaxed);
 
     glGenVertexArrays(1, &VAO);
     glGenBuffers(1, &VBO);
@@ -1212,6 +1230,7 @@ Mesh::Mesh(const float* vertexData, size_t dataSizeBytes, bool dynamicUsage,
            const void* boneData, size_t boneDataBytes) {
     vertexCount = dataSizeBytes / (8 * sizeof(float));
     strideFloats = 8;
+    serial = gNextMeshSerial.fetch_add(1, std::memory_order_relaxed);
     dynamic = dynamicUsage;
     hasBones = boneData && boneDataBytes > 0;
 
@@ -1492,8 +1511,18 @@ const OBJLoader::LoadedMesh* OBJLoader::getMeshInfo(int index) const {
 }
 
 // Renderer implementation
+Renderer::Renderer() = default;
+
 Renderer::~Renderer() {
     rendererShuttingDown = true;
+    if (optState) {
+        optState->releaseGpuResources();
+#if !MODULARITY_OPENGL_ES
+        if (optState->cullProgram) glDeleteProgram(optState->cullProgram);
+        if (optState->hiZProgram) glDeleteProgram(optState->hiZProgram);
+#endif
+        optState.reset();
+    }
     shaderCache.clear();
     shader = nullptr;
     defaultShader = nullptr;
@@ -1617,6 +1646,7 @@ Texture* Renderer::getTexture(const std::string& path, MaterialProperties::Textu
     if (policy == TextureFormatPolicy::Auto) policy = defaultTextureFormatPolicy;
     const std::string loadPath = Modularity::ResolveLoadableTexturePath(path);
     auto tex = std::make_unique<Texture>(loadPath, GL_REPEAT, GL_REPEAT, minFilter, magFilter, policy);
+    ++textureCacheGeneration;
     if (!tex->GetID()) {
         missingTextureRetryAfter[path] = nowSec + 1.0;
         textureLoadErrors[path] = tex->GetLoadError();
@@ -1637,6 +1667,7 @@ Texture* Renderer::getTexture(const std::string& path, MaterialProperties::Textu
 
 void Renderer::invalidateTexture(const std::string& path) {
     if (path.empty()) return;
+    ++textureCacheGeneration;
     missingTextureRetryAfter.erase(path);
     auto eraseFromCache = [this, &path](auto& cache) {
         auto it = cache.find(path);
@@ -1688,6 +1719,7 @@ void Renderer::setTextureFormatOverride(const std::string& path, TextureFormatPo
     };
     evictMatching(textureCacheBilinear);
     evictMatching(textureCachePoint);
+    ++textureCacheGeneration;
 }
 
 TextureFormatPolicy Renderer::getTextureFormatOverride(const std::string& path) const {
@@ -1698,6 +1730,7 @@ TextureFormatPolicy Renderer::getTextureFormatOverride(const std::string& path) 
 void Renderer::setMaxTextureDimension(int maxDimension) {
     if (Texture::GetMaxDimension() == maxDimension) return;
     Texture::SetMaxDimension(maxDimension);
+    ++textureCacheGeneration;
     textureCacheBilinear.clear();
     textureCachePoint.clear();
     textureCacheUsageBytes = 0;
@@ -1896,6 +1929,7 @@ void Renderer::purgeTextureCacheIfNeeded() {
                 ? (textureCacheUsageBytes - it->second.approxBytes)
                 : 0;
             cache.erase(it);
+            ++textureCacheGeneration;
 
             if (!honorRecency && !warnedTextureCacheThrashing) {
                 warnedTextureCacheThrashing = true;
@@ -1963,11 +1997,17 @@ void Renderer::rebuildStaticMergeBatches(const std::vector<SceneObject>& sceneOb
     }
     lastStaticMergeCheckFrameSerial = frameSerial;
 
+    // The optimized path caches which objects were merged; any change here invalidates it.
+    const auto noteMergedSetChanged = [this]() {
+        if (optState) ++optState->staticMergeGeneration;
+    };
+
     constexpr size_t kMinSceneObjectsForStaticMerge = 8;
     if (sceneObjects.size() < kMinSceneObjectsForStaticMerge) {
         staticMergeSceneSignature = 0;
         staticMergeBatches.clear();
         staticMergeSourceIds.clear();
+        noteMergedSetChanged();
         return;
     }
 
@@ -2018,6 +2058,7 @@ void Renderer::rebuildStaticMergeBatches(const std::vector<SceneObject>& sceneOb
         staticMergeSceneSignature = 0;
         staticMergeBatches.clear();
         staticMergeSourceIds.clear();
+        noteMergedSetChanged();
         return;
     }
 
@@ -2028,6 +2069,7 @@ void Renderer::rebuildStaticMergeBatches(const std::vector<SceneObject>& sceneOb
     staticMergeSceneSignature = signature;
     staticMergeBatches.clear();
     staticMergeSourceIds.clear();
+    noteMergedSetChanged();
 
     struct BatchAccumulator {
         Renderer::StaticMergeBatch batch;
@@ -3429,6 +3471,57 @@ bool Renderer::isObjectVisibleInCapturedFrustums(const SceneObject& obj, float r
     return false;
 }
 
+bool Renderer::measureObjectScreenSizePx(const SceneObject& obj, glm::vec2& outSizePx,
+                                         bool& outUnbounded) const {
+    outSizePx = glm::vec2(0.0f);
+    outUnbounded = false;
+    if (capturedSceneViews.empty()) {
+        return false;
+    }
+    // Sprite quads span -0.5..0.5 in local X/Y, so the model axes are the
+    // world-space edge lengths.
+    const glm::mat4 model = BuildSceneObjectModelMatrix(obj);
+    const glm::vec3 center(model[3]);
+    const float worldWidth = glm::length(glm::vec3(model[0]));
+    const float worldHeight = glm::length(glm::vec3(model[1]));
+    glm::vec3 cullCenter(0.0f);
+    float cullRadius = 0.0f;
+    const bool hasCullSphere = TryComputeObjectCullSphere(obj, model, cullCenter, cullRadius);
+    bool seen = false;
+    for (size_t i = 0; i < capturedSceneViews.size(); ++i) {
+        const CapturedSceneView& captured = capturedSceneViews[i];
+        if (captured.width <= 0 || captured.height <= 0) {
+            continue;
+        }
+        if (hasCullSphere && i < capturedSceneFrustums.size() &&
+            !SphereInsideFrustum(FrustumPlanes{capturedSceneFrustums[i]}, cullCenter, cullRadius)) {
+            continue;
+        }
+        seen = true;
+        const float pxPerUnitAtUnitDepth =
+            0.5f * std::max(std::abs(captured.proj[0][0]) * static_cast<float>(captured.width),
+                            std::abs(captured.proj[1][1]) * static_cast<float>(captured.height));
+        float pxPerUnit = pxPerUnitAtUnitDepth;
+        const bool perspective = std::abs(captured.proj[3][3]) < 0.5f;
+        if (perspective) {
+            const float depth = -(captured.view * glm::vec4(center, 1.0f)).z;
+            if (!(depth > 1e-3f)) {
+                // Centre at or behind the eye while the quad is still in view.
+                outUnbounded = true;
+                return true;
+            }
+            pxPerUnit /= depth;
+        }
+        if (!std::isfinite(pxPerUnit)) {
+            outUnbounded = true;
+            return true;
+        }
+        outSizePx.x = std::max(outSizePx.x, worldWidth * pxPerUnit);
+        outSizePx.y = std::max(outSizePx.y, worldHeight * pxPerUnit);
+    }
+    return seen;
+}
+
 void Renderer::ensureQuad() {
     if (quadVAO != 0) return;
 
@@ -3464,9 +3557,7 @@ void Renderer::drawFullscreenQuad() {
 }
 
 void Renderer::resetStats(RenderStats& stats) {
-    stats.drawCalls = 0;
-    stats.meshDraws = 0;
-    stats.fullscreenDraws = 0;
+    stats = RenderStats{};
 }
 
 void Renderer::recordDrawCall() {
@@ -3838,6 +3929,1143 @@ bool MainDirectionalSunDirection(const std::vector<SceneObject>& sceneObjects,
 }
 } // namespace
 
+// =====================================================================================
+// Optimized render path, scene-aware half (Project Settings > Graphics Manager >
+// Optimization). The GL half is RenderOptimization.cpp and the shared state is in
+// RenderOptimizationInternal.h. None of this runs unless an optimization is enabled.
+// =====================================================================================
+
+namespace {
+
+const std::string kEmptyRenderPath;
+const std::string kMultiDrawVertPath = "Resources/Shaders/vert_mdi.glsl";
+const std::string kShadowDirectionalMultiDrawVertPath =
+    "Resources/Shaders/shadow_directional_depth_mdi_vert.glsl";
+const std::string kShadowCubeMultiDrawVertPath = "Resources/Shaders/shadow_depth_mdi_vert.glsl";
+
+uint64_t ShaderPairHash(const std::string& vert, const std::string& frag) {
+    return HashCombine64(HashString64(vert), HashString64(frag));
+}
+
+uint64_t TextureSetHash(const std::string* const* paths, size_t count,
+                        MaterialProperties::TextureFilter filter, bool useOverlay) {
+    uint64_t hash = 1469598103934665603ull;
+    for (size_t i = 0; i < count; ++i) {
+        hash = HashCombine64(hash, HashString64(*paths[i]));
+    }
+    hash = HashCombine64(hash, static_cast<uint64_t>(filter));
+    return HashCombine64(hash, useOverlay ? 2u : 1u);
+}
+
+uint64_t HashCachedMaterial(const RenderOpt::CachedRenderable& entry) {
+    HashKeyVisitor visitor{1469598103934665603ull};
+    for (const std::string& path : entry.paths) {
+        visitor.str(path);
+    }
+    visitor.flag(entry.useOverlay);
+    VisitMaterialPropertiesKey(entry.material, visitor);
+    // A per-draw uniform, so batches must split on it. (The static merge key predates
+    // it and does not include it.)
+    visitor.num(entry.material.alphaCutoff);
+    return visitor.hash;
+}
+
+uint32_t InternGroup(std::unordered_map<uint64_t, uint32_t>& table, uint64_t key) {
+    auto found = table.find(key);
+    if (found != table.end()) {
+        return found->second;
+    }
+    const uint32_t id = static_cast<uint32_t>(table.size() + 1);
+    table.emplace(key, id);
+    return id;
+}
+
+// Opaque draw order: program first (a switch re-sends every light uniform), then the
+// texture set, then material values, then cull/front-face state, and last a coarse
+// front-to-back bucket so draws that share all of that still get early depth rejection.
+// The bucket is deliberately coarse: within one the sort is stable, so objects keep scene
+// order, and the draw loop reads each SceneObject (kilobytes apiece) close to sequentially.
+// A fine depth key scattered those reads across the whole scene array; in a 4900-object
+// test the cache misses cost more than the state changes the sort saved.
+uint64_t OpaqueSortKey(uint32_t shaderGroup, uint32_t textureGroup, uint64_t materialKey,
+                       uint32_t stateBits, float depth, float farPlane) {
+    float normalized = depth / std::max(farPlane, 1e-3f);
+    if (!(normalized > 0.0f)) normalized = 0.0f;
+    if (normalized > 1.0f) normalized = 1.0f;
+    const uint64_t depthBits = static_cast<uint64_t>(normalized * 7.0f);
+    return (static_cast<uint64_t>(shaderGroup & 0xFFFu) << 52) |
+           (static_cast<uint64_t>(textureGroup & 0xFFFFFu) << 32) |
+           ((materialKey & 0xFFFull) << 20) |
+           (static_cast<uint64_t>(stateBits & 0xFu) << 16) |
+           depthBits;
+}
+
+float FiniteOr(float value, float fallback) {
+    return std::isfinite(value) ? value : fallback;
+}
+
+bool IsUiCanvas3DObject(const SceneObject& obj) {
+    return obj.hasUI && obj.ui.type == UIElementType::Canvas && obj.ui.renderIn3D;
+}
+
+float MillisecondsSince(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+
+} // namespace
+
+Mesh* Renderer::OptimizationState::meshFor(Renderer& renderer, const SceneObject& obj) {
+    switch (obj.renderType) {
+        case RenderType::Cube: return renderer.cubeMesh;
+        case RenderType::Sphere: return renderer.sphereMesh;
+        case RenderType::Capsule: return renderer.capsuleMesh;
+        case RenderType::Plane:
+        case RenderType::Mirror:
+        case RenderType::Sprite: return renderer.planeMesh;
+        case RenderType::Torus: return renderer.torusMesh;
+        case RenderType::OBJMesh:
+            return obj.meshId != -1 ? g_objLoader.getMesh(obj.meshId) : nullptr;
+        case RenderType::Model:
+            return obj.meshId != -1 ? getModelLoader().getMesh(obj.meshId) : nullptr;
+        case RenderType::None:
+            break;
+    }
+    return nullptr;
+}
+
+void Renderer::OptimizationState::refreshTransforms(const std::vector<SceneObject>& sceneObjects,
+                                                    const Camera& camera, bool forceRecompute) {
+    if (cache.size() != sceneObjects.size()) {
+        cache.resize(sceneObjects.size());
+        bounds.resize(sceneObjects.size());
+    }
+    for (size_t i = 0; i < sceneObjects.size(); ++i) {
+        const SceneObject& obj = sceneObjects[i];
+        if (!IsObjectEnabledInHierarchy(obj) || !HasRendererComponent(obj)) {
+            continue;
+        }
+        RenderOpt::CachedRenderable& entry = cache[i];
+        if (entry.objectId != obj.id) {
+            // A different object now sits at this index (insertions, deletions, a new
+            // scene): nothing cached here describes it.
+            entry.objectId = obj.id;
+            entry.transformValid = false;
+            entry.materialValid = false;
+            entry.materialCheckedFrame = UINT64_MAX;
+            entry.alphaTextureGeneration = UINT64_MAX;
+            entry.staticMergeFlagGeneration = UINT64_MAX;
+        }
+        glm::vec3 localCenter(0.0f);
+        glm::vec3 localExtents(0.0f);
+        const bool hasLocalBounds = TryGetObjectLocalBounds(obj, localCenter, localExtents);
+        // A camera-facing sprite's matrix depends on the camera, so it never stays valid.
+        const bool cameraDependent = obj.renderType == RenderType::Sprite && obj.faceCamera;
+        if (!forceRecompute && !cameraDependent && entry.transformValid &&
+            entry.position == obj.position && entry.rotation == obj.rotation &&
+            entry.scale == obj.scale && entry.renderType == obj.renderType &&
+            entry.meshId == obj.meshId && entry.faceCamera == obj.faceCamera &&
+            entry.hasLocalBounds == hasLocalBounds &&
+            (!hasLocalBounds || (entry.localCenter == localCenter &&
+                                 entry.localExtents == localExtents))) {
+            continue;
+        }
+        entry.position = obj.position;
+        entry.rotation = obj.rotation;
+        entry.scale = obj.scale;
+        entry.renderType = obj.renderType;
+        entry.meshId = obj.meshId;
+        entry.faceCamera = obj.faceCamera;
+        entry.hasLocalBounds = hasLocalBounds;
+        entry.localCenter = localCenter;
+        entry.localExtents = localExtents;
+        entry.model = BuildSceneObjectModelMatrix(obj, &camera.position, &camera.up);
+        entry.mirrored = glm::determinant(glm::mat3(entry.model)) < 0.0f;
+        entry.transformVersion = ++versionCounter;
+        if (entry.transformVersion == 0) {
+            entry.transformVersion = ++versionCounter;   // 0 means "never uploaded"
+        }
+        entry.transformValid = true;
+
+        RenderOpt::CullBounds& b = bounds[i];
+        b.hasBounds = 0;
+        if (hasLocalBounds) {
+            RenderOpt::ComputeWorldBounds(entry.model, localCenter, localExtents, b);
+        }
+    }
+}
+
+void Renderer::OptimizationState::refreshMaterials(const std::vector<SceneObject>& sceneObjects,
+                                                   uint64_t frameSerial, bool forceRecompute) {
+    for (size_t i = 0; i < sceneObjects.size() && i < cache.size(); ++i) {
+        const SceneObject& obj = sceneObjects[i];
+        if (!IsObjectEnabledInHierarchy(obj) || !HasRendererComponent(obj)) {
+            continue;
+        }
+        RenderOpt::CachedRenderable& entry = cache[i];
+        if (entry.objectId != obj.id) {
+            continue;
+        }
+        if (!forceRecompute && entry.materialCheckedFrame == frameSerial) {
+            continue;
+        }
+        entry.materialCheckedFrame = frameSerial;
+        const std::string* current[RenderOpt::kPathCount] = {
+            &obj.vertexShaderPath, &obj.fragmentShaderPath, &obj.materialPath,
+            &obj.albedoTexturePath, &obj.overlayTexturePath, &obj.normalMapPath,
+            &obj.metallicRoughnessMapPath, &obj.metallicMapPath, &obj.roughnessMapPath,
+            &obj.opacityMapPath, &obj.emissiveMapPath, &obj.occlusionMapPath, &obj.heightMapPath};
+        // Byte comparison can report a change that is not one (padding, -0.0), which only
+        // costs a recompute; it can never miss a real change.
+        bool unchanged = !forceRecompute && entry.materialValid &&
+                         entry.useOverlay == obj.useOverlay &&
+                         std::memcmp(&entry.material, &obj.material, sizeof(MaterialProperties)) == 0;
+        for (int p = 0; unchanged && p < RenderOpt::kPathCount; ++p) {
+            unchanged = entry.paths[static_cast<size_t>(p)] == *current[p];
+        }
+        if (unchanged) {
+            continue;
+        }
+        entry.material = obj.material;
+        entry.useOverlay = obj.useOverlay;
+        for (int p = 0; p < RenderOpt::kPathCount; ++p) {
+            entry.paths[static_cast<size_t>(p)] = *current[p];
+        }
+        entry.materialKey = HashCachedMaterial(entry);
+        entry.shaderGroup = InternGroup(shaderGroups,
+                                        ShaderPairHash(entry.paths[RenderOpt::kPathVert],
+                                                       entry.paths[RenderOpt::kPathFrag]));
+        entry.textureGroup = InternGroup(textureGroups,
+                                         TextureSetHash(&current[RenderOpt::kPathAlbedo], 10,
+                                                        obj.material.textureFilter, obj.useOverlay));
+        entry.materialVersion = ++versionCounter;
+        entry.materialValid = true;
+    }
+}
+
+bool Renderer::OptimizationState::resolveAlphaBlend(Renderer& renderer, uint32_t objectIndex,
+                                                    const SceneObject& obj) {
+    RenderOpt::CachedRenderable& entry = cache[objectIndex];
+    if (entry.alphaMaterialVersion == entry.materialVersion &&
+        entry.alphaTextureGeneration == renderer.textureCacheGeneration) {
+        return entry.albedoAlphaBlend;
+    }
+    entry.albedoAlphaBlend = false;
+    entry.overlayAlphaBlend = false;
+    if (!obj.albedoTexturePath.empty()) {
+        if (Texture* tex = renderer.getTexture(obj.albedoTexturePath, obj.material.textureFilter)) {
+            entry.albedoAlphaBlend = tex->UsesAlphaBlending();
+        }
+    }
+    if (obj.useOverlay && !obj.overlayTexturePath.empty()) {
+        if (Texture* tex = renderer.getTexture(obj.overlayTexturePath, obj.material.textureFilter)) {
+            entry.overlayAlphaBlend = tex->UsesAlphaBlending();
+        }
+    }
+    entry.alphaMaterialVersion = entry.materialVersion;
+    // Read after the lookups: a lookup that loaded the texture bumped the generation.
+    entry.alphaTextureGeneration = renderer.textureCacheGeneration;
+    return entry.albedoAlphaBlend;
+}
+
+void Renderer::OptimizationState::refreshStaticMerge(Renderer& renderer,
+                                                     const std::vector<SceneObject>& sceneObjects,
+                                                     bool useCachedSignature) {
+    if (!useCachedSignature) {
+        renderer.rebuildStaticMergeBatches(sceneObjects);
+        return;
+    }
+    if (staticMergeCheckedFrame == renderer.frameSerial) {
+        return;
+    }
+    staticMergeCheckedFrame = renderer.frameSerial;
+    // The legacy check hashes every material field and path of every candidate each
+    // frame to notice edits. The cache already knows what changed, so combine its
+    // versions instead, and only hand over to the legacy builder when this moves.
+    uint64_t signature = 1469598103934665603ull;
+    uint64_t candidates = 0;
+    for (uint32_t i = 0; i < sceneObjects.size() && i < cache.size(); ++i) {
+        const SceneObject& obj = sceneObjects[i];
+        if (!IsStaticMergeCandidate(obj)) continue;
+        if (obj.material.alpha < 0.999f) continue;
+        if (obj.renderType == RenderType::Sprite && !HasDefaultSpriteUvRect(obj)) continue;
+        const RenderOpt::CachedRenderable& entry = cache[i];
+        if (entry.objectId != obj.id || !entry.transformValid || !entry.materialValid) {
+            signature = HashCombine64(signature, ~static_cast<uint64_t>(i));
+            continue;
+        }
+        resolveAlphaBlend(renderer, i, obj);
+        if (entry.albedoAlphaBlend || entry.overlayAlphaBlend) continue;
+        ++candidates;
+        signature = HashCombine64(signature, static_cast<uint64_t>(static_cast<uint32_t>(obj.id)));
+        signature = HashCombine64(signature, static_cast<uint64_t>(obj.meshId + 1));
+        signature = HashCombine64(signature, entry.transformVersion);
+        signature = HashCombine64(signature, entry.materialVersion);
+    }
+    signature = HashCombine64(signature, candidates);
+    signature = HashCombine64(signature, static_cast<uint64_t>(sceneObjects.size() < 8 ? 1u : 2u));
+    if (staticMergeCacheValid && signature == staticMergeCacheSignature) {
+        return;
+    }
+    staticMergeCacheSignature = signature;
+    staticMergeCacheValid = true;
+    renderer.lastStaticMergeCheckFrameSerial = std::numeric_limits<uint64_t>::max();
+    renderer.rebuildStaticMergeBatches(sceneObjects);
+}
+
+bool Renderer::OptimizationState::isMultiDrawEligible(Renderer& renderer, const Pass& pass,
+                                                      uint32_t objectIndex, const SceneObject& obj,
+                                                      Mesh* mesh) {
+    // A batch shares every uniform but the model matrix, so anything that sets a
+    // per-object uniform or texture the batch cannot vary keeps drawing on its own.
+    if (!mesh || mesh->isDynamic() || mesh->usesBones()) return false;
+    if (obj.renderType == RenderType::Mirror) return false;
+    if (obj.renderType == RenderType::Sprite && (obj.faceCamera || !HasDefaultSpriteUvRect(obj))) {
+        return false;
+    }
+    if (IsUiCanvas3DObject(obj)) return false;
+    if (!obj.vertexShaderPath.empty()) return false;
+    if (obj.hasSkeletalAnimation && obj.skeletal.enabled) return false;
+    if (obj.runtimeHasAlbedoTextureOverride && obj.runtimeAlbedoTextureOverrideId != 0) return false;
+    if (obj.material.alpha < 0.999f) return false;
+    const RenderOpt::CachedRenderable& entry = cache[objectIndex];
+    if (!entry.transformValid || !entry.materialValid) return false;
+    if (!obj.albedoTexturePath.empty() && resolveAlphaBlend(renderer, objectIndex, obj)) return false;
+    // Reflection probes blend by distance, so every object in range gets its own intensity.
+    for (const ProbeRef& probe : pass.probes) {
+        const glm::vec3 delta = obj.position - probe.position;
+        if (glm::dot(delta, delta) <= probe.range * probe.range) return false;
+    }
+    return true;
+}
+
+void Renderer::OptimizationState::updateMultiDrawMembership(Renderer& renderer, const Pass& pass,
+                                                            const std::vector<SceneObject>& sceneObjects) {
+    MultiDrawState& md = multiDraw;
+    const uint32_t objectCount = static_cast<uint32_t>(sceneObjects.size());
+    if (md.membershipFrame == renderer.frameSerial && md.objectSlot.size() == objectCount &&
+        md.builtArenaGeneration == md.arenaGeneration) {
+        return;
+    }
+    md.membershipFrame = renderer.frameSerial;
+
+    md.eligible.clear();
+    uint64_t signature = 1469598103934665603ull;
+    for (uint32_t i = 0; i < objectCount && i < cache.size(); ++i) {
+        const SceneObject& obj = sceneObjects[i];
+        if (!IsObjectEnabledInHierarchy(obj) || !HasRendererComponent(obj)) continue;
+        if (cache[i].objectId != obj.id) continue;
+        Mesh* mesh = meshFor(renderer, obj);
+        if (!isMultiDrawEligible(renderer, pass, i, obj, mesh)) continue;
+        const RenderOpt::CachedRenderable& entry = cache[i];
+        uint64_t key = HashCombine64(entry.materialKey, obj.renderType == RenderType::Sprite ? 2u : 1u);
+        key = HashCombine64(key, entry.mirrored ? 2u : 1u);
+        md.eligible.emplace_back(key, i);
+        signature = HashCombine64(signature, key);
+        signature = HashCombine64(signature, i);
+        signature = HashCombine64(signature, static_cast<uint64_t>(static_cast<uint32_t>(obj.id)));
+        signature = HashCombine64(signature, mesh->getSerial());
+        signature = HashCombine64(signature, static_cast<uint64_t>(static_cast<uint32_t>(obj.layer)));
+    }
+    signature = HashCombine64(signature, static_cast<uint64_t>(md.eligible.size()));
+    if (md.membershipValid && signature == md.membershipSignature &&
+        md.objectSlot.size() == objectCount && md.builtArenaGeneration == md.arenaGeneration) {
+        return;
+    }
+
+    // Rebuild: equal keys form a batch, each member takes a slot, and a batch's slots are
+    // contiguous so one multi-draw covers it. Only happens when membership changed.
+    std::sort(md.eligible.begin(), md.eligible.end());
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        beginArenaRegistration(false);
+        md.batches.clear();
+        md.slotObject.clear();
+        md.slotFirst.clear();
+        md.slotCount.clear();
+        md.slotTemplates.clear();
+        md.objectSlot.assign(objectCount, UINT32_MAX);
+        for (const auto& [key, objectIndex] : md.eligible) {
+            if (md.slotObject.size() >= RenderOpt::kMaxMultiDrawSlots) break;
+            const SceneObject& obj = sceneObjects[objectIndex];
+            GLint first = 0;
+            GLsizei vertexCount = 0;
+            if (!ensureArenaMesh(meshFor(renderer, obj), first, vertexCount, false)) continue;
+            if (md.batches.empty() || md.batches.back().key != key) {
+                MultiDrawBatch batch;
+                batch.key = key;
+                batch.firstSlot = static_cast<uint32_t>(md.slotObject.size());
+                batch.representative = objectIndex;
+                batch.shaderGroup = InternGroup(
+                    shaderGroups,
+                    ShaderPairHash(kMultiDrawVertPath, cache[objectIndex].paths[RenderOpt::kPathFrag]));
+                md.batches.push_back(batch);
+            }
+            MultiDrawBatch& batch = md.batches.back();
+            const uint32_t slot = static_cast<uint32_t>(md.slotObject.size());
+            md.slotObject.push_back(objectIndex);
+            md.slotFirst.push_back(first);
+            md.slotCount.push_back(vertexCount);
+            md.slotTemplates.emplace_back(static_cast<GLuint>(vertexCount), static_cast<GLuint>(first),
+                                          1u << (static_cast<uint32_t>(obj.layer) & 31u), 0u);
+            md.objectSlot[objectIndex] = slot;
+            ++batch.slotCount;
+            batch.triangles += vertexCount / 3;
+        }
+        if (!compactArenaIfWasteful()) break;   // emptied a wasteful arena: register again
+    }
+
+    const size_t slots = md.slotObject.size();
+    md.slotVersion.assign(slots, 0u);
+    md.slotMatrices.resize(slots);
+    md.slotBounds.resize(slots * 2);
+    md.passCommands.resize(slots);
+    md.templatesDirty = true;
+    const int regions = support.computeCulling ? RenderOpt::kGpuCommandRegions : 1;
+    if (slots == 0 || !ensureMultiDrawCapacity(slots, regions)) {
+        md.batches.clear();
+        md.slotObject.clear();
+        md.objectSlot.assign(objectCount, UINT32_MAX);
+    }
+    md.membershipSignature = signature;
+    md.membershipValid = true;
+    md.builtArenaGeneration = md.arenaGeneration;
+}
+
+bool Renderer::OptimizationState::prepareShadowBatch(Renderer& renderer, Pass& pass,
+                                                     const std::vector<SceneObject>& sceneObjects) {
+    OptimizationState& state = *renderer.optState;
+    if (!pass.plan.multiDraw || state.multiDrawFailed) {
+        return false;
+    }
+    collectShadowCasters(renderer, pass, sceneObjects);
+    ShadowBatchState& sb = state.shadowBatch;
+    MultiDrawState& md = state.multiDraw;
+    const uint32_t objectCount = static_cast<uint32_t>(sceneObjects.size());
+    const bool checkedThisFrame = sb.membershipFrame == renderer.frameSerial &&
+                                  sb.objectSlot.size() == objectCount &&
+                                  sb.builtArenaGeneration == md.arenaGeneration;
+    if (!checkedThisFrame) {
+        sb.membershipFrame = renderer.frameSerial;
+        // Every caster with a static mesh can batch: the depth pass reads nothing but the
+        // mesh and the model matrix. The set only changes when casters come and go.
+        uint64_t signature = 1469598103934665603ull;
+        for (const auto& caster : pass.shadowCasters) {
+            if (caster.second->isDynamic() || caster.second->usesBones()) continue;
+            signature = HashCombine64(signature, caster.first);
+            signature = HashCombine64(signature,
+                                      static_cast<uint64_t>(static_cast<uint32_t>(sceneObjects[caster.first].id)));
+            signature = HashCombine64(signature, caster.second->getSerial());
+        }
+        signature = HashCombine64(signature, static_cast<uint64_t>(pass.shadowCasters.size()));
+        if (!sb.membershipValid || signature != sb.membershipSignature ||
+            sb.objectSlot.size() != objectCount || sb.builtArenaGeneration != md.arenaGeneration) {
+            for (int attempt = 0; attempt < 2; ++attempt) {
+                state.beginArenaRegistration(true);
+                sb.slotObject.clear();
+                sb.slotFirst.clear();
+                sb.slotCount.clear();
+                sb.objectSlot.assign(objectCount, UINT32_MAX);
+                for (const auto& caster : pass.shadowCasters) {
+                    if (caster.second->isDynamic() || caster.second->usesBones()) continue;
+                    if (sb.slotObject.size() >= RenderOpt::kMaxMultiDrawSlots) break;
+                    GLint first = 0;
+                    GLsizei vertexCount = 0;
+                    if (!state.ensureArenaMesh(caster.second, first, vertexCount, true)) continue;
+                    sb.objectSlot[caster.first] = static_cast<uint32_t>(sb.slotObject.size());
+                    sb.slotObject.push_back(caster.first);
+                    sb.slotFirst.push_back(first);
+                    sb.slotCount.push_back(vertexCount);
+                }
+                if (!state.compactArenaIfWasteful()) break;
+            }
+            const size_t slots = sb.slotObject.size();
+            sb.slotVersion.assign(slots, 0u);
+            sb.slotMatrices.resize(slots);
+            sb.commands.resize(slots);
+            if (slots == 0 || !state.ensureShadowBatchCapacity(slots)) {
+                sb.slotObject.clear();
+                sb.objectSlot.assign(objectCount, UINT32_MAX);
+            }
+            sb.membershipSignature = signature;
+            sb.membershipValid = true;
+            sb.builtArenaGeneration = md.arenaGeneration;
+        }
+    }
+    if (sb.slotObject.empty()) {
+        return false;
+    }
+    state.uploadShadowSlots();
+    return true;
+}
+
+Renderer::OptimizationState::Pass* Renderer::OptimizationState::beginPass(
+    Renderer& renderer, const Camera& camera, const std::vector<SceneObject>& sceneObjects,
+    const glm::mat4& view, const glm::mat4& proj, const std::array<glm::vec4, 6>& planes,
+    int width, int height, float farPlane, bool drawMirrorObjects) {
+    const RenderOptimizationSettings& settings = renderer.optimizationSettings;
+    const bool anyEnabled = settings.cpuFrustumCulling || settings.multiDrawIndirect ||
+                            settings.gpuDrivenCulling || settings.lodOptimization ||
+                            settings.hiZOcclusionCulling || settings.materialSorting ||
+                            settings.staticObjectCaching;
+    if (!anyEnabled) {
+        return nullptr;
+    }
+    if (!renderer.optState) {
+        renderer.optState = std::make_unique<OptimizationState>();
+    }
+    OptimizationState& state = *renderer.optState;
+    if (state.passDepth >= static_cast<int>(state.passes.size())) {
+        return nullptr;
+    }
+    if (!state.supportQueried) {
+        state.support = querySupport();
+        state.supportQueried = true;
+    }
+    if (renderer.frameSerial >= state.readbackPollFrame + 4) {
+        state.readbackPollFrame = renderer.frameSerial;
+        state.pollReadbacks();
+    }
+
+    int candidateCount = 0;
+    if (settings.strategy == RenderOptimizationStrategy::Automatic) {
+        for (const SceneObject& obj : sceneObjects) {
+            if (IsObjectEnabledInHierarchy(obj) && HasRendererComponent(obj)) ++candidateCount;
+        }
+    }
+    const PassPlan plan = state.resolvePlan(settings, state.support, candidateCount,
+                                            renderer.reflectionCapturePass);
+    if (!plan.active) {
+        return nullptr;
+    }
+
+    Pass& pass = state.passes[static_cast<size_t>(state.passDepth++)];
+    pass.plan = plan;
+    pass.frameSerial = renderer.frameSerial;
+    pass.view = view;
+    pass.proj = proj;
+    pass.planes = planes;
+    pass.cameraPosition = camera.position;
+    pass.cameraForward = -glm::vec3(view[0][2], view[1][2], view[2][2]);
+    pass.viewDepthRow = -glm::vec4(view[0][2], view[1][2], view[2][2], view[3][2]);
+    pass.perspective = std::abs(proj[3][3]) < 0.5f;
+    pass.lodPxPerUnit = 0.5f * std::max(std::abs(proj[0][0]) * static_cast<float>(width),
+                                        std::abs(proj[1][1]) * static_cast<float>(height));
+    pass.farPlane = farPlane;
+    pass.width = width;
+    pass.height = height;
+    pass.cullingMask = camera.cullingMask;
+    pass.drawMirrorObjects = drawMirrorObjects;
+    pass.reflectionCapture = renderer.reflectionCapturePass;
+    pass.depthTexture = renderer.reflectionCapturePass ? 0 : renderer.sceneDepthTextureForPass;
+    pass.shadowCastersBuilt = false;
+    pass.gpuCommandRegion = -1;
+    pass.multiDrawUsed = false;
+    pass.multiDrawCpuCullMs = 0.0f;
+    {
+        MODU_PROFILE_SCOPE("Renderer::BuildRenderQueue", ProfilerSampleCategory::RenderDetail);
+        state.refreshTransforms(sceneObjects, camera, !plan.staticCache);
+    }
+    return &pass;
+}
+
+void Renderer::OptimizationState::collectShadowCasters(Renderer& renderer, Pass& pass,
+                                                       const std::vector<SceneObject>& sceneObjects) {
+    if (pass.shadowCastersBuilt) {
+        return;
+    }
+    pass.shadowCastersBuilt = true;
+    pass.shadowCasters.clear();
+    // The shadow loops' own filters, applied once per pass instead of per light and face.
+    for (uint32_t i = 0; i < sceneObjects.size(); ++i) {
+        const SceneObject& obj = sceneObjects[i];
+        if (!IsObjectEnabledInHierarchy(obj) || !HasRendererComponent(obj)) continue;
+        if (obj.renderType == RenderType::Mirror || obj.renderType == RenderType::Sprite) continue;
+        if (IsUiCanvas3DObject(obj)) continue;
+        if (obj.hasSkeletalAnimation && obj.skeletal.enabled) continue;
+        Mesh* mesh = meshFor(renderer, obj);
+        if (!mesh) continue;
+        pass.shadowCasters.emplace_back(i, mesh);
+    }
+}
+
+void Renderer::OptimizationState::buildQueue(Renderer& renderer, Pass& pass,
+                                             const std::vector<SceneObject>& sceneObjects,
+                                             RenderStats& passStats) {
+    using Clock = std::chrono::steady_clock;
+    OptimizationState& state = *renderer.optState;
+    const PassPlan& plan = pass.plan;
+    const RenderOptimizationSettings& settings = renderer.optimizationSettings;
+    MultiDrawState& md = state.multiDraw;
+    const auto queueStart = Clock::now();
+
+    pass.candidates.clear();
+    pass.opaque.clear();
+    pass.transparent.clear();
+    pass.items.clear();
+    pass.shaders.clear();
+    pass.probes.clear();
+
+    bool multiDrawPlanned = plan.multiDraw;
+    {
+        MODU_PROFILE_SCOPE("Renderer::BuildRenderQueue", ProfilerSampleCategory::RenderDetail);
+        state.refreshMaterials(sceneObjects, renderer.frameSerial, !plan.staticCache);
+        if (!renderer.reflectionCastTargets.empty()) {
+            for (const SceneObject& probeObj : sceneObjects) {
+                if (!IsObjectEnabledInHierarchy(probeObj) || !probeObj.hasReflectionCast ||
+                    !probeObj.reflectionCast.enabled) {
+                    continue;
+                }
+                auto target = renderer.reflectionCastTargets.find(probeObj.id);
+                if (target == renderer.reflectionCastTargets.end() || target->second.cube == 0 ||
+                    !target->second.hasCapture) {
+                    continue;
+                }
+                ProbeRef probe;
+                probe.position = probeObj.position;
+                probe.range = std::max(0.01f, probeObj.reflectionCast.blendDistance);
+                probe.intensity = probeObj.reflectionCast.intensity;
+                probe.cube = target->second.cube;
+                pass.probes.push_back(probe);
+            }
+        }
+        if (multiDrawPlanned) {
+            // Batches need their own vertex stage. If it does not build, draw everything one
+            // at a time rather than put every batched object at one object's matrix.
+            Shader* batchProgram = renderer.getShader(kMultiDrawVertPath, renderer.defaultFragPath);
+            if (!batchProgram || batchProgram == renderer.defaultShader || batchProgram->ID == 0) {
+                if (!state.multiDrawFailed) {
+                    std::cerr << "[Renderer] " << kMultiDrawVertPath
+                              << " did not build; multi-draw batching is off.\n";
+                }
+                state.multiDrawFailed = true;
+                state.multiDrawFailure =
+                    "Resources/Shaders/vert_mdi.glsl did not build, so objects draw one at a "
+                    "time. The log has the compiler error.";
+                multiDrawPlanned = false;
+            }
+        }
+        if (multiDrawPlanned) {
+            state.updateMultiDrawMembership(renderer, pass, sceneObjects);
+        } else {
+            state.refreshStaticMerge(renderer, sceneObjects, plan.staticCache);
+        }
+    }
+
+    const bool cullingMaskAllowsAll = (pass.cullingMask == 0xFFFFFFFFu);
+    const bool multiDrawActive = multiDrawPlanned && !md.batches.empty() &&
+                                 md.objectSlot.size() == sceneObjects.size();
+    const bool useStaticMerge = !multiDrawPlanned;
+    const bool skipStaticSources = useStaticMerge && cullingMaskAllowsAll &&
+                                   !renderer.staticMergeSourceIds.empty();
+    const bool gpuCulling = multiDrawActive && plan.gpuCulling && state.ensureComputePrograms();
+    const float lodMinPx = settings.lodMinScreenSizePx;
+    int submitted = 0;
+    int culled = 0;
+    int lodCulled = 0;
+    int batchedVisible = 0;
+    int indirectCommands = 0;
+    long long batchedTriangles = 0;
+
+    // False when the object is rejected, counting why.
+    const auto passesCulling = [&](const RenderOpt::CullBounds& b) {
+        if (!b.hasBounds) {
+            return true;   // unknown extent: always drawn, as the legacy path does
+        }
+        if (plan.cpuCulling &&
+            (!RenderOpt::SphereInsidePlanes(pass.planes, b.center, b.radius) ||
+             !RenderOpt::AabbInsidePlanes(pass.planes, b.center, b.extents))) {
+            ++culled;
+            return false;
+        }
+        if (plan.lod && !RenderOpt::PassesLodScreenSize(pass.viewDepthRow, pass.perspective,
+                                                        pass.lodPxPerUnit, lodMinPx, b.center,
+                                                        b.radius)) {
+            ++lodCulled;
+            return false;
+        }
+        return true;
+    };
+    const auto layerVisible = [&](const SceneObject& obj) {
+        return cullingMaskAllowsAll ||
+               (pass.cullingMask & (1u << (static_cast<uint32_t>(obj.layer) & 31u))) != 0u;
+    };
+
+    const auto cullStart = Clock::now();
+    {
+        MODU_PROFILE_SCOPE("Renderer::FrustumCulling", ProfilerSampleCategory::RenderDetail);
+        const uint32_t objectCount = static_cast<uint32_t>(sceneObjects.size());
+        for (uint32_t i = 0; i < objectCount; ++i) {
+            const SceneObject& obj = sceneObjects[i];
+            if (!IsObjectEnabledInHierarchy(obj)) continue;
+            if (!layerVisible(obj)) continue;
+            if (!pass.drawMirrorObjects && obj.hasRenderer && obj.renderType == RenderType::Mirror) continue;
+            if (!HasRendererComponent(obj)) continue;
+            if (multiDrawActive && md.objectSlot[i] != UINT32_MAX) continue;   // its batch draws it
+            RenderOpt::CachedRenderable& entry = state.cache[i];
+            if (skipStaticSources) {
+                if (entry.staticMergeFlagGeneration != state.staticMergeGeneration) {
+                    entry.staticMergeSource = renderer.staticMergeSourceIds.count(obj.id) != 0;
+                    entry.staticMergeFlagGeneration = state.staticMergeGeneration;
+                }
+                if (entry.staticMergeSource) continue;
+            }
+            if (!meshFor(renderer, obj)) continue;
+            ++submitted;
+            if (!passesCulling(state.bounds[i])) continue;
+            pass.candidates.push_back(i);
+        }
+
+        if (multiDrawActive && !gpuCulling) {
+            // CPU culling for batched objects: each batch's visible commands are packed at
+            // the start of its slot range, so the batch draws exactly its visible count.
+            const auto batchedStart = Clock::now();
+            for (MultiDrawBatch& batch : md.batches) {
+                batch.visibleCount = 0;
+                const uint32_t endSlot = batch.firstSlot + batch.slotCount;
+                for (uint32_t slot = batch.firstSlot; slot < endSlot; ++slot) {
+                    const uint32_t objectIndex = md.slotObject[slot];
+                    if (!layerVisible(sceneObjects[objectIndex])) continue;
+                    ++submitted;
+                    if (!passesCulling(state.bounds[objectIndex])) continue;
+                    RenderOpt::DrawArraysIndirectCommand& command =
+                        md.passCommands[batch.firstSlot + batch.visibleCount++];
+                    command.count = static_cast<GLuint>(md.slotCount[slot]);
+                    command.instanceCount = 1;
+                    command.first = static_cast<GLuint>(md.slotFirst[slot]);
+                    command.baseInstance = slot;
+                    ++batchedVisible;
+                    batchedTriangles += md.slotCount[slot] / 3;
+                }
+                indirectCommands += static_cast<int>(batch.visibleCount);
+            }
+            pass.multiDrawCpuCullMs = MillisecondsSince(batchedStart);
+        } else if (gpuCulling) {
+            for (const MultiDrawBatch& batch : md.batches) {
+                submitted += static_cast<int>(batch.slotCount);
+                indirectCommands += static_cast<int>(batch.slotCount);
+                batchedTriangles += batch.triangles;   // an upper bound: the GPU decides
+            }
+        }
+    }
+    passStats.cpuCullingMs += MillisecondsSince(cullStart);
+
+    if (multiDrawActive) {
+        MODU_PROFILE_SCOPE("Renderer::IndirectCommandGeneration", ProfilerSampleCategory::RenderDetail);
+        state.uploadMultiDrawSlots();
+        if (!gpuCulling) {
+            state.uploadPassCommands();
+        }
+    }
+
+    uint32_t order = 0;
+    {
+        MODU_PROFILE_SCOPE("Renderer::BuildRenderQueue", ProfilerSampleCategory::RenderDetail);
+        for (uint32_t objectIndex : pass.candidates) {
+            const SceneObject& obj = sceneObjects[objectIndex];
+            const RenderOpt::CachedRenderable& entry = state.cache[objectIndex];
+            const RenderOpt::CullBounds& b = state.bounds[objectIndex];
+            const bool isCanvas = IsUiCanvas3DObject(obj);
+            bool requiresBlending = obj.material.alpha < 0.999f || isCanvas;
+            if (!requiresBlending && !obj.albedoTexturePath.empty()) {
+                requiresBlending = state.resolveAlphaBlend(renderer, objectIndex, obj);
+            }
+            const glm::vec3 depthCenter = b.hasBounds ? b.center : obj.position;
+            const float cameraDepth = FiniteOr(-(pass.view * glm::vec4(depthCenter, 1.0f)).z, 0.0f);
+            if (!requiresBlending) {
+                OpaqueEntry opaque;
+                opaque.ref = objectIndex;
+                opaque.order = order++;
+                if (plan.sorting) {
+                    const bool doubleSided = obj.renderType == RenderType::Sprite ||
+                                             obj.renderType == RenderType::Mirror;
+                    const bool gpuSkinned = obj.hasSkeletalAnimation && obj.skeletal.enabled &&
+                                            obj.skeletal.useGpuSkinning;
+                    const uint32_t stateBits = (doubleSided ? 1u : 0u) | (entry.mirrored ? 2u : 0u) |
+                                               (gpuSkinned ? 4u : 0u);
+                    opaque.key = OpaqueSortKey(entry.shaderGroup, entry.textureGroup,
+                                               entry.materialKey, stateBits, cameraDepth,
+                                               pass.farPlane);
+                }
+                pass.opaque.push_back(opaque);
+            } else {
+                TransparentEntry transparent;
+                transparent.cameraDepth = cameraDepth;
+                const glm::vec3 toCamera = depthCenter - pass.cameraPosition;
+                transparent.cameraDistanceSq = FiniteOr(glm::dot(toCamera, toCamera), 0.0f);
+                transparent.objectId = obj.id;
+                transparent.ref = objectIndex;
+                transparent.isUiCanvas3D = isCanvas;
+                transparent.uiSortingOrder = isCanvas ? obj.ui.sortingOrder : 0;
+                transparent.order = order++;
+                pass.transparent.push_back(transparent);
+            }
+        }
+
+        if (useStaticMerge && cullingMaskAllowsAll) {
+            for (uint32_t k = 0; k < renderer.staticMergeBatches.size(); ++k) {
+                const StaticMergeBatch& batch = renderer.staticMergeBatches[k];
+                if (!batch.mesh) continue;
+                if (plan.cpuCulling && batch.boundsRadius > 0.0f &&
+                    !RenderOpt::SphereInsidePlanes(pass.planes, batch.boundsCenter, batch.boundsRadius)) {
+                    continue;
+                }
+                bool requiresBlending = batch.material.alpha < 0.999f;
+                if (!requiresBlending && !batch.albedoTexturePath.empty()) {
+                    if (Texture* tex = renderer.getTexture(batch.albedoTexturePath,
+                                                           batch.material.textureFilter)) {
+                        requiresBlending = tex->UsesAlphaBlending();
+                    }
+                }
+                const float cameraDepth =
+                    FiniteOr(-(pass.view * glm::vec4(batch.boundsCenter, 1.0f)).z, 0.0f);
+                if (!requiresBlending) {
+                    OpaqueEntry opaque;
+                    opaque.ref = kRefStaticBatch | k;
+                    opaque.order = order++;
+                    if (plan.sorting) {
+                        const std::string* texturePaths[10] = {
+                            &batch.albedoTexturePath, &batch.overlayTexturePath, &batch.normalMapPath,
+                            &batch.metallicRoughnessMapPath, &batch.metallicMapPath,
+                            &batch.roughnessMapPath, &batch.opacityMapPath, &batch.emissiveMapPath,
+                            &batch.occlusionMapPath, &batch.heightMapPath};
+                        const uint32_t shaderGroup =
+                            InternGroup(state.shaderGroups, ShaderPairHash(batch.vertPath, batch.fragPath));
+                        const uint32_t textureGroup = InternGroup(
+                            state.textureGroups,
+                            TextureSetHash(texturePaths, 10, batch.material.textureFilter, batch.useOverlay));
+                        opaque.key = OpaqueSortKey(shaderGroup, textureGroup, 0,
+                                                   batch.doubleSided ? 1u : 0u, cameraDepth,
+                                                   pass.farPlane);
+                    }
+                    pass.opaque.push_back(opaque);
+                } else {
+                    TransparentEntry transparent;
+                    transparent.cameraDepth = cameraDepth;
+                    const glm::vec3 toCamera = batch.boundsCenter - pass.cameraPosition;
+                    transparent.cameraDistanceSq = FiniteOr(glm::dot(toCamera, toCamera), 0.0f);
+                    transparent.objectId = -1;
+                    transparent.ref = kRefStaticBatch | k;
+                    transparent.order = order++;
+                    pass.transparent.push_back(transparent);
+                }
+            }
+        }
+
+        if (multiDrawActive) {
+            for (uint32_t k = 0; k < md.batches.size(); ++k) {
+                const MultiDrawBatch& batch = md.batches[k];
+                if (gpuCulling ? batch.slotCount == 0 : batch.visibleCount == 0) continue;
+                OpaqueEntry opaque;
+                opaque.ref = kRefMultiDraw | k;
+                opaque.order = order++;
+                if (plan.sorting) {
+                    const RenderOpt::CachedRenderable& representative = state.cache[batch.representative];
+                    const bool sprite = sceneObjects[batch.representative].renderType == RenderType::Sprite;
+                    opaque.key = OpaqueSortKey(batch.shaderGroup, representative.textureGroup,
+                                               representative.materialKey,
+                                               (sprite ? 1u : 0u) | (representative.mirrored ? 2u : 0u) | 8u,
+                                               0.0f, pass.farPlane);
+                }
+                pass.opaque.push_back(opaque);
+            }
+        }
+    }
+
+    const auto sortStart = Clock::now();
+    {
+        MODU_PROFILE_SCOPE("Renderer::MaterialSorting", ProfilerSampleCategory::RenderDetail);
+        if (plan.sorting && pass.opaque.size() > 1 && pass.opaque.size() < 256) {
+            std::sort(pass.opaque.begin(), pass.opaque.end(),
+                      [](const OpaqueEntry& a, const OpaqueEntry& b) {
+                          if (a.key != b.key) return a.key < b.key;
+                          return a.order < b.order;
+                      });
+        } else if (plan.sorting && pass.opaque.size() > 1) {
+            // Entries arrive in gather order, so the stable radix sort ties the same way
+            // the comparison sort above does, in a few linear passes instead.
+            RenderOpt::RadixSortByKey(pass.opaque, pass.opaqueScratch);
+        }
+        // Transparent order is about correctness, so it ignores the sorting setting: back
+        // to front exactly as the legacy path does (its stable sort ties on gather order).
+        if (pass.transparent.size() > 1) {
+            std::sort(pass.transparent.begin(), pass.transparent.end(),
+                      [](const TransparentEntry& a, const TransparentEntry& b) {
+                          if (a.cameraDepth != b.cameraDepth) return a.cameraDepth > b.cameraDepth;
+                          if (a.cameraDistanceSq != b.cameraDistanceSq) {
+                              return a.cameraDistanceSq > b.cameraDistanceSq;
+                          }
+                          if (a.objectId != b.objectId) return a.objectId < b.objectId;
+                          return a.order < b.order;
+                      });
+            // 3D UI canvases then reorder among the slots they occupy by sorting order.
+            pass.canvasPositions.clear();
+            pass.canvasEntries.clear();
+            for (uint32_t k = 0; k < pass.transparent.size(); ++k) {
+                if (!pass.transparent[k].isUiCanvas3D) continue;
+                pass.canvasPositions.push_back(k);
+                pass.canvasEntries.push_back(pass.transparent[k]);
+                pass.canvasEntries.back().order = static_cast<uint32_t>(pass.canvasEntries.size() - 1);
+            }
+            if (pass.canvasEntries.size() > 1) {
+                std::sort(pass.canvasEntries.begin(), pass.canvasEntries.end(),
+                          [](const TransparentEntry& a, const TransparentEntry& b) {
+                              if (a.uiSortingOrder != b.uiSortingOrder) {
+                                  return a.uiSortingOrder < b.uiSortingOrder;
+                              }
+                              return a.order < b.order;
+                          });
+                for (size_t k = 0; k < pass.canvasPositions.size(); ++k) {
+                    pass.transparent[pass.canvasPositions[k]] = pass.canvasEntries[k];
+                }
+            }
+        }
+    }
+    passStats.sortingMs += MillisecondsSince(sortStart);
+
+    {
+        MODU_PROFILE_SCOPE("Renderer::BuildRenderQueue", ProfilerSampleCategory::RenderDetail);
+        // Mirrors the legacy gather field for field, so the draw loop cannot tell the paths
+        // apart except by what was culled and the order.
+        const auto fillObjectItem = [&](SceneRenderItem& item, uint32_t objectIndex) {
+            const SceneObject& obj = sceneObjects[objectIndex];
+            const RenderOpt::CullBounds& b = state.bounds[objectIndex];
+            item.obj = &obj;
+            item.mesh = meshFor(renderer, obj);
+            item.model = state.cache[objectIndex].model;
+            item.sortCenter = obj.position;
+            item.depthSortCenter = b.hasBounds ? b.center : obj.position;
+            item.vertPath = &obj.vertexShaderPath;
+            item.fragPath = &obj.fragmentShaderPath;
+            item.material = obj.material;
+            item.materialPath = &obj.materialPath;
+            item.albedoTexturePath = &obj.albedoTexturePath;
+            item.overlayTexturePath = &obj.overlayTexturePath;
+            item.normalMapPath = &obj.normalMapPath;
+            item.metallicRoughnessMapPath = &obj.metallicRoughnessMapPath;
+            item.metallicMapPath = &obj.metallicMapPath;
+            item.roughnessMapPath = &obj.roughnessMapPath;
+            item.opacityMapPath = &obj.opacityMapPath;
+            item.emissiveMapPath = &obj.emissiveMapPath;
+            item.occlusionMapPath = &obj.occlusionMapPath;
+            item.heightMapPath = &obj.heightMapPath;
+            item.useOverlay = obj.useOverlay;
+            item.boneLimit = obj.skeletal.maxBones;
+            item.availableBones = static_cast<int>(obj.skeletal.finalMatrices.size());
+            const bool needsFallback = obj.hasSkeletalAnimation && obj.skeletal.enabled &&
+                                       obj.skeletal.allowCpuFallback &&
+                                       item.boneLimit > 0 && item.availableBones > item.boneLimit;
+            item.wantsGpuSkinning = obj.hasSkeletalAnimation && obj.skeletal.enabled &&
+                                    obj.skeletal.useGpuSkinning && !needsFallback;
+            if (item.wantsGpuSkinning && item.vertPath->empty()) {
+                item.vertPath = &renderer.skinnedVertPath;
+            }
+            item.isUiCanvas3D = IsUiCanvas3DObject(obj);
+            item.uiSortingOrder = item.isUiCanvas3D ? obj.ui.sortingOrder : 0;
+            item.unlit = obj.renderType == RenderType::Mirror || obj.renderType == RenderType::Sprite ||
+                         item.isUiCanvas3D;
+            item.doubleSided = obj.renderType == RenderType::Sprite || obj.renderType == RenderType::Mirror;
+            const glm::vec3 viewSpaceCenter = glm::vec3(pass.view * glm::vec4(item.depthSortCenter, 1.0f));
+            item.cameraDepth = -viewSpaceCenter.z;
+            const glm::vec3 toCamera = item.depthSortCenter - pass.cameraPosition;
+            item.cameraDistanceSq = glm::dot(toCamera, toCamera);
+        };
+        const auto emit = [&](uint32_t ref, bool opaque) {
+            pass.items.emplace_back();
+            SceneRenderItem& item = pass.items.back();
+            if (ref & kRefStaticBatch) {
+                const StaticMergeBatch& batch = renderer.staticMergeBatches[ref & kRefIndexMask];
+                item.staticBatch = &batch;
+                item.mesh = batch.mesh.get();
+                item.model = glm::mat4(1.0f);
+                item.sortCenter = batch.boundsCenter;
+                item.depthSortCenter = batch.boundsCenter;
+                item.vertPath = &batch.vertPath;
+                item.fragPath = &batch.fragPath;
+                item.material = batch.material;
+                item.materialPath = &batch.materialPath;
+                item.albedoTexturePath = &batch.albedoTexturePath;
+                item.overlayTexturePath = &batch.overlayTexturePath;
+                item.normalMapPath = &batch.normalMapPath;
+                item.metallicRoughnessMapPath = &batch.metallicRoughnessMapPath;
+                item.metallicMapPath = &batch.metallicMapPath;
+                item.roughnessMapPath = &batch.roughnessMapPath;
+                item.opacityMapPath = &batch.opacityMapPath;
+                item.emissiveMapPath = &batch.emissiveMapPath;
+                item.occlusionMapPath = &batch.occlusionMapPath;
+                item.heightMapPath = &batch.heightMapPath;
+                item.useOverlay = batch.useOverlay;
+                item.unlit = batch.unlit;
+                item.doubleSided = batch.doubleSided;
+                const glm::vec3 viewSpaceCenter = glm::vec3(pass.view * glm::vec4(item.depthSortCenter, 1.0f));
+                item.cameraDepth = -viewSpaceCenter.z;
+                const glm::vec3 toCamera = item.depthSortCenter - pass.cameraPosition;
+                item.cameraDistanceSq = glm::dot(toCamera, toCamera);
+            } else if (ref & kRefMultiDraw) {
+                const uint32_t batchIndex = ref & kRefIndexMask;
+                fillObjectItem(item, md.batches[batchIndex].representative);
+                item.mesh = nullptr;
+                item.multiDrawBatch = static_cast<int>(batchIndex);
+            } else {
+                fillObjectItem(item, ref);
+            }
+            item.requiresBlending = !opaque;
+            item.sortOpaque = opaque;
+        };
+        pass.items.reserve(pass.opaque.size() + pass.transparent.size());
+        for (const OpaqueEntry& entry : pass.opaque) {
+            emit(entry.ref, true);
+        }
+        for (const TransparentEntry& entry : pass.transparent) {
+            emit(entry.ref, false);
+        }
+
+        // Resolve each shader pair once per pass instead of building its cache key per draw,
+        // and each item's reflection probe once instead of scanning the scene per draw.
+        const auto resolveShader = [&](const std::string& vert, const std::string& frag) {
+            for (const ShaderSlot& slot : pass.shaders) {
+                if (*slot.vert == vert && *slot.frag == frag) return slot.shader;
+            }
+            Shader* shader = renderer.getShader(vert, frag);
+            pass.shaders.push_back({&vert, &frag, shader});
+            return shader;
+        };
+        for (SceneRenderItem& item : pass.items) {
+            const std::string& frag = item.fragPath ? *item.fragPath : kEmptyRenderPath;
+            if (item.multiDrawBatch >= 0) {
+                Shader* shader = resolveShader(kMultiDrawVertPath, frag);
+                // A material shader that fails to build falls back to the default program,
+                // whose vertex stage reads the per-draw model uniform. Keep the batch vertex
+                // stage and fall back only the fragment half.
+                if (shader == renderer.defaultShader) {
+                    shader = resolveShader(kMultiDrawVertPath, renderer.defaultFragPath);
+                }
+                item.shader = shader;
+            } else {
+                item.shader = resolveShader(item.vertPath ? *item.vertPath : kEmptyRenderPath, frag);
+            }
+            item.reflectionResolved = true;
+            item.reflectionCube = 0;
+            item.reflectionIntensity = 0.0f;
+            float bestDistSq = std::numeric_limits<float>::max();
+            for (const ProbeRef& probe : pass.probes) {
+                const glm::vec3 delta = item.sortCenter - probe.position;
+                const float distSq = glm::dot(delta, delta);
+                if (distSq > probe.range * probe.range || distSq >= bestDistSq) continue;
+                bestDistSq = distSq;
+                item.reflectionCube = probe.cube;
+                const float distance = std::sqrt(std::max(0.0f, distSq));
+                item.reflectionIntensity =
+                    probe.intensity * glm::clamp(1.0f - distance / probe.range, 0.0f, 1.0f);
+            }
+        }
+    }
+
+    if (gpuCulling) {
+        MODU_PROFILE_SCOPE("Renderer::GPUCulling", ProfilerSampleCategory::RenderDetail);
+        pass.gpuCommandRegion = state.dispatchGpuCulling(pass, settings, plan.hiZ, renderer.activeStats);
+        if (pass.gpuCommandRegion < 0) {
+            // The dispatch could not run; draw every batched object rather than none.
+            for (MultiDrawBatch& batch : md.batches) {
+                batch.visibleCount = batch.slotCount;
+                for (uint32_t slot = batch.firstSlot; slot < batch.firstSlot + batch.slotCount; ++slot) {
+                    RenderOpt::DrawArraysIndirectCommand& command = md.passCommands[slot];
+                    command.count = static_cast<GLuint>(md.slotCount[slot]);
+                    command.instanceCount = 1;
+                    command.first = static_cast<GLuint>(md.slotFirst[slot]);
+                    command.baseInstance = slot;
+                }
+            }
+            state.uploadPassCommands();
+        }
+    }
+
+    pass.multiDrawUsed = multiDrawActive;
+    passStats.objectsSubmitted += submitted;
+    passStats.objectsCulled += culled;
+    passStats.objectsLodCulled += lodCulled;
+    passStats.visibleRenderables += static_cast<int>(pass.candidates.size()) + batchedVisible;
+    passStats.triangles += batchedTriangles;
+    passStats.indirectDrawCommands += indirectCommands;
+    if (multiDrawActive) {
+        passStats.mdiObjects += static_cast<int>(md.slotObject.size());
+        passStats.mdiBatches += static_cast<int>(md.batches.size());
+    }
+    passStats.queueBuildMs += MillisecondsSince(queueStart);
+}
+
+void Renderer::OptimizationState::finishPass(Renderer& renderer, Pass& pass, RenderStats& passStats) {
+    OptimizationState& state = *renderer.optState;
+    const PassPlan& plan = pass.plan;
+    // Next frame's Hi-Z test reads this frame's finished depth.
+    if (plan.hiZ && pass.depthTexture != 0 && !pass.reflectionCapture && state.ensureComputePrograms()) {
+        MODU_PROFILE_SCOPE("Renderer::GPUCulling", ProfilerSampleCategory::RenderDetail);
+        state.buildHiZ(pass);
+    }
+    const GpuResult gpu = state.latestGpuResult(renderer.activeStats);
+    if (pass.gpuCommandRegion >= 0) {
+        passStats.gpuCullingMs = gpu.ms;
+        passStats.gpuVisible = gpu.visible;
+    }
+    uint32_t features = 0;
+    if (plan.cpuCulling) features |= kRenderOptCpuCulling;
+    if (plan.staticCache) features |= kRenderOptStaticCache;
+    if (plan.sorting) features |= kRenderOptSorting;
+    if (plan.lod) features |= kRenderOptLod;
+    if (pass.multiDrawUsed) features |= kRenderOptMultiDraw;
+    if (pass.gpuCommandRegion >= 0) features |= kRenderOptGpuCulling;
+    if (pass.gpuCommandRegion >= 0 && plan.hiZ) features |= kRenderOptHiZ;
+    passStats.optimizationFeatures = features;
+    passStats.optimizationAutomatic = plan.automatic;
+    state.notePassCosts(plan, passStats.mdiObjects, passStats.mdiBatches, pass.multiDrawCpuCullMs,
+                        pass.gpuCommandRegion >= 0 ? gpu.ms : -1.0f);
+
+    // MODULARITY_RENDER_OPT_LOG=1 prints one main view's pass every 5 s: the numbers the
+    // stats overlay shows, for builds and players that have no overlay.
+    static const bool logPasses = [] {
+        const char* value = std::getenv("MODULARITY_RENDER_OPT_LOG");
+        return value && value[0] == '1';
+    }();
+    static double lastLogSec[2] = {0.0, 0.0};
+    const int logView = renderer.activeStats == &renderer.viewportStats ? 0
+                      : renderer.activeStats == &renderer.previewStats ? 1 : -1;
+    if (logPasses && logView >= 0 && !pass.reflectionCapture) {
+        const double now = glfwGetTime();
+        if (now - lastLogSec[logView] >= 5.0) {
+            lastLogSec[logView] = now;
+            std::fprintf(stderr,
+                         "[RenderOpt] %s%s: features 0x%02x | submitted %d culled %d lod %d visible %d | "
+                         "multi-draw %d obj %d batches %d cmds | queue %.3f ms "
+                         "(cull %.3f, sort %.3f, batched cull %.3f) | gpu cull %.3f ms %d visible\n",
+                         logView == 0 ? "viewport" : "preview", plan.automatic ? " (auto)" : "",
+                         features, passStats.objectsSubmitted, passStats.objectsCulled,
+                         passStats.objectsLodCulled, passStats.visibleRenderables,
+                         passStats.mdiObjects, passStats.mdiBatches, passStats.indirectDrawCommands,
+                         passStats.queueBuildMs, passStats.cpuCullingMs,
+                         passStats.sortingMs, pass.multiDrawCpuCullMs, passStats.gpuCullingMs,
+                         passStats.gpuVisible);
+        }
+    }
+
+    if (RenderStats* stats = renderer.activeStats) {
+        stats->objectsSubmitted += passStats.objectsSubmitted;
+        stats->objectsCulled += passStats.objectsCulled;
+        stats->objectsLodCulled += passStats.objectsLodCulled;
+        stats->visibleRenderables += passStats.visibleRenderables;
+        stats->mdiObjects += passStats.mdiObjects;
+        stats->mdiBatches += passStats.mdiBatches;
+        stats->indirectDrawCommands += passStats.indirectDrawCommands;
+        stats->triangles += passStats.triangles;
+        stats->cpuCullingMs += passStats.cpuCullingMs;
+        stats->queueBuildMs += passStats.queueBuildMs;
+        stats->sortingMs += passStats.sortingMs;
+        stats->optimizationFeatures |= passStats.optimizationFeatures;
+        stats->optimizationAutomatic = stats->optimizationAutomatic || passStats.optimizationAutomatic;
+        if (pass.gpuCommandRegion >= 0) {
+            stats->gpuCullingMs = passStats.gpuCullingMs;
+            stats->gpuVisible = passStats.gpuVisible;
+        }
+    }
+}
+
 void Renderer::renderSceneInternal(const Camera& camera, const std::vector<SceneObject>& sceneObjects, int width, int height, bool unbindFramebuffer, float fovDeg, float nearPlane, float farPlane, bool drawMirrorObjects, bool drawSkybox) {
     if (!defaultShader || width <= 0 || height <= 0) return;
 
@@ -4094,7 +5322,21 @@ void Renderer::renderSceneInternal(const Camera& camera, const std::vector<Scene
 
     FrustumPlanes frustum = BuildFrustumPlanes(proj * view);
     capturedSceneFrustums.push_back(frustum.planes);
+    capturedSceneViews.push_back({view, proj, width, height});
     const float timeSeconds = static_cast<float>(glfwGetTime());
+
+    // Project Settings > Optimization. Null when nothing is enabled, or when Automatic
+    // picked the plain path for this scene: then everything below runs as it always has.
+    OptimizationState::Pass* optPass = OptimizationState::beginPass(
+        *this, camera, sceneObjects, view, proj, frustum.planes, width, height, farPlane,
+        drawMirrorObjects);
+    struct OptimizedPassEnd {
+        Renderer* renderer = nullptr;
+        ~OptimizedPassEnd() {
+            if (renderer && renderer->optState) --renderer->optState->passDepth;
+        }
+    } optimizedPassEnd{optPass ? this : nullptr};
+    RenderStats optPassStats;
 
     auto buildDirectionalShadowMatrix = [&](const glm::vec3& lightDir) {
         glm::mat4 shadowFitProj = proj;
@@ -4208,6 +5450,36 @@ void Renderer::renderSceneInternal(const Camera& camera, const std::vector<Scene
         glEnable(GL_CULL_FACE);
         glCullFace(GL_BACK);
 
+        // Multi-draw: static casters whose meshes are in the arena draw as one batch per light
+        // (per cube face for point lights); anything else still draws one at a time.
+        Shader* directionalCasterBatch = nullptr;
+        Shader* cubeCasterBatch = nullptr;
+        if (optPass && OptimizationState::prepareShadowBatch(*this, *optPass, sceneObjects)) {
+            const auto usable = [&](Shader* program) {
+                return (program && program != defaultShader && program->ID != 0) ? program : nullptr;
+            };
+            directionalCasterBatch = usable(getShader(kShadowDirectionalMultiDrawVertPath,
+                                                      directionalShadowDepthFragPath));
+            cubeCasterBatch = usable(getShader(kShadowCubeMultiDrawVertPath, shadowDepthFragPath));
+        }
+        const auto batchedCasterSlot = [&](uint32_t objectIndex, Shader* batchProgram) {
+            return batchProgram ? optState->shadowBatch.objectSlot[objectIndex] : UINT32_MAX;
+        };
+        const auto queueBatchedCaster = [&](size_t& queued, uint32_t slot) {
+            auto& sb = optState->shadowBatch;
+            RenderOpt::DrawArraysIndirectCommand& command = sb.commands[queued++];
+            command.count = static_cast<GLuint>(sb.slotCount[slot]);
+            command.instanceCount = 1;
+            command.first = static_cast<GLuint>(sb.slotFirst[slot]);
+            command.baseInstance = slot;
+        };
+        const auto noteBatchedCasters = [&](size_t queued) {
+            if (activeStats) {
+                activeStats->multiDrawCalls += 1;
+                activeStats->indirectDrawCommands += static_cast<int>(queued);
+            }
+        };
+
         int shadowSlot = 0;
         for (auto& light : lights) {
             light.shadowMapIndex = -1;
@@ -4280,6 +5552,44 @@ void Renderer::renderSceneInternal(const Camera& camera, const std::vector<Scene
                 glClear(GL_DEPTH_BUFFER_BIT);
 
                 const FrustumPlanes shadowFrustum = BuildFrustumPlanes(light.shadowMatrix);
+                if (optPass) {
+                    // Cached matrices and bounds instead of rebuilding every caster's matrix
+                    // per light. LOD skips casters under one shadow texel across.
+                    OptimizationState::collectShadowCasters(*this, *optPass, sceneObjects);
+                    const glm::vec3 lightRow(light.shadowMatrix[0][0], light.shadowMatrix[1][0],
+                                             light.shadowMatrix[2][0]);
+                    const float texelsPerUnit =
+                        0.5f * static_cast<float>(shadowMap.resolution) * glm::length(lightRow);
+                    size_t queued = 0;
+                    for (const auto& caster : optPass->shadowCasters) {
+                        if (sceneObjects[caster.first].id == light.sourceId) continue;
+                        const RenderOpt::CullBounds& b = optState->bounds[caster.first];
+                        if (b.hasBounds) {
+                            if (optPass->plan.cpuCulling &&
+                                (!RenderOpt::SphereInsidePlanes(shadowFrustum.planes, b.center, b.radius) ||
+                                 !RenderOpt::AabbInsidePlanes(shadowFrustum.planes, b.center, b.extents))) {
+                                continue;
+                            }
+                            if (optPass->plan.lod && 2.0f * b.radius * texelsPerUnit < 1.0f) {
+                                continue;
+                            }
+                        }
+                        const uint32_t batchSlot = batchedCasterSlot(caster.first, directionalCasterBatch);
+                        if (batchSlot != UINT32_MAX) {
+                            queueBatchedCaster(queued, batchSlot);
+                            continue;
+                        }
+                        directionalShadowDepthShader->setMat4("model", optState->cache[caster.first].model);
+                        caster.second->draw();
+                    }
+                    if (queued > 0) {
+                        directionalCasterBatch->use();
+                        directionalCasterBatch->setMat4("lightSpaceMatrix", light.shadowMatrix);
+                        optState->drawShadowBatch(queued);
+                        noteBatchedCasters(queued);
+                    }
+                    continue;
+                }
                 for (const auto& obj : sceneObjects) {
                     if (!IsObjectEnabledInHierarchy(obj) || !HasRendererComponent(obj)) continue;
                     if (obj.renderType == RenderType::Mirror) continue;
@@ -4373,6 +5683,58 @@ void Renderer::renderSceneInternal(const Camera& camera, const std::vector<Scene
                 glClear(GL_DEPTH_BUFFER_BIT);
                 shadowDepthShader->setMat4("lightSpaceMatrix", shadowProj * shadowViews[face]);
 
+                if (optPass) {
+                    // The legacy loop only range-tests casters, so every caster in range is
+                    // drawn into all six faces. CPU culling also tests each face's frustum.
+                    OptimizationState::collectShadowCasters(*this, *optPass, sceneObjects);
+                    FrustumPlanes faceFrustum{};
+                    if (optPass->plan.cpuCulling) {
+                        faceFrustum = BuildFrustumPlanes(shadowProj * shadowViews[face]);
+                    }
+                    // A 90 degree face: one texel spans 2 * distance / resolution.
+                    const float texelsAtUnitDistance = 0.5f * static_cast<float>(shadowMap.resolution);
+                    size_t queued = 0;
+                    for (const auto& caster : optPass->shadowCasters) {
+                        if (sceneObjects[caster.first].id == light.sourceId) continue;
+                        const RenderOpt::CullBounds& b = optState->bounds[caster.first];
+                        if (b.hasBounds) {
+                            const glm::vec3 lightDelta = b.center - light.pos;
+                            const float distanceSq = glm::dot(lightDelta, lightDelta);
+                            const float maxDistance = light.shadowFar + b.radius;
+                            if (distanceSq > maxDistance * maxDistance) continue;
+                            if (optPass->plan.cpuCulling &&
+                                (!RenderOpt::SphereInsidePlanes(faceFrustum.planes, b.center, b.radius) ||
+                                 !RenderOpt::AabbInsidePlanes(faceFrustum.planes, b.center, b.extents))) {
+                                continue;
+                            }
+                            if (optPass->plan.lod) {
+                                const float distance = std::sqrt(distanceSq);
+                                if (distance > b.radius &&
+                                    2.0f * b.radius * texelsAtUnitDistance / distance < 1.0f) {
+                                    continue;
+                                }
+                            }
+                        }
+                        const uint32_t batchSlot = batchedCasterSlot(caster.first, cubeCasterBatch);
+                        if (batchSlot != UINT32_MAX) {
+                            queueBatchedCaster(queued, batchSlot);
+                            continue;
+                        }
+                        shadowDepthShader->setMat4("model", optState->cache[caster.first].model);
+                        caster.second->draw();
+                    }
+                    if (queued > 0) {
+                        cubeCasterBatch->use();
+                        cubeCasterBatch->setMat4("lightSpaceMatrix", shadowProj * shadowViews[face]);
+                        cubeCasterBatch->setVec3("lightPos", light.pos);
+                        cubeCasterBatch->setFloat("farPlane", light.shadowFar);
+                        optState->drawShadowBatch(queued);
+                        noteBatchedCasters(queued);
+                        shadowDepthShader->use();   // the next face sets its matrix on this
+                    }
+                    continue;
+                }
+
                 for (const auto& obj : sceneObjects) {
                     if (!IsObjectEnabledInHierarchy(obj) || !HasRendererComponent(obj)) continue;
                     if (obj.renderType == RenderType::Mirror) continue;
@@ -4465,288 +5827,265 @@ void Renderer::renderSceneInternal(const Camera& camera, const std::vector<Scene
     } else if (drawSkybox) {
         skyboxPending = true;
     }
-    rebuildStaticMergeBatches(sceneObjects);
-
     const std::string emptyPath;
-    auto combineHash = [](uint64_t seed, uint64_t value) {
-        seed ^= value + 0x9e3779b97f4a7c15ull + (seed << 6) + (seed >> 2);
-        return seed;
-    };
-    auto buildOpaqueSortKey = [&](const std::string& vert,
-                                  const std::string& frag,
-                                  const std::string& material,
-                                  const std::string& albedo,
-                                  const std::string& overlay,
-                                  const std::string& normal) {
-        uint64_t key = 1469598103934665603ull;
-        key = combineHash(key, HashStringFNV1a(vert));
-        key = combineHash(key, HashStringFNV1a(frag));
-        key = combineHash(key, HashStringFNV1a(material));
-        key = combineHash(key, HashStringFNV1a(albedo));
-        key = combineHash(key, HashStringFNV1a(overlay));
-        key = combineHash(key, HashStringFNV1a(normal));
-        return key;
-    };
+    using RenderItem = SceneRenderItem;
+    // The optimized path keeps its draw list between frames; the legacy list is rebuilt
+    // (and reallocated) every pass, exactly as it always was.
+    std::vector<RenderItem> legacyDrawItems;
+    std::vector<RenderItem>& drawItems = optPass ? optPass->items : legacyDrawItems;
+    if (optPass) {
+        OptimizationState::buildQueue(*this, *optPass, sceneObjects, optPassStats);
+    } else {
+        MODU_PROFILE_SCOPE("Renderer::BuildRenderQueue", ProfilerSampleCategory::RenderDetail);
+        rebuildStaticMergeBatches(sceneObjects);
 
-    using RenderPathRef = const std::string*;
+        auto combineHash = [](uint64_t seed, uint64_t value) {
+            seed ^= value + 0x9e3779b97f4a7c15ull + (seed << 6) + (seed >> 2);
+            return seed;
+        };
+        auto buildOpaqueSortKey = [&](const std::string& vert,
+                                      const std::string& frag,
+                                      const std::string& material,
+                                      const std::string& albedo,
+                                      const std::string& overlay,
+                                      const std::string& normal) {
+            uint64_t key = 1469598103934665603ull;
+            key = combineHash(key, HashStringFNV1a(vert));
+            key = combineHash(key, HashStringFNV1a(frag));
+            key = combineHash(key, HashStringFNV1a(material));
+            key = combineHash(key, HashStringFNV1a(albedo));
+            key = combineHash(key, HashStringFNV1a(overlay));
+            key = combineHash(key, HashStringFNV1a(normal));
+            return key;
+        };
 
-    struct RenderItem {
-        const SceneObject* obj = nullptr;
-        const StaticMergeBatch* staticBatch = nullptr;
-        Mesh* mesh = nullptr;
-        glm::mat4 model = glm::mat4(1.0f);
-        glm::vec3 sortCenter = glm::vec3(0.0f);
-        glm::vec3 depthSortCenter = glm::vec3(0.0f);
-        RenderPathRef vertPath = nullptr;
-        RenderPathRef fragPath = nullptr;
-        MaterialProperties material = MaterialProperties{};
-        RenderPathRef materialPath = nullptr;
-        RenderPathRef albedoTexturePath = nullptr;
-        RenderPathRef overlayTexturePath = nullptr;
-        RenderPathRef normalMapPath = nullptr;
-        RenderPathRef metallicRoughnessMapPath = nullptr;
-        RenderPathRef metallicMapPath = nullptr;
-        RenderPathRef roughnessMapPath = nullptr;
-        RenderPathRef opacityMapPath = nullptr;
-        RenderPathRef emissiveMapPath = nullptr;
-        RenderPathRef occlusionMapPath = nullptr;
-        RenderPathRef heightMapPath = nullptr;
-        bool useOverlay = false;
-        int boneLimit = 0;
-        int availableBones = 0;
-        bool wantsGpuSkinning = false;
-        bool isUiCanvas3D = false;
-        int uiSortingOrder = 0;
-        bool requiresBlending = false;
-        bool sortOpaque = false;
-        bool unlit = false;
-        bool doubleSided = false;
-        float cameraDepth = 0.0f;
-        float cameraDistanceSq = 0.0f;
-        uint64_t opaqueSortKey = 0;
-    };
+        drawItems.reserve(sceneObjects.size() + staticMergeBatches.size());
 
-    std::vector<RenderItem> drawItems;
-    drawItems.reserve(sceneObjects.size() + staticMergeBatches.size());
+        const bool cullingMaskAllowsAll = (camera.cullingMask == 0xFFFFFFFFu);
 
-    const bool cullingMaskAllowsAll = (camera.cullingMask == 0xFFFFFFFFu);
+        auto gatherRenderItemsRange = [&](size_t beginIndex, size_t endIndex) {
+            std::vector<RenderItem> localItems;
+            localItems.reserve(endIndex > beginIndex ? (endIndex - beginIndex) : 0);
 
-    auto gatherRenderItemsRange = [&](size_t beginIndex, size_t endIndex) {
-        std::vector<RenderItem> localItems;
-        localItems.reserve(endIndex > beginIndex ? (endIndex - beginIndex) : 0);
+            for (size_t objIndex = beginIndex; objIndex < endIndex; ++objIndex) {
+                const auto& obj = sceneObjects[objIndex];
+                if (!IsObjectEnabledInHierarchy(obj)) continue;
+                if (!cullingMaskAllowsAll &&
+                    (camera.cullingMask & (1u << (static_cast<uint32_t>(obj.layer) & 31u))) == 0u) continue;
+                if (!drawMirrorObjects && obj.hasRenderer && obj.renderType == RenderType::Mirror) continue;
+                if (!HasRendererComponent(obj)) continue;
+                if (cullingMaskAllowsAll &&
+                    staticMergeSourceIds.find(obj.id) != staticMergeSourceIds.end()) continue;
 
-        for (size_t objIndex = beginIndex; objIndex < endIndex; ++objIndex) {
-            const auto& obj = sceneObjects[objIndex];
-            if (!IsObjectEnabledInHierarchy(obj)) continue;
-            if (!cullingMaskAllowsAll &&
-                (camera.cullingMask & (1u << (static_cast<uint32_t>(obj.layer) & 31u))) == 0u) continue;
-            if (!drawMirrorObjects && obj.hasRenderer && obj.renderType == RenderType::Mirror) continue;
-            if (!HasRendererComponent(obj)) continue;
-            if (cullingMaskAllowsAll &&
-                staticMergeSourceIds.find(obj.id) != staticMergeSourceIds.end()) continue;
+                glm::mat4 model = buildModelMatrix(obj);
+                glm::vec3 boundsCenter(0.0f);
+                float boundsRadius = 0.0f;
+                const bool hasBounds = TryComputeObjectCullSphere(obj, model, boundsCenter, boundsRadius);
+                if (hasBounds && !SphereInsideFrustum(frustum, boundsCenter, boundsRadius)) {
+                    continue;
+                }
 
-            glm::mat4 model = buildModelMatrix(obj);
-            glm::vec3 boundsCenter(0.0f);
-            float boundsRadius = 0.0f;
-            const bool hasBounds = TryComputeObjectCullSphere(obj, model, boundsCenter, boundsRadius);
-            if (hasBounds && !SphereInsideFrustum(frustum, boundsCenter, boundsRadius)) {
+                Mesh* mesh = selectMeshForObject(obj);
+                if (!mesh) continue;
+
+                RenderItem item;
+                item.obj = &obj;
+                item.mesh = mesh;
+                item.model = model;
+                item.sortCenter = obj.position;
+                item.depthSortCenter = hasBounds ? boundsCenter : obj.position;
+                item.vertPath = &obj.vertexShaderPath;
+                item.fragPath = &obj.fragmentShaderPath;
+                item.material = obj.material;
+                item.materialPath = &obj.materialPath;
+                item.albedoTexturePath = &obj.albedoTexturePath;
+                item.overlayTexturePath = &obj.overlayTexturePath;
+                item.normalMapPath = &obj.normalMapPath;
+                item.metallicRoughnessMapPath = &obj.metallicRoughnessMapPath;
+                item.metallicMapPath = &obj.metallicMapPath;
+                item.roughnessMapPath = &obj.roughnessMapPath;
+                item.opacityMapPath = &obj.opacityMapPath;
+                item.emissiveMapPath = &obj.emissiveMapPath;
+                item.occlusionMapPath = &obj.occlusionMapPath;
+                item.heightMapPath = &obj.heightMapPath;
+                item.useOverlay = obj.useOverlay;
+                item.boneLimit = obj.skeletal.maxBones;
+                item.availableBones = static_cast<int>(obj.skeletal.finalMatrices.size());
+                bool needsFallback = obj.hasSkeletalAnimation && obj.skeletal.enabled &&
+                                     obj.skeletal.allowCpuFallback &&
+                                     item.boneLimit > 0 && item.availableBones > item.boneLimit;
+                item.wantsGpuSkinning = obj.hasSkeletalAnimation && obj.skeletal.enabled &&
+                                        obj.skeletal.useGpuSkinning && !needsFallback;
+                if (item.wantsGpuSkinning && item.vertPath->empty()) {
+                    item.vertPath = &skinnedVertPath;
+                }
+                item.isUiCanvas3D = obj.hasUI && obj.ui.type == UIElementType::Canvas && obj.ui.renderIn3D;
+                item.uiSortingOrder = item.isUiCanvas3D ? obj.ui.sortingOrder : 0;
+                item.requiresBlending = item.material.alpha < 0.999f || item.isUiCanvas3D;
+                item.unlit = obj.renderType == RenderType::Mirror || obj.renderType == RenderType::Sprite || item.isUiCanvas3D;
+                item.doubleSided =
+                    obj.renderType == RenderType::Sprite ||
+                    obj.renderType == RenderType::Mirror;
+                glm::vec3 viewSpaceCenter = glm::vec3(view * glm::vec4(item.depthSortCenter, 1.0f));
+                item.cameraDepth = -viewSpaceCenter.z;
+                glm::vec3 toCamera = item.depthSortCenter - camera.position;
+                item.cameraDistanceSq = glm::dot(toCamera, toCamera);
+                localItems.push_back(std::move(item));
+            }
+
+            return localItems;
+        };
+
+        const unsigned int hardwareThreads = std::thread::hardware_concurrency();
+        const size_t minItemsPerTask = 2048;
+        const size_t maxTaskCountByWork = std::max<size_t>(1, sceneObjects.size() / minItemsPerTask);
+        const size_t taskCount = (hardwareThreads > 4 && sceneObjects.size() >= minItemsPerTask * 2)
+            ? std::min<size_t>(hardwareThreads, maxTaskCountByWork)
+            : 1;
+
+        if (taskCount <= 1) {
+            drawItems = gatherRenderItemsRange(0, sceneObjects.size());
+        } else {
+            std::vector<std::future<std::vector<RenderItem>>> gatherFutures;
+            gatherFutures.reserve(taskCount);
+            const size_t chunkSize = (sceneObjects.size() + taskCount - 1) / taskCount;
+
+            for (size_t taskIndex = 0; taskIndex < taskCount; ++taskIndex) {
+                const size_t beginIndex = taskIndex * chunkSize;
+                if (beginIndex >= sceneObjects.size()) {
+                    break;
+                }
+                const size_t endIndex = std::min(sceneObjects.size(), beginIndex + chunkSize);
+                gatherFutures.push_back(std::async(std::launch::async,
+                    [&, beginIndex, endIndex]() {
+                        return gatherRenderItemsRange(beginIndex, endIndex);
+                    }));
+            }
+
+            for (auto& future : gatherFutures) {
+                std::vector<RenderItem> chunkItems = future.get();
+                drawItems.insert(drawItems.end(),
+                                 std::make_move_iterator(chunkItems.begin()),
+                                 std::make_move_iterator(chunkItems.end()));
+            }
+        }
+
+        for (const auto& batch : staticMergeBatches) {
+            if (!cullingMaskAllowsAll) break;
+            if (!batch.mesh) continue;
+            if (batch.boundsRadius > 0.0f &&
+                !SphereInsideFrustum(frustum, batch.boundsCenter, batch.boundsRadius)) {
                 continue;
             }
 
-            Mesh* mesh = selectMeshForObject(obj);
-            if (!mesh) continue;
-
             RenderItem item;
-            item.obj = &obj;
-            item.mesh = mesh;
-            item.model = model;
-            item.sortCenter = obj.position;
-            item.depthSortCenter = hasBounds ? boundsCenter : obj.position;
-            item.vertPath = &obj.vertexShaderPath;
-            item.fragPath = &obj.fragmentShaderPath;
-            item.material = obj.material;
-            item.materialPath = &obj.materialPath;
-            item.albedoTexturePath = &obj.albedoTexturePath;
-            item.overlayTexturePath = &obj.overlayTexturePath;
-            item.normalMapPath = &obj.normalMapPath;
-            item.metallicRoughnessMapPath = &obj.metallicRoughnessMapPath;
-            item.metallicMapPath = &obj.metallicMapPath;
-            item.roughnessMapPath = &obj.roughnessMapPath;
-            item.opacityMapPath = &obj.opacityMapPath;
-            item.emissiveMapPath = &obj.emissiveMapPath;
-            item.occlusionMapPath = &obj.occlusionMapPath;
-            item.heightMapPath = &obj.heightMapPath;
-            item.useOverlay = obj.useOverlay;
-            item.boneLimit = obj.skeletal.maxBones;
-            item.availableBones = static_cast<int>(obj.skeletal.finalMatrices.size());
-            bool needsFallback = obj.hasSkeletalAnimation && obj.skeletal.enabled &&
-                                 obj.skeletal.allowCpuFallback &&
-                                 item.boneLimit > 0 && item.availableBones > item.boneLimit;
-            item.wantsGpuSkinning = obj.hasSkeletalAnimation && obj.skeletal.enabled &&
-                                    obj.skeletal.useGpuSkinning && !needsFallback;
-            if (item.wantsGpuSkinning && item.vertPath->empty()) {
-                item.vertPath = &skinnedVertPath;
-            }
-            item.isUiCanvas3D = obj.hasUI && obj.ui.type == UIElementType::Canvas && obj.ui.renderIn3D;
-            item.uiSortingOrder = item.isUiCanvas3D ? obj.ui.sortingOrder : 0;
-            item.requiresBlending = item.material.alpha < 0.999f || item.isUiCanvas3D;
-            item.unlit = obj.renderType == RenderType::Mirror || obj.renderType == RenderType::Sprite || item.isUiCanvas3D;
-            item.doubleSided =
-                obj.renderType == RenderType::Sprite ||
-                obj.renderType == RenderType::Mirror;
+            item.staticBatch = &batch;
+            item.mesh = batch.mesh.get();
+            item.model = glm::mat4(1.0f);
+            item.sortCenter = batch.boundsCenter;
+            item.depthSortCenter = batch.boundsCenter;
+            item.vertPath = &batch.vertPath;
+            item.fragPath = &batch.fragPath;
+            item.material = batch.material;
+            item.materialPath = &batch.materialPath;
+            item.albedoTexturePath = &batch.albedoTexturePath;
+            item.overlayTexturePath = &batch.overlayTexturePath;
+            item.normalMapPath = &batch.normalMapPath;
+            item.metallicRoughnessMapPath = &batch.metallicRoughnessMapPath;
+            item.metallicMapPath = &batch.metallicMapPath;
+            item.roughnessMapPath = &batch.roughnessMapPath;
+            item.opacityMapPath = &batch.opacityMapPath;
+            item.emissiveMapPath = &batch.emissiveMapPath;
+            item.occlusionMapPath = &batch.occlusionMapPath;
+            item.heightMapPath = &batch.heightMapPath;
+            item.useOverlay = batch.useOverlay;
+            item.requiresBlending = item.material.alpha < 0.999f;
+            item.unlit = batch.unlit;
+            item.doubleSided = batch.doubleSided;
             glm::vec3 viewSpaceCenter = glm::vec3(view * glm::vec4(item.depthSortCenter, 1.0f));
             item.cameraDepth = -viewSpaceCenter.z;
             glm::vec3 toCamera = item.depthSortCenter - camera.position;
             item.cameraDistanceSq = glm::dot(toCamera, toCamera);
-            localItems.push_back(std::move(item));
+            drawItems.push_back(std::move(item));
         }
 
-        return localItems;
-    };
-
-    const unsigned int hardwareThreads = std::thread::hardware_concurrency();
-    const size_t minItemsPerTask = 2048;
-    const size_t maxTaskCountByWork = std::max<size_t>(1, sceneObjects.size() / minItemsPerTask);
-    const size_t taskCount = (hardwareThreads > 4 && sceneObjects.size() >= minItemsPerTask * 2)
-        ? std::min<size_t>(hardwareThreads, maxTaskCountByWork)
-        : 1;
-
-    if (taskCount <= 1) {
-        drawItems = gatherRenderItemsRange(0, sceneObjects.size());
-    } else {
-        std::vector<std::future<std::vector<RenderItem>>> gatherFutures;
-        gatherFutures.reserve(taskCount);
-        const size_t chunkSize = (sceneObjects.size() + taskCount - 1) / taskCount;
-
-        for (size_t taskIndex = 0; taskIndex < taskCount; ++taskIndex) {
-            const size_t beginIndex = taskIndex * chunkSize;
-            if (beginIndex >= sceneObjects.size()) {
-                break;
+        auto classifyAlphaBehavior = [&](RenderItem& item) {
+            if (item.requiresBlending) {
+                item.sortOpaque = false;
+                return;
             }
-            const size_t endIndex = std::min(sceneObjects.size(), beginIndex + chunkSize);
-            gatherFutures.push_back(std::async(std::launch::async,
-                [&, beginIndex, endIndex]() {
-                    return gatherRenderItemsRange(beginIndex, endIndex);
-                }));
+
+            if (item.albedoTexturePath && !item.albedoTexturePath->empty()) {
+                if (Texture* tex = getTexture(*item.albedoTexturePath, item.material.textureFilter)) {
+                    if (tex->UsesAlphaBlending()) {
+                        item.requiresBlending = true;
+                    }
+                }
+            }
+
+            item.sortOpaque = !item.requiresBlending;
+            if (item.sortOpaque) {
+                item.opaqueSortKey = buildOpaqueSortKey(
+                    item.vertPath ? *item.vertPath : emptyPath,
+                    item.fragPath ? *item.fragPath : emptyPath,
+                    item.materialPath ? *item.materialPath : emptyPath,
+                    item.albedoTexturePath ? *item.albedoTexturePath : emptyPath,
+                    item.overlayTexturePath ? *item.overlayTexturePath : emptyPath,
+                    item.normalMapPath ? *item.normalMapPath : emptyPath);
+            }
+        };
+
+        for (RenderItem& item : drawItems) {
+            classifyAlphaBehavior(item);
         }
 
-        for (auto& future : gatherFutures) {
-            std::vector<RenderItem> chunkItems = future.get();
-            drawItems.insert(drawItems.end(),
-                             std::make_move_iterator(chunkItems.begin()),
-                             std::make_move_iterator(chunkItems.end()));
-        }
-    }
+        {
+            MODU_PROFILE_SCOPE("Renderer::MaterialSorting", ProfilerSampleCategory::RenderDetail);
+            if (drawItems.size() > 1) {
+                std::stable_sort(drawItems.begin(), drawItems.end(),
+                                 [](const RenderItem& a, const RenderItem& b) {
+                                     if (a.sortOpaque != b.sortOpaque) return a.sortOpaque > b.sortOpaque;
+                                     if (!a.sortOpaque) {
+                                         if (a.cameraDepth != b.cameraDepth) {
+                                             return a.cameraDepth > b.cameraDepth;
+                                         }
+                                         if (a.cameraDistanceSq != b.cameraDistanceSq) {
+                                             return a.cameraDistanceSq > b.cameraDistanceSq;
+                                         }
+                                         int aId = a.obj ? a.obj->id : -1;
+                                         int bId = b.obj ? b.obj->id : -1;
+                                         return aId < bId;
+                                     }
+                                     if (a.opaqueSortKey != b.opaqueSortKey) return a.opaqueSortKey < b.opaqueSortKey;
+                                     int aId = a.obj ? a.obj->id : -1;
+                                     int bId = b.obj ? b.obj->id : -1;
+                                     return aId < bId;
+                                 });
 
-    for (const auto& batch : staticMergeBatches) {
-        if (!cullingMaskAllowsAll) break;
-        if (!batch.mesh) continue;
-        if (batch.boundsRadius > 0.0f &&
-            !SphereInsideFrustum(frustum, batch.boundsCenter, batch.boundsRadius)) {
-            continue;
-        }
-
-        RenderItem item;
-        item.staticBatch = &batch;
-        item.mesh = batch.mesh.get();
-        item.model = glm::mat4(1.0f);
-        item.sortCenter = batch.boundsCenter;
-        item.depthSortCenter = batch.boundsCenter;
-        item.vertPath = &batch.vertPath;
-        item.fragPath = &batch.fragPath;
-        item.material = batch.material;
-        item.materialPath = &batch.materialPath;
-        item.albedoTexturePath = &batch.albedoTexturePath;
-        item.overlayTexturePath = &batch.overlayTexturePath;
-        item.normalMapPath = &batch.normalMapPath;
-        item.metallicRoughnessMapPath = &batch.metallicRoughnessMapPath;
-        item.metallicMapPath = &batch.metallicMapPath;
-        item.roughnessMapPath = &batch.roughnessMapPath;
-        item.opacityMapPath = &batch.opacityMapPath;
-        item.emissiveMapPath = &batch.emissiveMapPath;
-        item.occlusionMapPath = &batch.occlusionMapPath;
-        item.heightMapPath = &batch.heightMapPath;
-        item.useOverlay = batch.useOverlay;
-        item.requiresBlending = item.material.alpha < 0.999f;
-        item.unlit = batch.unlit;
-        item.doubleSided = batch.doubleSided;
-        glm::vec3 viewSpaceCenter = glm::vec3(view * glm::vec4(item.depthSortCenter, 1.0f));
-        item.cameraDepth = -viewSpaceCenter.z;
-        glm::vec3 toCamera = item.depthSortCenter - camera.position;
-        item.cameraDistanceSq = glm::dot(toCamera, toCamera);
-        drawItems.push_back(std::move(item));
-    }
-
-    auto classifyAlphaBehavior = [&](RenderItem& item) {
-        if (item.requiresBlending) {
-            item.sortOpaque = false;
-            return;
-        }
-
-        if (item.albedoTexturePath && !item.albedoTexturePath->empty()) {
-            if (Texture* tex = getTexture(*item.albedoTexturePath, item.material.textureFilter)) {
-                if (tex->UsesAlphaBlending()) {
-                    item.requiresBlending = true;
+                std::vector<size_t> canvasSlots;
+                for (size_t i = 0; i < drawItems.size(); ++i) {
+                    if (!drawItems[i].sortOpaque && drawItems[i].isUiCanvas3D) {
+                        canvasSlots.push_back(i);
+                    }
+                }
+                if (canvasSlots.size() > 1) {
+                    std::vector<RenderItem> canvasItems;
+                    canvasItems.reserve(canvasSlots.size());
+                    for (size_t slot : canvasSlots) {
+                        canvasItems.push_back(drawItems[slot]);
+                    }
+                    std::stable_sort(canvasItems.begin(), canvasItems.end(),
+                                     [](const RenderItem& a, const RenderItem& b) {
+                                         return a.uiSortingOrder < b.uiSortingOrder;
+                                     });
+                    for (size_t i = 0; i < canvasSlots.size(); ++i) {
+                        drawItems[canvasSlots[i]] = canvasItems[i];
+                    }
                 }
             }
         }
-
-        item.sortOpaque = !item.requiresBlending;
-        if (item.sortOpaque) {
-            item.opaqueSortKey = buildOpaqueSortKey(
-                item.vertPath ? *item.vertPath : emptyPath,
-                item.fragPath ? *item.fragPath : emptyPath,
-                item.materialPath ? *item.materialPath : emptyPath,
-                item.albedoTexturePath ? *item.albedoTexturePath : emptyPath,
-                item.overlayTexturePath ? *item.overlayTexturePath : emptyPath,
-                item.normalMapPath ? *item.normalMapPath : emptyPath);
-        }
-    };
-
-    for (RenderItem& item : drawItems) {
-        classifyAlphaBehavior(item);
-    }
-
-    if (drawItems.size() > 1) {
-        std::stable_sort(drawItems.begin(), drawItems.end(),
-                         [](const RenderItem& a, const RenderItem& b) {
-                             if (a.sortOpaque != b.sortOpaque) return a.sortOpaque > b.sortOpaque;
-                             if (!a.sortOpaque) {
-                                 if (a.cameraDepth != b.cameraDepth) {
-                                     return a.cameraDepth > b.cameraDepth;
-                                 }
-                                 if (a.cameraDistanceSq != b.cameraDistanceSq) {
-                                     return a.cameraDistanceSq > b.cameraDistanceSq;
-                                 }
-                                 int aId = a.obj ? a.obj->id : -1;
-                                 int bId = b.obj ? b.obj->id : -1;
-                                 return aId < bId;
-                             }
-                             if (a.opaqueSortKey != b.opaqueSortKey) return a.opaqueSortKey < b.opaqueSortKey;
-                             int aId = a.obj ? a.obj->id : -1;
-                             int bId = b.obj ? b.obj->id : -1;
-                             return aId < bId;
-                         });
-
-        std::vector<size_t> canvasSlots;
-        for (size_t i = 0; i < drawItems.size(); ++i) {
-            if (!drawItems[i].sortOpaque && drawItems[i].isUiCanvas3D) {
-                canvasSlots.push_back(i);
-            }
-        }
-        if (canvasSlots.size() > 1) {
-            std::vector<RenderItem> canvasItems;
-            canvasItems.reserve(canvasSlots.size());
-            for (size_t slot : canvasSlots) {
-                canvasItems.push_back(drawItems[slot]);
-            }
-            std::stable_sort(canvasItems.begin(), canvasItems.end(),
-                             [](const RenderItem& a, const RenderItem& b) {
-                                 return a.uiSortingOrder < b.uiSortingOrder;
-                             });
-            for (size_t i = 0; i < canvasSlots.size(); ++i) {
-                drawItems[canvasSlots[i]] = canvasItems[i];
-            }
+        if (activeStats) {
+            activeStats->visibleRenderables += static_cast<int>(drawItems.size());
         }
     }
 
@@ -5003,27 +6342,24 @@ void Renderer::renderSceneInternal(const Camera& camera, const std::vector<Scene
                                       gatherPrevious ? voxelVolume.texture[readIndex] : 0);
                         glActiveTexture(GL_TEXTURE0);
 
-                        for (const RenderItem& item : drawItems) {
-                            if (item.mesh == nullptr || !item.sortOpaque || item.isUiCanvas3D) {
-                                continue;
-                            }
-                            const SceneObject* objPtr = item.obj;
-                            voxelize->setMat4("model", item.model);
+                        const auto voxelizeDraw = [&](const SceneObject* objPtr,
+                                                      const glm::mat4& model,
+                                                      const MaterialProperties& material,
+                                                      const std::string& aPath, Mesh* mesh) {
+                            voxelize->setMat4("model", model);
                             voxelize->setVec4("uvRect",
                                               objPtr ? BuildSpriteUvRect(*objPtr)
                                                      : glm::vec4(0.0f, 0.0f, 1.0f, 1.0f));
                             voxelize->setVec4("uvTransform",
-                                              BuildSurfaceUvTransform(objPtr, item.material));
-                            voxelize->setVec3("materialColor", item.material.color);
-                            voxelize->setVec3("emissionColor", item.material.emissionColor);
-                            voxelize->setFloat("emissionStrength", item.material.emissionStrength);
-                            voxelize->setFloat("ambientStrength", item.material.ambientStrength);
+                                              BuildSurfaceUvTransform(objPtr, material));
+                            voxelize->setVec3("materialColor", material.color);
+                            voxelize->setVec3("emissionColor", material.emissionColor);
+                            voxelize->setFloat("emissionStrength", material.emissionStrength);
+                            voxelize->setFloat("ambientStrength", material.ambientStrength);
 
-                            const std::string& aPath =
-                                item.albedoTexturePath ? *item.albedoTexturePath : emptyPath;
                             bool albedoUsed = false;
                             if (!aPath.empty()) {
-                                if (auto* t = getTexture(aPath, item.material.textureFilter)) {
+                                if (auto* t = getTexture(aPath, material.textureFilter)) {
                                     glActiveTexture(GL_TEXTURE0);
                                     glBindTexture(GL_TEXTURE_2D, t->GetID());
                                     albedoUsed = true;
@@ -5032,7 +6368,37 @@ void Renderer::renderSceneInternal(const Camera& camera, const std::vector<Scene
                             voxelize->setBool("hasAlbedoTex", albedoUsed);
 
                             recordMeshDraw();
-                            item.mesh->draw();
+                            mesh->draw();
+                        };
+                        for (const RenderItem& item : drawItems) {
+                            if (item.multiDrawBatch >= 0 && optState) {
+                                // The voxelizer has its own vertex stage, so batched objects
+                                // voxelize one at a time, limited to the view frustum the
+                                // way the per-object items are.
+                                const auto& md = optState->multiDraw;
+                                const auto& batch = md.batches[static_cast<size_t>(item.multiDrawBatch)];
+                                for (uint32_t slot = batch.firstSlot;
+                                     slot < batch.firstSlot + batch.slotCount; ++slot) {
+                                    const uint32_t objectIndex = md.slotObject[slot];
+                                    const SceneObject& member = sceneObjects[objectIndex];
+                                    const RenderOpt::CullBounds& b = optState->bounds[objectIndex];
+                                    if (b.hasBounds &&
+                                        !RenderOpt::SphereInsidePlanes(frustum.planes, b.center, b.radius)) {
+                                        continue;
+                                    }
+                                    if (Mesh* mesh = OptimizationState::meshFor(*this, member)) {
+                                        voxelizeDraw(&member, optState->cache[objectIndex].model,
+                                                     member.material, member.albedoTexturePath, mesh);
+                                    }
+                                }
+                                continue;
+                            }
+                            if (item.mesh == nullptr || !item.sortOpaque || item.isUiCanvas3D) {
+                                continue;
+                            }
+                            voxelizeDraw(item.obj, item.model, item.material,
+                                         item.albedoTexturePath ? *item.albedoTexturePath : emptyPath,
+                                         item.mesh);
                         }
 
                         glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
@@ -5132,6 +6498,14 @@ void Renderer::renderSceneInternal(const Camera& camera, const std::vector<Scene
         float fogHeightFalloff = -1.0f;
     } matCache;
     auto invalidateMatCache = [&]() { matCache = MaterialUniformCache{}; };
+    // The legacy loop copies the sky settings (two heap strings) for every draw; the
+    // optimized path reads them in place. Same values either way.
+    static const SkyboxSettings kNoSkySettings{};
+    const SkyboxSettings* passSkySettings =
+        optPass ? (skybox ? &skybox->getSettings() : &kNoSkySettings) : nullptr;
+    // Closed right after the loop rather than at the end of the function.
+    std::optional<ProfilerScope> submissionScope;
+    submissionScope.emplace("Renderer::Submission", ProfilerSampleCategory::RenderDetail);
     for (const RenderItem& item : drawItems) {
         if (skyboxPending && !item.sortOpaque) {
             flushPendingSkybox();
@@ -5144,7 +6518,7 @@ void Renderer::renderSceneInternal(const Camera& camera, const std::vector<Scene
         const std::string& overlayTexturePath = item.overlayTexturePath ? *item.overlayTexturePath : emptyPath;
         const std::string& normalMapPath = item.normalMapPath ? *item.normalMapPath : emptyPath;
 
-        Shader* active = getShader(vertPath, fragPath);
+        Shader* active = item.shader ? item.shader : getShader(vertPath, fragPath);
         if (!active) continue;
         shader = active;
         if (currentShader != shader) {
@@ -5226,7 +6600,11 @@ void Renderer::renderSceneInternal(const Camera& camera, const std::vector<Scene
             }
         }
 
-        const SkyboxSettings skySettings = skybox ? skybox->getSettings() : SkyboxSettings{};
+        std::optional<SkyboxSettings> legacySkySettings;
+        if (!passSkySettings) {
+            legacySkySettings.emplace(skybox ? skybox->getSettings() : SkyboxSettings{});
+        }
+        const SkyboxSettings& skySettings = passSkySettings ? *passSkySettings : *legacySkySettings;
         const bool wantFogEnabled = skybox != nullptr && skySettings.fogEnabled;
         if (!matCache.valid || matCache.reflectionFadeStart != skySettings.reflectionDistanceFadeStart) {
             shader->setFloat("reflectionFadeStart", skySettings.reflectionDistanceFadeStart);
@@ -5497,8 +6875,10 @@ void Renderer::renderSceneInternal(const Camera& camera, const std::vector<Scene
             matCache.hasOverlay = overlayUsed;
         }
 
-        float reflectionIntensity = 0.0f;
-        unsigned int reflectionCube = findReflectionCastForItem(item, reflectionIntensity);
+        float reflectionIntensity = item.reflectionIntensity;
+        unsigned int reflectionCube = item.reflectionResolved
+            ? item.reflectionCube
+            : findReflectionCastForItem(item, reflectionIntensity);
         if (reflectionCube == 0 && skybox && skyboxReflectionTarget.cube != 0 && skyboxReflectionTarget.hasCapture) {
             const SkyboxSettings& skySettings = skybox->getSettings();
             if (skySettings.environmentReflections && skySettings.environmentReflectionIntensity > 0.001f) {
@@ -5701,9 +7081,24 @@ void Renderer::renderSceneInternal(const Camera& camera, const std::vector<Scene
             currentDepthMask = true;
             Runtime2DCountStateBind();
         }
+        if (item.multiDrawBatch >= 0 && optPass && optState) {
+            const auto& batch = optState->multiDraw.batches[static_cast<size_t>(item.multiDrawBatch)];
+            optState->drawMultiDrawBatch(*optPass, batch);
+            if (activeStats) {
+                activeStats->drawCalls += 1;
+                activeStats->multiDrawCalls += 1;
+                activeStats->meshDraws += static_cast<int>(
+                    optPass->gpuCommandRegion >= 0 ? batch.slotCount : batch.visibleCount);
+            }
+            continue;
+        }
         recordMeshDraw();
+        if (activeStats) {
+            activeStats->triangles += item.mesh->getVertexCount() / 3;
+        }
         item.mesh->draw();
     }
+    submissionScope.reset();
     flushPendingSkybox();
 
     auto drawMaskedSprite25DUiLayer = [&]() {
@@ -5890,13 +7285,25 @@ void Renderer::renderSceneInternal(const Camera& camera, const std::vector<Scene
                 glFrontFace(GL_CCW);
                 bool prepassCullEnabled = true;
 
+                // Batched objects write their surfaces through the same batches, with the
+                // batch vertex stage in front of the G-buffer fragment stage.
+                Shader* gbufferMultiDraw = nullptr;
+                if (optPass && optPass->multiDrawUsed) {
+                    gbufferMultiDraw = getShader(kMultiDrawVertPath, gbufferFragPath);
+                    if (!gbufferMultiDraw || gbufferMultiDraw == defaultShader ||
+                        gbufferMultiDraw->ID == 0) {
+                        gbufferMultiDraw = nullptr;
+                    }
+                }
                 Shader* active = nullptr;
                 for (const RenderItem& item : drawItems) {
-                    if (item.mesh == nullptr || !item.sortOpaque || item.unlit ||
+                    const bool drawsBatch = item.multiDrawBatch >= 0 && gbufferMultiDraw != nullptr;
+                    if ((item.mesh == nullptr && !drawsBatch) || !item.sortOpaque || item.unlit ||
                         item.isUiCanvas3D) {
                         continue;
                     }
-                    Shader* want = (item.wantsGpuSkinning && gbufferSkinned &&
+                    Shader* want = drawsBatch ? gbufferMultiDraw
+                                 : (item.wantsGpuSkinning && gbufferSkinned &&
                                     gbufferSkinned->ID != 0) ? gbufferSkinned : gbufferStatic;
                     if (want != active) {
                         active = want;
@@ -6014,6 +7421,12 @@ void Renderer::renderSceneInternal(const Camera& camera, const std::vector<Scene
                         prepassCullEnabled = !item.doubleSided;
                     }
 
+                    if (drawsBatch) {
+                        recordDrawCall();
+                        optState->drawMultiDrawBatch(
+                            *optPass, optState->multiDraw.batches[static_cast<size_t>(item.multiDrawBatch)]);
+                        continue;
+                    }
                     recordMeshDraw();
                     item.mesh->draw();
                 }
@@ -6261,6 +7674,10 @@ void Renderer::renderSceneInternal(const Camera& camera, const std::vector<Scene
                 }
             }
         }
+    }
+
+    if (optPass) {
+        OptimizationState::finishPass(*this, *optPass, optPassStats);
     }
 
     if (unbindFramebuffer) {
@@ -7364,6 +8781,26 @@ void Renderer::renderScene(const Camera &camera,
                         fovDeg, nearPlane, farPlane, true, true);
     sceneDepthTextureForPass = 0;
     sceneColorTextureForPass = 0;
+#if !MODULARITY_OPENGL_ES
+    // MODULARITY_RENDER_OPT_DUMP=<file.ppm> writes this view's raw scene colour once, on
+    // its 300th frame, so a scene rendered with and without the optimizations can be
+    // diffed pixel for pixel. A one-off blocking readback; nothing happens without it.
+    static const char* dumpPath = std::getenv("MODULARITY_RENDER_OPT_DUMP");
+    static int dumpCountdown = 300;
+    if (dumpPath && dumpPath[0] != '\0' && dumpCountdown > 0 && --dumpCountdown == 0) {
+      std::vector<unsigned char> pixels(static_cast<size_t>(currentWidth) * currentHeight * 3);
+      glBindTexture(GL_TEXTURE_2D, viewportTexture);
+      glPixelStorei(GL_PACK_ALIGNMENT, 1);
+      glGetTexImage(GL_TEXTURE_2D, 0, GL_RGB, GL_UNSIGNED_BYTE, pixels.data());
+      glPixelStorei(GL_PACK_ALIGNMENT, 4);
+      glBindTexture(GL_TEXTURE_2D, 0);
+      std::ofstream dump(dumpPath, std::ios::binary);
+      dump << "P6\n" << currentWidth << " " << currentHeight << "\n255\n";
+      dump.write(reinterpret_cast<const char*>(pixels.data()),
+                 static_cast<std::streamsize>(pixels.size()));
+      std::cerr << "[RenderOpt] wrote " << dumpPath << "\n";
+    }
+#endif
   } else if (!camera.orthographic) {
     glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
     glViewport(0, 0, currentWidth, currentHeight);

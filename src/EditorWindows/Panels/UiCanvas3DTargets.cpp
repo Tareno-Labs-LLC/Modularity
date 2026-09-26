@@ -20,6 +20,8 @@ void Engine::renderUiCanvas3DTargets() {
   if (!mainContext)
     return;
 
+  MODU_PROFILE_SCOPE("UI Canvas 3D", ProfilerSampleCategory::UI);
+  UiCanvas3DFrameStats frameStats;
   ImGuiStyle mainStyle = ImGui::GetStyle();
   ImGuiIO &mainIo = ImGui::GetIO();
   refreshSceneObjectIndexCache();
@@ -46,19 +48,29 @@ void Engine::renderUiCanvas3DTargets() {
     }
   }
 
-  auto isOffscreenCanvas = [](const SceneObject &canvas) {
-    return canvas.enabled && canvas.hasUI &&
-           canvas.ui.type == UIElementType::Canvas &&
+  auto isOffscreenCanvasType = [](const SceneObject &canvas) {
+    return canvas.hasUI && canvas.ui.type == UIElementType::Canvas &&
            (canvas.ui.renderIn3D || (canvas.ui.pseudo3DEnabled &&
                                      canvas.ui.pseudo3DUseOffscreenSurface));
   };
+  // A canvas under a disabled parent draws nowhere, so it gets no target and
+  // no redraw. Its ImGui context is kept (retained) so re-enabling the branch
+  // doesn't pay for context creation and font preloading again.
+  auto isOffscreenCanvas = [&](const SceneObject &canvas) {
+    return isOffscreenCanvasType(canvas) && IsObjectEnabledInHierarchy(canvas);
+  };
 
   std::unordered_set<int> activeCanvasIds;
+  std::unordered_set<int> retainedCanvasIds;
   for (const auto &canvas : sceneObjects) {
-    if (isOffscreenCanvas(canvas)) {
-      activeCanvasIds.insert(canvas.id);
+    if (canvas.enabled && isOffscreenCanvasType(canvas)) {
+      retainedCanvasIds.insert(canvas.id);
+      if (IsObjectEnabledInHierarchy(canvas)) {
+        activeCanvasIds.insert(canvas.id);
+      }
     }
   }
+  frameStats.active = static_cast<int>(activeCanvasIds.size());
 
   std::unordered_map<int, std::vector<SceneObject *>> elementsByCanvas;
 	  if (!activeCanvasIds.empty()) {
@@ -192,6 +204,11 @@ void Engine::renderUiCanvas3DTargets() {
     seed = hashCombine64(seed, static_cast<uint64_t>(obj.ui.sortingOrder));
     seed = hashCombine64(seed, hashString64(obj.albedoTexturePath));
     seed = hashCombine64(seed, static_cast<uint64_t>(obj.material.textureFilter));
+    seed = hashCombine64(seed, static_cast<uint64_t>(obj.material.uvScrollEnabled ? 1 : 0));
+    seed = hashCombine64(seed, hashFloat64(obj.material.scrollSpeed));
+    seed = addVec2(seed, obj.material.scrollDirection);
+    // getSpriteDisplaySize multiplies the UI size by the transform scale.
+    seed = addVec2(seed, glm::vec2(obj.scale.x, obj.scale.y));
     auto animIt = uiAnimationStates.find(obj.id);
     if (animIt != uiAnimationStates.end()) {
       seed = hashCombine64(seed, hashFloat64(animIt->second.hover));
@@ -200,6 +217,19 @@ void Engine::renderUiCanvas3DTargets() {
       seed = hashCombine64(seed, static_cast<uint64_t>(animIt->second.initialized ? 1 : 0));
     }
     return seed;
+  };
+  // Elements whose pixels change with time alone, so the signature can't see it.
+  auto isTimeAnimatedElement = [](const SceneObject &obj) {
+    if (obj.ui.type == UIElementType::Text)
+      return obj.ui.textEffectFlags != 0;
+    if (obj.ui.type == UIElementType::Image ||
+        obj.ui.type == UIElementType::Sprite2D) {
+      const glm::vec2 dir = obj.material.scrollDirection;
+      return obj.material.uvScrollEnabled &&
+             std::abs(obj.material.scrollSpeed) > 0.0f &&
+             (dir.x * dir.x + dir.y * dir.y) > 1e-12f;
+    }
+    return false;
   };
 
 	  struct UiCanvas3DRenderPlan {
@@ -211,7 +241,58 @@ void Engine::renderUiCanvas3DTargets() {
 	    bool targetInvalidated = false;
 	    bool hasTimeAnimatedContent = false;
 	    uint64_t contentSignature = 0;
+	    // Everything but the elements themselves; a change forces a full redraw.
+	    uint64_t canvasSignature = 0;
 	    Renderer::UiTargetInfo target;
+	  };
+
+	  // Project Settings > Quality: the max resolution caps the authored Render
+	  // Target (aspect kept), then auto resolution scales that down to what the
+	  // canvas covers on screen, in eighths so the target isn't reallocated for
+	  // every small camera move.
+	  const ProjectGraphicsSettings &graphicsSettings =
+	      projectManager.currentProject.graphicsSettings;
+	  auto applyResolutionPolicy = [&](const SceneObject &canvas, int &width, int &height) {
+	    auto scaleTarget = [&](float scale) {
+	      width = std::clamp(static_cast<int>(std::lround(width * scale)), 16, 4096);
+	      height = std::clamp(static_cast<int>(std::lround(height * scale)), 16, 4096);
+	    };
+	    const int cap = graphicsSettings.canvas3DMaxResolution;
+	    const int largest = std::max(width, height);
+	    if (cap > 0 && largest > cap) {
+	      scaleTarget(static_cast<float>(cap) / static_cast<float>(largest));
+	    }
+	    UiCanvas3DContext &state = uiCanvas3DContexts[canvas.id];
+	    if (!graphicsSettings.canvas3DAutoResolution) {
+	      state.autoResolutionEighths = 8;
+	      state.autoResolutionShrinkSeconds = 0.0f;
+	      return;
+	    }
+	    glm::vec2 screenPx(0.0f);
+	    bool unbounded = false;
+	    // Unseen this frame (or no 3D view rendered): keep the current size.
+	    if (renderer.measureObjectScreenSizePx(canvas, screenPx, unbounded)) {
+	      int wanted = 8;
+	      if (!unbounded) {
+	        const float needed =
+	            std::max(screenPx.x / static_cast<float>(width),
+	                     screenPx.y / static_cast<float>(height));
+	        wanted = std::clamp(static_cast<int>(std::ceil(needed * 8.0f - 1e-3f)), 1, 8);
+	      }
+	      if (wanted >= state.autoResolutionEighths) {
+	        state.autoResolutionEighths = wanted;
+	        state.autoResolutionShrinkSeconds = 0.0f;
+	      } else {
+	        state.autoResolutionShrinkSeconds += std::max(0.0f, mainIo.DeltaTime);
+	        if (state.autoResolutionShrinkSeconds >= 0.5f) {
+	          state.autoResolutionEighths = wanted;
+	          state.autoResolutionShrinkSeconds = 0.0f;
+	        }
+	      }
+	    }
+	    if (state.autoResolutionEighths < 8) {
+	      scaleTarget(static_cast<float>(state.autoResolutionEighths) / 8.0f);
+	    }
 	  };
 
 	  std::unordered_map<int, UiCanvas3DRenderPlan> canvasRenderPlans;
@@ -236,6 +317,9 @@ void Engine::renderUiCanvas3DTargets() {
 	                            : static_cast<int>(plan.layoutHeight);
 	    plan.targetWidth = std::clamp(plan.targetWidth, 16, 4096);
 	    plan.targetHeight = std::clamp(plan.targetHeight, 16, 4096);
+	    if (canvas.ui.renderIn3D) {
+	      applyResolutionPolicy(canvas, plan.targetWidth, plan.targetHeight);
+	    }
 	    plan.target = renderer.ensureUiTarget(
 	        canvas.id, plan.targetWidth, plan.targetHeight, canvas.layer,
 	        canvas.ui.renderTargetFilter, canvas.ui.renderIn3D);
@@ -251,6 +335,7 @@ void Engine::renderUiCanvas3DTargets() {
 	    signature = hashCombine64(signature, static_cast<uint64_t>(plan.targetWidth));
 	    signature = hashCombine64(signature, static_cast<uint64_t>(plan.targetHeight));
 	    signature = addUIObjectSignature(signature, canvas);
+	    plan.canvasSignature = signature;
 	    auto drawListIt = elementsByCanvas.find(canvas.id);
 	    if (drawListIt != elementsByCanvas.end()) {
 	      signature =
@@ -258,8 +343,7 @@ void Engine::renderUiCanvas3DTargets() {
 	      for (const SceneObject *objPtr : drawListIt->second) {
 	        if (!objPtr)
 	          continue;
-	        if (objPtr->ui.type == UIElementType::Text &&
-	            objPtr->ui.textEffectFlags != 0) {
+	        if (isTimeAnimatedElement(*objPtr)) {
 	          plan.hasTimeAnimatedContent = true;
 	        }
 	        signature = addUIObjectSignature(signature, *objPtr);
@@ -326,6 +410,7 @@ void Engine::renderUiCanvas3DTargets() {
 	          !ctxIt->second.hadInputLastFrame && !plan.hasTimeAnimatedContent &&
 	          !contentChanged) {
 	        Modu2DStats::CountSkippedRedraw();
+	        ++frameStats.cached;
 	        continue;
 	      }
 	      if (!targetInvalidated && everRendered && canvas.ui.renderIn3D && !inputNow &&
@@ -333,11 +418,22 @@ void Engine::renderUiCanvas3DTargets() {
 	          renderer.hasCapturedSceneFrustums() &&
 	          !renderer.isObjectVisibleInCapturedFrustums(canvas, 1.25f)) {
 	        Modu2DStats::CountSkippedRedraw();
+	        ++frameStats.cached;
 	        continue;
       }
     }
 
     UiCanvas3DContext &ctxEntry = uiCanvas3DContexts[canvas.id];
+    // Input drives hover/press state the signatures only see a frame late, so
+    // interactive frames (and the one after) always repaint the whole canvas.
+    const auto canvasInputIt = uiCanvas3DInputs.find(canvas.id);
+    const bool canvasHasInput = canvasInputIt != uiCanvas3DInputs.end() &&
+                                canvasInputIt->second.hasInput;
+    const bool partialRedrawAllowed =
+        !targetInvalidated && ctxEntry.backendReady &&
+        ctxEntry.hasRenderedTarget && !canvasHasInput &&
+        !ctxEntry.hadInputLastFrame &&
+        ctxEntry.lastCanvasSignature == plan.canvasSignature;
     if (!ctxEntry.context) {
       ctxEntry.context = ImGui::CreateContext();
       ImGui::SetCurrentContext(ctxEntry.context);
@@ -365,10 +461,17 @@ void Engine::renderUiCanvas3DTargets() {
 	    const ImVec2 canvasWindowPos(
 	        target.usesAtlas ? (static_cast<float>(target.x) / framebufferScaleX) : 0.0f,
 	        target.usesAtlas ? (static_cast<float>(target.y) / framebufferScaleY) : 0.0f);
-	    io.DisplaySize = target.usesAtlas
-	                         ? ImVec2(static_cast<float>(target.framebufferWidth) / framebufferScaleX,
-	                                  static_cast<float>(target.framebufferHeight) / framebufferScaleY)
-	                         : ImVec2(layoutWidth, layoutHeight);
+	    // The backend sizes its viewport as (int)(DisplaySize * scale). Plain
+	    // division can land a hair under the target and lose the last pixel row,
+	    // which would also skew the partial-redraw scissor math, so nudge up.
+	    auto exactDisplayExtent = [](int framebufferPixels, float scale) {
+	      float extent = static_cast<float>(framebufferPixels) / scale;
+	      for (int i = 0; i < 8 && static_cast<int>(extent * scale) < framebufferPixels; ++i)
+	        extent = std::nextafter(extent, FLT_MAX);
+	      return extent;
+	    };
+	    io.DisplaySize = ImVec2(exactDisplayExtent(target.framebufferWidth, framebufferScaleX),
+	                            exactDisplayExtent(target.framebufferHeight, framebufferScaleY));
 	    io.DisplayFramebufferScale = ImVec2(framebufferScaleX, framebufferScaleY);
     io.DeltaTime =
         (mainIo.DeltaTime > 0.0f) ? mainIo.DeltaTime : (1.0f / 60.0f);
@@ -561,16 +664,26 @@ void Engine::renderUiCanvas3DTargets() {
     std::vector<SceneObject *> &canvasDrawList = elementsByCanvas[canvas.id];
     StableSortRuntimeUiDrawList(canvasDrawList);
 
-    for (SceneObject *objPtr : canvasDrawList) {
-      SceneObject &obj = *objPtr;
+    struct ElementGeometry {
+      ImVec2 rectMin{0.0f, 0.0f}, rectMax{0.0f, 0.0f};
+      float rotRad = 0.0f;
+      bool masked = false;
+      ImVec2 maskMin{0.0f, 0.0f}, maskMax{0.0f, 0.0f};
+    };
+    // Draws one element into the canvas window. Hidden, degenerate and
+    // masked-away elements return before emitting anything.
+    auto drawElement = [&](SceneObject &obj, ElementGeometry &geom) {
       if (ViewportRenderHelpers::IsAssemblageLayerDrawable(obj))
-        continue;
+        return;
       ImVec2 rectMin, rectMax;
       float elementRotRad = 0.0f;
       resolveUIRect(obj, rectMin, rectMax, &elementRotRad);
+      geom.rectMin = rectMin;
+      geom.rectMax = rectMax;
+      geom.rotRad = elementRotRad;
       ImVec2 rectSize(rectMax.x - rectMin.x, rectMax.y - rectMin.y);
       if (rectSize.x <= 1.0f || rectSize.y <= 1.0f)
-        continue;
+        return;
 
       ImGuiStyle savedStyle;
       bool styleApplied = false;
@@ -603,12 +716,15 @@ void Engine::renderUiCanvas3DTargets() {
               std::min(maskMax.x, ImGui::GetWindowPos().x + layoutWidth);
           maskMax.y =
               std::min(maskMax.y, ImGui::GetWindowPos().y + layoutHeight);
+          geom.masked = true;
+          geom.maskMin = maskMin;
+          geom.maskMax = maskMax;
           if (maskMax.x <= maskMin.x || maskMax.y <= maskMin.y) {
             if (fontApplied)
               ImGui::PopFont();
             if (styleApplied)
               ImGui::GetStyle() = savedStyle;
-            continue;
+            return;
           }
           if (drawMax.x <= maskMin.x || drawMin.x >= maskMax.x ||
               drawMax.y <= maskMin.y || drawMin.y >= maskMax.y) {
@@ -616,7 +732,7 @@ void Engine::renderUiCanvas3DTargets() {
               ImGui::PopFont();
             if (styleApplied)
               ImGui::GetStyle() = savedStyle;
-            continue;
+            return;
           }
           spriteBatch.flush();
           ImGui::PushClipRect(maskMin, maskMax, true);
@@ -872,32 +988,275 @@ void Engine::renderUiCanvas3DTargets() {
         ImGui::PopFont();
       if (styleApplied)
         ImGui::GetStyle() = savedStyle;
+    };
+
+    // Draw every element, fingerprinting what it actually emitted: its own
+    // fields, resolved geometry, and the vertices themselves (which also
+    // catches time-driven motion like text effects and UV scroll).
+    auto floatBits = [](float value) -> uint64_t {
+      uint32_t bits = 0;
+      std::memcpy(&bits, &value, sizeof(bits));
+      return bits;
+    };
+    struct DisplayBounds {
+      bool valid = false;
+      bool finite = true;
+      ImVec2 min{0.0f, 0.0f}, max{0.0f, 0.0f};
+    };
+    ImDrawList *elementDrawList = ImGui::GetWindowDrawList();
+    std::vector<UiCanvas3DElementRecord> newRecords;
+    std::vector<DisplayBounds> newDisplayBounds;
+    newRecords.reserve(canvasDrawList.size());
+    newDisplayBounds.reserve(canvasDrawList.size());
+    for (SceneObject *objPtr : canvasDrawList) {
+      SceneObject &obj = *objPtr;
+      // Hash before drawing: drawing advances the hover/slider animation state.
+      uint64_t signature = addUIObjectSignature(0x6c62272e07bb0142ull, obj);
+      spriteBatch.flush();
+      const int vtxStart = elementDrawList->VtxBuffer.Size;
+      ElementGeometry geom;
+      drawElement(obj, geom);
+      spriteBatch.flush();
+      const int vtxEnd = elementDrawList->VtxBuffer.Size;
+
+      signature = hashCombine64(signature, (floatBits(geom.rectMin.x) << 32) | floatBits(geom.rectMin.y));
+      signature = hashCombine64(signature, (floatBits(geom.rectMax.x) << 32) | floatBits(geom.rectMax.y));
+      signature = hashCombine64(signature, floatBits(geom.rotRad));
+      signature = hashCombine64(signature, static_cast<uint64_t>(geom.masked ? 1 : 0));
+      if (geom.masked) {
+        signature = hashCombine64(signature, (floatBits(geom.maskMin.x) << 32) | floatBits(geom.maskMin.y));
+        signature = hashCombine64(signature, (floatBits(geom.maskMax.x) << 32) | floatBits(geom.maskMax.y));
+      }
+      signature = hashCombine64(signature, static_cast<uint64_t>(vtxEnd - vtxStart));
+      DisplayBounds bounds;
+      for (int v = vtxStart; v < vtxEnd; ++v) {
+        const ImDrawVert &vert = elementDrawList->VtxBuffer[v];
+        signature = hashCombine64(signature, (floatBits(vert.pos.x) << 32) | floatBits(vert.pos.y));
+        signature = hashCombine64(signature, (floatBits(vert.uv.x) << 32) | floatBits(vert.uv.y));
+        signature = hashCombine64(signature, static_cast<uint64_t>(vert.col));
+        if (!std::isfinite(vert.pos.x) || !std::isfinite(vert.pos.y)) {
+          bounds.finite = false;
+          continue;
+        }
+        if (!bounds.valid) {
+          bounds.valid = true;
+          bounds.min = bounds.max = vert.pos;
+        } else {
+          bounds.min.x = std::min(bounds.min.x, vert.pos.x);
+          bounds.min.y = std::min(bounds.min.y, vert.pos.y);
+          bounds.max.x = std::max(bounds.max.x, vert.pos.x);
+          bounds.max.y = std::max(bounds.max.y, vert.pos.y);
+        }
+      }
+      UiCanvas3DElementRecord &record = newRecords.emplace_back();
+      record.id = obj.id;
+      record.signature = signature;
+      newDisplayBounds.push_back(bounds);
     }
     spriteBatch.flush();
 
     ImGui::End();
     ImGui::PopStyleColor();
     ImGui::Render();
+    ImDrawData *drawData = ImGui::GetDrawData();
 
-	    captureRenderState();
-	    glBindFramebuffer(GL_FRAMEBUFFER, target.fbo);
-	    glViewport(0, 0, target.framebufferWidth, target.framebufferHeight);
-	    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
-	    if (target.usesAtlas) {
-	      glEnable(GL_SCISSOR_TEST);
-	      glScissor(target.clearX,
-	                target.framebufferHeight - (target.clearY + target.clearHeight),
-	                target.clearWidth, target.clearHeight);
-	    } else {
+    // Pixel bookkeeping happens in GL framebuffer coordinates (origin bottom
+    // left), using exactly the transform imgui_impl_opengl3 applies.
+    const ImVec2 clipOff = drawData->DisplayPos;
+    const ImVec2 clipScale = drawData->FramebufferScale;
+    const int backendFbHeight =
+        static_cast<int>(drawData->DisplaySize.y * drawData->FramebufferScale.y);
+    // The pixels this canvas owns in the target (atlas slot incl. padding).
+    const int regionX0 = target.clearX;
+    const int regionX1 = target.clearX + target.clearWidth;
+    const int regionY0 = target.framebufferHeight - (target.clearY + target.clearHeight);
+    const int regionY1 = target.framebufferHeight - target.clearY;
+    for (size_t i = 0; i < newRecords.size(); ++i) {
+      const DisplayBounds &bounds = newDisplayBounds[i];
+      UiCanvas3DElementRecord &record = newRecords[i];
+      if (!bounds.finite) {
+        // Can't bound it; claim the whole canvas.
+        record.hasBounds = true;
+        record.boundsMinX = regionX0;
+        record.boundsMinY = regionY0;
+        record.boundsMaxX = regionX1;
+        record.boundsMaxY = regionY1;
+        continue;
+      }
+      if (!bounds.valid)
+        continue;
+      auto toPixels = [](float v) { return std::clamp(v, -1.0e6f, 1.0e6f); };
+      const float left = toPixels((bounds.min.x - clipOff.x) * clipScale.x);
+      const float right = toPixels((bounds.max.x - clipOff.x) * clipScale.x);
+      const float top = toPixels((bounds.min.y - clipOff.y) * clipScale.y);
+      const float bottom = toPixels((bounds.max.y - clipOff.y) * clipScale.y);
+      // Covers AA fringes, float error, and the backend's viewport rounding.
+      constexpr int kBoundsMargin = 2;
+      const int x0 = std::max(regionX0, static_cast<int>(std::floor(left)) - kBoundsMargin);
+      const int x1 = std::min(regionX1, static_cast<int>(std::ceil(right)) + kBoundsMargin);
+      const int y0 = std::max(regionY0, backendFbHeight - static_cast<int>(std::ceil(bottom)) - kBoundsMargin);
+      const int y1 = std::min(regionY1, backendFbHeight - static_cast<int>(std::floor(top)) + kBoundsMargin);
+      if (x1 <= x0 || y1 <= y0)
+        continue;
+      record.hasBounds = true;
+      record.boundsMinX = x0;
+      record.boundsMinY = y0;
+      record.boundsMaxX = x1;
+      record.boundsMaxY = y1;
+    }
+
+    // Partial redraw: repaint only where changed elements were or now are.
+    // Same element list in the same order is required, since draw order
+    // decides how overlapping elements blend.
+    bool fullRedraw = !partialRedrawAllowed ||
+                      ctxEntry.elementRecords.size() != newRecords.size();
+    bool anyDirty = false;
+    int dirtyX0 = 0, dirtyY0 = 0, dirtyX1 = 0, dirtyY1 = 0;
+    auto addDirty = [&](const UiCanvas3DElementRecord &record) {
+      if (!record.hasBounds)
+        return;
+      if (!anyDirty) {
+        anyDirty = true;
+        dirtyX0 = record.boundsMinX;
+        dirtyY0 = record.boundsMinY;
+        dirtyX1 = record.boundsMaxX;
+        dirtyY1 = record.boundsMaxY;
+        return;
+      }
+      dirtyX0 = std::min(dirtyX0, record.boundsMinX);
+      dirtyY0 = std::min(dirtyY0, record.boundsMinY);
+      dirtyX1 = std::max(dirtyX1, record.boundsMaxX);
+      dirtyY1 = std::max(dirtyY1, record.boundsMaxY);
+    };
+    for (size_t i = 0; !fullRedraw && i < newRecords.size(); ++i) {
+      const UiCanvas3DElementRecord &previous = ctxEntry.elementRecords[i];
+      const UiCanvas3DElementRecord &current = newRecords[i];
+      if (previous.id != current.id) {
+        fullRedraw = true;
+        break;
+      }
+      if (previous.signature == current.signature)
+        continue;
+      addDirty(previous);
+      addDirty(current);
+    }
+    const int64_t regionArea =
+        static_cast<int64_t>(regionX1 - regionX0) * (regionY1 - regionY0);
+    if (!fullRedraw && anyDirty) {
+      dirtyX0 = std::max(dirtyX0, regionX0);
+      dirtyY0 = std::max(dirtyY0, regionY0);
+      dirtyX1 = std::min(dirtyX1, regionX1);
+      dirtyY1 = std::min(dirtyY1, regionY1);
+      anyDirty = dirtyX1 > dirtyX0 && dirtyY1 > dirtyY0;
+      const int64_t dirtyArea =
+          static_cast<int64_t>(dirtyX1 - dirtyX0) * (dirtyY1 - dirtyY0);
+      // Mostly dirty anyway; the plain path is simpler and just as cheap.
+      if (anyDirty && dirtyArea * 10 >= regionArea * 6)
+        fullRedraw = true;
+    }
+
+    // Clip every draw command to [x0,x1) x [y0,y1) so a partial redraw touches
+    // exactly the pixels a full redraw would inside it. Recomputes the
+    // backend's integer scissor, intersects in whole pixels, and writes back
+    // a clip rect the backend truncates to exactly that scissor (the +0.5 and
+    // +0.25 offsets keep truncation clear of float round-off).
+    auto restrictDrawDataToRect = [&](int x0, int y0, int x1, int y1) {
+      for (ImDrawList *list : drawData->CmdLists) {
+        for (ImDrawCmd &cmd : list->CmdBuffer) {
+          if (cmd.UserCallback != nullptr)
+            continue;
+          const ImVec2 clipMin((cmd.ClipRect.x - clipOff.x) * clipScale.x,
+                               (cmd.ClipRect.y - clipOff.y) * clipScale.y);
+          const ImVec2 clipMax((cmd.ClipRect.z - clipOff.x) * clipScale.x,
+                               (cmd.ClipRect.w - clipOff.y) * clipScale.y);
+          if (clipMax.x <= clipMin.x || clipMax.y <= clipMin.y)
+            continue;
+          const int sx = static_cast<int>(clipMin.x);
+          const int sy = static_cast<int>(static_cast<float>(backendFbHeight) - clipMax.y);
+          const int sw = static_cast<int>(clipMax.x - clipMin.x);
+          const int sh = static_cast<int>(clipMax.y - clipMin.y);
+          const int ix0 = std::max(sx, x0);
+          const int iy0 = std::max(sy, y0);
+          const int ix1 = std::min(sx + sw, x1);
+          const int iy1 = std::min(sy + sh, y1);
+          if (ix1 <= ix0 || iy1 <= iy0) {
+            cmd.ClipRect = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
+            continue;
+          }
+          const float newMinX = static_cast<float>(ix0) + 0.5f;
+          const float newMaxX = static_cast<float>(ix1) + 0.75f;
+          const float newMaxY = static_cast<float>(backendFbHeight - iy0) - 0.5f;
+          const float newMinY = static_cast<float>(backendFbHeight - iy1) - 0.75f;
+          cmd.ClipRect = ImVec4(newMinX / clipScale.x + clipOff.x,
+                                newMinY / clipScale.y + clipOff.y,
+                                newMaxX / clipScale.x + clipOff.x,
+                                newMaxY / clipScale.y + clipOff.y);
+        }
+      }
+    };
+
+    bool pendingTextureUpdates = false;
+    if (drawData->Textures != nullptr) {
+      for (ImTextureData *tex : *drawData->Textures) {
+        if (tex->Status == ImTextureStatus_WantCreate ||
+            tex->Status == ImTextureStatus_WantUpdates ||
+            tex->Status == ImTextureStatus_WantDestroy) {
+          pendingTextureUpdates = true;
+          break;
+        }
+      }
+    }
+
+	    if (fullRedraw) {
+	      captureRenderState();
+	      glBindFramebuffer(GL_FRAMEBUFFER, target.fbo);
+	      glViewport(0, 0, target.framebufferWidth, target.framebufferHeight);
+	      glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+	      if (target.usesAtlas) {
+	        glEnable(GL_SCISSOR_TEST);
+	        glScissor(target.clearX,
+	                  target.framebufferHeight - (target.clearY + target.clearHeight),
+	                  target.clearWidth, target.clearHeight);
+	      } else {
+	        glDisable(GL_SCISSOR_TEST);
+	      }
+	      glClear(GL_COLOR_BUFFER_BIT);
 	      glDisable(GL_SCISSOR_TEST);
+	      ImGui_ImplOpenGL3_RenderDrawData(drawData);
+	      ++frameStats.fullRedraws;
+	      frameStats.redrawnPixels += static_cast<double>(regionArea);
+	    } else if (anyDirty) {
+	      captureRenderState();
+	      glBindFramebuffer(GL_FRAMEBUFFER, target.fbo);
+	      glViewport(0, 0, target.framebufferWidth, target.framebufferHeight);
+	      glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+	      glEnable(GL_SCISSOR_TEST);
+	      glScissor(dirtyX0, dirtyY0, dirtyX1 - dirtyX0, dirtyY1 - dirtyY0);
+	      glClear(GL_COLOR_BUFFER_BIT);
+	      glDisable(GL_SCISSOR_TEST);
+	      restrictDrawDataToRect(dirtyX0, dirtyY0, dirtyX1, dirtyY1);
+	      ImGui_ImplOpenGL3_RenderDrawData(drawData);
+	      ++frameStats.partialRedraws;
+	      frameStats.redrawnPixels +=
+	          static_cast<double>(dirtyX1 - dirtyX0) * (dirtyY1 - dirtyY0);
+	    } else {
+	      // Nothing visible changed. Still let the backend upload any font
+	      // atlas changes, with every command clipped away.
+	      if (pendingTextureUpdates) {
+	        captureRenderState();
+	        glBindFramebuffer(GL_FRAMEBUFFER, target.fbo);
+	        restrictDrawDataToRect(0, 0, 0, 0);
+	        ImGui_ImplOpenGL3_RenderDrawData(drawData);
+	      }
+	      ++frameStats.cached;
 	    }
-	    glClear(GL_COLOR_BUFFER_BIT);
-	    glDisable(GL_SCISSOR_TEST);
-	    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+	    ctxEntry.elementRecords = std::move(newRecords);
+	    ctxEntry.lastCanvasSignature = plan.canvasSignature;
 	    ctxEntry.lastContentSignature = plan.contentSignature;
 	    ctxEntry.hasRenderedTarget = true;
 	    renderer.markUiTargetRendered(canvas.id);
 	  }
+	  uiCanvas3DStatsLastFrame = frameStats;
 
   if (renderStateCaptured) {
     glBindFramebuffer(GL_FRAMEBUFFER, savedFbo);
@@ -913,7 +1272,7 @@ void Engine::renderUiCanvas3DTargets() {
   }
 
   for (auto it = uiCanvas3DContexts.begin(); it != uiCanvas3DContexts.end();) {
-    if (activeCanvasIds.find(it->first) == activeCanvasIds.end()) {
+    if (retainedCanvasIds.find(it->first) == retainedCanvasIds.end()) {
       if (it->second.context) {
         ImGui::SetCurrentContext(it->second.context);
         if (it->second.backendReady) {

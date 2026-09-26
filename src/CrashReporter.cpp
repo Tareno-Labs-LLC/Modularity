@@ -841,20 +841,48 @@ namespace Modularity::CrashReporter {
             }   handleCrash("Unhandled termination", details, EXIT_FAILURE);
         }
         #if defined(_WIN32)
+        void appendFullReportPath(std::ostringstream& details) {
+            if (!gWinCrashLogPath[0]) return;
+            char narrowPath[kWinPathBufferSize * 2] = {};
+            if (WideCharToMultiByte(CP_UTF8, 0, gWinCrashLogPath, -1, narrowPath,
+                                    static_cast<int>(sizeof(narrowPath)), nullptr, nullptr) > 0) {
+                details << "\nFull report: " << narrowPath;
+            }
+        }
         LONG WINAPI unhandledExceptionFilter(EXCEPTION_POINTERS* exceptionInfo) {
             static char summary[1024];
             reportWindowsException(exceptionInfo, summary, sizeof(summary));
             std::ostringstream details;
             if (summary[0] != '\0') {details << summary;}
             else                    {details << "Structured exception with no accessible record.";}
-            if (gWinCrashLogPath[0]) {
-                char narrowPath[kWinPathBufferSize * 2] = {};
-                if (WideCharToMultiByte(CP_UTF8, 0, gWinCrashLogPath, -1, narrowPath,
-                                        static_cast<int>(sizeof(narrowPath)), nullptr, nullptr) > 0) {
-                    details << "\nFull report: " << narrowPath;
-                }
-            }
+            appendFullReportPath(details);
             handleCrash("Unhandled SEH exception", details.str(), EXIT_FAILURE);
+        }
+        // Heap corruption never reaches unhandledExceptionFilter. ntdll raises it from
+        // RtlReportFatalFailure inside its own __try, and that handler hands the process
+        // straight to WER and terminates it - so these crashes left no report at all, and
+        // last_crash.txt went on describing whatever had crashed before. Vectored handlers
+        // still run first, so this is the one place the crash can be seen.
+        //
+        // The heap is damaged by now, which is why reportWindowsException (static buffers,
+        // raw file handles) runs before anything here allocates. If a later allocation trips
+        // over the damage again, the nested exception lands back here and handleCrash exits.
+        LONG CALLBACK heapCorruptionHandler(EXCEPTION_POINTERS* exceptionInfo) {
+            if (!exceptionInfo || !exceptionInfo->ExceptionRecord ||
+                exceptionInfo->ExceptionRecord->ExceptionCode != 0xC0000374u) {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            static char summary[1024];
+            reportWindowsException(exceptionInfo, summary, sizeof(summary));
+            std::ostringstream details;
+            if (summary[0] != '\0') {details << summary << "\n\n";}
+            details << "The heap allocator found its own bookkeeping overwritten: something earlier wrote "
+                       "past the end of a heap block, or into one after it was freed. The stack in the "
+                       "report is where the damage was NOTICED, not the code that caused it.\n"
+                       "To catch the writer, enable full page heap for Modularity.exe (needs admin) and "
+                       "reproduce - the bad write then crashes on the spot with a normal report.";
+            appendFullReportPath(details);
+            handleCrash("Heap corruption", details.str(), EXIT_FAILURE);
         }
         #endif
         std::string readFilePreview(const fs::path& path) {
@@ -1232,6 +1260,7 @@ namespace Modularity::CrashReporter {
         _set_purecall_handler(pureCallHandler);
         SetUnhandledExceptionFilter(unhandledExceptionFilter);
         AddVectoredExceptionHandler(1, firstChanceThrowRecorder);
+        AddVectoredExceptionHandler(1, heapCorruptionHandler);
         ULONG stackGuarantee = 64 * 1024;
         SetThreadStackGuarantee(&stackGuarantee);
     #else

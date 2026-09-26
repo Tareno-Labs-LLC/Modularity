@@ -416,6 +416,13 @@ void FileBrowser::navigateUp() {
 }
 void FileBrowser::navigateTo(const fs::path& path) {
     if (fs::is_directory(path)) {
+        // Sound feedback: a folder change slides the page in, or back out when the new folder
+        // contains the old one (Up, or a breadcrumb higher up). setProjectRoot() stays silent.
+        if (path != currentPath) {
+            const fs::path fromNew = currentPath.lexically_relative(path);
+            const bool goingUp = !fromNew.empty() && *fromNew.begin() != fs::path("..");
+            ImGui::ReportWidgetFeedback(goingUp ? ImGuiWidgetFeedback_SlideClose : ImGuiWidgetFeedback_SlideOpen);
+        }
         // Add to history
         if (historyIndex < 0 || pathHistory.empty() || pathHistory[historyIndex] != currentPath) {
             // Clear forward history
@@ -435,6 +442,7 @@ void FileBrowser::navigateTo(const fs::path& path) {
 }
 void FileBrowser::navigateBack() {
     if (historyIndex > 0) {
+        ImGui::ReportWidgetFeedback(ImGuiWidgetFeedback_SlideClose);
         historyIndex--;
         currentPath = pathHistory[historyIndex];
         selectedFile.clear();
@@ -446,6 +454,7 @@ void FileBrowser::navigateBack() {
 }
 void FileBrowser::navigateForward() {
     if (historyIndex < (int)pathHistory.size() - 1) {
+        ImGui::ReportWidgetFeedback(ImGuiWidgetFeedback_SlideOpen);
         historyIndex++;
         currentPath = pathHistory[historyIndex];
         selectedFile.clear();

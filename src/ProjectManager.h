@@ -3,6 +3,7 @@
 #include "Common.h"
 #include "SceneObject.h"
 #include "HardwareProfile.h"
+#include "EditorSoundThemes.h"
 #include "XR/XRSettings.h"
 #include "../include/Skybox/Skybox.h"
 #include <map>
@@ -204,6 +205,13 @@ enum class ProjectColorResolution {
     Color16F = 2
 };
 
+// Project Settings > Graphics Manager > Optimization: Manual runs exactly the checked
+// optimizations; Automatic treats them as allowed and picks per scene.
+enum class ProjectOptimizationStrategy {
+    Manual = 0,
+    Automatic = 1
+};
+
 enum class ProjectQualityPreset {
     Low = 0,
     Balanced = 1,
@@ -262,6 +270,22 @@ struct ProjectGraphicsSettings {
     bool specularEnabled = true;
     bool softShadows = true;
     float shadowMaxDistance = 0.0f;
+    // Render In 3D UI canvases. Auto resolution sizes each canvas's target to
+    // what it covers on screen; the max caps the authored Render Target size
+    // (0 = no cap). Auto works underneath the cap.
+    bool canvas3DAutoResolution = false;
+    int canvas3DMaxResolution = 0;
+    // Rendering optimizations (Renderer::setOptimizationSettings). All off by default so an
+    // existing project renders exactly as before until someone opts in.
+    ProjectOptimizationStrategy optimizationStrategy = ProjectOptimizationStrategy::Manual;
+    bool optCpuFrustumCulling = false;
+    bool optMultiDrawIndirect = false;
+    bool optGpuDrivenCulling = false;
+    bool optLod = false;
+    float optLodMinScreenSize = 1.5f;
+    bool optHiZOcclusionCulling = false;
+    bool optMaterialSorting = false;
+    bool optStaticObjectCaching = false;
     ProjectQualityPreset qualityPreset = ProjectQualityPreset::Custom;
 };
 
@@ -404,6 +428,14 @@ struct EditorGlobalPreferences {
     bool feedbackClickSounds = true;
     bool feedbackErrorSounds = true;
     bool feedbackOtherSounds = true;
+    bool feedbackButtonSounds = true;
+    bool feedbackToggleSounds = true;
+    bool feedbackSlideSounds = true;
+    bool feedbackTransitionSounds = true;
+    bool feedbackHoverSounds = true;
+    float feedbackSoundVolume = 0.5f;  // UI volume, 0..1
+    // Folder name under Resources/Sounds/SoundThemes. Global only: never stored per project.
+    std::string feedbackSoundTheme = Modularity::EditorSounds::kDefaultThemeId;
 
     bool reopenLastProject = false;
     bool hierarchyTexturePreviews = true;
@@ -465,6 +497,7 @@ public:
     char openProjectPath[512] = "";
     bool showNewProjectDialog = false;
     bool showOpenProjectDialog = false;
+    bool showCloneProjectDialog = false;
     std::string acceptedTermsVersion;
     bool windowsDisclaimerAcknowledgedV68 = false;
     bool moduCppNvimWarningDismissedV1 = false;

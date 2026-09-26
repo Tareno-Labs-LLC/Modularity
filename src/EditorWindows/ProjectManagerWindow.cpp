@@ -1,5 +1,6 @@
 #include "Engine.h"
 #include "ModelLoader.h"
+#include "BuildSettingsHints.h"
 #include "../EditorLocalization.h"
 #include "../ModuCPPLanguagePack.h"
 #include "../XR/XRDiagnostics.h"
@@ -492,6 +493,8 @@ static bool LauncherRailItem(const char* id,
     const float width = std::max(48.0f * uiScale, ImGui::GetContentRegionAvail().x);
     const bool clicked = ImGui::InvisibleButton("##rail", ImVec2(width, height),
                                                 ImGuiButtonFlags_EnableNav);
+    if (clicked && !selected) ImGui::ReportWidgetFeedback(ImGuiWidgetFeedback_Tab);
+    ImGui::ReportItemHoverFeedback();
     const bool hovered = ImGui::IsItemHovered() || ImGui::IsItemFocused();
     const ImVec2 max(pos.x + width, pos.y + height);
 
@@ -2172,8 +2175,7 @@ void Engine::renderLauncher() {
             launcherSectionPrevious = launcherSection;
             launcherSection = newSection;
             launcherSectionSwitchTime = now;
-            playEditorFeedbackOneShot("Resources/Sounds/Selection Tick Main Editor.mp3", 0.85f,
-                                      EditorFeedbackSoundCategory::Click);
+            playEditorSound(EditorSoundCue::SectionSwitch, 0.85f);
             if (projectManager.preferences.launcherRememberLastTab &&
                 projectManager.preferences.launcherLastTab != newSection) {
                 projectManager.preferences.launcherLastTab = newSection;
@@ -2185,7 +2187,7 @@ void Engine::renderLauncher() {
             if (launcherBusy) return;
             // One-shot so the click sits on top of the intro/wind sounds instead of
             // stopping them via the single preview slot.
-            playEditorFeedbackOneShot("Resources/Sounds/Selection.mp3", 0.95f, EditorFeedbackSoundCategory::Click);
+            playEditorSound(EditorSoundCue::Confirm, 0.95f);
             launcherTransitionActive = true;
             launcherTransitionPendingHide = false;
             launcherTransitionFocus = focus;
@@ -2396,6 +2398,7 @@ void Engine::renderLauncher() {
             ImGui::PushID(tabs[i].index);
             const bool pressed = ImGui::InvisibleButton("##LauncherTab", ImVec2(tw, th),
                                                          ImGuiButtonFlags_EnableNav);
+            ImGui::ReportItemHoverFeedback();
             const bool hovered = ImGui::IsItemHovered() || ImGui::IsItemFocused();
             ImGui::PopID();
             if (pressed) setLauncherSection(tabs[i].index);
@@ -2471,6 +2474,8 @@ void Engine::renderLauncher() {
             ImGui::PushID(label);
             const bool pressed = ImGui::InvisibleButton("##HeaderLink", ImVec2(w, bh),
                                                          ImGuiButtonFlags_EnableNav);
+            if (pressed) ImGui::ReportWidgetFeedback(ImGuiWidgetFeedback_Button);
+            ImGui::ReportItemHoverFeedback();
             const bool hovered = ImGui::IsItemHovered() || ImGui::IsItemFocused();
             ImGuiStorage* storage = ImGui::GetStateStorage();
             const ImGuiID hoverKey = ImGui::GetID("##HeaderLinkHover");
@@ -2676,7 +2681,7 @@ void Engine::renderLauncher() {
             float colX = colOrigin.x;
 
             if (showRail) {
-                const float actionsH = 186.0f * uiScale;
+                const float actionsH = 222.0f * uiScale;
                 const float libraryH = std::max(180.0f * uiScale, availH - actionsH - gap);
 
                 ImGui::SetCursorPos(ImVec2(colX, colOrigin.y));
@@ -2725,6 +2730,12 @@ void Engine::renderLauncher() {
                 if (LauncherButton("Open Existing...", LauncherButtonKind::Neutral, railBtn)) {
                     openProjectDialog();
                 }
+                if (LauncherButton("Clone from Git...", LauncherButtonKind::Neutral, railBtn)) {
+                    projectManager.showCloneProjectDialog = true;
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Download a project backed up with Version Control on another computer");
+                }
                 ImGui::EndDisabled();
                 if (LauncherButton("Browse Folder", LauncherButtonKind::Neutral, railBtn)) {
                     openInFileManager(fs::path(projectManager.defaultProjectLocation));
@@ -2746,7 +2757,7 @@ void Engine::renderLauncher() {
                 const float compactBtnW = 84.0f * uiScale;
                 const bool inlineActions = !showRail && toolbarW > 360.0f * uiScale;
                 const float searchW = inlineActions
-                    ? toolbarW - (compactBtnW * 2.0f + ImGui::GetStyle().ItemSpacing.x * 2.0f)
+                    ? toolbarW - (compactBtnW * 3.0f + ImGui::GetStyle().ItemSpacing.x * 3.0f)
                     : toolbarW;
 
                 ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 5.0f * uiScale);
@@ -2770,6 +2781,11 @@ void Engine::renderLauncher() {
                     if (LauncherButton("New", LauncherButtonKind::Primary,
                                        ImVec2(compactBtnW, searchH))) {
                         openNewProjectDialog();
+                    }
+                    ImGui::SameLine();
+                    if (LauncherButton("Clone", LauncherButtonKind::Neutral,
+                                       ImVec2(compactBtnW, searchH))) {
+                        projectManager.showCloneProjectDialog = true;
                     }
                     ImGui::EndDisabled();
                 }
@@ -2820,6 +2836,7 @@ void Engine::renderLauncher() {
                     ImGui::SetCursorScreenPos(ImVec2(cursorPos.x, cursorPos.y + rowSlideY));
                     ImGui::SetNextItemAllowOverlap();
                     ImGui::InvisibleButton("##ProjectCard", ImVec2(listWidth, cardHeight));
+                    ImGui::ReportItemHoverFeedback();
                     const bool hovered    = ImGui::IsItemHovered();
                     const bool clicked    = ImGui::IsItemClicked(ImGuiMouseButton_Left);
                     const bool dblClicked = hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
@@ -3272,6 +3289,7 @@ void Engine::renderLauncher() {
                 const ImVec2 rowPos = ImGui::GetCursorScreenPos();
                 const ImVec2 rowSize(std::max(48.0f * uiScale, ImGui::GetContentRegionAvail().x), 62.0f * uiScale);
                 ImGui::InvisibleButton("TemplateSelectRow", rowSize);
+                ImGui::ReportItemHoverFeedback();
                 const bool hovered = ImGui::IsItemHovered();
                 if (ImGui::IsItemClicked()) {
                     selectTemplateEntry(entry);
@@ -3362,6 +3380,7 @@ void Engine::renderLauncher() {
                 const ImVec2 tilePos = ImGui::GetCursorScreenPos();
                 const ImVec2 tileSize(std::max(48.0f * uiScale, tileWidth), tileHeight);
                 ImGui::InvisibleButton("TemplateGridTile", tileSize);
+                ImGui::ReportItemHoverFeedback();
                 const bool hovered = ImGui::IsItemHovered();
                 if (ImGui::IsItemClicked()) {
                     selectTemplateEntry(entry);
@@ -3931,6 +3950,7 @@ void Engine::renderLauncher() {
                     ImGui::PushID(pkg.id.c_str());
                     const ImVec2 pos = ImGui::GetCursorScreenPos();
                     ImGui::InvisibleButton("##pkgRow", ImVec2(rowW, rowH));
+                    ImGui::ReportItemHoverFeedback();
                     const bool hovered = ImGui::IsItemHovered();
                     if (ImGui::IsItemClicked()) selectedPackageId = pkg.id;
                     const ImVec2 max(pos.x + rowW, pos.y + rowH);
@@ -4091,8 +4111,7 @@ void Engine::renderLauncher() {
                         if (packageManager.installRegistryPackageGlobally(pkg.id)) {
                             packageStatus = "Installed " + pkg.id + " into the global store.";
                             packageStatusError = false;
-                            playEditorFeedbackOneShot("Resources/Sounds/Modupak Success installed.mp3",
-                                                      0.85f, EditorFeedbackSoundCategory::Other);
+                            playEditorSound(EditorSoundCue::PackageInstalled, 0.85f);
                         } else {
                             packageStatus = packageManager.getLastError().empty()
                                 ? std::string("Global install failed.")
@@ -4548,6 +4567,45 @@ void Engine::renderLauncher() {
                     sectionHeading("Editor feedback",
                                    "The short sounds the editor plays for its own actions. Nothing "
                                    "here touches audio in your game.");
+                    {
+                        const auto& themes = editorSoundThemes.themes();
+                        const std::string& activeTheme = editorSoundThemes.activeId();
+                        std::vector<const char*> labels;
+                        int current = 0;
+                        const char* hint = "Which set of sounds the editor plays.";
+                        for (size_t i = 0; i < themes.size(); ++i) {
+                            labels.push_back(themes[i].displayName.c_str());
+                            if (themes[i].id == activeTheme) {
+                                current = static_cast<int>(i);
+                                if (!themes[i].description.empty()) hint = themes[i].description.c_str();
+                            }
+                        }
+                        LauncherSettingLabel("Sound theme", hint, uiScale);
+                        if (!labels.empty()) {
+                            ImGui::SetNextItemWidth(controlW);
+                            if (ImGui::Combo("##SoundTheme", &current, labels.data(),
+                                             static_cast<int>(labels.size()))) {
+                                // Frees `themes` (it rescans); nothing below reads it.
+                                selectEditorSoundTheme(themes[current].id);
+                            }
+                        } else {
+                            ImGui::PushStyleColor(ImGuiCol_Text, LauncherSkin::kTextDim);
+                            ImGui::TextUnformatted("No themes found in Resources/Sounds/SoundThemes.");
+                            ImGui::PopStyleColor();
+                        }
+                        ImGui::Dummy(ImVec2(0.0f, 9.0f * uiScale));
+                    }
+                    LauncherSettingLabel("UI volume",
+                                         "How loud every interface sound plays. Game audio and "
+                                         "audio previews are not affected.", uiScale);
+                    ImGui::SetNextItemWidth(controlW);
+                    if (ImGui::SliderFloat("##FeedbackVolume", &prefs.feedbackSoundVolume, 0.0f, 1.0f, "%.2f")) {
+                        prefsDirty = true;
+                    }
+                    if (ImGui::IsItemDeactivatedAfterEdit()) {
+                        playEditorSound(EditorSoundCue::Confirm);  // hear the new level on release
+                    }
+                    ImGui::Dummy(ImVec2(0.0f, 9.0f * uiScale));
                     checkboxSetting("Enable feedback sounds",
                                     "Master switch for every category below.",
                                     &prefs.feedbackSounds);
@@ -4559,6 +4617,21 @@ void Engine::renderLauncher() {
                     checkboxSetting("Notifications",
                                     "Package installs, info popups, the startup chime.",
                                     &prefs.feedbackOtherSounds);
+                    checkboxSetting("Buttons and tabs",
+                                    "Every button, menu command and tab.",
+                                    &prefs.feedbackButtonSounds);
+                    checkboxSetting("Toggles",
+                                    "Checkboxes, switches and radio buttons.",
+                                    &prefs.feedbackToggleSounds);
+                    checkboxSetting("Slide-outs",
+                                    "Menus, dropdowns, dock drawers and expanding sections.",
+                                    &prefs.feedbackSlideSounds);
+                    checkboxSetting("Transitions",
+                                    "Dialogs scaling in and out.",
+                                    &prefs.feedbackTransitionSounds);
+                    checkboxSetting("Hover",
+                                    "A soft tick as the pointer moves onto buttons, menu items and rows.",
+                                    &prefs.feedbackHoverSounds);
                     ImGui::EndDisabled();
                     break;
                 }
@@ -5207,6 +5280,10 @@ void Engine::renderLauncher() {
 
     if (projectManager.showOpenProjectDialog)
         renderOpenProjectDialog();
+#if !MODULARITY_RUNTIME_ONLY
+    if (projectManager.showCloneProjectDialog)
+        renderCloneProjectDialog();
+#endif
 
     if (projectLoadInProgress || sceneLoadInProgress) {
         const float elapsed = static_cast<float>(glfwGetTime() - projectLoadStartTime);
@@ -5457,6 +5534,7 @@ void Engine::renderNewProjectDialog() {
             const ImVec2 rowPos = ImGui::GetCursorScreenPos();
             const ImVec2 rowSize(ImGui::GetContentRegionAvail().x, 64.0f);
             ImGui::InvisibleButton("TemplateListRow", rowSize);
+            ImGui::ReportItemHoverFeedback();
             const bool hovered = ImGui::IsItemHovered();
             if (ImGui::IsItemClicked()) {
                 selectTemplateEntry(entry);
@@ -5536,6 +5614,7 @@ void Engine::renderNewProjectDialog() {
             const ImVec2 tilePos = ImGui::GetCursorScreenPos();
             const ImVec2 tileSize(tileWidth, tileHeight);
             ImGui::InvisibleButton("TemplateGridTile", tileSize);
+            ImGui::ReportItemHoverFeedback();
             const bool hovered = ImGui::IsItemHovered();
             if (ImGui::IsItemClicked()) {
                 selectTemplateEntry(entry);
@@ -5842,7 +5921,7 @@ void Engine::renderOpenProjectDialog() {
             if (strlen(projectManager.openProjectPath) == 0) {
                 projectManager.errorMessage = "Please enter a project path";
             } else {
-                playEditorFeedbackPreview("Resources/Sounds/Selection.mp3", 0.95f, false, EditorFeedbackSoundCategory::Click);
+                playEditorSound(EditorSoundCue::Confirm, 0.95f);
                 OpenProjectPath(projectManager.openProjectPath);
                 if (!projectManager.errorMessage.empty()) {
                     // Error handled in OpenProjectPath
@@ -6001,6 +6080,7 @@ void Engine::renderProjectBrowserPanel() {
             : ImVec2(ImGui::GetContentRegionAvail().x, 44.0f);
         ImGui::PushID(index);
         const bool pressed = ImGui::InvisibleButton("##ProjectSettingsNavTab", slotSize);
+        ImGui::ReportItemHoverFeedback();
         const bool hovered = ImGui::IsItemHovered();
         const bool held = ImGui::IsItemActive();
         ImGui::PopID();
@@ -6119,7 +6199,7 @@ void Engine::renderProjectBrowserPanel() {
     auto selectProjectSettingsTab = [&](int index) {
         if (selectedTab != index) {
             selectedTab = index;
-            playEditorFeedbackPreview("Resources/Sounds/Selection Tick Main Editor.mp3", 0.95f, false, EditorFeedbackSoundCategory::Click);
+            playEditorSound(EditorSoundCue::Tick, 0.95f);
         }
     };
     if (projectSettingsCompactSidebar) {
@@ -7001,6 +7081,47 @@ void Engine::renderProjectBrowserPanel() {
                         return false;
                     });
             }
+            if (visible(ProjectSettingsVisibilityMode::Advanced, "Quality", "3D Canvas Auto Resolution", "ui canvas render in 3d target resolution auto screen")) {
+                changed |= DrawSettingRow(
+                    Loc::T("SETTINGS_GRAPHICS_CANVAS3D_AUTO_RES", "3D Canvas Auto Resolution"),
+                    Loc::T("SETTINGS_GRAPHICS_CANVAS3D_AUTO_RES_DESC",
+                           "Render each Render In 3D canvas at the size it covers on screen "
+                           "instead of its full Render Target. A 2048 canvas filling 300 "
+                           "pixels renders at 512, so redraws and sampling cost a sixteenth. "
+                           "Never exceeds the canvas's own Render Target or the cap below."),
+                    [&]() {
+                        bool v = graphics.canvas3DAutoResolution;
+                        if (ImGui::Checkbox("##Canvas3DAutoResolution", &v)) {
+                            graphics.canvas3DAutoResolution = v;
+                            return true;
+                        }
+                        return false;
+                    });
+            }
+            if (visible(ProjectSettingsVisibilityMode::Advanced, "Quality", "3D Canvas Max Resolution", "ui canvas render in 3d target resolution cap limit memory vram")) {
+                changed |= DrawSettingRow(
+                    Loc::T("SETTINGS_GRAPHICS_CANVAS3D_MAX_RES", "3D Canvas Max Resolution"),
+                    Loc::T("SETTINGS_GRAPHICS_CANVAS3D_MAX_RES_DESC",
+                           "Largest render target any Render In 3D canvas gets, whatever its "
+                           "own Render Target says. A 2048 canvas holds 16 MB of VRAM and "
+                           "repaints 4 million pixels when it changes; low-end GPUs are far "
+                           "happier at 512 or 1024."),
+                    [&]() {
+                        const int sizeOptions[] = { 0, 256, 512, 1024, 2048 };
+                        const char* sizeLabels[] = {
+                            "No limit", "256", "512", "1024", "2048"
+                        };
+                        int sizeIdx = 0;
+                        for (int i = 0; i < (int)(sizeof(sizeOptions) / sizeof(sizeOptions[0])); ++i) {
+                            if (sizeOptions[i] == graphics.canvas3DMaxResolution) { sizeIdx = i; break; }
+                        }
+                        if (ImGui::Combo("##Canvas3DMaxResolution", &sizeIdx, sizeLabels, IM_ARRAYSIZE(sizeLabels))) {
+                            graphics.canvas3DMaxResolution = sizeOptions[std::clamp(sizeIdx, 0, 4)];
+                            return true;
+                        }
+                        return false;
+                    });
+            }
             if (visible(ProjectSettingsVisibilityMode::Advanced, "Quality", "Shadow Filtering", "shadow soft pcf")) {
                 changed |= DrawSettingRow(
                     Loc::T("SETTINGS_GRAPHICS_SHADOW_FILTER", "Shadow Filtering"),
@@ -7065,6 +7186,237 @@ void Engine::renderProjectBrowserPanel() {
                     }
                     return false;
                 });
+            }
+        }
+
+        if (DrawSettingSection("[O]", Loc::T("SETTINGS_GRAPHICS_OPTIMIZATION", "Optimization"),
+                               Loc::T("SETTINGS_GRAPHICS_OPTIMIZATION_DESC",
+                                      "Optional rendering optimizations. With all of them off the "
+                                      "renderer runs exactly as it always has, so each one can be "
+                                      "A/B tested against it."))) {
+            const bool optimizationRendererLive = rendererInitialized && !usingVulkan();
+            const RenderOptimizationSupport support = optimizationRendererLive
+                ? renderer.getOptimizationSupport()
+                : RenderOptimizationSupport{};
+            const bool automaticStrategy =
+                graphics.optimizationStrategy == ProjectOptimizationStrategy::Automatic;
+            bool optimizationChanged = false;
+            auto optimizationCheckbox = [&](const char* id, bool& value) {
+                bool v = value;
+                if (ImGui::Checkbox(id, &v)) {
+                    value = v;
+                    return true;
+                }
+                return false;
+            };
+
+            if (!optimizationRendererLive) {
+                DrawHelpText("These apply to the OpenGL renderer; support is checked once it is running.");
+            }
+            if (visible(ProjectSettingsVisibilityMode::Simple, "Optimization", "Optimization Strategy", "manual automatic auto adaptive performance")) {
+                optimizationChanged |= DrawSettingRow(
+                    Loc::T("SETTINGS_GRAPHICS_OPT_STRATEGY", "Optimization Strategy"),
+                    Loc::T("SETTINGS_GRAPHICS_OPT_STRATEGY_DESC",
+                           "Manual runs exactly the optimizations checked below. Automatic treats "
+                           "the checked ones as allowed and picks per scene: nothing extra for "
+                           "small scenes, CPU culling, caching and sorting for moderate ones, then "
+                           "Multi-Draw Indirect and GPU culling for large ones. It measures as it "
+                           "goes and backs off from multi-draw when batches are too small to pay, "
+                           "and from GPU culling when it runs slower than CPU culling on this "
+                           "machine."),
+                    [&]() {
+                        int strategy = automaticStrategy ? 1 : 0;
+                        const char* strategies[] = { "Manual", "Automatic" };
+                        if (ImGui::Combo("##OptimizationStrategy", &strategy, strategies, IM_ARRAYSIZE(strategies))) {
+                            graphics.optimizationStrategy = strategy == 1
+                                ? ProjectOptimizationStrategy::Automatic
+                                : ProjectOptimizationStrategy::Manual;
+                            return true;
+                        }
+                        return false;
+                    });
+                if (automaticStrategy) {
+                    DrawHelpText("Automatic only chooses among the optimizations checked below.");
+                }
+            }
+            if (visible(ProjectSettingsVisibilityMode::Simple, "Optimization", "Enable CPU Frustum Culling", "frustum culling aabb bounds visible cpu")) {
+                optimizationChanged |= DrawSettingRow(
+                    Loc::T("SETTINGS_GRAPHICS_OPT_CPU_CULLING", "Enable CPU Frustum Culling"),
+                    Loc::T("SETTINGS_GRAPHICS_OPT_CPU_CULLING_DESC",
+                           "Skips objects outside the camera's view before drawing them, testing "
+                           "each object's cached world bounding box against the camera's six "
+                           "frustum planes (built once per camera per frame). Shadow casters are "
+                           "tested against each light's frustum too, and point-light shadows "
+                           "against each cube face. With this off while other optimizations are "
+                           "on, nothing is frustum culled on the CPU - useful for comparing."),
+                    [&]() { return optimizationCheckbox("##OptCpuFrustumCulling", graphics.optCpuFrustumCulling); });
+            }
+            if (visible(ProjectSettingsVisibilityMode::Simple, "Optimization", "Enable Static Object Caching", "static cache dirty transform bounds matrix")) {
+                optimizationChanged |= DrawSettingRow(
+                    Loc::T("SETTINGS_GRAPHICS_OPT_STATIC_CACHE", "Enable Static Object Caching"),
+                    Loc::T("SETTINGS_GRAPHICS_OPT_STATIC_CACHE_DESC",
+                           "Keeps each object's matrix, bounds, material key and batch data "
+                           "between frames and rebuilds them only when its transform, mesh or "
+                           "material actually changes, so a still object costs a comparison per "
+                           "frame instead of a rebuild. Static batching also checks for edits "
+                           "this way instead of re-hashing every material. Off: all of it is "
+                           "rebuilt every frame."),
+                    [&]() { return optimizationCheckbox("##OptStaticObjectCaching", graphics.optStaticObjectCaching); });
+            }
+            if (visible(ProjectSettingsVisibilityMode::Simple, "Optimization", "Enable Material/Pipeline Sorting", "sort material shader pipeline state texture binds")) {
+                optimizationChanged |= DrawSettingRow(
+                    Loc::T("SETTINGS_GRAPHICS_OPT_SORTING", "Enable Material/Pipeline Sorting"),
+                    Loc::T("SETTINGS_GRAPHICS_OPT_SORTING_DESC",
+                           "Orders opaque draws by shader, then texture set, then material, then "
+                           "front to back, so each frame switches programs (which re-sends every "
+                           "light) and binds textures as rarely as possible. Transparent objects "
+                           "always stay back to front, and 3D UI canvases keep their sorting "
+                           "order."),
+                    [&]() { return optimizationCheckbox("##OptMaterialSorting", graphics.optMaterialSorting); });
+            }
+            if (visible(ProjectSettingsVisibilityMode::Simple, "Optimization", "Enable LOD Optimization", "lod level of detail screen size small distance")) {
+                optimizationChanged |= DrawSettingRow(
+                    Loc::T("SETTINGS_GRAPHICS_OPT_LOD", "Enable LOD Optimization"),
+                    Loc::T("SETTINGS_GRAPHICS_OPT_LOD_DESC",
+                           "Skips objects whose bounding sphere projects smaller on screen than "
+                           "the minimum size below - screen size, not distance, so a large "
+                           "object stays far away and a small one does not - and skips shadow "
+                           "casters smaller than one shadow-map texel. Meshes do not have LOD "
+                           "chains in Modularity yet, so the choice here is drawn or skipped."),
+                    [&]() { return optimizationCheckbox("##OptLod", graphics.optLod); });
+                if (graphics.optLod &&
+                    IsSettingVisibleForMode(settingsMode, ProjectSettingsVisibilityMode::Advanced)) {
+                    optimizationChanged |= DrawSettingRow(
+                        Loc::T("SETTINGS_GRAPHICS_OPT_LOD_MIN_SIZE", "LOD Minimum Screen Size"),
+                        Loc::T("SETTINGS_GRAPHICS_OPT_LOD_MIN_SIZE_DESC",
+                               "Projected diameter in pixels below which an object is skipped. "
+                               "1-2 px only removes sub-pixel clutter; higher values trade "
+                               "distant detail for draw calls."),
+                        [&]() {
+                            float v = graphics.optLodMinScreenSize;
+                            if (ImGui::SliderFloat("##OptLodMinScreenSize", &v, 0.5f, 16.0f, "%.1f px")) {
+                                graphics.optLodMinScreenSize = std::clamp(v, 0.1f, 64.0f);
+                                return true;
+                            }
+                            return false;
+                        });
+                }
+            }
+            if (visible(ProjectSettingsVisibilityMode::Simple, "Optimization", "Enable Multi-Draw Indirect", "mdi multi draw indirect batch instancing draw calls")) {
+                optimizationChanged |= DrawSettingRow(
+                    Loc::T("SETTINGS_GRAPHICS_OPT_MDI", "Enable Multi-Draw Indirect"),
+                    Loc::T("SETTINGS_GRAPHICS_OPT_MDI_DESC",
+                           "Draws opaque objects that share a shader and material with one "
+                           "multi-draw call per group instead of one call each. Their meshes are "
+                           "copied into a shared vertex buffer, and each object's matrix uploads "
+                           "only when it moves. Objects with a custom vertex shader, skinning, "
+                           "transparency, a runtime texture override or a reflection probe in "
+                           "range keep drawing one at a time. Replaces static batching while on. "
+                           "Requires OpenGL 4.3."),
+                    [&]() {
+                        ImGui::BeginDisabled(optimizationRendererLive && !support.multiDrawIndirect);
+                        const bool rowChanged = optimizationCheckbox("##OptMultiDrawIndirect", graphics.optMultiDrawIndirect);
+                        ImGui::EndDisabled();
+                        return rowChanged;
+                    });
+                if (optimizationRendererLive && !support.multiDrawIndirect) {
+                    DrawHelpText(support.multiDrawIndirectReason.c_str());
+                }
+            }
+            if (visible(ProjectSettingsVisibilityMode::Simple, "Optimization", "Enable GPU Driven Culling", "gpu driven culling compute shader indirect")) {
+                const bool gpuCullingUsable = !optimizationRendererLive || support.computeCulling;
+                optimizationChanged |= DrawSettingRow(
+                    Loc::T("SETTINGS_GRAPHICS_OPT_GPU_CULLING", "Enable GPU Driven Culling"),
+                    Loc::T("SETTINGS_GRAPHICS_OPT_GPU_CULLING_DESC",
+                           "Culls the multi-draw batches in a compute shader that writes their "
+                           "indirect draw commands directly, so the CPU never touches per-object "
+                           "visibility and nothing is read back. Falls back to CPU culling when "
+                           "unavailable. Not always faster: on a weak GPU the CPU path can win, "
+                           "which Automatic measures. Requires compute shaders (OpenGL 4.3) and "
+                           "Multi-Draw Indirect."),
+                    [&]() {
+                        ImGui::BeginDisabled(!gpuCullingUsable || !graphics.optMultiDrawIndirect);
+                        const bool rowChanged = optimizationCheckbox("##OptGpuDrivenCulling", graphics.optGpuDrivenCulling);
+                        ImGui::EndDisabled();
+                        return rowChanged;
+                    });
+                if (!gpuCullingUsable) {
+                    DrawHelpText(support.computeCullingReason.c_str());
+                } else if (!graphics.optMultiDrawIndirect) {
+                    DrawHelpText("Needs Multi-Draw Indirect: batched objects are what it culls.");
+                }
+            }
+            if (visible(ProjectSettingsVisibilityMode::Advanced, "Optimization", "Enable Hi-Z Occlusion Culling", "hi-z hiz occlusion depth pyramid experimental hidden")) {
+                const bool hiZUsable = !optimizationRendererLive || support.hiZ;
+                optimizationChanged |= DrawSettingRow(
+                    Loc::T("SETTINGS_GRAPHICS_OPT_HIZ", "Enable Hi-Z Occlusion Culling (Experimental)"),
+                    Loc::T("SETTINGS_GRAPHICS_OPT_HIZ_DESC",
+                           "Experimental. Builds a depth pyramid from each view's previous frame, "
+                           "and GPU culling then also skips batched objects hidden behind nearer "
+                           "geometry. Nothing is read back. Because it tests against last "
+                           "frame's depth, an object uncovered very quickly can appear a frame "
+                           "late; camera cuts and big jumps skip the test for a frame. Requires "
+                           "GPU Driven Culling."),
+                    [&]() {
+                        ImGui::BeginDisabled(!hiZUsable || !graphics.optMultiDrawIndirect ||
+                                             !graphics.optGpuDrivenCulling);
+                        const bool rowChanged = optimizationCheckbox("##OptHiZOcclusionCulling", graphics.optHiZOcclusionCulling);
+                        ImGui::EndDisabled();
+                        return rowChanged;
+                    });
+                if (!hiZUsable) {
+                    DrawHelpText(support.hiZReason.c_str());
+                } else if (!graphics.optGpuDrivenCulling || !graphics.optMultiDrawIndirect) {
+                    DrawHelpText("Needs GPU Driven Culling, which the occlusion test runs inside.");
+                }
+            }
+            if (optimizationRendererLive &&
+                visible(ProjectSettingsVisibilityMode::Advanced, "Optimization", "Last Frame", "statistics stats culled visible draw calls triangles")) {
+                const Renderer::RenderStats& stats = renderer.getLastViewportStats();
+                const uint32_t features = stats.optimizationFeatures;
+                std::string ran;
+                auto note = [&](uint32_t bit, const char* name) {
+                    if ((features & bit) == 0) return;
+                    if (!ran.empty()) ran += ", ";
+                    ran += name;
+                };
+                note(kRenderOptCpuCulling, "CPU culling");
+                note(kRenderOptStaticCache, "caching");
+                note(kRenderOptSorting, "sorting");
+                note(kRenderOptLod, "LOD");
+                note(kRenderOptMultiDraw, "multi-draw");
+                note(kRenderOptGpuCulling, "GPU culling");
+                note(kRenderOptHiZ, "Hi-Z");
+                char line[256];
+                std::snprintf(line, sizeof(line), "Scene view last frame%s: %s",
+                              stats.optimizationAutomatic ? " (Automatic)" : "",
+                              ran.empty() ? "standard path" : ran.c_str());
+                DrawHelpText(line);
+                if (features != 0) {
+                    std::snprintf(line, sizeof(line),
+                                  "%d submitted, %d culled, %d LOD-culled, %d visible, %d draw calls, "
+                                  "%lld triangles; queue %.2f ms (culling %.2f, sorting %.2f)",
+                                  stats.objectsSubmitted, stats.objectsCulled, stats.objectsLodCulled,
+                                  stats.visibleRenderables, stats.drawCalls, stats.triangles,
+                                  stats.queueBuildMs, stats.cpuCullingMs, stats.sortingMs);
+                    DrawHelpText(line);
+                }
+                if (stats.mdiBatches > 0) {
+                    std::snprintf(line, sizeof(line),
+                                  "Multi-draw: %d objects in %d batches, %d calls, %d indirect commands",
+                                  stats.mdiObjects, stats.mdiBatches, stats.multiDrawCalls,
+                                  stats.indirectDrawCommands);
+                    DrawHelpText(line);
+                }
+                if (stats.gpuCullingMs >= 0.0f || stats.gpuVisible >= 0) {
+                    std::snprintf(line, sizeof(line), "GPU culling: %.3f ms, %d visible (a few frames old)",
+                                  stats.gpuCullingMs, stats.gpuVisible);
+                    DrawHelpText(line);
+                }
+            }
+            if (optimizationChanged) {
+                applyProjectGraphicsToRenderer();
+                changed = true;
             }
         }
 
@@ -7415,6 +7767,48 @@ void Engine::renderProjectBrowserPanel() {
                     return ImGui::Checkbox("##FeedbackSounds", &feedbackSoundsEnabled);
                 });
             }
+            if (visible(ProjectSettingsVisibilityMode::Simple, "Audio", "Sound Theme", "feedback sounds sleek expressive")) {
+                DrawSettingRow(Loc::T("SETTINGS_AUDIO_SOUND_THEME", "Sound Theme"), Loc::T("SETTINGS_AUDIO_SOUND_THEME_DESC", "Which set of UI sounds the editor plays. A user preference shared by every project."), [&]() {
+                    const auto& themes = editorSoundThemes.themes();
+                    const std::string& activeTheme = editorSoundThemes.activeId();
+                    std::vector<const char*> labels;
+                    int current = 0;
+                    for (size_t i = 0; i < themes.size(); ++i) {
+                        labels.push_back(themes[i].displayName.c_str());
+                        if (themes[i].id == activeTheme) current = static_cast<int>(i);
+                    }
+                    if (labels.empty()) {
+                        ImGui::TextDisabled("No themes found in Resources/Sounds/SoundThemes.");
+                    } else if (ImGui::Combo("##SoundTheme", &current, labels.data(), static_cast<int>(labels.size()))) {
+                        // Frees `themes` (it rescans); nothing below reads it.
+                        selectEditorSoundTheme(themes[current].id);
+                    }
+                    // Saved globally by selectEditorSoundTheme, not into this project's settings.
+                    return false;
+                });
+            }
+            if (visible(ProjectSettingsVisibilityMode::Simple, "Audio", "Interface Sounds", "button toggle slide transition menu dialog")) {
+                editorSettingsChanged |= DrawSettingRow(Loc::T("SETTINGS_AUDIO_INTERFACE_SOUNDS", "Interface Sounds"), Loc::T("SETTINGS_AUDIO_INTERFACE_SOUNDS_DESC", "Sounds for buttons, toggles, slide-out menus and dialog transitions. Each group can be turned off on its own."), [&]() {
+                    bool changed = false;
+                    changed |= ImGui::Checkbox(Loc::T("SETTINGS_AUDIO_SOUNDS_BUTTONS", "Buttons"), &feedbackButtonSoundsEnabled);
+                    ImGui::SameLine();
+                    changed |= ImGui::Checkbox(Loc::T("SETTINGS_AUDIO_SOUNDS_TOGGLES", "Toggles"), &feedbackToggleSoundsEnabled);
+                    changed |= ImGui::Checkbox(Loc::T("SETTINGS_AUDIO_SOUNDS_SLIDES", "Slide-outs"), &feedbackSlideSoundsEnabled);
+                    ImGui::SameLine();
+                    changed |= ImGui::Checkbox(Loc::T("SETTINGS_AUDIO_SOUNDS_TRANSITIONS", "Transitions"), &feedbackTransitionSoundsEnabled);
+                    changed |= ImGui::Checkbox(Loc::T("SETTINGS_AUDIO_SOUNDS_HOVER", "Hover"), &feedbackHoverSoundsEnabled);
+                    return changed;
+                });
+            }
+            if (visible(ProjectSettingsVisibilityMode::Simple, "Audio", "UI Volume", "feedback interface sound level loud quiet")) {
+                editorSettingsChanged |= DrawSettingRow(Loc::T("SETTINGS_AUDIO_UI_VOLUME", "UI Volume"), Loc::T("SETTINGS_AUDIO_UI_VOLUME_DESC", "How loud interface sounds play. Game audio and audio previews are not affected."), [&]() {
+                    const bool changed = ImGui::SliderFloat("##FeedbackSoundVolume", &feedbackSoundVolume, 0.0f, 1.0f, "%.2f");
+                    if (ImGui::IsItemDeactivatedAfterEdit()) {
+                        playEditorSound(EditorSoundCue::Confirm);  // hear the new level on release
+                    }
+                    return changed;
+                });
+            }
             if (visible(ProjectSettingsVisibilityMode::Advanced, "Audio", "Preview Volume", "asset browser audio")) {
                 editorSettingsChanged |= DrawSettingRow(Loc::T("SETTINGS_AUDIO_PREVIEW_VOLUME", "Preview Volume"), Loc::T("SETTINGS_AUDIO_PREVIEW_VOLUME_DESC", "Volume for audio previews in editor tools."), [&]() {
                     return ImGui::SliderFloat("##AudioPreviewVolume", &audioPreviewVolume, 0.0f, 2.0f, "%.2f");
@@ -7677,10 +8071,13 @@ void Engine::renderProjectBrowserPanel() {
                 buildSettingsChanged |= DrawSettingRow(Loc::T("SETTINGS_EDITOR_PROFILING", "Profiling"), Loc::T("SETTINGS_EDITOR_PROFILING_DESC", "Developer build diagnostics and profiling options."), [&]() {
                     bool changed = false;
                     changed |= ImGui::Checkbox("Script Debug##ScriptDebuggingQuick", &buildSettings.scriptDebugging);
+                    ImGui::SetItemTooltip("%s", BuildSettingsHints::kScriptDebugging);
                     ImGui::SameLine();
                     changed |= ImGui::Checkbox("Profiler##AutoProfilerQuick", &buildSettings.autoConnectProfiler);
+                    ImGui::SetItemTooltip("%s", BuildSettingsHints::kAutoconnectProfiler);
                     ImGui::SameLine();
                     changed |= ImGui::Checkbox("Deep##DeepProfilingQuick", &buildSettings.deepProfiling);
+                    ImGui::SetItemTooltip("%s", BuildSettingsHints::kDeepProfiling);
                     return changed;
                 });
             }
@@ -8001,10 +8398,13 @@ void Engine::renderProjectBrowserPanel() {
                 changed |= DrawSettingRow(Loc::T("SETTINGS_BUILD_DEBUGGING", "Debugging"), Loc::T("SETTINGS_BUILD_DEBUGGING_DESC", "Developer diagnostics for exported builds."), [&]() {
                     bool rowChanged = false;
                     rowChanged |= ImGui::Checkbox("Script##BuildScriptDebugging", &buildSettings.scriptDebugging);
+                    ImGui::SetItemTooltip("%s", BuildSettingsHints::kScriptDebugging);
                     ImGui::SameLine();
                     rowChanged |= ImGui::Checkbox("Profiler##BuildAutoProfiler", &buildSettings.autoConnectProfiler);
+                    ImGui::SetItemTooltip("%s", BuildSettingsHints::kAutoconnectProfiler);
                     ImGui::SameLine();
                     rowChanged |= ImGui::Checkbox("Deep##BuildDeepProfiling", &buildSettings.deepProfiling);
+                    ImGui::SetItemTooltip("%s", BuildSettingsHints::kDeepProfiling);
                     return rowChanged;
                 });
             }
@@ -8012,8 +8412,10 @@ void Engine::renderProjectBrowserPanel() {
                 changed |= DrawSettingRow(Loc::T("SETTINGS_BUILD_SPECIAL_BUILDS", "Special Builds"), Loc::T("SETTINGS_BUILD_SPECIAL_BUILDS_DESC", "Internal build modes for script-only or server exports."), [&]() {
                     bool rowChanged = false;
                     rowChanged |= ImGui::Checkbox("Scripts Only##BuildScriptsOnly", &buildSettings.scriptsOnlyBuild);
+                    ImGui::SetItemTooltip("%s", BuildSettingsHints::kScriptsOnly);
                     ImGui::SameLine();
                     rowChanged |= ImGui::Checkbox("Server##BuildServer", &buildSettings.serverBuild);
+                    ImGui::SetItemTooltip("%s", BuildSettingsHints::kServerBuild);
                     return rowChanged;
                 });
             }
@@ -8723,9 +9125,9 @@ void Engine::renderProjectBrowserPanel() {
                     [&]() { return ImGui::Checkbox("##OpenXRTargetEnabled", &target.enabled); });
             }
             if (!XR::IsPlatformTargetSupported(platformTarget)) {
-                DrawHelpText("This editor build has no graphics binding for this target, so it "
+                /*DrawHelpText("This editor build has no graphics binding for this target, so it "
                              "cannot start a session here. The settings still save with the "
-                             "project and apply when you build for it.");
+                             "project and apply when you build for it.");*/
             }
 
             ImGui::BeginDisabled(!targetOn);
@@ -8799,9 +9201,9 @@ void Engine::renderProjectBrowserPanel() {
                         DrawHelpText("This runtime did not report multiview support, so the session "
                                      "will run Multi Pass.");
                     } else if (isPCTab) {
-                        DrawHelpText("GL_OVR_multiview2 is not available on every desktop GL "
+                        /*DrawHelpText("GL_OVR_multiview2 is not available on every desktop GL "
                                      "driver. If it is missing the session runs Multi Pass, and "
-                                     "Runtime Diagnostics below reports which one is in use.");
+                                     "Runtime Diagnostics below reports which one is in use.");*/
                     }
                 }
             }
@@ -9134,11 +9536,6 @@ void Engine::renderProjectBrowserPanel() {
                            "A built PC player always starts VR."),
                     [&]() { return ImGui::Checkbox("##OpenXRPCStartOnPlay", &xr.pc.startOnPlay); });
             }
-
-            DrawHelpText("Windows ships no system-wide OpenXR loader: openxr_loader.dll travels "
-                         "with the application. If Runtime Diagnostics reports no loader, put it "
-                         "next to Modularity.exe or in redist/windows-x64/ - "
-                         "tools/fetch-openxr-loader-windows.sh does it for you.");
             ImGui::EndDisabled();
         }
 
@@ -9220,7 +9617,7 @@ void Engine::renderProjectBrowserPanel() {
                     probe.shutdown();
                 }
                 ImGui::SameLine();
-                ImGui::TextDisabled("Starts and stops an OpenXR instance to read the runtime's own report.");
+                /*ImGui::TextDisabled("Starts and stops an OpenXR instance to read the runtime's own report.");*/
 
                 auto diagRow = [](const char* label, const std::string& value) {
                     DrawSettingRow(label, nullptr, [&]() {

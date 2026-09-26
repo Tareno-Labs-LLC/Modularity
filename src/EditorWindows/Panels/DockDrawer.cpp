@@ -1,7 +1,23 @@
+#include "../../EditorLocalization.h"
 #include "Engine.h"
 
+namespace Loc = Modularity::Loc;
+
+// Dock drawers: the left, right and bottom dock areas fold away into a slim rail.
+// Double-click (or double-tap) a drawer's tab strip and the panel bumps out a
+// little, then slides into a rail along its edge; clicking or tapping the rail
+// slides it back. The rail is drawn with ModuGUI's own tab shading and window
+// icons, so it reads as part of the dock rather than an overlay.
 namespace {
 enum class DockDrawerSide { Left, Right, Bottom };
+
+// Open: untouched, the user resizes it freely. Bump: the short grow before
+// closing. Closing/Opening: the slide. Closed: folded into the rail.
+enum class DrawerPhase { Open, Bump, Closing, Closed, Opening };
+
+constexpr double kBumpSeconds = 0.10;
+constexpr double kCloseSeconds = 0.26;
+constexpr double kOpenSeconds = 0.24;
 
 struct DockDrawerTarget {
   ImGuiDockNode *splitParent = nullptr;
@@ -11,14 +27,67 @@ struct DockDrawerTarget {
 
 struct DockDrawerState {
   ImGuiID activeSplitParentId = 0;
-  bool collapsed = false;
-  float openAmount = 1.0f;
-  float expandedExtent = 0.0f;
-  ImGuiID pendingTabFocusId = 0;
+  DrawerPhase phase = DrawerPhase::Open;
+  double phaseStart = 0.0;
+  float phaseFromExtent = 0.0f;  // drawer size when the current slide began
+  float expandedExtent = 0.0f;   // size to open back to
+  // Collapsed as of the last slide sound, so each user action is heard once and
+  // layout resets that force the drawer open are not.
+  bool reportedCollapsed = false;
+  // Tab to select once the drawer is open again (rail slot clicks).
+  ImGuiID pendingFocusNodeId = 0;
+  ImGuiID pendingFocusTabId = 0;
+  // Leaf nodes whose tab bar this drawer hid, so only those are shown again.
+  ImVector<ImGuiID> hiddenLeafIds;
+  // Tap tracking: a tap is a press and release in place, so dragging a tab to
+  // undock or reorder it never counts.
+  bool pressInside = false;
+  ImVec2 pressPos;
+  double lastTapTime = -1.0;
+  ImVec2 lastTapPos;
 };
 
+bool IsCollapsingOrCollapsed(DrawerPhase phase) {
+  return phase == DrawerPhase::Bump || phase == DrawerPhase::Closing ||
+         phase == DrawerPhase::Closed;
+}
+
+float EaseInOutCubic(float t) {
+  return t < 0.5f ? 4.0f * t * t * t
+                  : 1.0f - std::pow(-2.0f * t + 2.0f, 3.0f) * 0.5f;
+}
+
+float EaseOutCubic(float t) { return 1.0f - std::pow(1.0f - t, 3.0f); }
+
+float DistanceSq(const ImVec2 &a, const ImVec2 &b) {
+  const float dx = a.x - b.x;
+  const float dy = a.y - b.y;
+  return dx * dx + dy * dy;
+}
+
+float SmoothStep(float edge0, float edge1, float x) {
+  const float t = std::clamp((x - edge0) / (edge1 - edge0), 0.0f, 1.0f);
+  return t * t * (3.0f - 2.0f * t);
+}
+
+// Touch gets bigger rail slots and a looser double-tap. Sticky, so the layout
+// does not change size every time a mouse event arrives on a hybrid device.
+bool TouchPreferred() {
+#ifdef __ANDROID__
+  return true;
+#else
+  static bool touch = false;
+  const ImGuiIO &io = ImGui::GetIO();
+  if (io.MouseClicked[ImGuiMouseButton_Left]) {
+    touch = io.MouseSource == ImGuiMouseSource_TouchScreen;
+  }
+  return touch;
+#endif
+}
+
 void addRotatedText90CW(ImDrawList *drawList, ImFont *font, float fontSize,
-                        const ImRect &bounds, ImU32 color, const char *text) {
+                        const ImRect &bounds, ImU32 color, const char *text,
+                        const char *textEnd) {
   if (!drawList || !font || !text || !*text)
     return;
   if ((color & IM_COL32_A_MASK) == 0)
@@ -29,7 +98,7 @@ void addRotatedText90CW(ImDrawList *drawList, ImFont *font, float fontSize,
     return;
 
   const ImVec2 textSize =
-      font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, text, nullptr, nullptr);
+      font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, text, textEnd, nullptr);
   if (textSize.x <= 0.0f || textSize.y <= 0.0f)
     return;
 
@@ -44,9 +113,9 @@ void addRotatedText90CW(ImDrawList *drawList, ImFont *font, float fontSize,
 
   float cursorX = 0.0f;
   const char *s = text;
-  while (s && *s) {
+  while (s < textEnd && *s) {
     unsigned int c = 0;
-    const int bytes = ImTextCharFromUtf8(&c, s, nullptr);
+    const int bytes = ImTextCharFromUtf8(&c, s, textEnd);
     if (bytes <= 0)
       break;
     s += bytes;
@@ -61,533 +130,44 @@ void addRotatedText90CW(ImDrawList *drawList, ImFont *font, float fontSize,
     const float x2 = cursorX + glyph->X1 * scale;
     const float y1 = glyph->Y0 * scale;
     const float y2 = glyph->Y1 * scale;
-    const float u1 = glyph->U0;
-    const float v1 = glyph->V0;
-    const float u2 = glyph->U1;
-    const float v2 = glyph->V1;
 
     auto rotateCW = [&](float x, float y) -> ImVec2 {
       // (x,y) -> (y, textWidth - x), then centered in target bounds.
       return ImVec2(originX + y, originY + (textSize.x - x));
     };
 
-    const ImVec2 pTL = rotateCW(x1, y1);
-    const ImVec2 pTR = rotateCW(x2, y1);
-    const ImVec2 pBR = rotateCW(x2, y2);
-    const ImVec2 pBL = rotateCW(x1, y2);
-
-    drawList->AddImageQuad(ImGui::GetIO().Fonts->TexRef, pTL, pTR, pBR, pBL,
-                           ImVec2(u1, v1), ImVec2(u2, v1), ImVec2(u2, v2),
-                           ImVec2(u1, v2), color);
+    drawList->AddImageQuad(ImGui::GetIO().Fonts->TexRef, rotateCW(x1, y1),
+                           rotateCW(x2, y1), rotateCW(x2, y2),
+                           rotateCW(x1, y2), ImVec2(glyph->U0, glyph->V0),
+                           ImVec2(glyph->U1, glyph->V0),
+                           ImVec2(glyph->U1, glyph->V1),
+                           ImVec2(glyph->U0, glyph->V1), color);
 
     cursorX += glyph->AdvanceX * scale;
   }
 }
 
-struct DockTabInteractionState {
-  bool hovered = false;
-  bool clicked = false;
-  bool doubleClicked = false;
-};
-
-bool matchesVisibleWindowTitle(const char *windowName,
-                               const char *expectedTitle) {
-  if (!windowName || !expectedTitle)
-    return false;
-  const char *idSep = std::strstr(windowName, "###");
-  if (!idSep) {
-    idSep = std::strstr(windowName, "##");
+void collectLeafNodes(ImGuiDockNode *node, ImVector<ImGuiDockNode *> &out) {
+  if (!node)
+    return;
+  if (node->IsLeafNode()) {
+    out.push_back(node);
+    return;
   }
-  const size_t visibleLen =
-      idSep ? static_cast<size_t>(idSep - windowName) : std::strlen(windowName);
-  return std::strlen(expectedTitle) == visibleLen &&
-         std::strncmp(windowName, expectedTitle, visibleLen) == 0;
+  collectLeafNodes(node->ChildNodes[0], out);
+  collectLeafNodes(node->ChildNodes[1], out);
 }
 
-ImGuiWindow *findWindowByVisibleTitle(const char *expectedTitle) {
-  if (!expectedTitle || !*expectedTitle)
-    return nullptr;
-  if (ImGuiWindow *exact = ImGui::FindWindowByName(expectedTitle)) {
-    return exact;
-  }
-
-  ImGuiContext *ctx = ImGui::GetCurrentContext();
-  if (!ctx)
-    return nullptr;
-  for (ImGuiWindow *window : ctx->Windows) {
-    if (!window)
-      continue;
-    if ((window->Flags & ImGuiWindowFlags_ChildWindow) != 0)
-      continue;
-    if (!window->DockNode)
-      continue;
-    if (window && matchesVisibleWindowTitle(window->Name, expectedTitle)) {
-      return window;
-    }
-  }
-  return nullptr;
-}
-
-DockTabInteractionState
-queryDockTabInteraction(const DockDrawerTarget &target,
-                        const char *const *anchorWindows, int anchorCount) {
-  DockTabInteractionState out;
-
-  if (ImGuiTabBar *tabBar =
-          target.drawerBranch ? target.drawerBranch->TabBar : nullptr) {
-    if (ImGui::IsMouseHoveringRect(tabBar->BarRect.Min, tabBar->BarRect.Max,
-                                   false)) {
-      out.hovered = true;
-    }
-  }
-
-  for (int i = 0; i < anchorCount; ++i) {
-    ImGuiWindow *window = findWindowByVisibleTitle(anchorWindows[i]);
-    if (!window)
-      continue;
-    ImRect tabRect = window->DC.DockTabItemRect;
-    if (tabRect.GetWidth() <= 0.0f || tabRect.GetHeight() <= 0.0f)
-      continue;
-    if (ImGui::IsMouseHoveringRect(tabRect.Min, tabRect.Max, false)) {
-      out.hovered = true;
-      break;
-    }
-  }
-
-  if (!out.hovered && target.drawerBranch) {
-    const ImVec2 headerMin = target.drawerBranch->Pos;
-    const ImVec2 headerMax(
-        target.drawerBranch->Pos.x + target.drawerBranch->Size.x,
-        target.drawerBranch->Pos.y + ImGui::GetFrameHeight() + 8.0f);
-    if (ImGui::IsMouseHoveringRect(headerMin, headerMax, false)) {
-      out.hovered = true;
-    }
-  }
-
-  if (out.hovered) {
-    ImGuiIO &io = ImGui::GetIO();
-    out.doubleClicked = io.MouseClicked[ImGuiMouseButton_Left] &&
-                        io.MouseClickedCount[ImGuiMouseButton_Left] >= 2;
-    out.clicked =
-        !out.doubleClicked && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
-  }
-  return out;
-}
-
-void queueDrawerTabFocus(DockDrawerState &state, ImGuiTabBar *tabBar,
-                         ImGuiID tabId) {
-  if (!tabBar || tabId == 0)
-    return;
-  for (int i = 0; i < tabBar->Tabs.Size; ++i) {
-    ImGuiTabItem *tab = &tabBar->Tabs[i];
-    if (tab->ID != tabId)
-      continue;
-    ImGui::TabBarQueueFocus(tabBar, tab);
-    state.pendingTabFocusId = tabId;
-    return;
-  }
-}
-
-void applyPendingDrawerTabFocus(DockDrawerState &state, ImGuiTabBar *tabBar) {
-  if (!tabBar || state.pendingTabFocusId == 0)
-    return;
-
-  bool found = false;
-  for (int i = 0; i < tabBar->Tabs.Size; ++i) {
-    ImGuiTabItem *tab = &tabBar->Tabs[i];
-    if (tab->ID != state.pendingTabFocusId)
-      continue;
-    found = true;
-    if (tabBar->SelectedTabId == tab->ID || tabBar->VisibleTabId == tab->ID) {
-      state.pendingTabFocusId = 0;
-      return;
-    }
-    ImGui::TabBarQueueFocus(tabBar, tab);
-    break;
-  }
-
-  if (!found) {
-    state.pendingTabFocusId = 0;
-  }
-}
-
-void drawCollapsedDrawerHandleGrip(ImDrawList *draw, const ImRect &rect,
-                                   DockDrawerSide side, ImU32 color) {
-  if (!draw || (color & IM_COL32_A_MASK) == 0)
-    return;
-
-  if (side == DockDrawerSide::Bottom) {
-    const float gripWidth = ImMin(16.0f, ImMax(8.0f, rect.GetWidth() - 18.0f));
-    const float x0 = rect.GetCenter().x - gripWidth * 0.5f;
-    const float x1 = x0 + gripWidth;
-    const float startY = rect.Min.y + 5.0f;
-    for (int i = 0; i < 2; ++i) {
-      const float y = startY + static_cast<float>(i) * 3.0f;
-      draw->AddLine(ImVec2(x0, y), ImVec2(x1, y), color, 1.25f);
-    }
-    return;
-  }
-
-  const float gripX = (side == DockDrawerSide::Left) ? (rect.Max.x - 5.0f)
-                                                     : (rect.Min.x + 5.0f);
-  const float centerY = rect.GetCenter().y;
-  for (int i = -1; i <= 1; ++i) {
-    const float y0 = centerY + static_cast<float>(i) * 4.0f - 1.4f;
-    const float y1 = y0 + 2.8f;
-    draw->AddLine(ImVec2(gripX, y0), ImVec2(gripX, y1), color, 1.2f);
-  }
-}
-
-void renderCollapsedSideDockRail(DockDrawerState &state,
-                                 const DockDrawerTarget &target,
-                                 DockDrawerSide side, float railWidth,
-                                 float revealAmount) {
-  if (side == DockDrawerSide::Bottom)
-    return;
-  if (!target.drawerBranch || !target.splitParent)
-    return;
-  ImGuiTabBar *tabBar = target.drawerBranch->TabBar;
-  if (!tabBar || tabBar->Tabs.Size <= 0)
-    return;
-  const float reveal = std::clamp(revealAmount, 0.0f, 1.0f);
-  if (reveal <= 0.001f)
-    return;
-
-  const float splitMinX = target.splitParent->Pos.x;
-  const float splitMaxX =
-      target.splitParent->Pos.x + target.splitParent->Size.x;
-  const float splitWidth = ImMax(1.0f, splitMaxX - splitMinX);
-  const float fullRailWidth =
-      std::clamp(ImMax(railWidth, 22.0f), 8.0f, splitWidth);
-  const float visibleRailWidth = ImMax(1.0f, fullRailWidth * reveal);
-
-  const float branchMinX = target.drawerBranch->Pos.x;
-  const float branchMaxX =
-      target.drawerBranch->Pos.x + target.drawerBranch->Size.x;
-  const float branchMinY = target.drawerBranch->Pos.y;
-  const float branchMaxY =
-      target.drawerBranch->Pos.y + target.drawerBranch->Size.y;
-
-  ImVec2 railPos(branchMinX, branchMinY);
-  ImVec2 railSize = target.drawerBranch->Size;
-  railSize.x = visibleRailWidth;
-
-  const bool hasValidBarRect =
-      tabBar->BarRect.GetWidth() > 1.0f && tabBar->BarRect.GetHeight() > 1.0f;
-  const float hingeX = [&]() {
-    if (side == DockDrawerSide::Left) {
-      const float preferred =
-          hasValidBarRect ? tabBar->BarRect.Max.x : branchMaxX;
-      return std::clamp(preferred, splitMinX, splitMaxX);
-    }
-    const float preferred =
-        hasValidBarRect ? tabBar->BarRect.Min.x : branchMinX;
-    return std::clamp(preferred, splitMinX, splitMaxX);
-  }();
-
-  railPos.x =
-      (side == DockDrawerSide::Left) ? (hingeX - visibleRailWidth) : hingeX;
-  railPos.x = std::clamp(railPos.x, splitMinX, splitMaxX - railSize.x);
-
-  float railTopY = branchMinY;
-  if (hasValidBarRect) {
-    railTopY = ImMax(railTopY, tabBar->BarRect.Max.y - 1.0f);
-  }
-  railPos.y = railTopY;
-  railSize.y = ImMax(1.0f, branchMaxY - railTopY);
-
-  char railWindowName[64];
-  std::snprintf(railWindowName, sizeof(railWindowName), "##DockRail_%c_%08X",
-                side == DockDrawerSide::Left ? 'L' : 'R',
-                target.splitParent->ID);
-
-  ImGuiWindowFlags railFlags =
-      ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoDocking |
-      ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove |
-      ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoNav |
-      ImGuiWindowFlags_NoFocusOnAppearing;
-
-  ImGui::SetNextWindowPos(railPos, ImGuiCond_Always);
-  ImGui::SetNextWindowSize(railSize, ImGuiCond_Always);
-  if (target.drawerBranch->HostWindow) {
-    ImGui::SetNextWindowViewport(target.drawerBranch->HostWindow->ViewportId);
-  }
-  ImGui::SetNextWindowBgAlpha(0.94f * reveal);
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(1.0f, 1.0f));
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0f);
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
-  if (ImGui::Begin(railWindowName, nullptr, railFlags)) {
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(1.0f, 1.0f));
-    ImDrawList *draw = ImGui::GetWindowDrawList();
-
-    const ImGuiStyle &style = ImGui::GetStyle();
-    const float slotSpacing = ImMax(1.0f, style.ItemInnerSpacing.y);
-    const ImVec2 railMin = ImGui::GetWindowPos();
-    const ImVec2 railMax(railMin.x + ImGui::GetWindowSize().x,
-                         railMin.y + ImGui::GetWindowSize().y);
-    const ImRect railRect(railMin, railMax);
-    draw->AddRectFilled(railRect.Min, railRect.Max,
-                        ImGui::GetColorU32(ImGuiCol_Tab));
-    draw->AddRect(railRect.Min, railRect.Max,
-                  ImGui::GetColorU32(ImGuiCol_Border));
-
-    const bool tabBarFocused =
-        (tabBar->Flags & ImGuiTabBarFlags_IsFocused) != 0;
-    const float minSlotHeight = ImGui::GetFrameHeight() * 0.86f;
-    const float maxSlotHeight = ImGui::GetFrameHeight() * 2.55f;
-    const float slotWidth = ImMax(3.0f, ImGui::GetContentRegionAvail().x);
-    float cursorY = ImGui::GetCursorPosY() + style.FramePadding.y;
-
-    for (int i = 0; i < tabBar->Tabs.Size; ++i) {
-      ImGuiTabItem *tab = &tabBar->Tabs[i];
-      const char *tabName = ImGui::TabBarGetTabName(tabBar, tab);
-      const bool selected = (tabBar->SelectedTabId == tab->ID) ||
-                            (tabBar->VisibleTabId == tab->ID);
-      const ImVec2 labelSize = ImGui::CalcTextSize(tabName);
-      const float slotHeight =
-          std::clamp(labelSize.x + style.FramePadding.x * 2.0f, minSlotHeight,
-                     maxSlotHeight);
-
-      ImGui::PushID(static_cast<int>(tab->ID));
-      ImGui::SetCursorPosY(cursorY);
-      ImVec2 slotPos = ImGui::GetCursorScreenPos();
-      ImVec2 slotSize(slotWidth, slotHeight);
-      if (ImGui::InvisibleButton("##SideTab", slotSize)) {
-        queueDrawerTabFocus(state, tabBar, tab->ID);
-        state.collapsed = false;
-      }
-      const bool hovered = ImGui::IsItemHovered();
-      if (hovered) {
-        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-      }
-      const ImRect slotRect(
-          slotPos, ImVec2(slotPos.x + slotSize.x, slotPos.y + slotSize.y));
-
-      const ImU32 bg =
-          selected
-              ? ImGui::GetColorU32(tabBarFocused ? ImGuiCol_TabSelected
-                                                 : ImGuiCol_TabDimmedSelected)
-              : (hovered
-                     ? ImGui::GetColorU32(ImGuiCol_TabHovered)
-                     : ImGui::GetColorU32(tabBarFocused ? ImGuiCol_Tab
-                                                        : ImGuiCol_TabDimmed));
-      const ImU32 border = ImGui::GetColorU32(ImGuiCol_Border);
-      const ImU32 overline = ImGui::GetColorU32(
-          tabBarFocused ? ImGuiCol_TabSelectedOverline
-                        : ImGuiCol_TabDimmedSelectedOverline);
-
-      ImDrawFlags roundFlags = (side == DockDrawerSide::Left)
-                                   ? (ImDrawFlags_RoundCornersTopRight |
-                                      ImDrawFlags_RoundCornersBottomRight)
-                                   : (ImDrawFlags_RoundCornersTopLeft |
-                                      ImDrawFlags_RoundCornersBottomLeft);
-      draw->AddRectFilled(slotRect.Min, slotRect.Max, bg, style.TabRounding,
-                          roundFlags);
-      draw->AddRect(slotRect.Min, slotRect.Max, border, style.TabRounding,
-                    roundFlags);
-      if (selected) {
-        const float overlineThickness = ImMax(1.0f, style.TabBarOverlineSize);
-        if (side == DockDrawerSide::Left) {
-          draw->AddRectFilled(
-              ImVec2(slotRect.Max.x - overlineThickness, slotRect.Min.y + 1.0f),
-              ImVec2(slotRect.Max.x, slotRect.Max.y - 1.0f), overline);
-        } else {
-          draw->AddRectFilled(
-              ImVec2(slotRect.Min.x, slotRect.Min.y + 1.0f),
-              ImVec2(slotRect.Min.x + overlineThickness, slotRect.Max.y - 1.0f),
-              overline);
-        }
-      }
-
-      drawCollapsedDrawerHandleGrip(draw, slotRect, side,
-                                    ImGui::GetColorU32(ImGuiCol_TextDisabled));
-
-      const ImU32 textCol = ImGui::GetColorU32(
-          (selected || hovered) ? ImGuiCol_Text : ImGuiCol_TextDisabled);
-      const float baseFontSize = ImGui::GetFontSize();
-      const float minRailFont = baseFontSize * 0.64f;
-      const float maxRailFont = baseFontSize * 0.92f;
-      float railFontSize =
-          std::clamp(baseFontSize * 0.82f, minRailFont, maxRailFont);
-      const ImVec2 unscaledText =
-          ImGui::GetFont()->CalcTextSizeA(railFontSize, FLT_MAX, 0.0f, tabName);
-      if (unscaledText.x > 0.5f && unscaledText.y > 0.5f) {
-        const float fitToWidth = (slotRect.GetWidth() - 8.0f) / unscaledText.y;
-        const float fitToHeight =
-            (slotRect.GetHeight() - 10.0f) / unscaledText.x;
-        const float fitScale = ImMin(fitToWidth, fitToHeight);
-        railFontSize =
-            std::clamp(railFontSize * fitScale, minRailFont, maxRailFont);
-      }
-      addRotatedText90CW(draw, ImGui::GetFont(), railFontSize, slotRect,
-                         textCol, tabName);
-      if (hovered) {
-        ImGui::SetItemTooltip("%s", tabName);
-      }
-      ImGui::PopID();
-      cursorY += slotHeight + slotSpacing;
-    }
-    ImGui::PopStyleVar();
-  }
-  ImGui::End();
-  ImGui::PopStyleVar(3);
-}
-
-void renderCollapsedBottomDockRail(DockDrawerState &state,
-                                   const DockDrawerTarget &target,
-                                   float railHeight, float revealAmount) {
-  if (!target.drawerBranch || !target.splitParent)
-    return;
-  ImGuiTabBar *tabBar = target.drawerBranch->TabBar;
-  if (!tabBar || tabBar->Tabs.Size <= 0)
-    return;
-
-  const float reveal = std::clamp(revealAmount, 0.0f, 1.0f);
-  if (reveal <= 0.001f)
-    return;
-
-  const float splitMinY = target.splitParent->Pos.y;
-  const float splitMaxY =
-      target.splitParent->Pos.y + target.splitParent->Size.y;
-  const float splitHeight = ImMax(1.0f, splitMaxY - splitMinY);
-  const float fullRailHeight =
-      std::clamp(ImMax(railHeight, 20.0f), 8.0f, splitHeight);
-  const float visibleRailHeight = ImMax(1.0f, fullRailHeight * reveal);
-
-  const float branchMinX = target.drawerBranch->Pos.x;
-  const float branchMaxX =
-      target.drawerBranch->Pos.x + target.drawerBranch->Size.x;
-  const float branchMinY = target.drawerBranch->Pos.y;
-
-  ImVec2 railPos(branchMinX, std::clamp(branchMinY, splitMinY,
-                                        splitMaxY - visibleRailHeight));
-  ImVec2 railSize(ImMax(1.0f, branchMaxX - branchMinX), visibleRailHeight);
-
-  char railWindowName[64];
-  std::snprintf(railWindowName, sizeof(railWindowName), "##DockRail_B_%08X",
-                target.splitParent->ID);
-
-  ImGuiWindowFlags railFlags =
-      ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoDocking |
-      ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove |
-      ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoNav |
-      ImGuiWindowFlags_NoFocusOnAppearing;
-
-  ImGui::SetNextWindowPos(railPos, ImGuiCond_Always);
-  ImGui::SetNextWindowSize(railSize, ImGuiCond_Always);
-  if (target.drawerBranch->HostWindow) {
-    ImGui::SetNextWindowViewport(target.drawerBranch->HostWindow->ViewportId);
-  }
-  ImGui::SetNextWindowBgAlpha(0.96f * reveal);
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(4.0f, 2.0f));
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 7.0f);
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
-  if (ImGui::Begin(railWindowName, nullptr, railFlags)) {
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.0f, 2.0f));
-    ImDrawList *draw = ImGui::GetWindowDrawList();
-    const ImGuiStyle &style = ImGui::GetStyle();
-    const ImRect railRect(
-        ImGui::GetWindowPos(),
-        ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowSize().x,
-               ImGui::GetWindowPos().y + ImGui::GetWindowSize().y));
-    draw->AddRectFilled(railRect.Min, railRect.Max,
-                        ImGui::GetColorU32(ImGuiCol_Tab), style.WindowRounding,
-                        ImDrawFlags_RoundCornersTop);
-    draw->AddRect(railRect.Min, railRect.Max,
-                  ImGui::GetColorU32(ImGuiCol_Border), style.WindowRounding,
-                  ImDrawFlags_RoundCornersTop);
-
-    const bool tabBarFocused =
-        (tabBar->Flags & ImGuiTabBarFlags_IsFocused) != 0;
-    const float baseFontSize = ImGui::GetFontSize();
-    const float handleFontSize = std::clamp(
-        baseFontSize * 0.84f, baseFontSize * 0.72f, baseFontSize * 0.90f);
-    const float tabHeight = ImMax(16.0f, railRect.GetHeight() - 4.0f);
-    float cursorX = ImGui::GetCursorPosX();
-
-    for (int i = 0; i < tabBar->Tabs.Size; ++i) {
-      ImGuiTabItem *tab = &tabBar->Tabs[i];
-      const char *tabName = ImGui::TabBarGetTabName(tabBar, tab);
-      const bool selected = (tabBar->SelectedTabId == tab->ID) ||
-                            (tabBar->VisibleTabId == tab->ID);
-      const ImVec2 labelSize = ImGui::GetFont()->CalcTextSizeA(
-          handleFontSize, FLT_MAX, 0.0f, tabName);
-      const float tabWidth = std::clamp(labelSize.x + 26.0f, 58.0f, 124.0f);
-
-      ImGui::PushID(static_cast<int>(tab->ID));
-      ImGui::SetCursorPos(ImVec2(cursorX, ImGui::GetCursorPosY()));
-      ImVec2 slotPos = ImGui::GetCursorScreenPos();
-      ImVec2 slotSize(tabWidth, tabHeight);
-      if (ImGui::InvisibleButton("##BottomTab", slotSize)) {
-        queueDrawerTabFocus(state, tabBar, tab->ID);
-        state.collapsed = false;
-      }
-      const bool hovered = ImGui::IsItemHovered();
-      if (hovered) {
-        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-      }
-
-      const ImRect slotRect(
-          slotPos, ImVec2(slotPos.x + slotSize.x, slotPos.y + slotSize.y));
-      const ImU32 bg =
-          selected
-              ? ImGui::GetColorU32(tabBarFocused ? ImGuiCol_TabSelected
-                                                 : ImGuiCol_TabDimmedSelected)
-              : (hovered
-                     ? ImGui::GetColorU32(ImGuiCol_TabHovered)
-                     : ImGui::GetColorU32(tabBarFocused ? ImGuiCol_Tab
-                                                        : ImGuiCol_TabDimmed));
-      draw->AddRectFilled(slotRect.Min, slotRect.Max, bg, style.FrameRounding,
-                          ImDrawFlags_RoundCornersTop);
-      draw->AddRect(slotRect.Min, slotRect.Max,
-                    ImGui::GetColorU32(ImGuiCol_Border), style.FrameRounding,
-                    ImDrawFlags_RoundCornersTop);
-      if (selected) {
-        const float accentHeight = ImMax(1.0f, style.TabBarOverlineSize + 1.0f);
-        draw->AddRectFilled(
-            ImVec2(slotRect.Min.x + 1.0f, slotRect.Max.y - accentHeight),
-            ImVec2(slotRect.Max.x - 1.0f, slotRect.Max.y),
-            ImGui::GetColorU32(tabBarFocused
-                                   ? ImGuiCol_TabSelectedOverline
-                                   : ImGuiCol_TabDimmedSelectedOverline),
-            style.FrameRounding, ImDrawFlags_RoundCornersTop);
-      }
-
-      drawCollapsedDrawerHandleGrip(draw, slotRect, DockDrawerSide::Bottom,
-                                    ImGui::GetColorU32(ImGuiCol_TextDisabled));
-
-      const ImU32 textCol = ImGui::GetColorU32(
-          (selected || hovered) ? ImGuiCol_Text : ImGuiCol_TextDisabled);
-      const ImVec2 textSize = ImGui::GetFont()->CalcTextSizeA(
-          handleFontSize, FLT_MAX, 0.0f, tabName);
-      const ImVec2 textPos(
-          slotRect.Min.x + (slotRect.GetWidth() - textSize.x) * 0.5f,
-          slotRect.Min.y + 9.0f +
-              (slotRect.GetHeight() - 9.0f - textSize.y) * 0.5f);
-      draw->AddText(ImGui::GetFont(), handleFontSize, textPos, textCol,
-                    tabName);
-
-      if (hovered) {
-        ImGui::SetItemTooltip("%s", tabName);
-      }
-      ImGui::PopID();
-      cursorX += tabWidth + style.ItemSpacing.x;
-    }
-
-    ImGui::PopStyleVar();
-  }
-  ImGui::End();
-  ImGui::PopStyleVar(3);
-}
-
+// Anchors are the panels' stable "###Name" ids, so the drawers keep working
+// whatever language the titles are shown in.
 DockDrawerTarget findDockDrawerTarget(const char *const *anchorWindows,
                                       int anchorCount, DockDrawerSide side) {
   const ImGuiAxis axis =
       (side == DockDrawerSide::Bottom) ? ImGuiAxis_Y : ImGuiAxis_X;
 
   for (int anchorIdx = 0; anchorIdx < anchorCount; ++anchorIdx) {
-    const char *name = anchorWindows[anchorIdx];
-    ImGuiWindow *anchor = findWindowByVisibleTitle(name);
+    ImGuiWindow *anchor =
+        ImGui::FindWindowByName(Loc::WindowRef(anchorWindows[anchorIdx]));
     if (!anchor || !anchor->DockNode)
       continue;
 
@@ -599,7 +179,6 @@ DockDrawerTarget findDockDrawerTarget(const char *const *anchorWindows,
           parent->ChildNodes[1]) {
         ImGuiDockNode *child0 = parent->ChildNodes[0];
         ImGuiDockNode *child1 = parent->ChildNodes[1];
-
         const bool sourceInChild0 =
             ImGui::DockNodeIsInHierarchyOf(source, child0);
         const bool sourceInChild1 =
@@ -624,8 +203,11 @@ DockDrawerTarget findDockDrawerTarget(const char *const *anchorWindows,
           matchesSide =
               drawerCandidate->Pos.x >= oppositeCandidate->Pos.x - 0.5f;
         }
-
-        if (matchesSide) {
+        // Never fold the central node (the viewport) away.
+        if (matchesSide &&
+            !ImGui::DockNodeIsInHierarchyOf(
+                ImGui::DockNodeGetRootNode(drawerCandidate)->CentralNode,
+                drawerCandidate)) {
           return DockDrawerTarget{parent, drawerCandidate, oppositeCandidate};
         }
       }
@@ -636,155 +218,512 @@ DockDrawerTarget findDockDrawerTarget(const char *const *anchorWindows,
   return {};
 }
 
-void updateDockDrawerAnimation(DockDrawerState &state,
-                               const DockDrawerTarget &target,
-                               DockDrawerSide side,
-                               const char *const *anchorWindows,
-                               int anchorCount) {
-  if (!target.splitParent || !target.drawerBranch || !target.oppositeBranch ||
-      !target.splitParent->ChildNodes[0] ||
-      !target.splitParent->ChildNodes[1]) {
-    state.activeSplitParentId = 0;
-    state.collapsed = false;
-    state.openAmount = 1.0f;
-    state.expandedExtent = 0.0f;
-    state.pendingTabFocusId = 0;
-    return;
-  }
-
-  if (state.activeSplitParentId != target.splitParent->ID) {
-    state.activeSplitParentId = target.splitParent->ID;
-    state.collapsed = false;
-    state.openAmount = 1.0f;
-    state.expandedExtent = (side == DockDrawerSide::Bottom)
-                               ? ImMax(0.0f, target.drawerBranch->Size.y)
-                               : ImMax(0.0f, target.drawerBranch->Size.x);
-    state.pendingTabFocusId = 0;
-  }
-
-  ImGuiTabBar *tabBar = target.drawerBranch->TabBar;
-  applyPendingDrawerTabFocus(state, tabBar);
-  constexpr float kCollapsedSideRailWidth = 20.0f;
-  constexpr float kCollapsedBottomRailHeight = 24.0f;
-  float collapsedExtent = (side == DockDrawerSide::Bottom)
-                              ? kCollapsedBottomRailHeight
-                              : kCollapsedSideRailWidth;
-  if (tabBar) {
-    if (side == DockDrawerSide::Bottom) {
-      collapsedExtent = ImMax(collapsedExtent, kCollapsedBottomRailHeight);
-    } else {
-      collapsedExtent = ImMax(collapsedExtent, kCollapsedSideRailWidth);
-    }
-  }
-
-  DockTabInteractionState interaction =
-      queryDockTabInteraction(target, anchorWindows, anchorCount);
-  if (interaction.doubleClicked) {
-    if (!state.collapsed) {
-      const float liveExtent = (side == DockDrawerSide::Bottom)
-                                   ? target.drawerBranch->Size.y
-                                   : target.drawerBranch->Size.x;
-      if (liveExtent > 1.0f) {
-        state.expandedExtent = liveExtent;
+// A double tap or double click on one of the drawer's tab strips. Counted on
+// release, with a looser distance for fingers.
+bool detectDoubleTap(DockDrawerState &state,
+                     const ImVector<ImGuiDockNode *> &leaves, bool touch) {
+  ImGuiContext &g = *GImGui;
+  const ImGuiIO &io = g.IO;
+  auto overTabStrip = [&](const ImVec2 &pos) {
+    for (ImGuiDockNode *leaf : leaves) {
+      ImGuiTabBar *tabBar = leaf->TabBar;
+      if (!tabBar || !leaf->HostWindow || leaf->IsHiddenTabBar())
+        continue;
+      if (!tabBar->BarRect.Contains(pos))
+        continue;
+      // Only when nothing (a popup, a floating window) sits over the strip.
+      if (g.HoveredWindow &&
+          g.HoveredWindow->RootWindowDockTree ==
+              leaf->HostWindow->RootWindowDockTree) {
+        return true;
       }
     }
-    state.collapsed = !state.collapsed;
-  } else if (state.collapsed && interaction.clicked) {
-    state.collapsed = false;
+    return false;
+  };
+
+  if (io.MouseClicked[ImGuiMouseButton_Left]) {
+    state.pressInside = overTabStrip(io.MousePos);
+    state.pressPos = io.MousePos;
   }
+  if (!io.MouseReleased[ImGuiMouseButton_Left] || !state.pressInside)
+    return false;
+  state.pressInside = false;
 
-  const float totalExtent = (side == DockDrawerSide::Bottom)
-                                ? ImMax(0.0f, target.splitParent->Size.y)
-                                : ImMax(0.0f, target.splitParent->Size.x);
-  const float minOppositeExtent =
-      (side == DockDrawerSide::Bottom) ? 96.0f : 220.0f;
-  const float maxDrawerExtent =
-      ImMax(collapsedExtent, totalExtent - minOppositeExtent);
-  const float expandedMinExtent = ImMin(
-      collapsedExtent + ((side == DockDrawerSide::Bottom) ? 24.0f : 40.0f),
-      maxDrawerExtent);
+  const float fontSize = ImGui::GetFontSize();
+  const float slop = touch ? fontSize * 1.2f : ImMax(io.MouseDragThreshold, 4.0f);
+  if (DistanceSq(io.MousePos, state.pressPos) > slop * slop)
+    return false;  // a drag: the tab bar's own undock / reorder
 
-  const bool captureExpandedExtent =
-      !state.collapsed && state.openAmount >= 0.995f;
-  if (captureExpandedExtent) {
-    const float liveExtent = (side == DockDrawerSide::Bottom)
-                                 ? target.drawerBranch->Size.y
-                                 : target.drawerBranch->Size.x;
-    const float clampedLiveExtent =
-        std::clamp(liveExtent, collapsedExtent, maxDrawerExtent);
-    if (clampedLiveExtent > collapsedExtent + 1.0f) {
-      state.expandedExtent = clampedLiveExtent;
+  const double now = ImGui::GetTime();
+  const double pairTime =
+      touch ? ImMax(0.42, static_cast<double>(io.MouseDoubleClickTime))
+            : static_cast<double>(io.MouseDoubleClickTime);
+  const float pairDistance =
+      touch ? fontSize * 2.4f : ImMax(io.MouseDoubleClickMaxDist, 6.0f);
+  if (state.lastTapTime >= 0.0 && now - state.lastTapTime <= pairTime &&
+      DistanceSq(io.MousePos, state.lastTapPos) <=
+          pairDistance * pairDistance) {
+    state.lastTapTime = -1.0;
+    return true;
+  }
+  state.lastTapTime = now;
+  state.lastTapPos = io.MousePos;
+  return false;
+}
+
+void setDrawerTabBarsHidden(DockDrawerState &state,
+                            const ImVector<ImGuiDockNode *> &leaves,
+                            bool hidden) {
+  if (hidden) {
+    for (ImGuiDockNode *leaf : leaves) {
+      if (leaf->LocalFlags & ImGuiDockNodeFlags_HiddenTabBar)
+        continue;
+      leaf->SetLocalFlags(leaf->LocalFlags | ImGuiDockNodeFlags_HiddenTabBar);
+      state.hiddenLeafIds.push_back(leaf->ID);
+    }
+    return;
+  }
+  for (ImGuiID id : state.hiddenLeafIds) {
+    if (ImGuiDockNode *node = ImGui::DockBuilderGetNode(id)) {
+      node->SetLocalFlags(node->LocalFlags & ~ImGuiDockNodeFlags_HiddenTabBar);
     }
   }
+  state.hiddenLeafIds.clear();
+}
 
-  if (state.expandedExtent < collapsedExtent + 1.0f) {
-    const float defaultRatio = (side == DockDrawerSide::Bottom) ? 0.30f : 0.22f;
-    state.expandedExtent = std::clamp(totalExtent * defaultRatio,
-                                      expandedMinExtent, maxDrawerExtent);
-  } else {
-    state.expandedExtent =
-        std::clamp(state.expandedExtent, expandedMinExtent, maxDrawerExtent);
+void startPhase(DockDrawerState &state, DrawerPhase phase, float fromExtent) {
+  state.phase = phase;
+  state.phaseStart = ImGui::GetTime();
+  state.phaseFromExtent = fromExtent;
+}
+
+void openDrawer(DockDrawerState &state, float currentExtent,
+                ImGuiID focusNodeId = 0, ImGuiID focusTabId = 0) {
+  if (focusTabId != 0) {
+    state.pendingFocusNodeId = focusNodeId;
+    state.pendingFocusTabId = focusTabId;
   }
+  if (state.phase == DrawerPhase::Open || state.phase == DrawerPhase::Opening)
+    return;
+  startPhase(state, DrawerPhase::Opening, currentExtent);
+}
 
-  const float targetOpen = state.collapsed ? 0.0f : 1.0f;
-  const float blend = 1.0f - std::exp(-12.0f * ImGui::GetIO().DeltaTime);
-  state.openAmount += (targetOpen - state.openAmount) * blend;
-  if (std::fabs(state.openAmount - targetOpen) < 0.001f) {
-    state.openAmount = targetOpen;
+void applyPendingTabFocus(DockDrawerState &state) {
+  if (state.pendingFocusTabId == 0)
+    return;
+  ImGuiDockNode *node = ImGui::DockBuilderGetNode(state.pendingFocusNodeId);
+  ImGuiTabBar *tabBar = node ? node->TabBar : nullptr;
+  if (!tabBar) {
+    state.pendingFocusTabId = 0;
+    return;
   }
-  state.openAmount = std::clamp(state.openAmount, 0.0f, 1.0f);
-
-  const float desiredDrawerExtent =
-      collapsedExtent +
-      (state.expandedExtent - collapsedExtent) * state.openAmount;
-  const float drawerExtent =
-      std::clamp(desiredDrawerExtent, collapsedExtent, maxDrawerExtent);
-  const float oppositeExtent =
-      ImMax(minOppositeExtent, totalExtent - drawerExtent);
-
-  target.splitParent->AuthorityForSize = ImGuiDataAuthority_DockNode;
-  target.drawerBranch->AuthorityForSize = ImGuiDataAuthority_DockNode;
-  target.oppositeBranch->AuthorityForSize = ImGuiDataAuthority_DockNode;
-  if (side == DockDrawerSide::Bottom) {
-    target.drawerBranch->Size.y = drawerExtent;
-    target.drawerBranch->SizeRef.y = drawerExtent;
-    target.oppositeBranch->Size.y = oppositeExtent;
-    target.oppositeBranch->SizeRef.y = oppositeExtent;
-  } else {
-    target.drawerBranch->Size.x = drawerExtent;
-    target.drawerBranch->SizeRef.x = drawerExtent;
-    target.oppositeBranch->Size.x = oppositeExtent;
-    target.oppositeBranch->SizeRef.x = oppositeExtent;
-  }
-
-  const float railReveal = std::clamp(1.0f - state.openAmount, 0.0f, 1.0f);
-  const bool useCollapsedRail = railReveal > 0.01f;
-  ImGuiDockNodeFlags desiredFlags = target.drawerBranch->LocalFlags;
-  if (useCollapsedRail) {
-    desiredFlags |= ImGuiDockNodeFlags_HiddenTabBar;
-  } else {
-    desiredFlags &= ~ImGuiDockNodeFlags_HiddenTabBar;
-  }
-  if (desiredFlags != target.drawerBranch->LocalFlags) {
-    target.drawerBranch->SetLocalFlags(desiredFlags);
-  }
-
-  if (useCollapsedRail) {
-    if (side == DockDrawerSide::Bottom) {
-      renderCollapsedBottomDockRail(state, target, collapsedExtent, railReveal);
+  for (int i = 0; i < tabBar->Tabs.Size; ++i) {
+    ImGuiTabItem *tab = &tabBar->Tabs[i];
+    if (tab->ID != state.pendingFocusTabId)
+      continue;
+    if (tabBar->SelectedTabId == tab->ID) {
+      state.pendingFocusTabId = 0;
     } else {
-      renderCollapsedSideDockRail(state, target, side, collapsedExtent,
-                                  railReveal);
+      ImGui::TabBarQueueFocus(tabBar, tab);
+    }
+    return;
+  }
+  state.pendingFocusTabId = 0;
+}
+
+struct RailTab {
+  ImGuiDockNode *node = nullptr;
+  ImGuiTabItem *tab = nullptr;
+  const char *label = nullptr;
+  const char *labelEnd = nullptr;  // before the "###Id" part, like ImGui's own tabs
+  const ImGuiNamedIcon *icon = nullptr;
+  bool selected = false;
+  bool groupStart = false;  // first tab of a leaf after another leaf's tabs
+};
+
+void collectRailTabs(const ImVector<ImGuiDockNode *> &leaves,
+                     ImVector<RailTab> &out) {
+  for (ImGuiDockNode *leaf : leaves) {
+    ImGuiTabBar *tabBar = leaf->TabBar;
+    if (!tabBar)
+      continue;
+    bool first = true;
+    for (int i = 0; i < tabBar->Tabs.Size; ++i) {
+      ImGuiTabItem *tab = &tabBar->Tabs[i];
+      RailTab entry;
+      entry.node = leaf;
+      entry.tab = tab;
+      entry.label = ImGui::TabBarGetTabName(tabBar, tab);
+      entry.labelEnd = ImGui::FindRenderedTextEnd(entry.label);
+      entry.icon = ImGui::FindNamedIcon(tab->Window ? tab->Window->Name
+                                                     : entry.label);
+      entry.selected = tabBar->SelectedTabId == tab->ID ||
+                       tabBar->VisibleTabId == tab->ID;
+      entry.groupStart = first && !out.empty();
+      out.push_back(entry);
+      first = false;
     }
   }
 }
 
-void updateDockDrawerAnimations() {
-  static int lastUpdatedFrame = -1;
-  const int currentFrame = ImGui::GetFrameCount();
-  if (lastUpdatedFrame == currentFrame) {
+ImU32 railTabColor(bool selected, bool hovered, bool focused) {
+  if (selected)
+    return ImGui::GetColorU32(focused ? ImGuiCol_TabSelected
+                                      : ImGuiCol_TabDimmedSelected);
+  if (hovered)
+    return ImGui::GetColorU32(ImGuiCol_TabHovered);
+  return ImGui::GetColorU32(focused ? ImGuiCol_Tab : ImGuiCol_TabDimmed);
+}
+
+// The folded drawer: a strip of shaded tabs where the panel was. `reveal` fades
+// and slides it in while the drawer closes, and out while it opens.
+void renderDrawerRail(DockDrawerState &state, const DockDrawerTarget &target,
+                      const ImVector<ImGuiDockNode *> &leaves,
+                      DockDrawerSide side, float railExtent, float reveal,
+                      bool touch) {
+  if (reveal <= 0.001f || !target.drawerBranch || !target.splitParent)
+    return;
+  ImVector<RailTab> tabs;
+  collectRailTabs(leaves, tabs);
+  if (tabs.empty())
+    return;
+
+  const ImGuiStyle &style = ImGui::GetStyle();
+  const float fontSize = ImGui::GetFontSize();
+  const bool bottom = side == DockDrawerSide::Bottom;
+  const ImGuiDockNode *branch = target.drawerBranch;
+
+  // The rail fills the folded drawer's edge; it slides in from that edge.
+  const float slide = (1.0f - reveal) * railExtent * 0.5f;
+  ImVec2 railPos = branch->Pos;
+  ImVec2 railSize = branch->Size;
+  if (bottom) {
+    railSize.y = railExtent;
+    railPos.y = branch->Pos.y + branch->Size.y - railExtent + slide;
+  } else {
+    railSize.x = railExtent;
+    railPos.x = side == DockDrawerSide::Left
+                    ? branch->Pos.x - slide
+                    : branch->Pos.x + branch->Size.x - railExtent + slide;
+  }
+
+  char railWindowName[64];
+  std::snprintf(railWindowName, sizeof(railWindowName), "##DockRail_%c_%08X",
+                side == DockDrawerSide::Left
+                    ? 'L'
+                    : (side == DockDrawerSide::Right ? 'R' : 'B'),
+                target.splitParent->ID);
+  const ImGuiWindowFlags railFlags =
+      ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoDocking |
+      ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove |
+      ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoNav |
+      ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoBackground |
+      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
+
+  ImGui::SetNextWindowPos(railPos, ImGuiCond_Always);
+  ImGui::SetNextWindowSize(railSize, ImGuiCond_Always);
+  if (branch->HostWindow) {
+    ImGui::SetNextWindowViewport(branch->HostWindow->ViewportId);
+  }
+  ImGui::PushStyleVar(ImGuiStyleVar_Alpha, style.Alpha * reveal);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+  if (ImGui::Begin(railWindowName, nullptr, railFlags)) {
+    ImDrawList *draw = ImGui::GetWindowDrawList();
+    const ImVec2 winPos = ImGui::GetWindowPos();
+    const ImVec2 winSize = ImGui::GetWindowSize();
+    const ImRect railRect(winPos, ImVec2(winPos.x + winSize.x, winPos.y + winSize.y));
+
+    // The strip itself is a toolbar surface, like a dock node's tab bar area.
+    ImGui::ShadeRect(draw, railRect.Min, railRect.Max,
+                     ImGui::GetColorU32(ImGuiCol_MenuBarBg),
+                     ImGuiShadeClass_MenuBar, ImGuiShadeState_Normal);
+    const ImU32 edgeCol = ImGui::GetColorU32(ImGuiCol_Separator);
+    if (bottom) {
+      draw->AddLine(railRect.Min, ImVec2(railRect.Max.x, railRect.Min.y),
+                    edgeCol);
+    } else if (side == DockDrawerSide::Left) {
+      draw->AddLine(ImVec2(railRect.Max.x - 1.0f, railRect.Min.y),
+                    ImVec2(railRect.Max.x - 1.0f, railRect.Max.y), edgeCol);
+    } else {
+      draw->AddLine(railRect.Min, ImVec2(railRect.Min.x, railRect.Max.y),
+                    edgeCol);
+    }
+
+    // Tapping empty rail opens the drawer on whatever tab was showing.
+    ImGui::SetCursorScreenPos(railRect.Min);
+    ImGui::SetNextItemAllowOverlap();
+    if (ImGui::InvisibleButton("##RailBackground", railRect.GetSize())) {
+      openDrawer(state, railExtent);
+    }
+
+    const float inset = ImFloor(fontSize * (touch ? 0.22f : 0.16f));
+    const float gap = ImMax(2.0f, style.ItemInnerSpacing.y);
+    const float groupGap = ImFloor(fontSize * 0.55f);
+    const float iconSize = ImFloor(fontSize);
+    const float pad = style.FramePadding.x;
+    float cursor = (bottom ? railRect.Min.x : railRect.Min.y) + inset + 1.0f;
+
+    for (const RailTab &entry : tabs) {
+      const bool focused =
+          (entry.node->TabBar->Flags & ImGuiTabBarFlags_IsFocused) != 0;
+      if (entry.groupStart) {
+        const float mid = cursor + groupGap * 0.5f - gap * 0.5f;
+        if (bottom) {
+          draw->AddLine(ImVec2(mid, railRect.Min.y + inset * 2.0f),
+                        ImVec2(mid, railRect.Max.y - inset * 2.0f), edgeCol);
+        } else {
+          draw->AddLine(ImVec2(railRect.Min.x + inset * 2.0f, mid),
+                        ImVec2(railRect.Max.x - inset * 2.0f, mid), edgeCol);
+        }
+        cursor += groupGap;
+      }
+
+      const ImVec2 labelSize = ImGui::CalcTextSize(entry.label, entry.labelEnd);
+      const float iconSpan = entry.icon ? iconSize + style.ItemInnerSpacing.x : 0.0f;
+      ImRect slot;
+      if (bottom) {
+        const float width = ImMin(labelSize.x + iconSpan + pad * 2.0f,
+                                  fontSize * 12.0f);
+        slot = ImRect(ImVec2(cursor, railRect.Min.y + inset + 1.0f),
+                      ImVec2(cursor + width, railRect.Max.y));
+      } else {
+        const float minHeight = fontSize * (touch ? 3.2f : 2.6f);
+        const float height = std::clamp(labelSize.x + iconSpan + pad * 2.0f,
+                                        minHeight, fontSize * 9.0f);
+        const float x0 = railRect.Min.x + (side == DockDrawerSide::Left ? 0.0f : inset + 1.0f);
+        const float x1 = railRect.Max.x - (side == DockDrawerSide::Left ? inset + 1.0f : 0.0f);
+        slot = ImRect(ImVec2(x0, cursor), ImVec2(x1, cursor + height));
+      }
+      if ((bottom ? slot.Min.x : slot.Min.y) >
+          (bottom ? railRect.Max.x : railRect.Max.y) - 4.0f) {
+        break;  // out of room; the rest show once the drawer opens
+      }
+
+      ImGui::PushID(static_cast<int>(entry.tab->ID));
+      ImGui::SetCursorScreenPos(slot.Min);
+      const bool pressed = ImGui::InvisibleButton("##RailTab", slot.GetSize());
+      ImGui::ReportItemHoverFeedback();
+      const bool hovered = ImGui::IsItemHovered();
+      const bool held = ImGui::IsItemActive();
+      if (pressed) {
+        openDrawer(state, railExtent, entry.node->ID, entry.tab->ID);
+      }
+      if (hovered) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        ImGui::SetItemTooltip("%.*s", static_cast<int>(entry.labelEnd - entry.label), entry.label);
+      }
+
+      const ImU32 fill = railTabColor(entry.selected, hovered, focused);
+      const ImGuiShadeClass shadeClass =
+          entry.selected ? ImGuiShadeClass_TabActive : ImGuiShadeClass_Tab;
+      const ImGuiShadeState shadeState =
+          ImGui::ShadeStateFromInteraction(hovered, held, entry.selected);
+      const ImU32 overline = ImGui::GetColorU32(
+          focused ? ImGuiCol_TabSelectedOverline
+                  : ImGuiCol_TabDimmedSelectedOverline);
+      const float overlineSize = ImMax(1.0f, style.TabBarOverlineSize);
+      const ImU32 textCol = ImGui::GetColorU32(
+          (entry.selected || hovered) ? ImGuiCol_Text : ImGuiCol_TextDisabled);
+
+      if (bottom) {
+        // Exactly a dock tab: same shape, shading and overline.
+        ImGui::TabItemBackground(draw, slot, ImGuiTabItemFlags_None, fill,
+                                 shadeClass, shadeState);
+        if (entry.selected) {
+          draw->AddRectFilled(ImVec2(slot.Min.x + style.TabRounding, slot.Min.y),
+                              ImVec2(slot.Max.x - style.TabRounding,
+                                     slot.Min.y + overlineSize),
+                              overline);
+        }
+        float textX = slot.Min.x + pad;
+        if (entry.icon) {
+          const ImVec2 iconMin(textX, slot.GetCenter().y - iconSize * 0.5f);
+          draw->AddImage(entry.icon->TexId, iconMin,
+                         ImVec2(iconMin.x + iconSize, iconMin.y + iconSize), entry.icon->Uv0,
+                         entry.icon->Uv1,
+                         ImGui::GetColorU32(ImVec4(1, 1, 1, entry.selected ? 1.0f : 0.72f)));
+          textX += iconSpan;
+        }
+        draw->PushClipRect(slot.Min, ImVec2(slot.Max.x - pad * 0.5f, slot.Max.y), true);
+        draw->AddText(ImVec2(textX, slot.GetCenter().y - labelSize.y * 0.5f),
+                      textCol, entry.label, entry.labelEnd);
+        draw->PopClipRect();
+      } else {
+        // A dock tab turned on its side: rounded on the side facing the
+        // viewport, overline on that side when selected.
+        const bool left = side == DockDrawerSide::Left;
+        const ImDrawFlags corners =
+            left ? (ImDrawFlags_RoundCornersTopRight | ImDrawFlags_RoundCornersBottomRight)
+                 : (ImDrawFlags_RoundCornersTopLeft | ImDrawFlags_RoundCornersBottomLeft);
+        ImGui::ShadeRect(draw, slot.Min, slot.Max, fill, shadeClass, shadeState,
+                         style.TabRounding, corners);
+        if (entry.selected) {
+          const float x = left ? slot.Max.x - overlineSize : slot.Min.x;
+          draw->AddRectFilled(ImVec2(x, slot.Min.y + style.TabRounding),
+                              ImVec2(x + overlineSize, slot.Max.y - style.TabRounding),
+                              overline);
+        }
+        float textTop = slot.Min.y + pad;
+        if (entry.icon) {
+          const ImVec2 iconMin(slot.GetCenter().x - iconSize * 0.5f, textTop);
+          draw->AddImage(entry.icon->TexId, iconMin,
+                         ImVec2(iconMin.x + iconSize, iconMin.y + iconSize), entry.icon->Uv0,
+                         entry.icon->Uv1,
+                         ImGui::GetColorU32(ImVec4(1, 1, 1, entry.selected ? 1.0f : 0.72f)));
+          textTop += iconSpan;
+        }
+        const ImRect textRect(ImVec2(slot.Min.x, textTop),
+                              ImVec2(slot.Max.x, slot.Max.y - pad));
+        draw->PushClipRect(textRect.Min, textRect.Max, true);
+        addRotatedText90CW(draw, ImGui::GetFont(), fontSize, textRect, textCol,
+                           entry.label, entry.labelEnd);
+        draw->PopClipRect();
+      }
+      ImGui::PopID();
+      cursor = (bottom ? slot.Max.x : slot.Max.y) + gap;
+    }
+  }
+  ImGui::End();
+  ImGui::PopStyleVar(4);
+}
+
+void updateDockDrawer(DockDrawerState &state, const DockDrawerTarget &target,
+                      DockDrawerSide side, bool touch) {
+  if (!target.splitParent || !target.drawerBranch || !target.oppositeBranch) {
+    setDrawerTabBarsHidden(state, {}, false);
+    state = DockDrawerState();
     return;
   }
+
+  const bool bottom = side == DockDrawerSide::Bottom;
+  const float fontSize = ImGui::GetFontSize();
+  const float collapsedExtent =
+      bottom ? ImGui::GetFrameHeight() + ImFloor(fontSize * (touch ? 0.9f : 0.5f))
+             : ImFloor(fontSize * (touch ? 2.6f : 2.0f));
+  auto extentOf = [&](const ImGuiDockNode *node) {
+    return bottom ? node->Size.y : node->Size.x;
+  };
+  const float liveExtent = extentOf(target.drawerBranch);
+  const float totalExtent = ImMax(0.0f, extentOf(target.splitParent));
+  const float minOppositeExtent = bottom ? 96.0f : 220.0f;
+  const float maxDrawerExtent =
+      ImMax(collapsedExtent, totalExtent - minOppositeExtent);
+  const float defaultExtent = std::clamp(totalExtent * (bottom ? 0.30f : 0.22f),
+                                         collapsedExtent + 40.0f, maxDrawerExtent);
+
+  ImVector<ImGuiDockNode *> leaves;
+  collectLeafNodes(target.drawerBranch, leaves);
+
+  if (state.activeSplitParentId != target.splitParent->ID) {
+    setDrawerTabBarsHidden(state, {}, false);
+    state = DockDrawerState();
+    state.activeSplitParentId = target.splitParent->ID;
+    state.expandedExtent = liveExtent;
+    // A layout saved while a drawer was folded comes back tiny, sometimes with
+    // its tab bar hidden. Resume it as a rail so it can be opened again.
+    if (liveExtent > 1.0f && liveExtent <= collapsedExtent + 4.0f) {
+      for (ImGuiDockNode *leaf : leaves) {
+        if (leaf->LocalFlags & ImGuiDockNodeFlags_HiddenTabBar)
+          state.hiddenLeafIds.push_back(leaf->ID);
+      }
+      state.expandedExtent = defaultExtent;
+      state.phase = DrawerPhase::Closed;
+      state.reportedCollapsed = true;
+    }
+  }
+
+  // Double tap / double click the tab strip: fold (or fold back mid-open).
+  if (detectDoubleTap(state, leaves, touch) &&
+      (state.phase == DrawerPhase::Open || state.phase == DrawerPhase::Opening)) {
+    if (state.phase == DrawerPhase::Open && liveExtent > collapsedExtent + 8.0f) {
+      state.expandedExtent = liveExtent;
+    }
+    startPhase(state, DrawerPhase::Bump, liveExtent);
+  }
+
+  const bool collapsed = IsCollapsingOrCollapsed(state.phase);
+  if (collapsed != state.reportedCollapsed) {
+    state.reportedCollapsed = collapsed;
+    ImGui::ReportWidgetFeedback(collapsed ? ImGuiWidgetFeedback_SlideClose
+                                          : ImGuiWidgetFeedback_SlideOpen);
+  }
+
+  const float expanded =
+      std::clamp(state.expandedExtent > collapsedExtent + 8.0f ? state.expandedExtent
+                                                               : defaultExtent,
+                 collapsedExtent + 8.0f, maxDrawerExtent);
+  const float elapsed = static_cast<float>(ImGui::GetTime() - state.phaseStart);
+  // Decided before the switch: the frame an opening finishes still sets the final size.
+  const bool driveSize = state.phase != DrawerPhase::Open;
+  float drawerExtent = liveExtent;
+  float railReveal = 0.0f;
+  switch (state.phase) {
+  case DrawerPhase::Open:
+    break;
+  case DrawerPhase::Bump: {
+    // The little grow before it goes, so the fold reads as a response to the tap.
+    const float t = std::clamp(elapsed / static_cast<float>(kBumpSeconds), 0.0f, 1.0f);
+    const float bump = std::clamp(expanded * 0.06f, 8.0f, fontSize * 2.0f);
+    drawerExtent = state.phaseFromExtent + bump * std::sin(t * IM_PI);
+    if (t >= 1.0f)
+      startPhase(state, DrawerPhase::Closing, state.phaseFromExtent);
+    break;
+  }
+  case DrawerPhase::Closing: {
+    const float t = std::clamp(elapsed / static_cast<float>(kCloseSeconds), 0.0f, 1.0f);
+    drawerExtent = ImLerp(state.phaseFromExtent, collapsedExtent, EaseInOutCubic(t));
+    railReveal = SmoothStep(0.55f, 1.0f, t);
+    if (t >= 1.0f)
+      state.phase = DrawerPhase::Closed;
+    break;
+  }
+  case DrawerPhase::Closed:
+    drawerExtent = collapsedExtent;
+    railReveal = 1.0f;
+    break;
+  case DrawerPhase::Opening: {
+    const float t = std::clamp(elapsed / static_cast<float>(kOpenSeconds), 0.0f, 1.0f);
+    drawerExtent = ImLerp(state.phaseFromExtent, expanded, EaseOutCubic(t));
+    railReveal = 1.0f - SmoothStep(0.0f, 0.4f, t);
+    if (t >= 1.0f) {
+      state.phase = DrawerPhase::Open;
+      drawerExtent = expanded;
+    }
+    break;
+  }
+  }
+
+  // Open drawers are left to ImGui, so dragging the splitter is never fought.
+  if (driveSize) {
+    drawerExtent = std::clamp(drawerExtent, collapsedExtent, maxDrawerExtent);
+    const float oppositeExtent = ImMax(minOppositeExtent, totalExtent - drawerExtent);
+    target.splitParent->AuthorityForSize = ImGuiDataAuthority_DockNode;
+    target.drawerBranch->AuthorityForSize = ImGuiDataAuthority_DockNode;
+    target.oppositeBranch->AuthorityForSize = ImGuiDataAuthority_DockNode;
+    if (bottom) {
+      target.drawerBranch->Size.y = target.drawerBranch->SizeRef.y = drawerExtent;
+      target.oppositeBranch->Size.y = target.oppositeBranch->SizeRef.y = oppositeExtent;
+    } else {
+      target.drawerBranch->Size.x = target.drawerBranch->SizeRef.x = drawerExtent;
+      target.oppositeBranch->Size.x = target.oppositeBranch->SizeRef.x = oppositeExtent;
+    }
+  }
+
+  // Tab strips hide once the rail starts to show, and return as it fades.
+  setDrawerTabBarsHidden(state, leaves, railReveal > 0.01f);
+  if (state.phase == DrawerPhase::Open) {
+    applyPendingTabFocus(state);
+  }
+  renderDrawerRail(state, target, leaves, side, collapsedExtent, railReveal, touch);
+}
+
+void updateDockDrawers() {
+  static int lastUpdatedFrame = -1;
+  const int currentFrame = ImGui::GetFrameCount();
+  if (lastUpdatedFrame == currentFrame)
+    return;
   lastUpdatedFrame = currentFrame;
 
   static DockDrawerState leftState;
@@ -794,23 +733,22 @@ void updateDockDrawerAnimations() {
   static const char *kLeftAnchors[] = {"Hierarchy", "Camera"};
   static const char *kRightAnchors[] = {"Inspector", "Environment"};
   static const char *kBottomAnchors[] = {"Project", "Project Settings",
-                                         "Animation", "AI Pathfinding"};
+                                         "Animation", "AI Pathfinding",
+                                         "Version Control"};
 
-  updateDockDrawerAnimation(
-      leftState,
-      findDockDrawerTarget(kLeftAnchors, IM_ARRAYSIZE(kLeftAnchors),
-                           DockDrawerSide::Left),
-      DockDrawerSide::Left, kLeftAnchors, IM_ARRAYSIZE(kLeftAnchors));
-  updateDockDrawerAnimation(
-      rightState,
-      findDockDrawerTarget(kRightAnchors, IM_ARRAYSIZE(kRightAnchors),
-                           DockDrawerSide::Right),
-      DockDrawerSide::Right, kRightAnchors, IM_ARRAYSIZE(kRightAnchors));
-  updateDockDrawerAnimation(
-      bottomState,
-      findDockDrawerTarget(kBottomAnchors, IM_ARRAYSIZE(kBottomAnchors),
-                           DockDrawerSide::Bottom),
-      DockDrawerSide::Bottom, kBottomAnchors, IM_ARRAYSIZE(kBottomAnchors));
+  const bool touch = TouchPreferred();
+  updateDockDrawer(leftState,
+                   findDockDrawerTarget(kLeftAnchors, IM_ARRAYSIZE(kLeftAnchors),
+                                        DockDrawerSide::Left),
+                   DockDrawerSide::Left, touch);
+  updateDockDrawer(rightState,
+                   findDockDrawerTarget(kRightAnchors, IM_ARRAYSIZE(kRightAnchors),
+                                        DockDrawerSide::Right),
+                   DockDrawerSide::Right, touch);
+  updateDockDrawer(bottomState,
+                   findDockDrawerTarget(kBottomAnchors, IM_ARRAYSIZE(kBottomAnchors),
+                                        DockDrawerSide::Bottom),
+                   DockDrawerSide::Bottom, touch);
 }
 } // namespace
 
@@ -819,7 +757,5 @@ void Engine::updateDockDrawerInteractions() {
       glfwGetTime() < workspaceLayoutStabilizeUntil) {
     return;
   }
-  updateDockDrawerAnimations();
+  updateDockDrawers();
 }
-
-

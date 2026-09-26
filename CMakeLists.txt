@@ -1248,6 +1248,8 @@ set(MODULARITY_PLAYER_EDITOR_ONLY_SOURCES
     ${PROJECT_SOURCE_DIR}/src/EditorWindows/RegistryPackagesWindow.cpp
     ${PROJECT_SOURCE_DIR}/src/EditorWindows/XRPreviewWindow.cpp
     ${PROJECT_SOURCE_DIR}/src/EditorWindows/TextureTranscodeTool.cpp
+    ${PROJECT_SOURCE_DIR}/src/EditorWindows/VersionControlWindow.cpp
+    ${PROJECT_SOURCE_DIR}/src/VersionControl.cpp
     ${PROJECT_SOURCE_DIR}/src/EditorWindows/Panels/SceneHierarchyWindow.cpp
     ${PROJECT_SOURCE_DIR}/src/EditorWindows/ScriptingWindow.cpp
 )

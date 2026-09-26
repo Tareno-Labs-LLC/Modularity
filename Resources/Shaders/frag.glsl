@@ -599,10 +599,16 @@ void main()
     vec3 norm = normalize(Normal);
     vec3 viewDir = normalize(viewPos - FragPos);
 
+    // Parallax is part of the PBR feature set: the Inspector hides the height
+    // controls while Physically Based is off, so the shader must not keep
+    // displacing with values the user can no longer see. gbuffer_frag.glsl
+    // mirrors this gate.
+    bool wantsParallax = usePbr && hasHeightMap && heightScale > 0.0;
+
     // Both parallax and normal mapping want the same tangent frame, so it is
     // built once here. The condition is uniform across the draw, which keeps the
     // derivatives inside it well defined.
-    bool wantsTangentFrame = hasNormalMap || (hasHeightMap && heightScale > 0.0);
+    bool wantsTangentFrame = hasNormalMap || wantsParallax;
     mat3 TBN = mat3(1.0);
     if (wantsTangentFrame) {
         TBN = computeTBN(uv, norm);
@@ -611,7 +617,7 @@ void main()
     // Displacement runs before every other fetch: albedo, overlay, normal and
     // the PBR maps all have to be read at the displaced coordinate or the
     // surface detail slides against the silhouette.
-    if (hasHeightMap && heightScale > 0.0) {
+    if (wantsParallax) {
         // TBN is orthonormal enough that its transpose inverts it, which is the
         // cheap way to get the view ray into tangent space.
         vec3 viewTangent = normalize(transpose(TBN) * viewDir);

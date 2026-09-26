@@ -359,9 +359,7 @@ void Engine::renderModuCppNvimWarningPopup() {
     if (!moduCppNvimWarningPopupOpened && !showModuCppNvimRemovalSteps) {
         ImGui::OpenPopup(warningTitle);
         moduCppNvimWarningPopupOpened = true;
-        playEditorFeedbackOneShot("Resources/Sounds/Package Warning Chime.mp3",
-                                  0.95f,
-                                  EditorFeedbackSoundCategory::Other);
+        playEditorSound(EditorSoundCue::Warning, 0.95f);
     }
 
     const ImVec2 displaySize = ImGui::GetIO().DisplaySize;

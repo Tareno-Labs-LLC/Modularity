@@ -113,12 +113,14 @@ void main()
     vec3 norm = normalize(Normal);
     vec3 viewDir = normalize(viewPos - FragPos);
 
-    bool wantsTangentFrame = hasNormalMap || (hasHeightMap && heightScale > 0.0);
+    // Parallax only runs for PBR materials, matching frag.glsl.
+    bool wantsParallax = usePbr && hasHeightMap && heightScale > 0.0;
+    bool wantsTangentFrame = hasNormalMap || wantsParallax;
     mat3 TBN = mat3(1.0);
     if (wantsTangentFrame) {
         TBN = computeTBN(uv, norm);
     }
-    if (hasHeightMap && heightScale > 0.0) {
+    if (wantsParallax) {
         vec3 viewTangent = normalize(transpose(TBN) * viewDir);
         uv = parallaxOcclusionUv(uv, viewTangent);
     }

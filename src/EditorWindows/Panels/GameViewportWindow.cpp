@@ -267,6 +267,8 @@ void Engine::renderGameViewportWindow() {
     const ImVec2 slotSize(gameToolbarSwitchSide, gameToolbarSwitchSide);
     const ImVec2 slotPos = ImGui::GetCursorScreenPos();
     const bool pressed = ImGui::InvisibleButton(id, slotSize);
+    if (pressed) ImGui::ReportWidgetFeedback(value ? ImGuiWidgetFeedback_ToggleOff : ImGuiWidgetFeedback_ToggleOn);
+    ImGui::ReportItemHoverFeedback();
     const bool hovered = ImGui::IsItemHovered();
     const bool held = ImGui::IsItemActive();
     const ImVec2 slotMax(slotPos.x + slotSize.x, slotPos.y + slotSize.y);
@@ -736,9 +738,55 @@ void Engine::renderGameViewportWindow() {
                     postStats.resolvedBlend, postStats.activeVolumeCount);
 
       const char *lines[] = {line1, line2, line3, line4, line5, line6, line7};
-      profilerOverlayLines.reserve(sizeof(lines) / sizeof(lines[0]));
+      profilerOverlayLines.reserve(sizeof(lines) / sizeof(lines[0]) + 1);
       for (const char *line : lines) {
         profilerOverlayLines.emplace_back(line);
+      }
+      if (stats.triangles > 0) {
+        char trianglesLine[96];
+        std::snprintf(trianglesLine, sizeof(trianglesLine), "Triangles: %lld",
+                      stats.triangles);
+        profilerOverlayLines.emplace_back(trianglesLine);
+      }
+      if (stats.optimizationFeatures != 0) {
+        // Project Settings > Graphics Manager > Optimization.
+        char cullLine[192];
+        std::snprintf(cullLine, sizeof(cullLine),
+                      "Culling%s: %d / %d visible | %d culled | %d LOD | %.2f ms",
+                      stats.optimizationAutomatic ? " (auto)" : "",
+                      stats.visibleRenderables, stats.objectsSubmitted,
+                      stats.objectsCulled, stats.objectsLodCulled,
+                      stats.cpuCullingMs);
+        profilerOverlayLines.emplace_back(cullLine);
+        char queueLine[160];
+        std::snprintf(queueLine, sizeof(queueLine),
+                      "Queue: %.2f ms | Sort: %.2f ms", stats.queueBuildMs,
+                      stats.sortingMs);
+        profilerOverlayLines.emplace_back(queueLine);
+        if (stats.mdiBatches > 0) {
+          char mdiLine[192];
+          std::snprintf(mdiLine, sizeof(mdiLine),
+                        "Multi-draw: %d obj | %d batches | %d cmds",
+                        stats.mdiObjects, stats.mdiBatches,
+                        stats.indirectDrawCommands);
+          profilerOverlayLines.emplace_back(mdiLine);
+        }
+        if (stats.gpuCullingMs >= 0.0f || stats.gpuVisible >= 0) {
+          char gpuLine[160];
+          std::snprintf(gpuLine, sizeof(gpuLine),
+                        "GPU cull: %.3f ms | %d visible (async)",
+                        stats.gpuCullingMs, stats.gpuVisible);
+          profilerOverlayLines.emplace_back(gpuLine);
+        }
+      }
+      const UiCanvas3DFrameStats &canvasStats = uiCanvas3DStatsLastFrame;
+      if (canvasStats.active > 0) {
+        char line8[160];
+        std::snprintf(line8, sizeof(line8),
+                      "3D Canvas: %d full | %d partial | %d cached | %.2f Mpx",
+                      canvasStats.fullRedraws, canvasStats.partialRedraws,
+                      canvasStats.cached, canvasStats.redrawnPixels / 1.0e6);
+        profilerOverlayLines.emplace_back(line8);
       }
       profilerPanelMin = ImVec2(imageMin.x + 14.0f, imageMin.y + 14.0f);
       profilerOverlayPending = true;

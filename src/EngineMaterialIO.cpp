@@ -1,7 +1,10 @@
 #include "EngineMaterialIO.h"
+#include "DurableFile.h"
 #include "MaterialAssetUtils.h"
 #include <algorithm>
 #include <cstdio>
+#include <iostream>
+#include <sstream>
 bool readMaterialFile(const std::string& path, MaterialFileData& outData) {
     std::ifstream f(path); if (!f.is_open()) {return false;} std::string line;
     while (std::getline(f, line)) {
@@ -69,8 +72,10 @@ bool readMaterialFile(const std::string& path, MaterialFileData& outData) {
     return true;
 }
 bool writeMaterialFile(const MaterialFileData& data, const std::string& path) {
-    std::ofstream f(path);
-    if (!f.is_open()) return false;
+    // Built in memory and written through WriteFileDurably: the Inspector autosaves a material
+    // every time an edit settles, and a plain ofstream truncates first, so a crash right after
+    // could leave the .mat as zero bytes (see DurableFile.h).
+    std::ostringstream f;
     f << "# Material\n";
     f << "color=" << data.props.color.r << "," << data.props.color.g << "," << data.props.color.b << "\n";
     f << "opacity=" << data.props.alpha << "\n";
@@ -120,4 +125,11 @@ bool writeMaterialFile(const MaterialFileData& data, const std::string& path) {
     f << "shaderPack=" << data.shaderPack << "\n";
     f << "vertexShader=" << data.vertexShader << "\n";
     f << "fragmentShader=" << data.fragmentShader << "\n";
+    std::string error;
+    // Text mode keeps the CRLF line endings the old text-mode ofstream wrote on Windows.
+    if (!Modularity::WriteFileDurably(std::filesystem::path(path), f.str(), error,
+                                      Modularity::DurableFileMode::Text)) {
+        std::cerr << "[Material] " << error << "\n";
+        return false;
+    }
     return true;}
