@@ -1344,78 +1344,8 @@ void Engine::renderViewport() {
         }
       }
 
-      const unsigned int fallbackParticleTextureId = rendererInitialized ? renderer.getDebugWhiteTextureId() : 0;
-      const glm::mat4 invView = glm::inverse(view);
-      const glm::vec3 cameraRight = glm::normalize(glm::vec3(invView[0]));
-      const glm::vec3 cameraUp = glm::normalize(glm::vec3(invView[1]));
-      for (auto &obj : sceneObjects) {
-        if (!IsObjectEnabledInHierarchy(obj) || !obj.hasParticleSystem2D) continue;
-        SimulateParticleSystem2D(obj, glfwGetTime());
-        ParticleSystem2DComponent &ps = obj.particleSystem2D;
-        if (!ps.enabled || ps.particles.empty()) continue;
-
-        unsigned int texId = 0;
-        const std::string texturePath = !ps.texturePath.empty() ? ps.texturePath : obj.albedoTexturePath;
-        if (rendererInitialized && !texturePath.empty()) {
-          if (Texture *particleTex = renderer.getTexture(texturePath, obj.material.textureFilter)) texId = particleTex->GetID();
-        }
-        if (texId == 0) texId = fallbackParticleTextureId;
-
-        for (const auto &particle : ps.particles) {
-          if (!particle.alive) continue;
-          const float t = std::clamp(particle.age / std::max(0.01f, particle.lifetime), 0.0f, 1.0f);
-          const float size = ps.sizeOverLifetimeEnabled ? glm::mix(particle.size, ps.sizeOverLifetime, t) : particle.size;
-          const float halfSize = std::max(0.001f, size) * 0.5f;
-          const float angle = glm::radians(particle.rotation);
-          const float c = std::cos(angle);
-          const float s = std::sin(angle);
-          glm::mat4 objectRotation(1.0f);
-          objectRotation = glm::rotate(objectRotation, glm::radians(obj.rotation.x), glm::vec3(1.0f, 0.0f, 0.0f));
-          objectRotation = glm::rotate(objectRotation, glm::radians(obj.rotation.y), glm::vec3(0.0f, 1.0f, 0.0f));
-          objectRotation = glm::rotate(objectRotation, glm::radians(obj.rotation.z), glm::vec3(0.0f, 0.0f, 1.0f));
-          const glm::vec3 particleWorldCenter = obj.position + glm::vec3(objectRotation * glm::vec4(particle.position.x * obj.scale.x, particle.position.y * obj.scale.y, particle.position.z * obj.scale.z, 0.0f));
-          auto localToWorld = [&](float x, float y) {
-            const float rx = x * c - y * s;
-            const float ry = x * s + y * c;
-            return particleWorldCenter + cameraRight * rx + cameraUp * ry;
-          };
-
-          std::array<ImVec2, 4> quad;
-          const std::array<glm::vec3, 4> corners = {
-              localToWorld(-halfSize, -halfSize),
-              localToWorld(halfSize, -halfSize),
-              localToWorld(halfSize, halfSize),
-              localToWorld(-halfSize, halfSize),
-          };
-          bool valid = true;
-          for (size_t i = 0; i < corners.size(); ++i) {
-            if (!ProjectWorldToOverlayPoint(
-                    corners[i], view, proj, imageMin,
-                    ImVec2(imageMax.x - imageMin.x, imageMax.y - imageMin.y),
-                    quad[i])) {
-              valid = false;
-              break;
-            }
-          }
-          if (!valid) continue;
-
-          ImVec2 rectMin(quad[0].x, quad[0].y);
-          ImVec2 rectMax(quad[0].x, quad[0].y);
-          for (const ImVec2 &point : quad) {
-            rectMin.x = std::min(rectMin.x, point.x);
-            rectMin.y = std::min(rectMin.y, point.y);
-            rectMax.x = std::max(rectMax.x, point.x);
-            rectMax.y = std::max(rectMax.y, point.y);
-          }
-          if (rectMax.x < imageMin.x || rectMin.x > imageMax.x || rectMax.y < imageMin.y || rectMin.y > imageMax.y) continue;
-
-          const glm::vec4 tint =
-              ps.colorOverLifetimeEnabled ? glm::mix(particle.startColor, ps.colorOverLifetime, t) : particle.startColor;
-          const ImU32 tintColor = ImGui::GetColorU32(ImVec4(tint.r, tint.g, tint.b, tint.a));
-          if (texId != 0) { spriteBatch.push((ImTextureID)(intptr_t)texId, quad[0], quad[1], quad[2], quad[3], ImVec2(0.0f, 0.0f), ImVec2(1.0f, 0.0f), ImVec2(1.0f, 1.0f), ImVec2(0.0f, 1.0f), tintColor); }
-          else { spriteBatch.flush(); viewportDrawList->AddQuadFilled(quad[0], quad[1], quad[2], quad[3], tintColor); }
-        }
-      }
+      // Particle Systems used to be overlaid here; the Renderer draws them into the 3D
+      // frame itself now (Renderer::renderParticleSystems).
       spriteBatch.flush();
     };
     if (!worldUiEditing && !isProject25DPipeline()) drawProjected25DSceneSprites();
@@ -1823,6 +1753,11 @@ void Engine::renderViewport() {
             continue;
           }
           if (!(obj.ui.type == UIElementType::Image || obj.ui.type == UIElementType::Sprite2D)) continue;
+          if (ViewportRenderHelpers::HasUiImageMaterialShader(obj)) {
+            setLight2DRoutingReason(
+                obj.id, "Material shader: rendered by the UI image shader path.");
+            continue;
+          }
           if (obj.ui.nineSliceEnabled) {
             setLight2DRoutingReason(obj.id, "Legacy path: nine-slice sprites are not " "routed through Light2D yet.");
             continue;
@@ -2188,10 +2123,25 @@ void Engine::renderViewport() {
           Texture *spriteTex = spriteTextureResolver.resolveTexture(obj);
           unsigned int texId = (spriteTex != nullptr) ? spriteTex->GetID() : 0;
           std::array<ImVec2, 4> uvQuad = buildSpriteSheetUvs(obj);
+          bool renderedMaterialShader = false;
+          if (ViewportRenderHelpers::HasUiImageMaterialShader(obj)) {
+            spriteBatch.flush();
+            const unsigned int shadedTexture =
+                ViewportRenderHelpers::RenderUiImageMaterialShader(
+                    renderer, obj, drawSize, uvQuad, texId, ImGui::GetTime());
+            if (shadedTexture != 0) {
+              texId = shadedTexture;
+              uvQuad = {ImVec2(0.0f, 1.0f), ImVec2(1.0f, 1.0f),
+                        ImVec2(1.0f, 0.0f), ImVec2(0.0f, 0.0f)};
+              renderedMaterialShader = true;
+            }
+          }
           const int frame = resolveSpriteSheetFrame(obj);
           const ImVec2 sourceFrameSizePx = ResolveUiSourceFrameSizePx(obj, frame, spriteTex);
           ImVec4 tint(obj.ui.color.r, obj.ui.color.g, obj.ui.color.b, obj.ui.color.a);
-          const ImU32 tintColor = ImGui::GetColorU32(tint);
+          const ImU32 tintColor = renderedMaterialShader
+                                      ? IM_COL32_WHITE
+                                      : ImGui::GetColorU32(tint);
           bool repeatX = obj.hasParallaxLayer2D && obj.parallaxLayer2D.enabled && obj.parallaxLayer2D.repeatX;
           bool repeatY = obj.hasParallaxLayer2D && obj.parallaxLayer2D.enabled && obj.parallaxLayer2D.repeatY;
           glm::vec2 spriteSizeWorld = getSpriteDisplaySize(obj);
@@ -2219,12 +2169,14 @@ void Engine::renderViewport() {
             if (size.x <= 1.0f || size.y <= 1.0f) return;
             ImVec2 drawMinLocal(min.x, min.y);
             ImVec2 drawMaxLocal(max.x, max.y);
-            if (DrawScrollingUiSprite(spriteBatch, (ImTextureID)(intptr_t)texId,
+            if (!renderedMaterialShader &&
+                DrawScrollingUiSprite(spriteBatch, (ImTextureID)(intptr_t)texId,
                                       obj, drawMinLocal, drawMaxLocal, angle, tintColor,
                                       ImGui::GetTime())) {
               return;
             }
-            if (DrawNineSliceSprite(spriteBatch, (ImTextureID)(intptr_t)texId, obj, drawMinLocal, drawMaxLocal, uvQuad, sourceFrameSizePx, angle, tintColor)) {
+            if (!renderedMaterialShader &&
+                DrawNineSliceSprite(spriteBatch, (ImTextureID)(intptr_t)texId, obj, drawMinLocal, drawMaxLocal, uvQuad, sourceFrameSizePx, angle, tintColor)) {
               return;
             }
             if (std::abs(angle) > 1e-4f) {
@@ -3021,7 +2973,8 @@ void Engine::renderViewport() {
       }
 
       SceneObject *selected = getSelectedObject();
-      if (worldUiEditing && selected && isUIType(*selected)) {
+      if (worldUiEditing && selected && isUIType(*selected) &&
+          !selected->IsInvariable) {
         auto anchorToPivotUI = [](UIAnchor anchor, const ImVec2 &size) {
           switch (anchor) {
           case UIAnchor::TopLeft:
@@ -3061,7 +3014,8 @@ void Engine::renderViewport() {
         gizmoTargets.reserve(candidateIds.size());
         for (int id : candidateIds) {
           SceneObject *candidate = findObjectById(id);
-          if (!candidate || !IsObjectEnabledInHierarchy(*candidate))
+          if (!candidate || !IsObjectEnabledInHierarchy(*candidate) ||
+              candidate->IsInvariable)
             continue;
           if (!isUIType(*candidate))
             continue;
@@ -3491,6 +3445,7 @@ void Engine::renderViewport() {
     }
     const bool sceneGizmoEligible =
         !worldUiEditing && selectedObj && IsObjectEnabledInHierarchy(*selectedObj) &&
+        !selectedObj->IsInvariable &&
         !selectedObj->hasPostFX &&
         (!HasUIComponent(*selectedObj) || selectedIsUiCanvas3D ||
          selectedIsSprite25D);
@@ -7454,6 +7409,7 @@ void Engine::renderViewport() {
           };
 
           auto applyDelta = [&](SceneObject &o) {
+            if (o.IsInvariable) return;
             const GizmoDragTransform start = dragStartOf(o);
             glm::mat4 m = ComposeTransform(start.position, start.rotation, start.scale);
             glm::mat4 newM = delta * m;
@@ -7504,8 +7460,13 @@ void Engine::renderViewport() {
           if (selectedObjectIds.size() <= 1) {
             selectedRoots.push_back(selectedObj->id);
           } else {
-            std::unordered_set<int> selectedSet(selectedObjectIds.begin(),
-                                                selectedObjectIds.end());
+            std::unordered_set<int> selectedSet;
+            for (int id : selectedObjectIds) {
+              SceneObject *candidate = findObjectById(id);
+              if (candidate && !candidate->IsInvariable) {
+                selectedSet.insert(id);
+              }
+            }
             auto getParentId = [&](int id) -> int {
               auto it = std::find_if(
                   sceneObjects.begin(), sceneObjects.end(),
@@ -7525,6 +7486,8 @@ void Engine::renderViewport() {
               return false;
             };
             for (int id : selectedObjectIds) {
+              SceneObject *candidate = findObjectById(id);
+              if (!candidate || candidate->IsInvariable) continue;
               if (!hasSelectedAncestor(id)) {
                 selectedRoots.push_back(id);
               }
@@ -7593,6 +7556,8 @@ void Engine::renderViewport() {
                 continue;
 
               SceneObject &o = *itObj;
+              if (o.IsInvariable)
+                continue;
               const GizmoDragTransform objectStart = dragStartOf(o);
               bool changed = false;
 
@@ -8243,7 +8208,8 @@ void Engine::renderViewport() {
       case ObjectType::PointLight:
       case ObjectType::SpotLight:
       case ObjectType::AreaLight:
-        return obj.hasLight && obj.light.enabled;
+        // Disabled lights stay visible as the unlit bulb.
+        return obj.hasLight;
       case ObjectType::PostFXNode:
         return obj.hasPostFX && obj.postFx.enabled;
       case ObjectType::Camera:
@@ -8259,45 +8225,26 @@ void Engine::renderViewport() {
       bool flipY = false;
     };
 
-    auto getMainTypeGizmoIcon = [&](ObjectType type) -> GizmoIconImage {
-      const char *iconPath = nullptr;
-      switch (type) {
+    auto getMainTypeGizmoIconPath = [&](const SceneObject &obj) -> const char * {
+      switch (resolveMainObjectType(obj)) {
       case ObjectType::Camera:
-        iconPath = "Resources/Engine-Root/Gizmos/Placeholder/Camera view.png";
-        break;
+        return "Resources/Engine-Root/Gizmos/Camera view.png";
       case ObjectType::DirectionalLight:
       case ObjectType::PointLight:
       case ObjectType::SpotLight:
       case ObjectType::AreaLight:
-        iconPath = "Resources/Engine-Root/Gizmos/Placeholder/Light bulb.png";
-        break;
+        return obj.light.enabled
+                   ? "Resources/Engine-Root/Gizmos/Light bulb On.png"
+                   : "Resources/Engine-Root/Gizmos/Light bulb Off.png";
       case ObjectType::UIText:
-        iconPath = "Resources/Engine-Root/Gizmos/Placeholder/Dynamic Text.png";
-        break;
+        return "Resources/Engine-Root/Gizmos/Dynamic Text.png";
       default:
-        return {};
+        return nullptr;
       }
-
-      if (rendererInitialized) {
-        if (Texture *icon = renderer.getTexture(iconPath);
-            icon && icon->GetID()) {
-          return {static_cast<ImTextureID>(icon->GetID()), true};
-        }
-        return {};
-      }
-
-      if (hasVulkanSceneTexture && vulkanRenderer) {
-        ImTextureID vkIcon = vulkanRenderer->getOrCreateUIImage(iconPath);
-        if (vkIcon != static_cast<ImTextureID>(0)) {
-          return {vkIcon, false};
-        }
-      }
-
-      return {};
     };
 
-    auto getCustomGizmoIcon = [&](const std::string &path) -> GizmoIconImage {
-      if (path.empty())
+    auto loadGizmoIcon = [&](const char *path) -> GizmoIconImage {
+      if (!path || !*path)
         return {};
       if (rendererInitialized) {
         if (Texture *icon = renderer.getTexture(path); icon && icon->GetID()) {
@@ -8306,7 +8253,7 @@ void Engine::renderViewport() {
         return {};
       }
       if (hasVulkanSceneTexture && vulkanRenderer) {
-        ImTextureID vkIcon = vulkanRenderer->getOrCreateUIImage(path.c_str());
+        ImTextureID vkIcon = vulkanRenderer->getOrCreateUIImage(path);
         if (vkIcon != static_cast<ImTextureID>(0)) {
           return {vkIcon, false};
         }
@@ -8315,17 +8262,24 @@ void Engine::renderViewport() {
     };
 
     auto drawMainTypeGizmoIcon = [&](const SceneObject &obj) {
+      if (!IsObjectEnabledInHierarchy(obj))
+        return;
       const bool wantsCustomIcon =
           obj.editorIconShowInViewport && !obj.editorIconPath.empty();
-      if (!wantsCustomIcon && !isMainTypeGizmoEnabled(obj))
-        return;
-      if (wantsCustomIcon && !IsObjectEnabledInHierarchy(obj))
-        return;
-
-      const GizmoIconImage icon =
-          wantsCustomIcon ? getCustomGizmoIcon(obj.editorIconPath)
-                          : getMainTypeGizmoIcon(resolveMainObjectType(obj));
-      if (icon.id == static_cast<ImTextureID>(0))
+      GizmoIconImage icon;
+      if (wantsCustomIcon) {
+        icon = loadGizmoIcon(obj.editorIconPath.c_str());
+      } else if (isMainTypeGizmoEnabled(obj)) {
+        icon = loadGizmoIcon(getMainTypeGizmoIconPath(obj));
+      }
+      const bool hasIcon = icon.id != static_cast<ImTextureID>(0);
+      const GizmoIconImage lockIcon =
+          gizmoShowInvariableLocks && obj.IsInvariable
+              ? loadGizmoIcon(
+                    "Resources/Engine-Root/Gizmos/Invariable Object Lock.png")
+              : GizmoIconImage{};
+      const bool hasLock = lockIcon.id != static_cast<ImTextureID>(0);
+      if (!hasIcon && !hasLock)
         return;
 
       auto screen = projectToScreen(obj.position);
@@ -8335,6 +8289,29 @@ void Engine::renderViewport() {
       const bool isSelected =
           std::find(selectedObjectIds.begin(), selectedObjectIds.end(),
                     obj.id) != selectedObjectIds.end();
+      ImDrawList *dl = ImGui::GetWindowDrawList();
+      auto addIconImage = [&](const GizmoIconImage &image, const ImVec2 &min,
+                              const ImVec2 &max, ImU32 tint) {
+        const ImVec2 uvMin = image.flipY ? ImVec2(0, 1) : ImVec2(0, 0);
+        const ImVec2 uvMax = image.flipY ? ImVec2(1, 0) : ImVec2(1, 1);
+        dl->AddImage(image.id, min, max, uvMin, uvMax, tint);
+      };
+      const ImU32 lockTint = IM_COL32(255, 255, 255, 232);
+
+      if (!hasIcon) {
+        // Objects without a type icon (meshes, empties) get the lock alone.
+        const float lockHalf =
+            (isSelected ? 22.0f : 17.0f) * gizmoIconScaleClamped;
+        const ImVec2 lockMin(screen->x - lockHalf, screen->y - lockHalf);
+        const ImVec2 lockMax(screen->x + lockHalf, screen->y + lockHalf);
+        addIconImage(lockIcon, lockMin, lockMax, lockTint);
+        if (isSelected) {
+          dl->AddRect(lockMin, lockMax, IM_COL32(255, 255, 255, 170),
+                      4.0f * gizmoIconScaleClamped, 0, 1.5f);
+        }
+        return;
+      }
+
       const float size = (isSelected ? 74.0f : 56.0f) * gizmoIconScaleClamped;
       const float half = size * 0.5f;
       const ImVec2 min(screen->x - half, screen->y - half);
@@ -8343,13 +8320,16 @@ void Engine::renderViewport() {
           ImVec4(obj.editorIconTint.r, obj.editorIconTint.g, obj.editorIconTint.b,
                  obj.editorIconTint.a * 0.91f));
 
-      ImDrawList *dl = ImGui::GetWindowDrawList();
-      const ImVec2 uvMin = icon.flipY ? ImVec2(0, 1) : ImVec2(0, 0);
-      const ImVec2 uvMax = icon.flipY ? ImVec2(1, 0) : ImVec2(1, 1);
-      dl->AddImage(icon.id, min, max, uvMin, uvMax, tint);
+      addIconImage(icon, min, max, tint);
       if (isSelected) {
         dl->AddRect(min, max, IM_COL32(255, 255, 255, 170),
                     5.0f * gizmoIconScaleClamped, 0, 1.8f);
+      }
+      if (hasLock) {
+        // Bottom-left badge; the top-right corner holds the intensity label.
+        const float lockSize = size * 0.42f;
+        addIconImage(lockIcon, ImVec2(min.x, max.y - lockSize),
+                     ImVec2(min.x + lockSize, max.y), lockTint);
       }
       if (obj.hasLight && gizmoShowLightIntensityLabels) {
         char brightness[24];
@@ -9149,6 +9129,10 @@ void Engine::renderViewport() {
         }
         ImGui::EndDisabled();
 
+        if (ImGui::Checkbox("Invariable Locks", &gizmoShowInvariableLocks)) {
+          toolbarEditorSettingsChanged = true;
+        }
+
         ImGui::Separator();
         if (ImGui::Checkbox("Viewport Hint Overlay",
                             &showViewportHintOverlay)) {
@@ -9187,6 +9171,7 @@ void Engine::renderViewport() {
           gizmoShowCameraFrustumLabels = true;
           gizmoShowLightOverlays = true;
           gizmoShowLightIntensityLabels = true;
+          gizmoShowInvariableLocks = true;
           showViewportHintOverlay = true;
           showLight2DStatsOverlay = true;
           sceneViewportRenderMode = SceneRenderMode::Normal;

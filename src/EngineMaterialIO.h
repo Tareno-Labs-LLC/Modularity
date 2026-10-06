@@ -19,4 +19,7 @@ struct MaterialFileData {
     std::string fragmentShader;
 };
 bool readMaterialFile(const std::string& path, MaterialFileData& outData);
+// Same parse over text already in memory - for callers that read through AssetSource, which
+// a mounted .modbundle needs (std::ifstream cannot see inside it).
+bool parseMaterialText(const std::string& text, const std::string& path, MaterialFileData& outData);
 bool writeMaterialFile(const MaterialFileData& data, const std::string& path);

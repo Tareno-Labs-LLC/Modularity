@@ -535,6 +535,15 @@ private:
     bool sunOnScreen = false;
     unsigned int quadVAO = 0;
     unsigned int quadVBO = 0;
+    // Particle System quads (RenderParticles.cpp): rebuilt each frame on the CPU and
+    // streamed through one buffer; the index buffer only ever grows.
+    unsigned int particleVAO = 0;
+    unsigned int particleVBO = 0;
+    unsigned int particleEBO = 0;
+    size_t particleIndexQuads = 0;
+    std::vector<float> particleVertexScratch;
+    std::vector<uint32_t> particleOrderScratch;
+    std::vector<float> particleDepthScratch;
     unsigned int displayTexture = 0;
     bool historyValid = false;
     size_t textureCacheBudgetBytes = 384ull * 1024ull * 1024ull;
@@ -618,6 +627,11 @@ private:
     void updateSkyboxReflectionTarget();
     void ensureQuad();
     void drawFullscreenQuad();
+    // Every Particle System as camera-facing quads in the 3D scene: depth-tested against what
+    // is already drawn, drawn after the scene's transparent surfaces. RenderParticles.cpp.
+    void renderParticleSystems(const std::vector<SceneObject>& sceneObjects,
+                               const glm::mat4& view, const glm::mat4& proj);
+    void releaseParticleBuffers();
     void purgeTextureCacheIfNeeded();
     float updateEyeAdaptation(unsigned int sourceTexture, int width, int height,
                               const PostFXSettings& settings);

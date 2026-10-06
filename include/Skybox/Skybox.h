@@ -321,7 +321,7 @@ private:
 
     void setupMesh();
     bool reloadShader();
-    void reloadTextures();
+    void reloadTextures(bool sun, bool moon, bool scrolling);
     void releaseBakedSky();
     bool ensureBakedSkyTargets();
     void bakeDirtyFaces(int maxFaces);
@@ -341,6 +341,9 @@ public:
     void setShaderPaths(const std::string& vert, const std::string& frag);
     std::string getVertPath() const { return vertPath; }
     std::string getFragPath() const { return fragPath; }
+    // Reloads the sun, moon and scrolling textures from disk. setSettings only reloads a
+    // texture whose path changed, so this is how a file edited in place is picked up.
+    void reloadTextures() { reloadTextures(true, true, true); }
     void setSettings(const SkyboxSettings& newSettings);
     // This frame's resolved weather. The skybox only consumes it; the schedule
     // and the audio live with the engine.

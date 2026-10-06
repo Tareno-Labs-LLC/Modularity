@@ -228,21 +228,21 @@ bool Skybox::reloadShader() {
     return skyboxShader && skyboxShader->ID != 0;
 }
 
-void Skybox::reloadTextures() {
-    if (sunTexture) {
+void Skybox::reloadTextures(bool sun, bool moon, bool scrolling) {
+    if (sun && sunTexture) {
         delete sunTexture;
         sunTexture = nullptr;
     }
-    if (moonTexture) {
+    if (moon && moonTexture) {
         delete moonTexture;
         moonTexture = nullptr;
     }
-    if (scrollingTexture) {
+    if (scrolling && scrollingTexture) {
         delete scrollingTexture;
         scrollingTexture = nullptr;
     }
 
-    if (!settings.sunTexturePath.empty()) {
+    if (sun && !settings.sunTexturePath.empty()) {
         sunTexture = new Texture(settings.sunTexturePath,
                                  GL_CLAMP_TO_EDGE,
                                  GL_CLAMP_TO_EDGE,
@@ -254,7 +254,7 @@ void Skybox::reloadTextures() {
         }
     }
 
-    if (!settings.moonTexturePath.empty()) {
+    if (moon && !settings.moonTexturePath.empty()) {
         moonTexture = new Texture(settings.moonTexturePath,
                                   GL_CLAMP_TO_EDGE,
                                   GL_CLAMP_TO_EDGE,
@@ -266,7 +266,7 @@ void Skybox::reloadTextures() {
         }
     }
 
-    if (!settings.scrollingTexturePath.empty()) {
+    if (scrolling && !settings.scrollingTexturePath.empty()) {
         scrollingTexture = new Texture(settings.scrollingTexturePath,
                                        GL_REPEAT,
                                        GL_REPEAT,
@@ -298,6 +298,11 @@ void Skybox::setShaderPaths(const std::string& vert, const std::string& frag) {
 }
 
 void Skybox::setSettings(const SkyboxSettings& newSettings) {
+    // Every Environment window slider lands here, once per frame while it is dragged. This
+    // used to delete and re-decode all three textures from disk on every call.
+    const bool sunChanged = newSettings.sunTexturePath != settings.sunTexturePath;
+    const bool moonChanged = newSettings.moonTexturePath != settings.moonTexturePath;
+    const bool scrollingChanged = newSettings.scrollingTexturePath != settings.scrollingTexturePath;
     settings = newSettings;
     settings.scrollingRepeatX = std::max(0.01f, settings.scrollingRepeatX);
     settings.scrollingRepeatY = std::max(0.01f, settings.scrollingRepeatY);
@@ -311,7 +316,9 @@ void Skybox::setSettings(const SkyboxSettings& newSettings) {
     settings.fogEnd = std::max(settings.fogStart + 0.01f, settings.fogEnd);
     settings.fogDensity = std::clamp(settings.fogDensity, 0.0f, 1.0f);
     settings.fogHeightFalloff = std::clamp(settings.fogHeightFalloff, 0.0f, 1.0f);
-    reloadTextures();
+    if (sunChanged || moonChanged || scrollingChanged) {
+        reloadTextures(sunChanged, moonChanged, scrollingChanged);
+    }
     if (!settings.cachedSky) {
         releaseBakedSky();
     } else if (bakedCube != 0) {

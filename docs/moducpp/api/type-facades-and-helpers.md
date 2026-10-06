@@ -214,6 +214,30 @@ if (audio.HasSource()) {
 - The facade is about the current object’s audio setup.
 - If playback should come from another object or needs more explicit context handling, use `ctx.PlayAudioOneShot(...)`.
 
+## `Particles`
+
+### Overview
+`Particles` drives another object's Particle System through an `[ObjectRef]` field, the same way `Audio.PlayOneShot(ref)` plays another object's sound. Every call is safe with an empty ref, an unresolved ref, or an object without a Particle System.
+
+### Members
+- `Play(ref)` - restarts emission from time zero, so the system's start delay and bursts fire again. Particles already in flight are kept, so two quick hits overlap instead of the second cutting the first off.
+- `Emit(ref, count)` - spawns `count` particles on the next frame with the system's start settings, whether or not it is playing.
+- `Stop(ref)` - stops emitting and clears every live particle.
+- `IsAlive(ref)` - still emitting, or particles still on screen.
+
+### Common Uses
+```cpp
+[ObjectRef] public SceneObj hitParticles;
+
+void OnHit() {
+    Particles.Play(hitParticles);
+}
+```
+
+### Important Notes
+- An effect fired from a script wants **Looping** and **Play On Awake** off in its Particle System, or it also plays on its own.
+- Each replay rolls fresh random values (with Auto Random Seed on), so repeated hits do not repeat the exact same burst.
+
 ## `sprite`
 
 ### Overview

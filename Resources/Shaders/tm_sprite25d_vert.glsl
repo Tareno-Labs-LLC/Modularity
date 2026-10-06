@@ -6,6 +6,7 @@ layout (location = 2) in vec4 aColor;
 
 out vec2 vUv;
 out vec4 vColor;
+out vec3 vWorldPosition;
 
 uniform mat4 u_view;
 uniform mat4 u_projection;
@@ -14,5 +15,6 @@ uniform vec3 u_cameraForward;
 void main() {
     vUv = aUv;
     vColor = aColor;
+    vWorldPosition = aPosition;
     gl_Position = u_projection * u_view * vec4(aPosition, 1.0);
 }

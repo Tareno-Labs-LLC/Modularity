@@ -8,6 +8,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <mutex>
 #include <optional>
@@ -27,6 +28,118 @@
 #endif
 
 namespace {
+    // An unresolved symbol, reduced from the linker's mangled wall of text to the bit a
+    // person recognises ("ScriptContext::SetCursorImage").
+    struct UnresolvedSymbol {
+        std::string name;
+        bool engineImport = false; // the script expects Modularity.exe to export it
+    };
+
+    std::string readableSymbolName(std::string demangled) {
+        const std::string dllimport = "__declspec(dllimport) ";
+        if (const size_t at = demangled.find(dllimport); at != std::string::npos) {
+            demangled.erase(at, dllimport.size());
+        }
+        // "public: bool __cdecl ScriptContext::IsMouseButtonDown(int)const " -> the
+        // qualified name between the calling convention and the parameter list.
+        for (const char* convention : {"__cdecl ", "__stdcall ", "__fastcall ", "__vectorcall ", "__thiscall "}) {
+            const size_t at = demangled.rfind(convention);
+            if (at == std::string::npos) continue;
+            std::string name = demangled.substr(at + std::strlen(convention));
+            const size_t paren = name.find('(');
+            return paren == std::string::npos ? name : name.substr(0, paren);
+        }
+        while (!demangled.empty() && std::isspace(static_cast<unsigned char>(demangled.back()))) {
+            demangled.pop_back();
+        }
+        return demangled;
+    }
+
+    // MSVC / lld-link: error LNK2019: unresolved external symbol "<demangled>" (<mangled>) ...
+    //                  error LNK2001: unresolved external symbol <plain C name>
+    // GNU ld / lld:    undefined reference to `Name(args)'
+    std::vector<UnresolvedSymbol> findUnresolvedSymbols(const std::string& linkLog) {
+        std::vector<UnresolvedSymbol> symbols;
+        std::set<std::string> seen;
+        std::istringstream lines(linkLog);
+        std::string line;
+        while (std::getline(lines, line)) {
+            UnresolvedSymbol symbol;
+            const std::string msvc = "unresolved external symbol ";
+            const std::string gnu = "undefined reference to `";
+            if (const size_t at = line.find(msvc); at != std::string::npos) {
+                const size_t start = at + msvc.size();
+                if (start < line.size() && line[start] == '"') {
+                    const size_t close = line.find('"', start + 1);
+                    if (close == std::string::npos) continue;
+                    const std::string demangled = line.substr(start + 1, close - start - 1);
+                    symbol.engineImport = demangled.find("__declspec(dllimport)") != std::string::npos;
+                    symbol.name = readableSymbolName(demangled);
+                } else {
+                    const size_t end = line.find(' ', start);
+                    symbol.name = line.substr(start, end == std::string::npos ? std::string::npos : end - start);
+                    symbol.engineImport = symbol.name.rfind("__imp_", 0) == 0;
+                    if (symbol.engineImport) symbol.name.erase(0, 6);
+                }
+            } else if (const size_t gnuAt = line.find(gnu); gnuAt != std::string::npos) {
+                const size_t start = gnuAt + gnu.size();
+                const size_t close = line.find('\'', start);
+                if (close == std::string::npos) continue;
+                symbol.name = line.substr(start, close - start);
+                if (const size_t paren = symbol.name.find('('); paren != std::string::npos) {
+                    symbol.name.erase(paren);
+                }
+                symbol.engineImport = symbol.name.rfind("ScriptContext::", 0) == 0;
+            } else {
+                continue;
+            }
+            if (!symbol.name.empty() && seen.insert(symbol.name).second) {
+                symbols.push_back(symbol);
+            }
+        }
+        return symbols;
+    }
+
+    // Leads a failed link's log with what it means in plain words; the raw linker output
+    // stays underneath for when the detail matters. Returns the one-line error to report.
+    std::string explainUnresolvedSymbols(std::string& linkLog) {
+        const std::vector<UnresolvedSymbol> symbols = findUnresolvedSymbols(linkLog);
+        if (symbols.empty()) return "Link failed";
+
+        const bool engineMissing = std::any_of(symbols.begin(), symbols.end(),
+                                               [](const UnresolvedSymbol& s) { return s.engineImport; });
+        std::ostringstream summary;
+        std::ostringstream names;
+        constexpr size_t kMaxListed = 10;
+        if (engineMissing) {
+            summary << "The script compiled, but it uses engine functions that the running\n"
+                       "Modularity doesn't have:\n";
+        } else {
+            summary << "The script compiled, but these functions are used and never defined:\n";
+        }
+        for (size_t i = 0; i < symbols.size() && i < kMaxListed; ++i) {
+            summary << "  - " << symbols[i].name << "\n";
+            names << (i ? ", " : "") << symbols[i].name;
+        }
+        if (symbols.size() > kMaxListed) {
+            summary << "  ...and " << (symbols.size() - kMaxListed) << " more\n";
+            names << ", ...";
+        }
+        if (engineMissing) {
+            summary << "The script SDK is newer than the Modularity you're running (the engine\n"
+                       "was changed but not rebuilt). Rebuild Modularity, then compile again.\n";
+        } else {
+            summary << "Look for a function that is declared but has no body, or a library the\n"
+                       "script needs that isn't linked.\n";
+        }
+        summary << "\n--- linker output ---\n";
+        linkLog = summary.str() + linkLog;
+
+        return engineMissing
+            ? "Engine is older than the script SDK - rebuild Modularity (missing: " + names.str() + ")"
+            : "Link failed: no definition for " + names.str();
+    }
+
     std::string quoteShellArgument(const fs::path& path) {
 #if defined(_WIN32)
         std::string value = path.string();
@@ -1381,7 +1494,21 @@ bool ScriptCompiler::makeCommands(const ScriptBuildConfig& config, const fs::pat
             const size_t lineStart = source.rfind('\n', namePos);
             const size_t prefixStart = lineStart == std::string::npos ? 0 : lineStart + 1;
             const std::string beforeName = trimLocal(source.substr(prefixStart, namePos - prefixStart));
-            if (beforeName != "void" && beforeName != "void IEnum") {
+            auto endsWithReturnType = [&](const std::string& returnType) {
+                if (beforeName == returnType) return true;
+                if (beforeName.size() <= returnType.size() ||
+                    beforeName.compare(beforeName.size() - returnType.size(),
+                                       returnType.size(), returnType) != 0) {
+                    return false;
+                }
+                return std::isspace(static_cast<unsigned char>(
+                           beforeName[beforeName.size() - returnType.size() - 1])) != 0;
+            };
+            // Native hooks are often declared with linkage/export qualifiers,
+            // e.g. `extern "C" MODULARITY_SCRIPT_EXPORT void Script_OnInspector(...)`.
+            // Treat any line prefix ending in the supported void return form as
+            // a hook declaration so the generated wrapper always exports it.
+            if (!endsWithReturnType("void") && !endsWithReturnType("void IEnum")) {
                 cursor = nameEnd;
                 continue;
             }
@@ -2497,7 +2624,7 @@ bool ScriptCompiler::compile(const ScriptBuildCommands& commands, ScriptCompileO
         const std::string linkCommand = commands.link + " 2>&1";
 #endif
         if (!runCommand(linkCommand, output.linkLog)) {
-            error = "Link failed";
+            error = explainUnresolvedSymbols(output.linkLog);
             if (!failureMarkerPath.empty()) {
                 std::error_code ec;
                 fs::create_directories(failureMarkerPath.parent_path(), ec);

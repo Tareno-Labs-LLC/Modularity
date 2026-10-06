@@ -568,8 +568,9 @@ JoltPhysicsBackend::BodyRecord JoltPhysicsBackend::createBodyFor(const SceneObje
     const JPH::Vec3 pos = bakeWorldStaticMesh ? JPH::Vec3::sZero() : ToJVec3(obj.position);
     const JPH::Quat rot = bakeWorldStaticMesh ? JPH::Quat::sIdentity() : ToJQuat(obj.rotation);
     const JPH::ObjectLayer layer = wantsDynamic ? JoltLayers::MOVING : JoltLayers::NON_MOVING;
+    const bool transformLocked = obj.rigidbody.isKinematic || obj.IsInvariable;
     const JPH::EMotionType motionType = wantsDynamic
-        ? (obj.rigidbody.isKinematic ? JPH::EMotionType::Kinematic : JPH::EMotionType::Dynamic)
+        ? (transformLocked ? JPH::EMotionType::Kinematic : JPH::EMotionType::Dynamic)
         : JPH::EMotionType::Static;
 
     JPH::BodyCreationSettings settings(shape, pos, rot, motionType, layer);
@@ -583,7 +584,7 @@ JoltPhysicsBackend::BodyRecord JoltPhysicsBackend::createBodyFor(const SceneObje
         settings.mAngularDamping = std::max(0.0f, obj.rigidbody.angularDamping);
         settings.mGravityFactor = obj.rigidbody.useGravity ? 1.0f : 0.0f;
         settings.mAllowedDOFs = BuildAllowedDOFs(obj);
-        if (!obj.rigidbody.isKinematic) {
+        if (!transformLocked) {
             const float massKg = EffectiveMassKilograms(obj, mProjectSettings);
             settings.mOverrideMassProperties = JPH::EOverrideMassProperties::CalculateInertia;
             settings.mMassPropertiesOverride.mMass = massKg;
@@ -603,7 +604,7 @@ JoltPhysicsBackend::BodyRecord JoltPhysicsBackend::createBodyFor(const SceneObje
 
     rec.bodyId = bodyId;
     rec.isDynamic = wantsDynamic;
-    rec.isKinematic = wantsDynamic && obj.rigidbody.isKinematic;
+    rec.isKinematic = wantsDynamic && transformLocked;
     rec.hasWorldBakedStaticMesh = bakeWorldStaticMesh;
     rec.hasAuthoringPose = true;
     rec.lastAuthoringPosition = obj.position;
@@ -966,8 +967,12 @@ void JoltPhysicsBackend::simulate(float deltaTime, std::vector<SceneObject>& obj
         if (!enabledInHierarchy) continue;
 
         if (rec.isDynamic) {
-            const bool isKinematic = obj.rigidbody.isKinematic;
+            const bool isKinematic = obj.rigidbody.isKinematic || obj.IsInvariable;
             if (rec.isKinematic != isKinematic) {
+                if (isKinematic) {
+                    bi.SetLinearAndAngularVelocity(rec.bodyId, JPH::Vec3::sZero(),
+                                                   JPH::Vec3::sZero());
+                }
                 bi.SetMotionType(rec.bodyId,
                     isKinematic ? JPH::EMotionType::Kinematic : JPH::EMotionType::Dynamic,
                     JPH::EActivation::Activate);

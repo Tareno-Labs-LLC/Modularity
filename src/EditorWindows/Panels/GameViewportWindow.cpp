@@ -633,7 +633,17 @@ void Engine::renderGameViewportWindow() {
                             IM_COL32(12, 14, 20, 255), 6.0f);
 
     glm::vec2 hoveredPixel(0.0f);
+    // The rectangle test alone ignores windows stacked on top: a floating window (Build
+    // Settings, the Inspector undocked) over the image still passed it, so scrolling that
+    // window zoomed the game view and clicking it locked the cursor during play. Require the
+    // Game Viewport or its overlay child to be the window actually under the mouse. Popups it
+    // opened don't count either - a toolbar combo's dropdown hanging over the image is not
+    // the image.
+    const bool viewportUnderMouse = ImGui::IsWindowHovered(
+        ImGuiHoveredFlags_ChildWindows | ImGuiHoveredFlags_NoPopupHierarchy |
+        ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
     bool imageHovered =
+        viewportUnderMouse &&
         TryMapScreenPointToRenderPixel(gameLayout, ImGui::GetIO().MousePos,
                                        renderWidth, renderHeight, hoveredPixel);
     if (imageHovered) {
@@ -967,10 +977,12 @@ void Engine::renderGameViewportWindow() {
           playerCam->camera.nearClip, playerCam->camera.farClip);
       hasProjectedUiCamera = true;
     }
-    if (!useWorldUi && hasProjectedUiCamera) {
+    // A 3D camera's particles are part of the frame now (Renderer::renderParticleSystems).
+    // Only the 2.5D pipeline, whose TM renderer has no particle pass, still overlays them -
+    // clipped to the game image, which this used to spill past.
+    if (project25DPipeline && !useWorldUi && hasProjectedUiCamera) {
       BatchedSpriteEmitter particleBatch(drawList);
-      const unsigned int fallbackParticleTextureId =
-          rendererInitialized ? renderer.getDebugWhiteTextureId() : 0;
+      drawList->PushClipRect(outputLayout.displayMin, outputLayout.displayMax, true);
       const glm::mat4 invView = glm::inverse(projectedUiView);
       const glm::vec3 cameraRight = glm::normalize(glm::vec3(invView[0]));
       const glm::vec3 cameraUp = glm::normalize(glm::vec3(invView[1]));
@@ -978,51 +990,35 @@ void Engine::renderGameViewportWindow() {
         if (!IsObjectEnabledInHierarchy(obj) || !obj.hasParticleSystem2D) {
           continue;
         }
-        SimulateParticleSystem2D(obj, glfwGetTime());
         ParticleSystem2DComponent &ps = obj.particleSystem2D;
         if (!ps.enabled || ps.particles.empty()) continue;
 
         unsigned int texId = 0;
-        const std::string texturePath =
-            !ps.texturePath.empty() ? ps.texturePath : obj.albedoTexturePath;
-        if (rendererInitialized && !texturePath.empty()) {
-          if (Texture *particleTex =
-                  renderer.getTexture(texturePath, obj.material.textureFilter)) {
-            texId = particleTex->GetID();
-          }
+        int texWidth = 0;
+        int texHeight = 0;
+        if (!rendererInitialized ||
+            !ResolveParticleSpriteTexture(renderer, obj, texId, texWidth,
+                                          texHeight)) {
+          texId = 0;
         }
-        if (texId == 0) texId = fallbackParticleTextureId;
 
-        glm::mat4 objectRotation(1.0f);
-        objectRotation =
-            glm::rotate(objectRotation, glm::radians(obj.rotation.x),
-                        glm::vec3(1.0f, 0.0f, 0.0f));
-        objectRotation =
-            glm::rotate(objectRotation, glm::radians(obj.rotation.y),
-                        glm::vec3(0.0f, 1.0f, 0.0f));
-        objectRotation =
-            glm::rotate(objectRotation, glm::radians(obj.rotation.z),
-                        glm::vec3(0.0f, 0.0f, 1.0f));
-
+        const ParticleRuntime::EmitterFrame emitter =
+            ParticleRuntime::MakeEmitterFrame(obj);
+        const bool sheetAnimated = ParticleRuntime::SheetFrameCount(ps) > 0;
         for (const auto &particle : ps.particles) {
           if (!particle.alive) continue;
-          const float t = std::clamp(
-              particle.age / std::max(0.01f, particle.lifetime), 0.0f, 1.0f);
-          const float size = ps.sizeOverLifetimeEnabled
-                                 ? glm::mix(particle.size,
-                                            ps.sizeOverLifetime, t)
-                                 : particle.size;
-          const float halfSize = std::max(0.001f, size) * 0.5f;
+          const float t = ParticleRuntime::NormalizedAge(particle);
+          const ParticleRuntime::Frame frame = ParticleRuntime::CurrentFrame(
+              ps, particle, t, texWidth, texHeight);
+          const float halfSize =
+              std::max(0.001f, ParticleRuntime::CurrentSize(ps, particle, t)) *
+              0.5f;
+          const float halfWidth = halfSize * (sheetAnimated ? frame.aspect : 1.0f);
           const float angle = glm::radians(particle.rotation);
           const float c = std::cos(angle);
           const float s = std::sin(angle);
           const glm::vec3 particleWorldCenter =
-              obj.position +
-              glm::vec3(objectRotation *
-                        glm::vec4(particle.position.x * obj.scale.x,
-                                  particle.position.y * obj.scale.y,
-                                  particle.position.z * obj.scale.z,
-                                  0.0f));
+              ParticleRuntime::WorldPosition(emitter, particle);
           auto localToWorld = [&](float x, float y) {
             const float rx = x * c - y * s;
             const float ry = x * s + y * c;
@@ -1031,10 +1027,10 @@ void Engine::renderGameViewportWindow() {
 
           std::array<ImVec2, 4> quad;
           const std::array<glm::vec3, 4> corners = {
-              localToWorld(-halfSize, -halfSize),
-              localToWorld(halfSize, -halfSize),
-              localToWorld(halfSize, halfSize),
-              localToWorld(-halfSize, halfSize),
+              localToWorld(-halfWidth, -halfSize),
+              localToWorld(halfWidth, -halfSize),
+              localToWorld(halfWidth, halfSize),
+              localToWorld(-halfWidth, halfSize),
           };
           bool valid = true;
           for (size_t i = 0; i < corners.size(); ++i) {
@@ -1062,24 +1058,24 @@ void Engine::renderGameViewportWindow() {
             rectMax.x = std::max(rectMax.x, point.x);
             rectMax.y = std::max(rectMax.y, point.y);
           }
-          if (rectMax.x < outputLayout.panelMin.x ||
-              rectMin.x > outputLayout.panelMax.x ||
-              rectMax.y < outputLayout.panelMin.y ||
-              rectMin.y > outputLayout.panelMax.y) {
+          if (rectMax.x < outputLayout.displayMin.x ||
+              rectMin.x > outputLayout.displayMax.x ||
+              rectMax.y < outputLayout.displayMin.y ||
+              rectMin.y > outputLayout.displayMax.y) {
             continue;
           }
 
-          const glm::vec4 tint =
-              ps.colorOverLifetimeEnabled
-                  ? glm::mix(particle.startColor, ps.colorOverLifetime, t)
-                  : particle.startColor;
+          const glm::vec4 tint = ParticleRuntime::CurrentColor(ps, particle, t);
           const ImU32 tintColor = ImGui::GetColorU32(
               ImVec4(tint.r, tint.g, tint.b, tint.a));
           if (texId != 0) {
+            // corners[0] is the world-space bottom-left: the frame's bottom edge.
             particleBatch.push((ImTextureID)(intptr_t)texId, quad[0], quad[1],
-                               quad[2], quad[3], ImVec2(0.0f, 0.0f),
-                               ImVec2(1.0f, 0.0f), ImVec2(1.0f, 1.0f),
-                               ImVec2(0.0f, 1.0f), tintColor);
+                               quad[2], quad[3],
+                               ImVec2(frame.uvMin.x, frame.uvMin.y),
+                               ImVec2(frame.uvMax.x, frame.uvMin.y),
+                               ImVec2(frame.uvMax.x, frame.uvMax.y),
+                               ImVec2(frame.uvMin.x, frame.uvMax.y), tintColor);
           } else {
             particleBatch.flush();
             drawList->AddQuadFilled(quad[0], quad[1], quad[2], quad[3],
@@ -1088,6 +1084,7 @@ void Engine::renderGameViewportWindow() {
         }
       }
       particleBatch.flush();
+      drawList->PopClipRect();
     }
     auto worldToScreen = [&](const glm::vec2 &world) {
       glm::vec2 renderLocal = uiWorldCamera.WorldToScreen(world);
@@ -1485,6 +1482,11 @@ void Engine::renderGameViewportWindow() {
         }
         if (!(obj.ui.type == UIElementType::Image ||
               obj.ui.type == UIElementType::Sprite2D)) {
+          continue;
+        }
+        if (ViewportRenderHelpers::HasUiImageMaterialShader(obj)) {
+          setLight2DRoutingReason(
+              obj.id, "Material shader: rendered by the UI image shader path.");
           continue;
         }
         if (obj.ui.nineSliceEnabled) {
@@ -2052,12 +2054,27 @@ void Engine::renderGameViewportWindow() {
           }
         }
         std::array<ImVec2, 4> uvQuad = buildSpriteSheetUvs(obj);
+        bool renderedMaterialShader = false;
+        if (ViewportRenderHelpers::HasUiImageMaterialShader(obj)) {
+          spriteBatch.flush();
+          const unsigned int shadedTexture =
+              ViewportRenderHelpers::RenderUiImageMaterialShader(
+                  renderer, obj, drawSize, uvQuad, texId, ImGui::GetTime());
+          if (shadedTexture != 0) {
+            texId = shadedTexture;
+            uvQuad = {ImVec2(0.0f, 1.0f), ImVec2(1.0f, 1.0f),
+                      ImVec2(1.0f, 0.0f), ImVec2(0.0f, 0.0f)};
+            renderedMaterialShader = true;
+          }
+        }
         const int frame = resolveSpriteSheetFrame(obj);
         const ImVec2 sourceFrameSizePx =
             ResolveUiSourceFrameSizePx(obj, frame, spriteTex);
         ImVec4 tint(obj.ui.color.r, obj.ui.color.g, obj.ui.color.b,
                     obj.ui.color.a);
-        const ImU32 tintColor = ImGui::GetColorU32(tint);
+        const ImU32 tintColor = renderedMaterialShader
+                                    ? IM_COL32_WHITE
+                                    : ImGui::GetColorU32(tint);
         bool repeatX = useWorldUi && obj.hasParallaxLayer2D &&
                        obj.parallaxLayer2D.enabled &&
                        obj.parallaxLayer2D.repeatX;
@@ -2086,12 +2103,14 @@ void Engine::renderGameViewportWindow() {
           ImVec2 size(max.x - min.x, max.y - min.y);
           if (size.x <= 1.0f || size.y <= 1.0f)
             return;
-          if (DrawScrollingUiSprite(spriteBatch, (ImTextureID)(intptr_t)texId,
+          if (!renderedMaterialShader &&
+              DrawScrollingUiSprite(spriteBatch, (ImTextureID)(intptr_t)texId,
                                     obj, min, max, angle, tintColor,
                                     ImGui::GetTime())) {
             return;
           }
-          if (DrawNineSliceSprite(spriteBatch, (ImTextureID)(intptr_t)texId,
+          if (!renderedMaterialShader &&
+              DrawNineSliceSprite(spriteBatch, (ImTextureID)(intptr_t)texId,
                                   obj, min, max, uvQuad, sourceFrameSizePx,
                                   angle, tintColor)) {
             return;
@@ -2706,7 +2725,7 @@ void Engine::renderGameViewportWindow() {
     bool gizmoUsed = false;
     if (allowEditorUi && !isPlaying) {
       SceneObject *selected = getSelectedObject();
-      if (selected && isUIType(*selected) &&
+      if (selected && isUIType(*selected) && !selected->IsInvariable &&
           selected->ui.type != UIElementType::Canvas) {
         ImVec2 rectMin, rectMax;
         ImVec2 parentMin, parentMax;
@@ -2750,7 +2769,8 @@ void Engine::renderGameViewportWindow() {
             validIds.reserve(candidateIds.size());
             for (int id : candidateIds) {
               SceneObject *candidate = findObjectById(id);
-              if (!candidate || !IsObjectEnabledInHierarchy(*candidate))
+              if (!candidate || !IsObjectEnabledInHierarchy(*candidate) ||
+                  candidate->IsInvariable)
                 continue;
               if (!isUIType(*candidate) ||
                   candidate->ui.type == UIElementType::Canvas)
@@ -3279,13 +3299,18 @@ void Engine::renderGameViewportWindow() {
                    ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
                    !uiInteracting;
 
-    if (clicked && !gameViewCursorLocked) {
+    // A click only captures the mouse when something steers with it (a PlayerController
+    // or a mouse-look script); otherwise it is just a click on the game.
+    if (clicked && !gameViewCursorLocked && runtimeWantsMouseCapture()) {
       gameViewCursorLocked = true;
     }
     if (gameViewCursorLocked &&
         (!isPlaying || ImGui::IsKeyPressed(ImGuiKey_Escape))) {
       gameViewCursorLocked = false;
     }
+    runtimeCursorOverGame = imageHovered;
+    runtimeCursorGameWindow =
+        static_cast<GLFWwindow *>(ImGui::GetWindowViewport()->PlatformHandle);
 
     gameViewportFocused = windowFocused || gameViewCursorLocked;
     if (restoreUiWorldCamera) {

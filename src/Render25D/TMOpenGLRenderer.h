@@ -68,6 +68,7 @@ private:
     unsigned int spriteVAO = 0;
     unsigned int spriteVBO = 0;
     const TMRenderContext* activeContext = nullptr;
+    const std::vector<TMPointLightInstance>* activePointLights = nullptr;
     RenderTarget* activeTarget = nullptr;
     BackendStats viewportBackendStats;
     BackendStats previewBackendStats;

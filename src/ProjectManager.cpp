@@ -1344,6 +1344,7 @@ bool SceneSerializationInternal::WriteLegacySceneStream(std::ostream& file,
             file << "hasCollider2D=" << (obj.hasCollider2D ? 1 : 0) << "\n";
             if (obj.hasCollider2D) {
                 file << "collider2dEnabled=" << (obj.collider2D.enabled ? 1 : 0) << "\n";
+                file << "collider2dIsTrigger=" << (obj.collider2D.isTrigger ? 1 : 0) << "\n";
                 file << "collider2dType=" << static_cast<int>(obj.collider2D.type) << "\n";
                 file << "collider2dBox=" << obj.collider2D.boxSize.x << "," << obj.collider2D.boxSize.y << "\n";
                 file << "collider2dOffset=" << obj.collider2D.offset.x << "," << obj.collider2D.offset.y << "\n";
@@ -1440,6 +1441,11 @@ bool SceneSerializationInternal::WriteLegacySceneStream(std::ostream& file,
                 file << "pcVmAttachedStiffness=" << obj.playerViewMotion.attachedStiffness << "\n";
                 file << "pcVmAttachedDamping=" << obj.playerViewMotion.attachedDamping << "\n";
                 file << "pcVmAttachedMax=" << obj.playerViewMotion.attachedMax << "\n";
+                file << "pcVmHeldEnabled=" << (obj.playerViewMotion.heldItemEnabled ? 1 : 0) << "\n";
+                file << "pcVmHeldBob=" << obj.playerViewMotion.heldItemBob << "\n";
+                file << "pcVmHeldIdle=" << obj.playerViewMotion.heldItemIdle << "\n";
+                file << "pcVmHeldJump=" << obj.playerViewMotion.heldItemJump << "\n";
+                file << "pcVmHeldRunPose=" << obj.playerViewMotion.heldItemRunPose << "\n";
                 file << "pcVmJumpCrouchDip=" << obj.playerViewMotion.jumpCrouchDip << "\n";
                 file << "pcFeelLookSmoothing=" << obj.playerControlFeel.lookSmoothing << "\n";
                 file << "pcFeelChargedJump=" << (obj.playerControlFeel.chargedJump ? 1 : 0) << "\n";
@@ -1542,6 +1548,22 @@ bool SceneSerializationInternal::WriteLegacySceneStream(std::ostream& file,
                 file << "ps2dReceiveLighting2D=" << (ps.receiveLighting2D ? 1 : 0) << "\n";
                 file << "ps2dUnlitLighting2D=" << (ps.unlitLighting2D ? 1 : 0) << "\n";
                 file << "ps2dEmissiveLighting2D=" << ps.emissiveLighting2D << "\n";
+                file << "ps2dSimulationSpace=" << ps.simulationSpace << "\n";
+                file << "ps2dShapeAngle=" << ps.shapeAngle << "\n";
+                file << "ps2dRenderAlignment=" << ps.renderAlignment << "\n";
+                file << "ps2dStretchLengthScale=" << ps.stretchLengthScale << "\n";
+                file << "ps2dStretchSpeedScale=" << ps.stretchSpeedScale << "\n";
+                file << "ps2dBlendMode=" << ps.blendMode << "\n";
+                file << "ps2dSheetEnabled=" << (ps.textureSheetEnabled ? 1 : 0) << "\n";
+                file << "ps2dSheetMode=" << ps.textureSheetMode << "\n";
+                file << "ps2dSheetTiles=" << ps.textureSheetTilesX << "," << ps.textureSheetTilesY << "\n";
+                file << "ps2dSheetTiming=" << ps.textureSheetTiming << "\n";
+                file << "ps2dSheetCycles=" << ps.textureSheetCycles << "\n";
+                file << "ps2dSheetFps=" << ps.textureSheetFps << "\n";
+                file << "ps2dSheetLoop=" << (ps.textureSheetLoop ? 1 : 0) << "\n";
+                file << "ps2dSheetStartFrame=" << ps.textureSheetStartFrame << "\n";
+                file << "ps2dSheetFrameCount=" << ps.textureSheetFrameCount << "\n";
+                file << "ps2dSheetRandomStart=" << (ps.textureSheetRandomStart ? 1 : 0) << "\n";
             }
             file << "hasReverbZone=" << (obj.hasReverbZone ? 1 : 0) << "\n";
             if (obj.hasReverbZone) {
@@ -2610,6 +2632,7 @@ const std::unordered_map<std::string, KeyHandler>& GetSceneObjectKeyHandlers() {
         {"rb2dVelocity", +[](SceneObject& obj, const std::string& value) { ParseVec2(value, obj.rigidbody2D.velocity); }},
         {"hasCollider2D", +[](SceneObject& obj, const std::string& value) { obj.hasCollider2D = std::stoi(value) != 0; }},
         {"collider2dEnabled", +[](SceneObject& obj, const std::string& value) { obj.collider2D.enabled = std::stoi(value) != 0; }},
+        {"collider2dIsTrigger", +[](SceneObject& obj, const std::string& value) { obj.collider2D.isTrigger = std::stoi(value) != 0; }},
         {"collider2dType", +[](SceneObject& obj, const std::string& value) { obj.collider2D.type = static_cast<Collider2DType>(std::stoi(value)); }},
         {"collider2dBox", +[](SceneObject& obj, const std::string& value) { ParseVec2(value, obj.collider2D.boxSize); }},
         {"collider2dOffset", +[](SceneObject& obj, const std::string& value) { ParseVec2(value, obj.collider2D.offset); }},
@@ -2702,6 +2725,11 @@ const std::unordered_map<std::string, KeyHandler>& GetSceneObjectKeyHandlers() {
         {"pcVmAttachedStiffness", +[](SceneObject& obj, const std::string& value) { obj.playerViewMotion.attachedStiffness = std::stof(value); }},
         {"pcVmAttachedDamping", +[](SceneObject& obj, const std::string& value) { obj.playerViewMotion.attachedDamping = std::stof(value); }},
         {"pcVmAttachedMax", +[](SceneObject& obj, const std::string& value) { obj.playerViewMotion.attachedMax = std::stof(value); }},
+        {"pcVmHeldEnabled", +[](SceneObject& obj, const std::string& value) { obj.playerViewMotion.heldItemEnabled = std::stoi(value) != 0; }},
+        {"pcVmHeldBob", +[](SceneObject& obj, const std::string& value) { obj.playerViewMotion.heldItemBob = std::stof(value); }},
+        {"pcVmHeldIdle", +[](SceneObject& obj, const std::string& value) { obj.playerViewMotion.heldItemIdle = std::stof(value); }},
+        {"pcVmHeldJump", +[](SceneObject& obj, const std::string& value) { obj.playerViewMotion.heldItemJump = std::stof(value); }},
+        {"pcVmHeldRunPose", +[](SceneObject& obj, const std::string& value) { obj.playerViewMotion.heldItemRunPose = std::stof(value); }},
         {"pcVmJumpCrouchDip", +[](SceneObject& obj, const std::string& value) { obj.playerViewMotion.jumpCrouchDip = std::stof(value); }},
         {"pcFeelLookSmoothing", +[](SceneObject& obj, const std::string& value) { obj.playerControlFeel.lookSmoothing = std::stof(value); }},
         {"pcFeelChargedJump", +[](SceneObject& obj, const std::string& value) { obj.playerControlFeel.chargedJump = std::stoi(value) != 0; }},
@@ -2780,7 +2808,7 @@ const std::unordered_map<std::string, KeyHandler>& GetSceneObjectKeyHandlers() {
         {"ps2dBurstCount", +[](SceneObject& obj, const std::string& value) { obj.hasParticleSystem2D = true; obj.particleSystem2D.burstCount = std::max(0, std::stoi(value)); }},
         {"ps2dBurstTime", +[](SceneObject& obj, const std::string& value) { obj.hasParticleSystem2D = true; obj.particleSystem2D.burstTime = std::max(0.0f, std::stof(value)); }},
         {"ps2dBurstLoop", +[](SceneObject& obj, const std::string& value) { obj.hasParticleSystem2D = true; obj.particleSystem2D.burstLoop = std::stoi(value) != 0; }},
-        {"ps2dShape", +[](SceneObject& obj, const std::string& value) { obj.hasParticleSystem2D = true; obj.particleSystem2D.shape = std::clamp(std::stoi(value), 0, 2); }},
+        {"ps2dShape", +[](SceneObject& obj, const std::string& value) { obj.hasParticleSystem2D = true; obj.particleSystem2D.shape = std::clamp(std::stoi(value), 0, 5); }},
         {"ps2dShapeRadius", +[](SceneObject& obj, const std::string& value) { obj.hasParticleSystem2D = true; obj.particleSystem2D.shapeRadius = std::max(0.0f, std::stof(value)); }},
         {"ps2dShapeBox", +[](SceneObject& obj, const std::string& value) { obj.hasParticleSystem2D = true; ParseVec3(value, obj.particleSystem2D.shapeBox); }},
         {"ps2dEmitIn3D", +[](SceneObject& obj, const std::string& value) { obj.hasParticleSystem2D = true; obj.particleSystem2D.emitIn3D = std::stoi(value) != 0; }},
@@ -2800,6 +2828,29 @@ const std::unordered_map<std::string, KeyHandler>& GetSceneObjectKeyHandlers() {
         {"ps2dReceiveLighting2D", +[](SceneObject& obj, const std::string& value) { obj.hasParticleSystem2D = true; obj.particleSystem2D.receiveLighting2D = std::stoi(value) != 0; }},
         {"ps2dUnlitLighting2D", +[](SceneObject& obj, const std::string& value) { obj.hasParticleSystem2D = true; obj.particleSystem2D.unlitLighting2D = std::stoi(value) != 0; }},
         {"ps2dEmissiveLighting2D", +[](SceneObject& obj, const std::string& value) { obj.hasParticleSystem2D = true; obj.particleSystem2D.emissiveLighting2D = std::stof(value); }},
+        {"ps2dSimulationSpace", +[](SceneObject& obj, const std::string& value) { obj.hasParticleSystem2D = true; obj.particleSystem2D.simulationSpace = std::clamp(std::stoi(value), 0, 1); }},
+        {"ps2dShapeAngle", +[](SceneObject& obj, const std::string& value) { obj.hasParticleSystem2D = true; obj.particleSystem2D.shapeAngle = std::clamp(std::stof(value), 0.0f, 89.0f); }},
+        {"ps2dRenderAlignment", +[](SceneObject& obj, const std::string& value) { obj.hasParticleSystem2D = true; obj.particleSystem2D.renderAlignment = std::clamp(std::stoi(value), 0, 4); }},
+        {"ps2dStretchLengthScale", +[](SceneObject& obj, const std::string& value) { obj.hasParticleSystem2D = true; obj.particleSystem2D.stretchLengthScale = std::max(0.0f, std::stof(value)); }},
+        {"ps2dStretchSpeedScale", +[](SceneObject& obj, const std::string& value) { obj.hasParticleSystem2D = true; obj.particleSystem2D.stretchSpeedScale = std::max(0.0f, std::stof(value)); }},
+        {"ps2dBlendMode", +[](SceneObject& obj, const std::string& value) { obj.hasParticleSystem2D = true; obj.particleSystem2D.blendMode = std::clamp(std::stoi(value), 0, 3); }},
+        {"ps2dSheetEnabled", +[](SceneObject& obj, const std::string& value) { obj.hasParticleSystem2D = true; obj.particleSystem2D.textureSheetEnabled = std::stoi(value) != 0; }},
+        {"ps2dSheetMode", +[](SceneObject& obj, const std::string& value) { obj.hasParticleSystem2D = true; obj.particleSystem2D.textureSheetMode = std::clamp(std::stoi(value), 0, 1); }},
+        {"ps2dSheetTiles", +[](SceneObject& obj, const std::string& value) {
+            obj.hasParticleSystem2D = true;
+            int x = obj.particleSystem2D.textureSheetTilesX;
+            int y = obj.particleSystem2D.textureSheetTilesY;
+            sscanf(value.c_str(), "%d,%d", &x, &y);
+            obj.particleSystem2D.textureSheetTilesX = std::clamp(x, 1, 256);
+            obj.particleSystem2D.textureSheetTilesY = std::clamp(y, 1, 256);
+        }},
+        {"ps2dSheetTiming", +[](SceneObject& obj, const std::string& value) { obj.hasParticleSystem2D = true; obj.particleSystem2D.textureSheetTiming = std::clamp(std::stoi(value), 0, 1); }},
+        {"ps2dSheetCycles", +[](SceneObject& obj, const std::string& value) { obj.hasParticleSystem2D = true; obj.particleSystem2D.textureSheetCycles = std::max(0.0f, std::stof(value)); }},
+        {"ps2dSheetFps", +[](SceneObject& obj, const std::string& value) { obj.hasParticleSystem2D = true; obj.particleSystem2D.textureSheetFps = std::max(0.0f, std::stof(value)); }},
+        {"ps2dSheetLoop", +[](SceneObject& obj, const std::string& value) { obj.hasParticleSystem2D = true; obj.particleSystem2D.textureSheetLoop = std::stoi(value) != 0; }},
+        {"ps2dSheetStartFrame", +[](SceneObject& obj, const std::string& value) { obj.hasParticleSystem2D = true; obj.particleSystem2D.textureSheetStartFrame = std::max(0, std::stoi(value)); }},
+        {"ps2dSheetFrameCount", +[](SceneObject& obj, const std::string& value) { obj.hasParticleSystem2D = true; obj.particleSystem2D.textureSheetFrameCount = std::max(0, std::stoi(value)); }},
+        {"ps2dSheetRandomStart", +[](SceneObject& obj, const std::string& value) { obj.hasParticleSystem2D = true; obj.particleSystem2D.textureSheetRandomStart = std::stoi(value) != 0; }},
         {"hasReverbZone", +[](SceneObject& obj, const std::string& value) { obj.hasReverbZone = std::stoi(value) != 0; }},
         {"reverbEnabled", +[](SceneObject& obj, const std::string& value) { obj.reverbZone.enabled = std::stoi(value) != 0; }},
         {"reverbPreset", +[](SceneObject& obj, const std::string& value) { obj.reverbZone.preset = static_cast<ReverbPreset>(std::stoi(value)); }},

@@ -7,153 +7,10 @@
 #include <cstring>
 #include <numeric>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace ViewportRenderHelpers {
-
-uint32_t ParticleHash(uint32_t x) {
-  x ^= x >> 16;
-  x *= 0x7feb352du;
-  x ^= x >> 15;
-  x *= 0x846ca68bu;
-  x ^= x >> 16;
-  return x;
-}
-
-float ParticleUnit(uint32_t &state) {
-  state = ParticleHash(state + 0x9e3779b9u);
-  return static_cast<float>(state & 0x00ffffffu) / static_cast<float>(0x01000000u);
-}
-
-float ParticleRange(ParticleSystem2DComponent::MinMaxFloat range, uint32_t &state) {
-  if (!range.random) return range.min;
-  return glm::mix(range.min, range.max, ParticleUnit(state));
-}
-
-void RestartParticleSystem2D(ParticleSystem2DComponent &ps, double now) {
-  ps.particles.clear();
-  ps.runtimeAccumulator = 0.0f;
-  ps.runtimeTime = 0.0f;
-  ps.runtimeLastUpdateTime = now;
-  ps.runtimeInitialized = true;
-  ps.playing = ps.playOnAwake;
-  ps.paused = false;
-}
-
-void EmitParticle2D(SceneObject &obj, uint32_t emissionIndex) {
-  ParticleSystem2DComponent &ps = obj.particleSystem2D;
-  if (static_cast<int>(ps.particles.size()) >= std::max(1, ps.maxParticles)) return;
-  uint32_t seed = ps.autoRandomSeed
-                      ? ParticleHash(static_cast<uint32_t>(obj.id) * 747796405u + emissionIndex + static_cast<uint32_t>(ps.runtimeTime * 1000.0f))
-                      : ParticleHash(ps.randomSeed + emissionIndex);
-  ParticleSystem2DComponent::Particle particle;
-  particle.alive = true;
-  particle.seed = seed;
-  particle.lifetime = std::max(0.01f, ParticleRange(ps.startLifetime, seed));
-  particle.size = std::max(0.0f, ParticleRange(ps.startSize, seed));
-  particle.rotation = ParticleRange(ps.startRotation, seed);
-  particle.startColor = ps.startColor;
-
-  const float angle = ParticleUnit(seed) * 6.28318530718f;
-  glm::vec3 direction(std::cos(angle), std::sin(angle), 0.0f);
-  if (ps.emitIn3D) {
-    const float z = ParticleUnit(seed) * 2.0f - 1.0f;
-    const float r = std::sqrt(std::max(0.0f, 1.0f - z * z));
-    direction = glm::vec3(std::cos(angle) * r, std::sin(angle) * r, z);
-  }
-
-  if (ps.shape == 1) {
-    const float u = ParticleUnit(seed);
-    const float radius = ps.shapeRadius *
-                         (ps.emitIn3D ? std::cbrt(u) : std::sqrt(u));
-    particle.position = direction * radius;
-  } else if (ps.shape == 2) {
-    particle.position = glm::vec3((ParticleUnit(seed) - 0.5f) * ps.shapeBox.x,
-                                  (ParticleUnit(seed) - 0.5f) * ps.shapeBox.y,
-                                  ps.emitIn3D ? (ParticleUnit(seed) - 0.5f) * ps.shapeBox.z
-                                              : 0.0f);
-    direction = glm::length(particle.position) > 0.0001f
-                    ? glm::normalize(particle.position)
-                    : direction;
-  }
-  particle.velocity = direction * ParticleRange(ps.startSpeed, seed);
-  particle.angularVelocity = ps.rotationOverLifetimeEnabled ? ps.rotationOverLifetime : 0.0f;
-  ps.particles.push_back(particle);
-}
-
-void SimulateParticleSystem2D(SceneObject &obj, double now) {
-  if (!obj.hasParticleSystem2D) return;
-  ParticleSystem2DComponent &ps = obj.particleSystem2D;
-  if (!ps.enabled) return;
-  if (!ps.runtimeInitialized) {
-    RestartParticleSystem2D(ps, now);
-    if (ps.prewarm) {
-      const float prewarmStep = 1.0f / 30.0f;
-      const float prewarmTime = std::max(0.0f, ps.startLifetime.max);
-      for (float t = 0.0f; t < prewarmTime; t += prewarmStep) {
-        ps.runtimeLastUpdateTime -= prewarmStep;
-        SimulateParticleSystem2D(obj, now - prewarmTime + t);
-      }
-      ps.runtimeLastUpdateTime = now;
-    }
-  }
-  float dt = static_cast<float>(now - ps.runtimeLastUpdateTime);
-  ps.runtimeLastUpdateTime = now;
-  if (dt <= 0.0f || dt > 0.25f) dt = 1.0f / 60.0f;
-  if (!ps.playing || ps.paused) return;
-  dt *= std::max(0.0f, ps.simulationSpeed);
-  ps.runtimeTime += dt;
-  if (ps.runtimeTime < ps.startDelay) return;
-
-  ps.runtimeAccumulator += std::max(0.0f, ps.emissionRate) * dt;
-  int emitCount = static_cast<int>(ps.runtimeAccumulator);
-  ps.runtimeAccumulator -= static_cast<float>(emitCount);
-  if (ps.burstCount > 0) {
-    if (ps.burstLoop && ps.burstTime > 0.0f) {
-      const int previousBurst =
-          static_cast<int>(std::floor((ps.runtimeTime - dt) / ps.burstTime));
-      const int currentBurst =
-          static_cast<int>(std::floor(ps.runtimeTime / ps.burstTime));
-      if (currentBurst > previousBurst) {
-        emitCount += (currentBurst - previousBurst) * ps.burstCount;
-      }
-    } else if (ps.runtimeTime - dt <= ps.burstTime &&
-               ps.runtimeTime >= ps.burstTime) {
-      emitCount += ps.burstCount;
-    }
-  }
-  for (int i = 0; i < emitCount; ++i) {
-    EmitParticle2D(obj, static_cast<uint32_t>(ps.particles.size() + i));
-  }
-
-  for (auto &particle : ps.particles) {
-    if (!particle.alive) continue;
-    particle.age += dt;
-    if (particle.age >= particle.lifetime) {
-      particle.alive = false;
-      continue;
-    }
-    glm::vec3 velocity = particle.velocity;
-    if (ps.velocityOverLifetimeEnabled) velocity += ps.velocityOverLifetime;
-    velocity.y -= ps.gravityModifier * dt;
-    if (ps.noiseEnabled && ps.noiseStrength > 0.0f) {
-      const float n = std::sin((ps.runtimeTime + static_cast<float>(particle.seed % 997u)) * std::max(0.01f, ps.noiseFrequency));
-      const float m = std::cos((ps.runtimeTime * 0.7f + static_cast<float>(particle.seed % 613u)) * std::max(0.01f, ps.noiseFrequency));
-      glm::vec3 drift(std::cos(n * 6.28318f), std::sin(n * 6.28318f),
-                      ps.emitIn3D ? std::sin(m * 6.28318f) : 0.0f);
-      velocity += drift * ps.noiseStrength;
-    }
-    particle.velocity = velocity;
-    particle.position += velocity * dt;
-    particle.rotation += particle.angularVelocity * dt;
-  }
-  ps.particles.erase(std::remove_if(ps.particles.begin(), ps.particles.end(),
-                                    [](const auto &p) { return !p.alive; }),
-                     ps.particles.end());
-  if (!ps.looping && ps.runtimeTime > ps.startDelay + ps.startLifetime.max) {
-    ps.playing = false;
-  }
-}
 
 ImVec2 ComputeAspectFitSize(const ImVec2 &available, float aspect) {
   const float safeWidth = std::max(1.0f, available.x);
@@ -441,6 +298,335 @@ void EmitRuntimeUiBackdropBlur(ImDrawList *drawList, const SceneObject &obj,
   drawList->AddImageRounded(backdrop, rectMin, rectMax, uvMin, uvMax,
                             ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, strength)),
                             std::max(0.0f, obj.ui.backdropRounding));
+}
+
+namespace {
+
+struct UiImageShaderSurfaceKey {
+  const Renderer *renderer = nullptr;
+  int objectId = -1;
+
+  bool operator==(const UiImageShaderSurfaceKey &other) const {
+    return renderer == other.renderer && objectId == other.objectId;
+  }
+};
+
+struct UiImageShaderSurfaceKeyHash {
+  size_t operator()(const UiImageShaderSurfaceKey &key) const {
+    size_t h = std::hash<const void *>{}(key.renderer);
+    h ^= std::hash<int>{}(key.objectId) + 0x9e3779b9u + (h << 6) + (h >> 2);
+    return h;
+  }
+};
+
+struct UiImageShaderSurface {
+  GLuint framebuffer = 0;
+  GLuint texture = 0;
+  int width = 0;
+  int height = 0;
+  int lastUsedFrame = 0;
+};
+
+std::unordered_map<UiImageShaderSurfaceKey, UiImageShaderSurface,
+                   UiImageShaderSurfaceKeyHash>
+    gUiImageShaderSurfaces;
+GLuint gUiImageShaderVao = 0;
+GLuint gUiImageShaderVbo = 0;
+GLuint gUiImageShaderWhiteTexture = 0;
+int gUiImageShaderLastPurgeFrame = 0;
+
+void EnsureUiImageShaderQuad() {
+  if (gUiImageShaderVao != 0 && gUiImageShaderVbo != 0)
+    return;
+  glGenVertexArrays(1, &gUiImageShaderVao);
+  glGenBuffers(1, &gUiImageShaderVbo);
+  glBindVertexArray(gUiImageShaderVao);
+  glBindBuffer(GL_ARRAY_BUFFER, gUiImageShaderVbo);
+  glBufferData(GL_ARRAY_BUFFER, sizeof(float) * 8 * 6, nullptr,
+               GL_DYNAMIC_DRAW);
+  glEnableVertexAttribArray(0);
+  glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(float) * 8,
+                        reinterpret_cast<void *>(0));
+  glEnableVertexAttribArray(1);
+  glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(float) * 8,
+                        reinterpret_cast<void *>(sizeof(float) * 3));
+  glEnableVertexAttribArray(2);
+  glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(float) * 8,
+                        reinterpret_cast<void *>(sizeof(float) * 6));
+}
+
+GLuint EnsureUiImageShaderWhiteTexture() {
+  if (gUiImageShaderWhiteTexture != 0)
+    return gUiImageShaderWhiteTexture;
+  const unsigned char white[4] = {255, 255, 255, 255};
+  glGenTextures(1, &gUiImageShaderWhiteTexture);
+  glBindTexture(GL_TEXTURE_2D, gUiImageShaderWhiteTexture);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA,
+               GL_UNSIGNED_BYTE, white);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  return gUiImageShaderWhiteTexture;
+}
+
+UiImageShaderSurface &EnsureUiImageShaderSurface(
+    const UiImageShaderSurfaceKey &key, int width, int height) {
+  auto [it, inserted] = gUiImageShaderSurfaces.try_emplace(key);
+  UiImageShaderSurface &surface = it->second;
+  if (!inserted && surface.width == width && surface.height == height)
+    return surface;
+
+  if (surface.framebuffer == 0)
+    glGenFramebuffers(1, &surface.framebuffer);
+  if (surface.texture == 0)
+    glGenTextures(1, &surface.texture);
+  surface.width = width;
+  surface.height = height;
+  glBindTexture(GL_TEXTURE_2D, surface.texture);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA,
+               GL_UNSIGNED_BYTE, nullptr);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glBindFramebuffer(GL_FRAMEBUFFER, surface.framebuffer);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                         surface.texture, 0);
+  return surface;
+}
+
+void PurgeStaleUiImageShaderSurfaces(int frame) {
+  if (frame - gUiImageShaderLastPurgeFrame < 240)
+    return;
+  gUiImageShaderLastPurgeFrame = frame;
+  for (auto it = gUiImageShaderSurfaces.begin();
+       it != gUiImageShaderSurfaces.end();) {
+    if (frame - it->second.lastUsedFrame <= 600) {
+      ++it;
+      continue;
+    }
+    if (it->second.framebuffer != 0)
+      glDeleteFramebuffers(1, &it->second.framebuffer);
+    if (it->second.texture != 0)
+      glDeleteTextures(1, &it->second.texture);
+    it = gUiImageShaderSurfaces.erase(it);
+  }
+}
+
+} // namespace
+
+bool HasUiImageMaterialShader(const SceneObject &obj) {
+  if (!obj.hasUI || (obj.ui.type != UIElementType::Image &&
+                     obj.ui.type != UIElementType::Sprite2D)) {
+    return false;
+  }
+  return !obj.vertexShaderPath.empty() || !obj.fragmentShaderPath.empty();
+}
+
+unsigned int RenderUiImageMaterialShader(
+    Renderer &renderer, const SceneObject &obj, const ImVec2 &drawSize,
+    const std::array<ImVec2, 4> &sourceUvs, unsigned int sourceTexture,
+    double timeSeconds) {
+  if (!HasUiImageMaterialShader(obj) || glfwGetCurrentContext() == nullptr)
+    return 0;
+
+  int width = std::max(16, static_cast<int>(std::ceil(std::abs(drawSize.x))));
+  int height = std::max(16, static_cast<int>(std::ceil(std::abs(drawSize.y))));
+  const float downscale = std::min(
+      1.0f, 1024.0f / static_cast<float>(std::max(width, height)));
+  width = std::max(16, static_cast<int>(std::ceil(width * downscale)));
+  height = std::max(16, static_cast<int>(std::ceil(height * downscale)));
+  // Pop/scale animations change by fractions of a pixel every frame. Quantizing the
+  // backing surface prevents a texture reallocation on every animation tick.
+  width = std::min(1024, ((width + 31) / 32) * 32);
+  height = std::min(1024, ((height + 31) / 32) * 32);
+
+  GLint previousDrawFramebuffer = 0;
+  GLint previousReadFramebuffer = 0;
+  GLint previousViewport[4] = {};
+  GLint previousProgram = 0;
+  GLint previousVao = 0;
+  GLint previousArrayBuffer = 0;
+  GLint previousActiveTexture = GL_TEXTURE0;
+  GLint previousTexture0 = 0;
+  GLint previousTexture1 = 0;
+  GLfloat previousClearColor[4] = {};
+  GLboolean previousColorMask[4] = {};
+  const GLboolean blendEnabled = glIsEnabled(GL_BLEND);
+  const GLboolean depthEnabled = glIsEnabled(GL_DEPTH_TEST);
+  const GLboolean cullEnabled = glIsEnabled(GL_CULL_FACE);
+  const GLboolean scissorEnabled = glIsEnabled(GL_SCISSOR_TEST);
+  glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &previousDrawFramebuffer);
+  glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &previousReadFramebuffer);
+  glGetIntegerv(GL_VIEWPORT, previousViewport);
+  glGetIntegerv(GL_CURRENT_PROGRAM, &previousProgram);
+  glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &previousVao);
+  glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &previousArrayBuffer);
+  glGetIntegerv(GL_ACTIVE_TEXTURE, &previousActiveTexture);
+  glGetFloatv(GL_COLOR_CLEAR_VALUE, previousClearColor);
+  glGetBooleanv(GL_COLOR_WRITEMASK, previousColorMask);
+  glActiveTexture(GL_TEXTURE0);
+  glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture0);
+  glActiveTexture(GL_TEXTURE1);
+  glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture1);
+
+  const int frame = ImGui::GetFrameCount();
+  PurgeStaleUiImageShaderSurfaces(frame);
+  const UiImageShaderSurfaceKey key{&renderer, obj.id};
+  UiImageShaderSurface &surface =
+      EnsureUiImageShaderSurface(key, width, height);
+  surface.lastUsedFrame = frame;
+  if (surface.framebuffer == 0 || surface.texture == 0 ||
+      glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, previousDrawFramebuffer);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, previousReadFramebuffer);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture0));
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture1));
+    glActiveTexture(previousActiveTexture);
+    return 0;
+  }
+
+  const std::string vertexPath = obj.vertexShaderPath.empty()
+                                     ? "Resources/Shaders/ui_image_material_vert.glsl"
+                                     : obj.vertexShaderPath;
+  const std::string fragmentPath = obj.fragmentShaderPath.empty()
+                                       ? "Resources/Shaders/standard_unlit_frag.glsl"
+                                       : obj.fragmentShaderPath;
+  Shader *shader = renderer.getShader(vertexPath, fragmentPath);
+  if (shader == nullptr || shader->ID == 0) {
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, previousDrawFramebuffer);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, previousReadFramebuffer);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture0));
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture1));
+    glActiveTexture(previousActiveTexture);
+    return 0;
+  }
+
+  EnsureUiImageShaderQuad();
+  const auto writeVertex = [](float *dst, float x, float y,
+                              const ImVec2 &uv) {
+    dst[0] = x;
+    dst[1] = y;
+    dst[2] = 0.0f;
+    dst[3] = 0.0f;
+    dst[4] = 0.0f;
+    dst[5] = 1.0f;
+    dst[6] = uv.x;
+    dst[7] = uv.y;
+  };
+  float quadVertices[6 * 8] = {};
+  writeVertex(quadVertices + 0 * 8, -1.0f, 1.0f, sourceUvs[0]);
+  writeVertex(quadVertices + 1 * 8, 1.0f, 1.0f, sourceUvs[1]);
+  writeVertex(quadVertices + 2 * 8, 1.0f, -1.0f, sourceUvs[2]);
+  writeVertex(quadVertices + 3 * 8, -1.0f, 1.0f, sourceUvs[0]);
+  writeVertex(quadVertices + 4 * 8, 1.0f, -1.0f, sourceUvs[2]);
+  writeVertex(quadVertices + 5 * 8, -1.0f, -1.0f, sourceUvs[3]);
+
+  glBindFramebuffer(GL_FRAMEBUFFER, surface.framebuffer);
+  glViewport(0, 0, width, height);
+  glDisable(GL_BLEND);
+  glDisable(GL_DEPTH_TEST);
+  glDisable(GL_CULL_FACE);
+  glDisable(GL_SCISSOR_TEST);
+  glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+  glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+  glClear(GL_COLOR_BUFFER_BIT);
+
+  shader->use();
+  const glm::mat4 identity(1.0f);
+  const glm::vec3 uiColor(obj.ui.color.r, obj.ui.color.g, obj.ui.color.b);
+  const glm::vec3 materialColor = obj.material.color * uiColor;
+  const float materialAlpha = obj.material.alpha * obj.ui.color.a;
+  shader->setMat4("model", identity);
+  shader->setMat4("view", identity);
+  shader->setMat4("projection", identity);
+  shader->setBool("useSkinning", false);
+  shader->setInt("boneCount", 0);
+  shader->setBool("unlit", true);
+  shader->setFloat("uTime", static_cast<float>(timeSeconds));
+  shader->setFloat("iTime", static_cast<float>(timeSeconds));
+  shader->setVec2("uResolution",
+                  glm::vec2(static_cast<float>(width),
+                            static_cast<float>(height)));
+  shader->setVec3("iResolution",
+                  glm::vec3(static_cast<float>(width),
+                            static_cast<float>(height), 1.0f));
+  shader->setVec4("uvTransform",
+                  glm::vec4(obj.material.uvTiling, obj.material.uvOffset));
+  shader->setVec3("materialColor", materialColor);
+  shader->setFloat("materialAlpha", materialAlpha);
+  shader->setVec4("tint", glm::vec4(materialColor, materialAlpha));
+  shader->setFloat("ambientStrength", 1.0f);
+  shader->setFloat("specularStrength", 0.0f);
+  shader->setFloat("shininess", obj.material.shininess);
+  shader->setVec3("viewPos", glm::vec3(0.0f, 0.0f, 1.0f));
+  shader->setFloat("mixAmount", obj.material.textureMix);
+  shader->setFloat("uScrollSpeed", obj.material.scrollSpeed);
+  shader->setVec2("uScrollDir", obj.material.scrollDirection);
+  shader->setVec3("uCloudColor", obj.material.cloudColor);
+  shader->setVec3("uCloudSkyColor", obj.material.cloudSkyColor);
+  shader->setFloat("uCloudScale", obj.material.cloudScale);
+  shader->setFloat("uCloudCoverage", obj.material.cloudCoverage);
+  shader->setFloat("uCloudSoftness", obj.material.cloudSoftness);
+  shader->setInt("uCloudDetail", obj.material.cloudDetail);
+  shader->setFloat("uCloudSpeed", obj.material.cloudSpeed);
+  shader->setFloat("uCloudWarp", obj.material.cloudWarp);
+  shader->setFloat("uCloudHighlight", obj.material.cloudHighlight);
+  shader->setFloat("uCloudStars", obj.material.cloudStars);
+  shader->setFloat("uCloudHorizon", obj.material.cloudHorizon);
+
+  const GLuint baseTexture = sourceTexture != 0
+                                 ? sourceTexture
+                                 : EnsureUiImageShaderWhiteTexture();
+  GLuint overlayTexture = 0;
+  if (!obj.overlayTexturePath.empty()) {
+    if (Texture *overlay = renderer.getTexture(obj.overlayTexturePath,
+                                                obj.material.textureFilter)) {
+      overlayTexture = overlay->GetID();
+    }
+  }
+  shader->setInt("texture1", 0);
+  shader->setInt("uTexture", 0);
+  shader->setInt("spriteTexture", 0);
+  shader->setInt("overlayTex", 1);
+  shader->setBool("hasOverlay", obj.useOverlay && overlayTexture != 0);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, baseTexture);
+  glActiveTexture(GL_TEXTURE1);
+  glBindTexture(GL_TEXTURE_2D,
+                overlayTexture != 0 ? overlayTexture : baseTexture);
+
+  glBindVertexArray(gUiImageShaderVao);
+  glBindBuffer(GL_ARRAY_BUFFER, gUiImageShaderVbo);
+  glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(quadVertices), quadVertices);
+  glDrawArrays(GL_TRIANGLES, 0, 6);
+
+  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, previousDrawFramebuffer);
+  glBindFramebuffer(GL_READ_FRAMEBUFFER, previousReadFramebuffer);
+  glViewport(previousViewport[0], previousViewport[1], previousViewport[2],
+             previousViewport[3]);
+  if (blendEnabled) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+  if (depthEnabled) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+  if (cullEnabled) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
+  if (scissorEnabled) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
+  glColorMask(previousColorMask[0], previousColorMask[1], previousColorMask[2],
+              previousColorMask[3]);
+  glClearColor(previousClearColor[0], previousClearColor[1],
+               previousClearColor[2], previousClearColor[3]);
+  glUseProgram(static_cast<GLuint>(previousProgram));
+  glBindVertexArray(static_cast<GLuint>(previousVao));
+  glBindBuffer(GL_ARRAY_BUFFER, static_cast<GLuint>(previousArrayBuffer));
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture0));
+  glActiveTexture(GL_TEXTURE1);
+  glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture1));
+  glActiveTexture(previousActiveTexture);
+  return surface.texture;
 }
 
 bool ProjectWorldToOverlayPoint(const glm::vec3 &worldPos,

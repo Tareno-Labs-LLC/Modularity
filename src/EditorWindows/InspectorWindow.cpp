@@ -4,6 +4,7 @@
 #include "MapMaker.h"
 #include "MaterialAssetUtils.h"
 #include "ModelLoader.h"
+#include "ParticleSystemRuntime.h"
 #include "SceneObjectIcons.h"
 #include "../../SpritesheetFormat.h"
 #include "DragPreviewOverlay.h"
@@ -1884,6 +1885,7 @@ void Engine::renderInspectorPanel() {
 
     static float assetMaterialPreviewScale = 1.0f;
     static float objectMaterialPreviewScale = 1.0f;
+    static float uiImageMaterialPreviewScale = 1.0f;
 
     struct ComponentHeaderState {
         bool open = false;
@@ -1966,6 +1968,16 @@ void Engine::renderInspectorPanel() {
             return MaterialShaderPreset::ProceduralClouds;
         }
         return MaterialShaderPreset::Custom;
+    };
+
+    auto shaderUsesCloudControls = [&](const std::string& vert, const std::string& frag) {
+        if (shaderPresetFromPaths(vert, frag) == MaterialShaderPreset::ProceduralClouds) {
+            return true;
+        }
+        std::string vertFile = MaterialAssetLowercase(fs::path(vert).filename().string());
+        std::string fragFile = MaterialAssetLowercase(fs::path(frag).filename().string());
+        return vertFile.find("cloud") != std::string::npos ||
+               fragFile.find("cloud") != std::string::npos;
     };
 
     auto applyShaderPreset = [&](MaterialShaderPreset preset,
@@ -3357,7 +3369,7 @@ void Engine::renderInspectorPanel() {
         }
         if (InspectorReveal _fs = drawInspectorSubsectionFoldout(
                 "Clouds", nullptr, true,
-                shaderPresetFromPaths(vertShaderPath, fragShaderPath) == MaterialShaderPreset::ProceduralClouds)) {
+                shaderUsesCloudControls(vertShaderPath, fragShaderPath))) {
             drawMaterialInlineLabel("Cloud Color");
             ImGui::SameLine();
             ImGui::SetNextItemWidth(-1.0f);
@@ -5417,6 +5429,11 @@ void Engine::renderInspectorPanel() {
             }
         };
 
+        if (obj.IsInvariable) {
+            ImGui::TextDisabled("Transform locked by Invariable");
+        }
+        ImGui::BeginDisabled(obj.IsInvariable);
+
         if (ImGui::BeginTable("##TransformTable", 2, ImGuiTableFlags_SizingStretchProp))
         {
             ImGui::TableSetupColumn("LabelColumn", ImGuiTableColumnFlags_WidthFixed, 62.0f);
@@ -5470,6 +5487,7 @@ void Engine::renderInspectorPanel() {
             }
             ImGui::EndTable();
         }
+        ImGui::EndDisabled();
     }
 
     ImGui::PopStyleVar(2);
@@ -5586,6 +5604,11 @@ void Engine::renderInspectorPanel() {
             InspectorBodyScope _ibs(*this);
             ImGui::PushID("UI");
 
+            if (obj.IsInvariable) {
+                ImGui::TextDisabled("UI transform locked by Invariable");
+            }
+            ImGui::BeginDisabled(obj.IsInvariable);
+
             if (obj.type != ObjectType::Sprite25D) {
                 const char* anchors[] = { "Center", "Top Left", "Top Right", "Bottom Left", "Bottom Right" };
                 int anchor = static_cast<int>(obj.ui.anchor);
@@ -5634,6 +5657,7 @@ void Engine::renderInspectorPanel() {
                 obj.ui.size.y = std::max(minSize.y, obj.ui.size.y);
                 changed = true;
             }
+            ImGui::EndDisabled();
 
             if (obj.ui.type == UIElementType::Canvas) {
                 if (ImGui::Checkbox(Loc::Widget("COMPONENT_UI_RENDER_IN_3_D", "Render In 3D"), &obj.ui.renderIn3D)) {
@@ -5985,6 +6009,89 @@ void Engine::renderInspectorPanel() {
                         float aspect = frameWidth > 0.0f ? (frameHeight / frameWidth) : 1.0f;
                         ImVec2 previewSize(previewWidth, std::max(64.0f, previewWidth * aspect));
                         ImGui::Image((ImTextureID)(intptr_t)previewTex->GetID(), previewSize, uvMin, uvMax);
+                    }
+                }
+
+                auto uiMaterialHeaderMenu = [&]() {
+                    const bool hasMaterialAsset = !obj.materialPath.empty();
+                    if (hasMaterialAsset) {
+                        const int users = countMaterialAssetUsers(obj.materialPath);
+                        ImGui::TextDisabled(users > 1 ? "Shared by %d objects" : "Material asset", users);
+                        ImGui::Separator();
+                    }
+                    if (ImGui::MenuItem("Reload Material", nullptr, false, hasMaterialAsset)) {
+                        loadMaterialFromFile(obj);
+                        propagateMaterialAsset(obj.materialPath, materialFileDataFromObject(obj), obj.id);
+                        changed = true;
+                    }
+                    if (ImGui::MenuItem("Save Material", nullptr, false, hasMaterialAsset)) {
+                        saveMaterialToFile(obj);
+                    }
+                    if (ImGui::MenuItem("Reload Shader", nullptr, false,
+                                        !obj.vertexShaderPath.empty() || !obj.fragmentShaderPath.empty())) {
+                        renderer.forceReloadShader(obj.vertexShaderPath, obj.fragmentShaderPath);
+                    }
+                };
+
+                const std::string uiMaterialName = obj.materialPath.empty()
+                    ? std::string("Image Material")
+                    : assetDisplayName(obj.materialPath, "Image Material");
+                auto uiMaterialHeaderState = drawMaterialSectionHeader(
+                    "UIImageMaterialSection",
+                    uiMaterialName,
+                    obj.shaderPackPath,
+                    obj.vertexShaderPath,
+                    obj.fragmentShaderPath,
+                    obj.material,
+                    obj.albedoTexturePath,
+                    obj.overlayTexturePath,
+                    obj.normalMapPath,
+                    obj.useOverlay,
+                    true,
+                    1204,
+                    uiMaterialHeaderMenu);
+
+                bool uiMaterialChanged = uiMaterialHeaderState.second;
+                if (uiMaterialHeaderState.first) {
+                    InspectorBodyScope _materialBody(*this);
+                    uiMaterialChanged |= renderMaterialEditorBody(
+                        "UIImageMaterial",
+                        obj.material,
+                        obj.albedoTexturePath,
+                        obj.overlayTexturePath,
+                        obj.normalMapPath,
+                        obj.metallicRoughnessMapPath,
+                        obj.metallicMapPath,
+                        obj.roughnessMapPath,
+                        obj.opacityMapPath,
+                        obj.emissiveMapPath,
+                        obj.occlusionMapPath,
+                        obj.heightMapPath,
+                        obj.useOverlay,
+                        obj.shaderPackPath,
+                        obj.vertexShaderPath,
+                        obj.fragmentShaderPath,
+                        nullptr,
+                        uiImageMaterialPreviewScale,
+                        1205);
+                }
+
+                static int pendingUiImageMaterialSaveId = -1;
+                if (uiMaterialChanged) {
+                    changed = true;
+                    if (!obj.materialPath.empty()) {
+                        propagateMaterialAsset(obj.materialPath, materialFileDataFromObject(obj), obj.id);
+                        pendingUiImageMaterialSaveId = obj.id;
+                    }
+                }
+                if (pendingUiImageMaterialSaveId == obj.id && !ImGui::IsAnyItemActive()) {
+                    pendingUiImageMaterialSaveId = -1;
+                    if (!obj.materialPath.empty()) {
+                        const std::string filePath = resolveMaterialAssetPath(obj.materialPath).string();
+                        if (!writeMaterialFile(materialFileDataFromObject(obj), filePath)) {
+                            addConsoleMessage("Failed to save material: " + filePath,
+                                              ConsoleMessageType::Error);
+                        }
                     }
                 }
 
@@ -6754,6 +6861,32 @@ void Engine::renderInspectorPanel() {
                             endCompFields();
                         }
                     }
+
+                    if (InspectorReveal _h = drawInspectorSubsectionFoldout("Held Item", nullptr, true)) {
+                        if (beginCompFields("##Fields_VmHeld")) {
+                            noteRow("A direct child with a light inside it (a flashlight model and its "
+                                    "spot light) moves as though a hand is holding it.");
+                            if (boolRow("Enabled", &vm.heldItemEnabled)) { changed = true; }
+                            if (vm.heldItemEnabled) {
+                                motionSlider("Walk / Run Bob", "##VmHeldBob", &vm.heldItemBob,
+                                             0.01f, 0.0f, 4.0f, "%.2f",
+                                             "Figure-eight swing that trails each stride, on top of\n"
+                                             "the camera bob it already rides. 0 holds it steady.");
+                                motionSlider("Idle", "##VmHeldIdle", &vm.heldItemIdle,
+                                             0.01f, 0.0f, 4.0f, "%.2f",
+                                             "Slow breathing drift while standing still.");
+                                motionSlider("Jump", "##VmHeldJump", &vm.heldItemJump,
+                                             0.01f, 0.0f, 4.0f, "%.2f",
+                                             "Lag through a jump: dips on take-off, sinks while\n"
+                                             "rising, floats while falling, drops on landing.");
+                                motionSlider("Run Pose", "##VmHeldRunPose", &vm.heldItemRunPose,
+                                             0.01f, 0.0f, 4.0f, "%.2f",
+                                             "How far it tucks down and in at Run Speed. Mirrored\n"
+                                             "automatically for an item held on the left.");
+                            }
+                            endCompFields();
+                        }
+                    }
                 }
             }
             ImGui::PopID();
@@ -6990,6 +7123,9 @@ void Engine::renderInspectorPanel() {
             if (beginCompFields("##Fields_Collider2D")) {
                 if (!UsesUIOnly2DPhysics(obj)) {
                     noteRow("Collider2D is for UI/canvas objects only.");
+                }
+                if (boolRow(Loc::T("COMPONENT_COLLIDER2_D_IS_TRIGGER", "Is Trigger"), &obj.collider2D.isTrigger)) {
+                    changed = true;
                 }
                 const char* colliderTypes[] = { "Box", "Polygon", "Edge" };
                 int colliderType = static_cast<int>(obj.collider2D.type);
@@ -8067,7 +8203,7 @@ void Engine::renderInspectorPanel() {
     if (inspectorComponentKey == "particle_system2d" && obj.hasParticleSystem2D && sharedParticleSystem2D) {
         ImGui::Dummy(ImVec2(0.0f, 1.0f));
         bool changed = false;
-        auto header = drawComponentHeader(Loc::T("COMPONENT_PARTICLE_SYSTEM2_D", "Particle System 2D"), "ParticleSystem2D", "particle_system2d", &obj.particleSystem2D.enabled, true, [&]() {
+        auto header = drawComponentHeader(Loc::T("COMPONENT_PARTICLE_SYSTEM2_D", "Particle System"), "ParticleSystem2D", "particle_system2d", &obj.particleSystem2D.enabled, true, [&]() {
             if (ImGui::MenuItem("Reset")) {
                 obj.particleSystem2D = ParticleSystem2DComponent{};
                 changed = true;
@@ -8100,24 +8236,14 @@ void Engine::renderInspectorPanel() {
                 }
                 ImGui::SameLine();
                 if (ImGui::SmallButton("Restart")) {
-                    ps.particles.clear();
-                    ps.runtimeAccumulator = 0.0f;
-                    ps.runtimeTime = 0.0f;
-                    ps.runtimeLastUpdateTime = glfwGetTime();
-                    ps.runtimeInitialized = true;
+                    ParticleRuntime::Restart(ps);
                     ps.playing = true;
-                    ps.paused = false;
                     changed = true;
                 }
                 ImGui::SameLine();
                 if (ImGui::SmallButton("Stop")) {
+                    ParticleRuntime::Restart(ps);
                     ps.playing = false;
-                    ps.paused = false;
-                    ps.particles.clear();
-                    ps.runtimeAccumulator = 0.0f;
-                    ps.runtimeTime = 0.0f;
-                    ps.runtimeInitialized = true;
-                    ps.runtimeLastUpdateTime = glfwGetTime();
                     changed = true;
                 }
                 ImGui::TextDisabled("Live Particles: %d", static_cast<int>(ps.particles.size()));
@@ -8129,6 +8255,17 @@ void Engine::renderInspectorPanel() {
                 changed |= ImGui::DragFloat(Loc::Widget("COMPONENT_AUDIO_MODE_START_DELAY", "Start Delay"), &ps.startDelay, 0.01f, 0.0f, 1000.0f, "%.2f");
                 changed |= ImGui::DragFloat(Loc::Widget("COMPONENT_AUDIO_MODE_GRAVITY", "Gravity"), &ps.gravityModifier, 0.01f, -100.0f, 100.0f, "%.2f");
                 changed |= ImGui::DragFloat(Loc::Widget("COMPONENT_AUDIO_MODE_SIMULATION_SPEED", "Simulation Speed"), &ps.simulationSpeed, 0.01f, 0.0f, 20.0f, "%.2f");
+                const char* spaces[] = { "Local", "World" };
+                if (ImGui::Combo("Simulation Space", &ps.simulationSpace, spaces, IM_ARRAYSIZE(spaces))) {
+                    // Live particles are stored in the old space; start clean rather than
+                    // reinterpret every one of them.
+                    ParticleRuntime::Restart(ps);
+                    ps.playing = true;
+                    changed = true;
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Local: particles move with the emitter.\nWorld: they stay where they were emitted (trails, smoke).");
+                }
                 changed |= ImGui::DragInt("Max Particles", &ps.maxParticles, 1.0f, 1, 100000);
                 changed |= ImGui::ColorEdit4(Loc::Widget("COMPONENT_AUDIO_MODE_START_COLOR", "Start Color"), &ps.startColor.x);
                 if (InspectorReveal _fs = drawInspectorSubsectionFoldout("Start Lifetime", nullptr, true)) minMaxRow("StartLifetime", ps.startLifetime);
@@ -8143,14 +8280,35 @@ void Engine::renderInspectorPanel() {
                 changed |= ImGui::Checkbox(Loc::Widget("COMPONENT_AUDIO_MODE_BURST_LOOP", "Burst Loop"), &ps.burstLoop);
             }
             if (InspectorReveal _fs = drawInspectorSubsectionFoldout("Shape", nullptr, true)) {
-                const char* shapes[] = { "Point", "Circle", "Box" };
+                const char* shapes[] = { "Point", "Circle / Sphere", "Box", "Cone", "Hemisphere", "Edge" };
                 changed |= ImGui::Combo(Loc::Widget("COMPONENT_AUDIO_MODE_EMITTER_SHAPE", "Emitter Shape"), &ps.shape, shapes, IM_ARRAYSIZE(shapes));
-                changed |= ImGui::DragFloat(Loc::Widget("COMPONENT_AUDIO_MODE_RADIUS", "Radius"), &ps.shapeRadius, 0.01f, 0.0f, 10000.0f, "%.2f");
-                changed |= ImGui::DragFloat2("Box", &ps.shapeBox.x, 0.01f, 0.0f, 10000.0f, "%.2f");
+                changed |= ImGui::Checkbox("Emit In 3D", &ps.emitIn3D);
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Spread particles through depth too: a sphere instead of a circle,\na disc-shaped cone instead of a fan. Off keeps everything on the emitter's XY plane.");
+                }
+                if (ps.shape != ParticleSystem2DComponent::ShapePoint &&
+                    ps.shape != ParticleSystem2DComponent::ShapeBox) {
+                    changed |= ImGui::DragFloat(Loc::Widget("COMPONENT_AUDIO_MODE_RADIUS", "Radius"), &ps.shapeRadius, 0.01f, 0.0f, 10000.0f, "%.2f");
+                }
+                if (ps.shape == ParticleSystem2DComponent::ShapeCone) {
+                    changed |= ImGui::SliderFloat("Angle", &ps.shapeAngle, 0.0f, 89.0f, "%.1f deg");
+                }
+                if (ps.shape == ParticleSystem2DComponent::ShapeBox) {
+                    if (ps.emitIn3D) {
+                        changed |= ImGui::DragFloat3("Box", &ps.shapeBox.x, 0.01f, 0.0f, 10000.0f, "%.2f");
+                    } else {
+                        changed |= ImGui::DragFloat2("Box", &ps.shapeBox.x, 0.01f, 0.0f, 10000.0f, "%.2f");
+                    }
+                }
+                if (ps.shape == ParticleSystem2DComponent::ShapeCone ||
+                    ps.shape == ParticleSystem2DComponent::ShapeHemisphere ||
+                    ps.shape == ParticleSystem2DComponent::ShapeEdge) {
+                    ImGui::TextDisabled("Emits along the emitter's +Y; rotate the object to aim it.");
+                }
             }
             if (InspectorReveal _fs = drawInspectorSubsectionFoldout("Velocity over Lifetime")) {
                 changed |= ImGui::Checkbox(Loc::Widget("COMPONENT_AUDIO_MODE_ENABLED_VEL_LIFE", "Enabled##VelLife"), &ps.velocityOverLifetimeEnabled);
-                changed |= ImGui::DragFloat2("Velocity", &ps.velocityOverLifetime.x, 0.01f, -1000.0f, 1000.0f, "%.2f");
+                changed |= ImGui::DragFloat3("Velocity", &ps.velocityOverLifetime.x, 0.01f, -1000.0f, 1000.0f, "%.2f");
             }
             if (InspectorReveal _fs = drawInspectorSubsectionFoldout("Color over Lifetime")) {
                 changed |= ImGui::Checkbox(Loc::Widget("COMPONENT_AUDIO_MODE_ENABLED_COLOR_LIFE", "Enabled##ColorLife"), &ps.colorOverLifetimeEnabled);
@@ -8169,13 +8327,65 @@ void Engine::renderInspectorPanel() {
                 changed |= ImGui::DragFloat(Loc::Widget("COMPONENT_AUDIO_MODE_STRENGTH", "Strength"), &ps.noiseStrength, 0.01f, 0.0f, 1000.0f, "%.2f");
                 changed |= ImGui::DragFloat(Loc::Widget("COMPONENT_AUDIO_MODE_FREQUENCY", "Frequency"), &ps.noiseFrequency, 0.01f, 0.01f, 1000.0f, "%.2f");
             }
+            if (InspectorReveal _fs = drawInspectorSubsectionFoldout("Texture Sheet Animation")) {
+                changed |= ImGui::Checkbox("Enabled##TextureSheet", &ps.textureSheetEnabled);
+                const char* sheetModes[] = { "Grid", "Sprite Clips" };
+                changed |= ImGui::Combo("Mode##TextureSheet", &ps.textureSheetMode, sheetModes, IM_ARRAYSIZE(sheetModes));
+                if (ps.textureSheetMode == ParticleSystem2DComponent::SheetGrid) {
+                    int tiles[2] = { ps.textureSheetTilesX, ps.textureSheetTilesY };
+                    if (ImGui::DragInt2("Tiles (X, Y)", tiles, 0.1f, 1, 256)) {
+                        ps.textureSheetTilesX = std::clamp(tiles[0], 1, 256);
+                        ps.textureSheetTilesY = std::clamp(tiles[1], 1, 256);
+                        changed = true;
+                    }
+                } else if (!ps.textureSheetEnabled) {
+                    ImGui::TextDisabled("Uses the clips of the texture's .spritesheet.");
+                } else if (!ps.runtimeSheetRects.empty()) {
+                    ImGui::TextDisabled("%d clips from %s.spritesheet",
+                                        static_cast<int>(ps.runtimeSheetRects.size()),
+                                        fs::path(ParticleRuntime::TexturePath(obj)).filename().string().c_str());
+                } else {
+                    ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.35f, 1.0f),
+                                       "No .spritesheet next to the texture - slice it in the\nPixel Sprite Editor, or use Grid.");
+                }
+                const char* timings[] = { "Over Lifetime", "Frames Per Second" };
+                changed |= ImGui::Combo("Timing", &ps.textureSheetTiming, timings, IM_ARRAYSIZE(timings));
+                if (ps.textureSheetTiming == ParticleSystem2DComponent::SheetFps) {
+                    changed |= ImGui::DragFloat("FPS", &ps.textureSheetFps, 0.1f, 0.0f, 240.0f, "%.1f");
+                    changed |= ImGui::Checkbox("Loop##TextureSheet", &ps.textureSheetLoop);
+                } else {
+                    changed |= ImGui::DragFloat("Cycles", &ps.textureSheetCycles, 0.05f, 0.0f, 100.0f, "%.2f");
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("How many times the animation plays over one particle's life.");
+                    }
+                }
+                changed |= ImGui::DragInt("Start Frame", &ps.textureSheetStartFrame, 0.1f, 0, 4096);
+                changed |= ImGui::DragInt("Frame Count", &ps.textureSheetFrameCount, 0.1f, 0, 4096, ps.textureSheetFrameCount == 0 ? "All" : "%d");
+                changed |= ImGui::Checkbox("Random Start Frame", &ps.textureSheetRandomStart);
+            }
             if (InspectorReveal _fs = drawInspectorSubsectionFoldout("Renderer", nullptr, true)) {
-                char texBuf[512] = {};
-                std::snprintf(texBuf, sizeof(texBuf), "%s", ps.texturePath.c_str());
-                if (ImGui::InputText(Loc::Widget("COMPONENT_AUDIO_MODE_TEXTURE", "Texture"), texBuf, sizeof(texBuf))) { ps.texturePath = texBuf; changed = true; }
-                char matBuf[512] = {};
-                std::snprintf(matBuf, sizeof(matBuf), "%s", ps.materialPath.c_str());
-                if (ImGui::InputText(Loc::Widget("COMPONENT_AUDIO_MODE_MATERIAL", "Material"), matBuf, sizeof(matBuf))) { ps.materialPath = matBuf; changed = true; }
+                changed |= drawAssetReferenceSlot("##ParticleTexture", "Texture", ps.texturePath,
+                                                  FileCategory::Texture, "Texture");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Overrides the material's texture. Empty: the material's, else the object's.");
+                }
+                changed |= drawAssetReferenceSlot("##ParticleMaterial", "Material", ps.materialPath,
+                                                  FileCategory::Material, "Material");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Tints particles with its colour and opacity, adds its emission,\nand supplies a texture when Texture is empty.");
+                }
+                const char* alignments[] = { "Billboard", "Stretched", "Horizontal", "Vertical", "Local" };
+                changed |= ImGui::Combo("Render Alignment", &ps.renderAlignment, alignments, IM_ARRAYSIZE(alignments));
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("How quads face the camera in 3D views.\nBillboard: always face it. Stretched: streak along their motion.\nHorizontal: lie flat. Vertical: stand upright. Local: the emitter's XY plane.");
+                }
+                if (ps.renderAlignment == ParticleSystem2DComponent::AlignStretched) {
+                    changed |= ImGui::DragFloat("Length Scale", &ps.stretchLengthScale, 0.01f, 0.0f, 100.0f, "%.2f");
+                    changed |= ImGui::DragFloat("Speed Scale", &ps.stretchSpeedScale, 0.005f, 0.0f, 10.0f, "%.3f");
+                }
+                const char* blendModes[] = { "Alpha", "Additive", "Premultiplied", "Multiply" };
+                changed |= ImGui::Combo("Blend Mode", &ps.blendMode, blendModes, IM_ARRAYSIZE(blendModes));
+                ImGui::TextDisabled("2D lighting (2D views)");
                 changed |= ImGui::Checkbox(Loc::Widget("COMPONENT_AUDIO_MODE_RECEIVE_LIGHTING", "Receive Lighting"), &ps.receiveLighting2D);
                 changed |= ImGui::Checkbox(Loc::Widget("COMPONENT_AUDIO_MODE_FORCE_UNLIT", "Force Unlit"), &ps.unlitLighting2D);
                 changed |= ImGui::SliderFloat(Loc::Widget("COMPONENT_AUDIO_MODE_EMISSIVE", "Emissive"), &ps.emissiveLighting2D, 0.0f, 8.0f, "%.2f");
@@ -12055,7 +12265,7 @@ void Engine::renderInspectorPanel() {
             obj.videoPlayer = VideoPlayerComponent{};
             componentChanged = true;
         });
-        addEntry("Effects/Particle System 2D", !obj.hasParticleSystem2D, [&]() {
+        addEntry("Effects/Particle System", !obj.hasParticleSystem2D, [&]() {
             obj.hasParticleSystem2D = true;
             obj.particleSystem2D = ParticleSystem2DComponent{};
             componentChanged = true;
@@ -12766,7 +12976,7 @@ void Engine::renderInspectorPanel() {
             if (path.rfind("Collider/", 0) == 0) return iconCompCollider;
             if (path == "Physics/Rigidbody 3D" || path == "Physics/Rigidbody 2D") return iconCompRigidbody;
             if (path == "Physics/Collider 2D") return iconCompCollider;
-            if (path == "Effects/Particle System 2D") return iconCompParticle;
+            if (path == "Effects/Particle System") return iconCompParticle;
             if (path == "Rendering/Video Player") return iconCompVideo;
             if (path == "Rendering/Camera" || path == "Rendering/Camera Follow 2D") return iconCompCamera;
             if (path == "Rendering/ModuVolume") return iconCompVolume;
@@ -13249,13 +13459,15 @@ void Engine::renderInspectorPanel() {
         APPLY_CHANGED_FIELD(editorIconTint);
         APPLY_CHANGED_FIELD(editorIconPath);
         APPLY_CHANGED_FIELD(editorIconShowInViewport);
-        APPLY_CHANGED_FIELD(position);
-        APPLY_CHANGED_FIELD(rotation);
-        APPLY_CHANGED_FIELD(scale);
-        APPLY_CHANGED_FIELD(localPosition);
-        APPLY_CHANGED_FIELD(localRotation);
-        APPLY_CHANGED_FIELD(localScale);
-        APPLY_CHANGED_FIELD(localInitialized);
+        if (!target.IsInvariable) {
+            APPLY_CHANGED_FIELD(position);
+            APPLY_CHANGED_FIELD(rotation);
+            APPLY_CHANGED_FIELD(scale);
+            APPLY_CHANGED_FIELD(localPosition);
+            APPLY_CHANGED_FIELD(localRotation);
+            APPLY_CHANGED_FIELD(localScale);
+            APPLY_CHANGED_FIELD(localInitialized);
+        }
         APPLY_CHANGED_FIELD(parentId);
         APPLY_CHANGED_FIELD(childIds);
         APPLY_CHANGED_FIELD(isExpanded);
@@ -13264,10 +13476,12 @@ void Engine::renderInspectorPanel() {
             APPLY_CHANGED_FIELD(hasUI);
             APPLY_CHANGED_UI_FIELD(type);
             APPLY_CHANGED_UI_FIELD(anchor);
-            APPLY_CHANGED_UI_FIELD(position);
-            APPLY_CHANGED_UI_FIELD(size);
+            if (!target.IsInvariable) {
+                APPLY_CHANGED_UI_FIELD(position);
+                APPLY_CHANGED_UI_FIELD(size);
+                APPLY_CHANGED_UI_FIELD(rotation);
+            }
             APPLY_CHANGED_UI_FIELD(maskChildren);
-            APPLY_CHANGED_UI_FIELD(rotation);
             APPLY_CHANGED_UI_FIELD(sliderValue);
             APPLY_CHANGED_UI_FIELD(sliderMin);
             APPLY_CHANGED_UI_FIELD(sliderMax);
@@ -13328,6 +13542,43 @@ void Engine::renderInspectorPanel() {
             APPLY_CHANGED_UI_FIELD(unlitLighting2D);
             APPLY_CHANGED_UI_FIELD(emissiveLighting2D);
             APPLY_CHANGED_FIELD(albedoTexturePath);
+            APPLY_CHANGED_FIELD(materialPath);
+            APPLY_CHANGED_FIELD(overlayTexturePath);
+            APPLY_CHANGED_FIELD(normalMapPath);
+            APPLY_CHANGED_FIELD(metallicRoughnessMapPath);
+            APPLY_CHANGED_FIELD(metallicMapPath);
+            APPLY_CHANGED_FIELD(roughnessMapPath);
+            APPLY_CHANGED_FIELD(opacityMapPath);
+            APPLY_CHANGED_FIELD(emissiveMapPath);
+            APPLY_CHANGED_FIELD(occlusionMapPath);
+            APPLY_CHANGED_FIELD(heightMapPath);
+            APPLY_CHANGED_FIELD(shaderPackPath);
+            APPLY_CHANGED_FIELD(vertexShaderPath);
+            APPLY_CHANGED_FIELD(fragmentShaderPath);
+            APPLY_CHANGED_FIELD(useOverlay);
+            APPLY_CHANGED_MATERIAL_FIELD(color);
+            APPLY_CHANGED_MATERIAL_FIELD(alpha);
+            APPLY_CHANGED_MATERIAL_FIELD(ambientStrength);
+            APPLY_CHANGED_MATERIAL_FIELD(specularStrength);
+            APPLY_CHANGED_MATERIAL_FIELD(shininess);
+            APPLY_CHANGED_MATERIAL_FIELD(normalMapIntensity);
+            APPLY_CHANGED_MATERIAL_FIELD(textureMix);
+            APPLY_CHANGED_MATERIAL_FIELD(uvTiling);
+            APPLY_CHANGED_MATERIAL_FIELD(uvOffset);
+            APPLY_CHANGED_MATERIAL_FIELD(scrollSpeed);
+            APPLY_CHANGED_MATERIAL_FIELD(scrollDirection);
+            APPLY_CHANGED_MATERIAL_FIELD(uvScrollEnabled);
+            APPLY_CHANGED_MATERIAL_FIELD(cloudColor);
+            APPLY_CHANGED_MATERIAL_FIELD(cloudSkyColor);
+            APPLY_CHANGED_MATERIAL_FIELD(cloudScale);
+            APPLY_CHANGED_MATERIAL_FIELD(cloudCoverage);
+            APPLY_CHANGED_MATERIAL_FIELD(cloudSoftness);
+            APPLY_CHANGED_MATERIAL_FIELD(cloudDetail);
+            APPLY_CHANGED_MATERIAL_FIELD(cloudSpeed);
+            APPLY_CHANGED_MATERIAL_FIELD(cloudWarp);
+            APPLY_CHANGED_MATERIAL_FIELD(cloudHighlight);
+            APPLY_CHANGED_MATERIAL_FIELD(cloudStars);
+            APPLY_CHANGED_MATERIAL_FIELD(cloudHorizon);
             APPLY_CHANGED_MATERIAL_FIELD(textureFilter);
         }
 
@@ -13394,6 +13645,7 @@ void Engine::renderInspectorPanel() {
         if (sharedCollider2D) {
             APPLY_CHANGED_FIELD(hasCollider2D);
             APPLY_CHANGED_COMPONENT_FIELD(collider2D, enabled);
+            APPLY_CHANGED_COMPONENT_FIELD(collider2D, isTrigger);
             APPLY_CHANGED_COMPONENT_FIELD(collider2D, type);
             APPLY_CHANGED_COMPONENT_FIELD(collider2D, boxSize);
             APPLY_CHANGED_COMPONENT_FIELD(collider2D, offset);
@@ -13489,6 +13741,24 @@ void Engine::renderInspectorPanel() {
             APPLY_CHANGED_COMPONENT_FIELD(particleSystem2D, receiveLighting2D);
             APPLY_CHANGED_COMPONENT_FIELD(particleSystem2D, unlitLighting2D);
             APPLY_CHANGED_COMPONENT_FIELD(particleSystem2D, emissiveLighting2D);
+            APPLY_CHANGED_COMPONENT_FIELD(particleSystem2D, emitIn3D);
+            APPLY_CHANGED_COMPONENT_FIELD(particleSystem2D, simulationSpace);
+            APPLY_CHANGED_COMPONENT_FIELD(particleSystem2D, shapeAngle);
+            APPLY_CHANGED_COMPONENT_FIELD(particleSystem2D, renderAlignment);
+            APPLY_CHANGED_COMPONENT_FIELD(particleSystem2D, stretchLengthScale);
+            APPLY_CHANGED_COMPONENT_FIELD(particleSystem2D, stretchSpeedScale);
+            APPLY_CHANGED_COMPONENT_FIELD(particleSystem2D, blendMode);
+            APPLY_CHANGED_COMPONENT_FIELD(particleSystem2D, textureSheetEnabled);
+            APPLY_CHANGED_COMPONENT_FIELD(particleSystem2D, textureSheetMode);
+            APPLY_CHANGED_COMPONENT_FIELD(particleSystem2D, textureSheetTilesX);
+            APPLY_CHANGED_COMPONENT_FIELD(particleSystem2D, textureSheetTilesY);
+            APPLY_CHANGED_COMPONENT_FIELD(particleSystem2D, textureSheetTiming);
+            APPLY_CHANGED_COMPONENT_FIELD(particleSystem2D, textureSheetCycles);
+            APPLY_CHANGED_COMPONENT_FIELD(particleSystem2D, textureSheetFps);
+            APPLY_CHANGED_COMPONENT_FIELD(particleSystem2D, textureSheetLoop);
+            APPLY_CHANGED_COMPONENT_FIELD(particleSystem2D, textureSheetStartFrame);
+            APPLY_CHANGED_COMPONENT_FIELD(particleSystem2D, textureSheetFrameCount);
+            APPLY_CHANGED_COMPONENT_FIELD(particleSystem2D, textureSheetRandomStart);
         }
 
         if (sharedGroundBaked) {

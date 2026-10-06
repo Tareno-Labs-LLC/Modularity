@@ -27,7 +27,7 @@ class Engine;
     #define MODULARITY_SCRIPT_EXPORT __attribute__((visibility("default")))
 #endif
 
-#define MODULARITY_NATIVE_SCRIPT_ABI_VERSION 54
+#define MODULARITY_NATIVE_SCRIPT_ABI_VERSION 58
 
 #define MODULARITY_SCRIPT_LAYOUT_SIGNATURE() \
     ((static_cast<unsigned long long>(sizeof(SceneObject)) << 40) ^ \
@@ -86,8 +86,19 @@ struct MODULARITY_SCRIPT_API ScriptContext {
     void SetScale(const glm::vec3& scl);
     void GetPlanarYawPitchVectors(float pitchDeg, float yawDeg, glm::vec3& outForward, glm::vec3& outRight) const;
     glm::vec3 GetMoveInputWASD(float pitchDeg, float yawDeg) const;
+    // Also keeps the mouse captured while it is applying (see RequestMouseCapture).
     bool ApplyMouseLook(float& pitchDeg, float& yawDeg, float sensitivity, float maxDelta, float deltaTime,
                         bool requireMouseButton) const;
+    // The game only captures the mouse (hidden + locked) while something asks for it. Call
+    // this every frame the mouse steers the camera/character; stop and the pointer returns.
+    void RequestMouseCapture();
+    bool IsMouseCaptured() const;
+    // GLFW button index: 0 = left, 1 = right, 2 = middle.
+    bool IsMouseButtonDown(int glfwButton) const;
+    // Show a project image as the pointer while it is visible over the game. Hotspot is a
+    // 0..1 fraction of the image (0,0 = top-left); height is pixels at 100% display scale.
+    void SetCursorImage(const std::string& path, float hotspotX, float hotspotY, float heightPx);
+    void ClearCursorImage();
     int GetSelectedObjectId() const;
     bool IsSprintDown() const;
     bool IsJumpDown() const;

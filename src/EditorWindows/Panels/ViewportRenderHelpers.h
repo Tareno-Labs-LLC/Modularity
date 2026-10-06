@@ -3,6 +3,7 @@
 #include "Engine.h"
 #include "AssemblageRuntime.h"
 #include "Modu2DStats.h"
+#include "ParticleSystemRuntime.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -75,13 +76,30 @@ struct ViewportFpsWindow {
 void DrawViewportProfilerPanel(ImDrawList *drawList, const ImVec2 &topLeft,
                                const std::vector<std::string> &lines);
 
-uint32_t ParticleHash(uint32_t x);
-float ParticleUnit(uint32_t &state);
-float ParticleRange(ParticleSystem2DComponent::MinMaxFloat range, uint32_t &state);
-void RestartParticleSystem2D(ParticleSystem2DComponent &ps, double now);
-void EmitParticle2D(SceneObject &obj, uint32_t emissionIndex);
-void SimulateParticleSystem2D(SceneObject &obj, double now);
+// Texture a particle system draws with in a sprite path, plus its source size for sheet UVs.
+// Falls back to the renderer's white texture; returns false when there is none at all.
+inline bool ResolveParticleSpriteTexture(Renderer &renderer, const SceneObject &obj,
+                                         unsigned int &outTextureId, int &outWidth,
+                                         int &outHeight) {
+  outTextureId = 0;
+  outWidth = 0;
+  outHeight = 0;
+  const std::string &texturePath = ParticleRuntime::TexturePath(obj);
+  if (!texturePath.empty()) {
+    if (Texture *particleTex =
+            renderer.getTexture(texturePath, ParticleRuntime::TextureFilter(obj))) {
+      outTextureId = particleTex->GetID();
+      outWidth = particleTex->GetSourceWidth() > 0 ? particleTex->GetSourceWidth()
+                                                   : particleTex->GetWidth();
+      outHeight = particleTex->GetSourceHeight() > 0 ? particleTex->GetSourceHeight()
+                                                     : particleTex->GetHeight();
+    }
+  }
+  if (outTextureId == 0) outTextureId = renderer.getDebugWhiteTextureId();
+  return outTextureId != 0;
+}
 
+// Particles are simulated once per frame by Engine::updateParticleSystems; these only draw.
 template <typename WorldToScreenFn, typename WorldToRenderLocalFn,
           typename ParentOffsetFn, typename RectOutsideFn>
 void AppendParticleSystem2DSprites(std::vector<SceneObject> &sceneObjects,
@@ -92,40 +110,39 @@ void AppendParticleSystem2DSprites(std::vector<SceneObject> &sceneObjects,
                                    RectOutsideFn rectOutsideOverlay,
                                    Light2DRenderRequest &lightRequest,
                                    int &drawOrder) {
-  const unsigned int fallbackTextureId = renderer.getDebugWhiteTextureId();
+  (void)now;
   for (SceneObject &obj : sceneObjects) {
     if (!IsObjectEnabledInHierarchy(obj) || !obj.hasParticleSystem2D) continue;
-
-    SimulateParticleSystem2D(obj, now);
 
     ParticleSystem2DComponent &ps = obj.particleSystem2D;
     if (!ps.enabled || ps.particles.empty()) continue;
 
     unsigned int textureId = 0;
-    const std::string texturePath =
-        !ps.texturePath.empty() ? ps.texturePath : obj.albedoTexturePath;
-    if (!texturePath.empty()) {
-      if (Texture *particleTex =
-              renderer.getTexture(texturePath, obj.material.textureFilter)) {
-        textureId = particleTex->GetID();
-      }
+    int textureWidth = 0;
+    int textureHeight = 0;
+    if (!ResolveParticleSpriteTexture(renderer, obj, textureId, textureWidth,
+                                      textureHeight)) {
+      continue;
     }
-    if (textureId == 0) {
-      textureId = fallbackTextureId;
-    }
-    if (textureId == 0) continue;
 
+    // Local particles are stored relative to the emitter; world ones were born at the
+    // emitter's position and are stored relative to its parent, so they stay put.
+    const glm::vec2 parentOffset = getParentOffset(obj);
     const glm::vec2 emitterWorld =
-        getParentOffset(obj) + glm::vec2(obj.position.x, obj.position.y);
+        ps.simulationSpace == ParticleSystem2DComponent::SpaceWorld
+            ? parentOffset
+            : parentOffset + glm::vec2(obj.position.x, obj.position.y);
+    const bool sheetAnimated = ParticleRuntime::SheetFrameCount(ps) > 0;
     for (const auto &particle : ps.particles) {
       if (!particle.alive) continue;
-      const float t = std::clamp(
-          particle.age / std::max(0.01f, particle.lifetime), 0.0f, 1.0f);
+      const float t = ParticleRuntime::NormalizedAge(particle);
+      const ParticleRuntime::Frame frame = ParticleRuntime::CurrentFrame(
+          ps, particle, t, textureWidth, textureHeight);
       const glm::vec2 worldCenter = emitterWorld + glm::vec2(particle.position);
-      const float size = ps.sizeOverLifetimeEnabled
-                             ? glm::mix(particle.size, ps.sizeOverLifetime, t)
-                             : particle.size;
-      const glm::vec2 half(std::max(0.001f, size) * 0.5f);
+      const float size =
+          std::max(0.001f, ParticleRuntime::CurrentSize(ps, particle, t));
+      const glm::vec2 half(size * 0.5f * (sheetAnimated ? frame.aspect : 1.0f),
+                           size * 0.5f);
       const glm::vec2 worldMin = worldCenter - half;
       const glm::vec2 worldMax = worldCenter + half;
       ImVec2 s0 = worldToScreen(worldMin);
@@ -152,9 +169,7 @@ void AppendParticleSystem2DSprites(std::vector<SceneObject> &sceneObjects,
       sprite.layer = obj.layer;
       sprite.drawOrder = drawOrder++;
       sprite.textureId = textureId;
-      sprite.tint = ps.colorOverLifetimeEnabled
-                        ? glm::mix(particle.startColor, ps.colorOverLifetime, t)
-                        : particle.startColor;
+      sprite.tint = ParticleRuntime::CurrentColor(ps, particle, t);
       sprite.receiveLighting = ps.receiveLighting2D;
       sprite.unlit = ps.unlitLighting2D;
       sprite.emissiveIntensity = ps.emissiveLighting2D;
@@ -162,10 +177,13 @@ void AppendParticleSystem2DSprites(std::vector<SceneObject> &sceneObjects,
       sprite.positions[1] = rotatePoint(renderHalf.x, -renderHalf.y);
       sprite.positions[2] = rotatePoint(renderHalf.x, renderHalf.y);
       sprite.positions[3] = rotatePoint(-renderHalf.x, renderHalf.y);
-      sprite.uvs[0] = glm::vec2(0.0f, 0.0f);
-      sprite.uvs[1] = glm::vec2(1.0f, 0.0f);
-      sprite.uvs[2] = glm::vec2(1.0f, 1.0f);
-      sprite.uvs[3] = glm::vec2(0.0f, 1.0f);
+      // positions[0] is the quad's top-left ON SCREEN, so it takes the frame's top edge.
+      // Textures are stored bottom-up, so that is uvMax.y; this path used to hand it v=0
+      // and drew every particle texture upside down.
+      sprite.uvs[0] = glm::vec2(frame.uvMin.x, frame.uvMax.y);
+      sprite.uvs[1] = glm::vec2(frame.uvMax.x, frame.uvMax.y);
+      sprite.uvs[2] = glm::vec2(frame.uvMax.x, frame.uvMin.y);
+      sprite.uvs[3] = glm::vec2(frame.uvMin.x, frame.uvMin.y);
       lightRequest.sprites.push_back(sprite);
     }
   }
@@ -338,6 +356,17 @@ bool ResolveProjectedSprite25DRect(const SceneObject &obj,
 
 void EmitRuntimeUiBackdropBlur(ImDrawList *drawList, const SceneObject &obj,
                                const ImVec2 &rectMin, const ImVec2 &rectMax);
+
+// UI Images normally go straight into ImGui's sprite batch. When a material
+// shader is assigned, render that shader into a small transparent surface first
+// and hand the resulting texture back to the same batch. This keeps ordering,
+// canvas clipping, rotation and tint behavior identical to ordinary UI sprites
+// while allowing animated fragment shaders on Image and Sprite2D components.
+bool HasUiImageMaterialShader(const SceneObject &obj);
+unsigned int RenderUiImageMaterialShader(
+    Renderer &renderer, const SceneObject &obj, const ImVec2 &drawSize,
+    const std::array<ImVec2, 4> &sourceUvs, unsigned int sourceTexture,
+    double timeSeconds);
 
 void ApplyUIFontFilterCallback(const ImDrawList *, const ImDrawCmd *cmd);
 
@@ -721,7 +750,7 @@ void AppendProjectedParticleSystem2DSprites(
     const ImVec2 &overlaySize, const ImVec2 &renderLocalOrigin,
     RectOutsideFn rectOutsideRenderLocal, Light2DRenderRequest &lightRequest,
     int &drawOrder) {
-  const unsigned int fallbackTextureId = renderer.getDebugWhiteTextureId();
+  (void)now;
   const glm::mat4 invView = glm::inverse(view);
   const glm::vec3 cameraRight = glm::normalize(glm::vec3(invView[0]));
   const glm::vec3 cameraUp = glm::normalize(glm::vec3(invView[1]));
@@ -729,47 +758,33 @@ void AppendProjectedParticleSystem2DSprites(
   for (SceneObject &obj : sceneObjects) {
     if (!IsObjectEnabledInHierarchy(obj) || !obj.hasParticleSystem2D) continue;
 
-    SimulateParticleSystem2D(obj, now);
-
     ParticleSystem2DComponent &ps = obj.particleSystem2D;
     if (!ps.enabled || ps.particles.empty()) continue;
 
     unsigned int textureId = 0;
-    const std::string texturePath =
-        !ps.texturePath.empty() ? ps.texturePath : obj.albedoTexturePath;
-    if (!texturePath.empty()) {
-      if (Texture *particleTex =
-              renderer.getTexture(texturePath, obj.material.textureFilter)) {
-        textureId = particleTex->GetID();
-      }
+    int textureWidth = 0;
+    int textureHeight = 0;
+    if (!ResolveParticleSpriteTexture(renderer, obj, textureId, textureWidth,
+                                      textureHeight)) {
+      continue;
     }
-    if (textureId == 0) textureId = fallbackTextureId;
-    if (textureId == 0) continue;
 
-    glm::mat4 objectRotation(1.0f);
-    objectRotation = glm::rotate(objectRotation, glm::radians(obj.rotation.x),
-                                 glm::vec3(1.0f, 0.0f, 0.0f));
-    objectRotation = glm::rotate(objectRotation, glm::radians(obj.rotation.y),
-                                 glm::vec3(0.0f, 1.0f, 0.0f));
-    objectRotation = glm::rotate(objectRotation, glm::radians(obj.rotation.z),
-                                 glm::vec3(0.0f, 0.0f, 1.0f));
-
+    const ParticleRuntime::EmitterFrame emitter =
+        ParticleRuntime::MakeEmitterFrame(obj);
+    const bool sheetAnimated = ParticleRuntime::SheetFrameCount(ps) > 0;
     for (const auto &particle : ps.particles) {
       if (!particle.alive) continue;
-      const float t = std::clamp(
-          particle.age / std::max(0.01f, particle.lifetime), 0.0f, 1.0f);
-      const float size = ps.sizeOverLifetimeEnabled
-                             ? glm::mix(particle.size, ps.sizeOverLifetime, t)
-                             : particle.size;
-      const float halfSize = std::max(0.001f, size) * 0.5f;
+      const float t = ParticleRuntime::NormalizedAge(particle);
+      const ParticleRuntime::Frame frame = ParticleRuntime::CurrentFrame(
+          ps, particle, t, textureWidth, textureHeight);
+      const float halfSize =
+          std::max(0.001f, ParticleRuntime::CurrentSize(ps, particle, t)) * 0.5f;
+      const float halfWidth = halfSize * (sheetAnimated ? frame.aspect : 1.0f);
       const float angle = glm::radians(particle.rotation);
       const float c = std::cos(angle);
       const float s = std::sin(angle);
       const glm::vec3 particleWorldCenter =
-          obj.position + glm::vec3(objectRotation *
-                                   glm::vec4(particle.position.x * obj.scale.x,
-                                             particle.position.y * obj.scale.y,
-                                             0.0f, 0.0f));
+          ParticleRuntime::WorldPosition(emitter, particle);
       auto localToWorld = [&](float x, float y) {
         const float rx = x * c - y * s;
         const float ry = x * s + y * c;
@@ -778,10 +793,10 @@ void AppendProjectedParticleSystem2DSprites(
 
       std::array<ImVec2, 4> projected;
       const std::array<glm::vec3, 4> corners = {
-          localToWorld(-halfSize, -halfSize),
-          localToWorld(halfSize, -halfSize),
-          localToWorld(halfSize, halfSize),
-          localToWorld(-halfSize, halfSize),
+          localToWorld(-halfWidth, -halfSize),
+          localToWorld(halfWidth, -halfSize),
+          localToWorld(halfWidth, halfSize),
+          localToWorld(-halfWidth, halfSize),
       };
       bool valid = true;
       for (size_t i = 0; i < corners.size(); ++i) {
@@ -810,9 +825,7 @@ void AppendProjectedParticleSystem2DSprites(
       sprite.layer = obj.layer;
       sprite.drawOrder = drawOrder++;
       sprite.textureId = textureId;
-      sprite.tint = ps.colorOverLifetimeEnabled
-                        ? glm::mix(particle.startColor, ps.colorOverLifetime, t)
-                        : particle.startColor;
+      sprite.tint = ParticleRuntime::CurrentColor(ps, particle, t);
       sprite.receiveLighting = ps.receiveLighting2D;
       sprite.unlit = ps.unlitLighting2D;
       sprite.emissiveIntensity = ps.emissiveLighting2D;
@@ -820,10 +833,11 @@ void AppendProjectedParticleSystem2DSprites(
       sprite.positions[1] = glm::vec2(projected[1].x, projected[1].y);
       sprite.positions[2] = glm::vec2(projected[2].x, projected[2].y);
       sprite.positions[3] = glm::vec2(projected[3].x, projected[3].y);
-      sprite.uvs[0] = glm::vec2(0.0f, 0.0f);
-      sprite.uvs[1] = glm::vec2(1.0f, 0.0f);
-      sprite.uvs[2] = glm::vec2(1.0f, 1.0f);
-      sprite.uvs[3] = glm::vec2(0.0f, 1.0f);
+      // corners[0] is the world-space bottom-left, which is the frame's bottom edge.
+      sprite.uvs[0] = glm::vec2(frame.uvMin.x, frame.uvMin.y);
+      sprite.uvs[1] = glm::vec2(frame.uvMax.x, frame.uvMin.y);
+      sprite.uvs[2] = glm::vec2(frame.uvMax.x, frame.uvMax.y);
+      sprite.uvs[3] = glm::vec2(frame.uvMin.x, frame.uvMax.y);
       lightRequest.sprites.push_back(sprite);
     }
   }

@@ -92,6 +92,27 @@ Texture::Texture(const std::string& path,
         return;
     }
 
+    // Grey + alpha has no upload format below: it fell through to GL_RGBA and the driver read
+    // twice as many bytes as stb allocated. Expand it to RGBA (grey, grey, grey, alpha).
+    if (m_Channels == 2) {
+        const size_t pixelCount = static_cast<size_t>(m_Width) * static_cast<size_t>(m_Height);
+        std::vector<uint8_t> expanded(pixelCount * 4u);
+        for (size_t i = 0; i < pixelCount; ++i) {
+            const uint8_t grey = data[i * 2u];
+            expanded[i * 4u + 0u] = grey;
+            expanded[i * 4u + 1u] = grey;
+            expanded[i * 4u + 2u] = grey;
+            expanded[i * 4u + 3u] = data[i * 2u + 1u];
+        }
+        if (dataOwnedByStb) {
+            stbi_image_free(data);
+            dataOwnedByStb = false;
+        }
+        exrPixels.swap(expanded);
+        data = exrPixels.data();
+        m_Channels = 4;
+    }
+
     m_SourceWidth = m_Width;
     m_SourceHeight = m_Height;
 

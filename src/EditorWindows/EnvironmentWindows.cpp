@@ -447,6 +447,9 @@ void Engine::renderEnvironmentWindow() {
                     ImGui::SameLine();
                     if (ImGui::Button("Apply")) {
                         applySkySettings();
+                        // Settings changes only reload a texture whose path changed; Apply
+                        // also picks up a file that was edited in place.
+                        if (skybox) skybox->reloadTextures();
                     }
                 });
                 ImGui::EndTable();

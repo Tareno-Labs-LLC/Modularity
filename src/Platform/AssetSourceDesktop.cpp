@@ -174,6 +174,10 @@ void SetAssetSource(std::unique_ptr<AssetSource> source) {
     desktopRootStorage().clear();  // not a desktop source any more; GetAssetSource() re-roots one
 }
 
+std::unique_ptr<AssetSource> MakeDesktopAssetSource(const std::string& root) {
+    return std::make_unique<DesktopAssetSource>(fs::path(root));
+}
+
 void SetPortableAssetRoot(const std::string& projectRoot) {
     std::lock_guard<std::mutex> lock(portableRootMutex());
     portableRootStorage() = projectRoot.empty() ? fs::path() : fs::path(projectRoot);

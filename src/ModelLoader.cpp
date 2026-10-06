@@ -1,6 +1,8 @@
 #include "ModelLoader.h"
 #include "../include/Platform/AssetSource.h"
+#if MODULARITY_ENABLE_ASSIMP
 #include "AssimpPortableIO.h"
+#endif
 #include "Render25D/MMeshConvert.h"
 #include "Render25D/MMeshLoader.h"
 #include <algorithm>

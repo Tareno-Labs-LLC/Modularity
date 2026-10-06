@@ -720,6 +720,14 @@ struct PlayerViewMotionSettings {
     float attachedStiffness = 18.0f;
     float attachedDamping = 7.0f;
     float attachedMax = 4.0f;
+
+    // A direct child that carries a light (a flashlight model with its spot light inside)
+    // is animated as though a hand holds it. Each value scales one part of that motion.
+    bool heldItemEnabled = true;
+    float heldItemBob = 1.0f;
+    float heldItemIdle = 1.0f;
+    float heldItemJump = 1.0f;
+    float heldItemRunPose = 1.0f;
 };
 
 struct PlayerMovementAudioSettings {
@@ -843,6 +851,7 @@ enum class Collider2DType {
 
 struct Collider2DComponent {
     bool enabled = true;
+    bool isTrigger = false;
     Collider2DType type = Collider2DType::Box;
     glm::vec2 boxSize = glm::vec2(1.0f);
     glm::vec2 offset = glm::vec2(0.0f);
@@ -940,7 +949,19 @@ struct ParticleSystem2DComponent {
         float angularVelocity = 0.0f;
         glm::vec4 startColor = glm::vec4(1.0f);
         uint32_t seed = 1u;
+        int sheetFrameOffset = 0; // texture sheet start frame, rolled at emission
     };
+
+    // Values of the int-backed settings below. Kept as ints so the scene format and the
+    // Inspector combos stay plain; these name them for code.
+    enum Shape { ShapePoint = 0, ShapeCircle = 1, ShapeBox = 2, ShapeCone = 3,
+                 ShapeHemisphere = 4, ShapeEdge = 5 };
+    enum SimulationSpace { SpaceLocal = 0, SpaceWorld = 1 };
+    enum RenderAlignment { AlignBillboard = 0, AlignStretched = 1, AlignHorizontal = 2,
+                           AlignVertical = 3, AlignLocal = 4 };
+    enum BlendMode { BlendAlpha = 0, BlendAdditive = 1, BlendPremultiplied = 2, BlendMultiply = 3 };
+    enum SheetMode { SheetGrid = 0, SheetSpriteClips = 1 };
+    enum SheetTiming { SheetOverLifetime = 0, SheetFps = 1 };
 
     bool enabled = true;
     bool looping = true;
@@ -983,11 +1004,49 @@ struct ParticleSystem2DComponent {
     bool receiveLighting2D = true;
     bool unlitLighting2D = false;
     float emissiveLighting2D = 0.0f;
+    // World: particles keep the position they were born at when the emitter moves
+    // (trails, smoke). Local: they ride along with the emitter.
+    int simulationSpace = SpaceLocal;
+    float shapeAngle = 25.0f;          // cone half-angle, degrees
+    // How each particle's quad faces the camera in 3D views.
+    int renderAlignment = AlignBillboard;
+    float stretchLengthScale = 2.0f;   // stretched: length in multiples of size...
+    float stretchSpeedScale = 0.1f;    // ...plus this much per unit of speed
+    int blendMode = BlendAlpha;
+    // Texture sheet animation: a grid of equal tiles, or the clips of the texture's
+    // .spritesheet sidecar (the same clips a UI Image picks up from that texture).
+    bool textureSheetEnabled = false;
+    int textureSheetMode = SheetGrid;
+    int textureSheetTilesX = 1;
+    int textureSheetTilesY = 1;
+    int textureSheetTiming = SheetOverLifetime;
+    float textureSheetCycles = 1.0f;   // over lifetime: passes through the frames per life
+    float textureSheetFps = 12.0f;
+    bool textureSheetLoop = true;      // fps: wrap, or hold the last frame
+    int textureSheetStartFrame = 0;
+    int textureSheetFrameCount = 0;    // 0 = every frame from the start frame on
+    bool textureSheetRandomStart = false;
     float runtimeAccumulator = 0.0f;
     float runtimeTime = 0.0f;
     double runtimeLastUpdateTime = 0.0;
     bool runtimeInitialized = false;
     std::vector<Particle> particles;
+    // Resolved by Engine::updateParticleSystems so renderers never touch the disk. Not saved.
+    std::string runtimeMaterialKey;           // materialPath these were read from
+    std::string runtimeMaterialTexture;       // the material's albedo
+    glm::vec4 runtimeMaterialTint = glm::vec4(1.0f);
+    glm::vec3 runtimeMaterialEmission = glm::vec3(0.0f);
+    int runtimeMaterialFilter = -1;           // -1: the object's own filter
+    long long runtimeMaterialStamp = 0;
+    std::string runtimeSheetKey;              // texture whose .spritesheet supplied the clips
+    std::vector<glm::ivec4> runtimeSheetRects;
+    long long runtimeSheetStamp = 0;
+    double runtimeAssetCheckTime = -1.0;
+    // Script requests (Particles.Emit / Particles.Play), consumed by the next simulation step.
+    int runtimePendingEmit = 0;
+    // Bumped on every scripted Play/Emit and mixed into the auto random seed, so replaying a
+    // burst does not replay the exact same particles.
+    uint32_t runtimeEmitSalt = 0;
 };
 
 struct ReverbZoneComponent {

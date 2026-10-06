@@ -240,6 +240,20 @@ void TMSceneBuilder::buildFromSceneObjects(const std::vector<SceneObject>& scene
     outStats.modelCount = static_cast<uint32_t>(outScene.sectorModels.size());
 
     for (const SceneObject& obj : sceneObjects) {
+        if (!IsObjectEnabledInHierarchy(obj) || !obj.hasLight || !obj.light.enabled ||
+            obj.light.type != LightType::Point || obj.light.intensity <= 0.0f) {
+            continue;
+        }
+
+        TMPointLightInstance light;
+        light.position = obj.position;
+        light.color = glm::max(obj.light.color, glm::vec3(0.0f));
+        light.intensity = std::max(0.0f, obj.light.intensity);
+        light.range = std::max(0.01f, obj.light.range);
+        outScene.pointLights.push_back(light);
+    }
+
+    for (const SceneObject& obj : sceneObjects) {
         if (!IsSprite25DImageObject(obj)) {
             continue;
         }

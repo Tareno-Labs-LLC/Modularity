@@ -161,6 +161,10 @@ private:
     bool weatherActive = false;
     std::string weatherAmbiencePath;
     std::shared_ptr<DecodedAudioData> weatherDecodedData;
+    // The engine asks for the ambience every frame, so a path that fails to load is left
+    // alone until this time (steady clock, seconds) instead of re-read from disk each frame.
+    std::string weatherFailedPath;
+    double weatherRetryAfterSec = 0.0;
     bool prefer2DSpatialAudio = false;
     glm::vec3 lastListenerPosition = glm::vec3(0.0f);
     void destroyActiveSounds();

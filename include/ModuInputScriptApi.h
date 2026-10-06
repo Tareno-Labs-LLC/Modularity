@@ -557,6 +557,40 @@ inline void ReloadBindings() {
 }
 } // namespace Input
 
+// The mouse pointer. The game only captures the mouse (hidden + locked, deltas only)
+// while something steers with it: an enabled PlayerController, ApplyMouseLook while it
+// is applying, or a script calling Cursor.Capture() every frame it needs to. Stop
+// asking and the pointer comes back, so menus and 2D games keep a visible mouse.
+namespace Cursor {
+inline void Capture() {
+    if (ScriptContext* c = ctxPtr()) c->RequestMouseCapture();
+}
+
+inline bool IsCaptured() {
+    if (ScriptContext* c = ctxPtr()) return c->IsMouseCaptured();
+    return false;
+}
+
+// 0 = left, 1 = right, 2 = middle.
+inline bool IsButtonDown(int button = 0) {
+    if (ScriptContext* c = ctxPtr()) return c->IsMouseButtonDown(button);
+    return false;
+}
+
+// Draw a project image ("Assets/UI/Hand.png") as the pointer while it is visible over
+// the game. hotspotX/Y place the click point as a fraction of the image (0,0 = top-left);
+// height is on-screen pixels at 100% display scaling. Stays until ClearImage() or play
+// stops, and is cheap to call every frame, e.g. to swap in a pressed pose.
+inline void SetImage(const std::string& imagePath, float hotspotX = 0.0f, float hotspotY = 0.0f,
+                     float height = 32.0f) {
+    if (ScriptContext* c = ctxPtr()) c->SetCursorImage(imagePath, hotspotX, hotspotY, height);
+}
+
+inline void ClearImage() {
+    if (ScriptContext* c = ctxPtr()) c->ClearCursorImage();
+}
+} // namespace Cursor
+
 inline bool IsSubmitDown() {
     return IsRuntimeKeyDown(GLFW_KEY_ENTER, ImGuiKey_Enter) ||
            IsRuntimeKeyDown(GLFW_KEY_KP_ENTER, ImGuiKey_KeypadEnter);

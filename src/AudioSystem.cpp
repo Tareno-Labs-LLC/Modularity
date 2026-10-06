@@ -6,6 +6,7 @@
 #include <cmath>
 #include <atomic>
 #include <array>
+#include <chrono>
 #include "../include/Platform/AssetSource.h"
 #include "AudioExportCompression.h"
 #if defined(__ANDROID__)
@@ -925,11 +926,20 @@ bool AudioSystem::playWeatherAmbience(const std::string& path, float volume) {
         return true;
     }
 
+    const double nowSec = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (path == weatherFailedPath && nowSec < weatherRetryAfterSec) {
+        return false;
+    }
+
     stopWeatherAmbience();
     if (!initSoundFromPath(path, MA_SOUND_FLAG_STREAM, nullptr, weatherSound, weatherDecodedData)) {
         std::cerr << "AudioSystem: weather ambience load failed for " << path << "\n";
+        weatherFailedPath = path;
+        weatherRetryAfterSec = nowSec + 3.0;
         return false;
     }
+    weatherFailedPath.clear();
     ma_sound_set_looping(&weatherSound, MA_TRUE);
     ma_sound_set_volume(&weatherSound, volume);
     ma_sound_set_spatialization_enabled(&weatherSound, MA_FALSE);

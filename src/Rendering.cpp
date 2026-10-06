@@ -1609,6 +1609,7 @@ Renderer::~Renderer() {
     if (sceneDepthTexture) glDeleteTextures(1, &sceneDepthTexture);
     if (quadVBO) glDeleteBuffers(1, &quadVBO);
     if (quadVAO) glDeleteVertexArrays(1, &quadVAO);
+    releaseParticleBuffers();
     if (debugWhiteTexture) glDeleteTextures(1, &debugWhiteTexture);
     if (missingMaterialFallbackTexture) glDeleteTextures(1, &missingMaterialFallbackTexture);
 }
@@ -1648,7 +1649,12 @@ Texture* Renderer::getTexture(const std::string& path, MaterialProperties::Textu
     auto tex = std::make_unique<Texture>(loadPath, GL_REPEAT, GL_REPEAT, minFilter, magFilter, policy);
     ++textureCacheGeneration;
     if (!tex->GetID()) {
-        missingTextureRetryAfter[path] = nowSec + 1.0;
+        // A missing file is cheap to probe and may appear any moment. One that exists but
+        // cannot be decoded (a DWAA EXR) fails the same way until it is edited, and retrying
+        // it every second re-read tens of megabytes on the main thread. invalidateTexture,
+        // called by the EXR transcoder and Version Control, clears the wait early.
+        const bool unreadable = !Modularity::Platform::GetAssetSource().Exists(loadPath);
+        missingTextureRetryAfter[path] = nowSec + (unreadable ? 1.0 : 30.0);
         textureLoadErrors[path] = tex->GetLoadError();
         return nullptr;
     }
@@ -6498,6 +6504,26 @@ void Renderer::renderSceneInternal(const Camera& camera, const std::vector<Scene
         float fogHeightFalloff = -1.0f;
     } matCache;
     auto invalidateMatCache = [&]() { matCache = MaterialUniformCache{}; };
+    // A texture-transparent pixel at least this opaque goes into the depth buffer before
+    // its item's colour is blended (see the depth prepass in the loop). Half coverage is
+    // the cut that keeps the worst case smallest: hiding what is behind a pixel errs by
+    // (1 - alpha), drawing it on top instead errs by alpha.
+    constexpr float kTransparentDepthCutoff = 0.5f;
+    // The prepass leans on the shader discarding below alphaCutoff; a shader that
+    // ignores it would write depth for its whole quad, invisible parts included.
+    // Asked once per shader per pass: glGetUniformLocation is a driver round-trip.
+    std::array<std::pair<const Shader*, bool>, 8> cutoffShaders{};
+    size_t cutoffShaderCount = 0;
+    auto shaderHonorsAlphaCutoff = [&](const Shader* s) {
+        for (size_t k = 0; k < cutoffShaderCount; ++k) {
+            if (cutoffShaders[k].first == s) return cutoffShaders[k].second;
+        }
+        const bool honors = glGetUniformLocation(s->ID, "alphaCutoff") >= 0;
+        if (cutoffShaderCount < cutoffShaders.size()) {
+            cutoffShaders[cutoffShaderCount++] = {s, honors};
+        }
+        return honors;
+    };
     // The legacy loop copies the sky settings (two heap strings) for every draw; the
     // optimized path reads them in place. Same values either way.
     static const SkyboxSettings kNoSkySettings{};
@@ -7092,11 +7118,40 @@ void Renderer::renderSceneInternal(const Camera& camera, const std::vector<Scene
             }
             continue;
         }
+        // Blended surfaces never write depth, so between themselves they are ordered only
+        // by one sort key per object. That cannot order two that overlap in depth - a long
+        // fence running past a wide grass card - nor the cards inside one foliage mesh.
+        // A surface that is transparent because of its texture (soft-edged albedo alpha at
+        // full material alpha: fences, foliage, cut-out sprites) first writes its solid
+        // pixels to depth, the way a binary-alpha texture already does on the opaque path.
+        // Per item, right before its own colour: a correctly sorted scene draws the same
+        // colours, and only what was drawn out of order behind a solid pixel is rejected.
+        // Material alpha below 1 is deliberate translucency (glass, fades) and stays as is.
+        const bool depthPrepass = wantsTransparency && !item.isUiCanvas3D &&
+                                  item.material.alpha >= 0.999f && shaderHonorsAlphaCutoff(shader);
+        if (depthPrepass) {
+            glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+            glDepthMask(GL_TRUE);
+            shader->setFloat("alphaCutoff", std::max(wantCutoff, kTransparentDepthCutoff));
+            shader->setBool("depthPrepass", true);
+            recordMeshDraw();
+            item.mesh->draw();
+            shader->setBool("depthPrepass", false);
+            shader->setFloat("alphaCutoff", wantCutoff);
+            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+            glDepthMask(GL_FALSE);
+            // Same program and vertices, so the colour pass lands on exactly that depth.
+            glDepthFunc(GL_LEQUAL);
+            Runtime2DCountStateBind();
+        }
         recordMeshDraw();
         if (activeStats) {
             activeStats->triangles += item.mesh->getVertexCount() / 3;
         }
         item.mesh->draw();
+        if (depthPrepass) {
+            glDepthFunc(GL_LESS);
+        }
     }
     submissionScope.reset();
     flushPendingSkybox();
@@ -7226,6 +7281,13 @@ void Renderer::renderSceneInternal(const Camera& camera, const std::vector<Scene
         glDepthFunc(previousDepthFunc);
     };
     drawMaskedSprite25DUiLayer();
+
+    // Particles go last among the scene's blended surfaces, so they still land over 3D UI
+    // canvases as they did when they were an overlay, but now inside the frame: depth-tested
+    // against solid geometry, fogged, and through post FX. Reflection probes skip them.
+    if (!reflectionCapturePass) {
+        renderParticleSystems(sceneObjects, view, proj);
+    }
 
     if (currentBlendEnabled != (blendEnabled == GL_TRUE)) {
         if (blendEnabled) glEnable(GL_BLEND);

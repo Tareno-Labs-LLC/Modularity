@@ -13,6 +13,9 @@ uniform vec4 uvTransform = vec4(1.0, 1.0, 0.0, 0.0);
 
 uniform vec3 materialColor = vec3(1.0);
 uniform float materialAlpha = 1.0;
+// Same contract as frag.glsl: fragments below this alpha are discarded, 0 disables
+// the test. The renderer's transparent depth prepass relies on it.
+uniform float alphaCutoff = 0.0;
 
 void main()
 {
@@ -26,6 +29,9 @@ void main()
 
     vec3 baseColor = texColor * materialColor;
     float alpha = tex1.a * materialAlpha;
+    if (alphaCutoff > 0.0 && alpha < alphaCutoff) {
+        discard;
+    }
     if (alpha <= 0.001) {
         discard;
     }

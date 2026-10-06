@@ -58,6 +58,20 @@ AssetSource& GetAssetSource();
 // before Engine exists; desktop can also pin the root if cwd isn't right.
 void SetAssetSource(std::unique_ptr<AssetSource> source);
 
+// A filesystem-rooted source you own, for handing to MakeBundleAssetSource as the fallback.
+std::unique_ptr<AssetSource> MakeDesktopAssetSource(const std::string& root);
+
+// Mounts a runtime content bundle (.modbundle) so the engine reads assets straight out of the one
+// file (data.win style) instead of unpacking it. `bundlePath` is opened through `fallback`, and any
+// path not inside the bundle falls through to `fallback` (so loose files next to it still resolve).
+// With `verifyIntegrity`, the whole-bundle SHA-256 is checked once at mount and mounting fails on a
+// mismatch. Returns nullptr with `error` set on a malformed/failed bundle; on success it takes
+// ownership of `fallback`. Install the result with SetAssetSource().
+std::unique_ptr<AssetSource> MakeBundleAssetSource(std::unique_ptr<AssetSource> fallback,
+                                                   const std::string& bundlePath,
+                                                   bool verifyIntegrity,
+                                                   std::string& error);
+
 // Root of the open project, used to rescue asset paths that were saved on a different
 // machine. Scenes store absolute paths, so a project authored elsewhere arrives pointing at
 // e.g. /home/<someone>/ModularityProjects/<name>/Assets/... - which exists nowhere locally

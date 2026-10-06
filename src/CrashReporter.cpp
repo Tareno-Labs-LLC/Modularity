@@ -488,6 +488,130 @@ namespace Modularity::CrashReporter {
             }
             CloseHandle(snapshot);
         }
+        // Everything below runs on a damaged heap: static buffers only, and ReadProcessMemory on
+        // our own process so an unmapped address fails instead of faulting.
+        bool readOwnMemory(uintptr_t address, void* out, size_t size) {
+            SIZE_T got = 0;
+            return address >= 0x10000 &&
+                   ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(address), out, size, &got) &&
+                   got == size;
+        }
+        struct ExtraDumpRange {
+            ULONG64 base;
+            ULONG size;
+        };
+        ExtraDumpRange gExtraDumpRanges[4];
+        int gExtraDumpRangeCount = 0;
+        int gExtraDumpRangeNext = 0;
+        void addExtraDumpRange(uintptr_t start, size_t size) {
+            unsigned char probe = 0;
+            if (gExtraDumpRangeCount >= 4 || !readOwnMemory(start, &probe, 1) ||
+                !readOwnMemory(start + size - 1, &probe, 1)) {
+                return;
+            }
+            gExtraDumpRanges[gExtraDumpRangeCount].base = static_cast<ULONG64>(start);
+            gExtraDumpRanges[gExtraDumpRangeCount].size = static_cast<ULONG>(size);
+            ++gExtraDumpRangeCount;
+        }
+        void writeHexWindow(CrashSink& sink, const char* label, uintptr_t address, size_t before, size_t after) {
+            if (address < 0x10000) return;
+            static constexpr char kHex[] = "0123456789abcdef";
+            sinkWriteKeyHex(sink, label, address);
+            const uintptr_t start = (address - before) & ~static_cast<uintptr_t>(15);
+            const uintptr_t end = address + after;
+            addExtraDumpRange(start, static_cast<size_t>(end - start));
+            for (uintptr_t row = start; row < end; row += 16) {
+                char line[128];
+                char* ptr = line;
+                *ptr++ = ' ';
+                ptr = appendHex(ptr, row);
+                *ptr++ = (row <= address && address < row + 16) ? '>' : ' ';
+                unsigned char bytes[16];
+                if (!readOwnMemory(row, bytes, sizeof(bytes))) {
+                    for (const char* p = " <unreadable>"; *p; ++p) *ptr++ = *p;
+                } else {
+                    for (int i = 0; i < 16; ++i) {
+                        *ptr++ = ' ';
+                        *ptr++ = kHex[bytes[i] >> 4];
+                        *ptr++ = kHex[bytes[i] & 15];
+                    }
+                    *ptr++ = ' ';
+                    *ptr++ = '|';
+                    for (int i = 0; i < 16; ++i) {
+                        *ptr++ = (bytes[i] >= 32 && bytes[i] < 127) ? static_cast<char>(bytes[i]) : '.';
+                    }
+                    *ptr++ = '|';
+                }
+                *ptr++ = '\r';
+                *ptr++ = '\n';
+                sinkWrite(sink, line, static_cast<size_t>(ptr - line));
+            }
+        }
+        const char* heapFailureName(ULONG type) {
+            switch (type) {
+                case 3:  return "entry corruption";
+                case 4:  return "multiple entries corruption";
+                case 5:  return "virtual block corruption";
+                case 6:  return "buffer overrun";
+                case 7:  return "buffer underrun";
+                case 8:  return "block not busy (double free)";
+                case 9:  return "invalid argument";
+                case 10: return "usage after free";
+                case 11: return "cross-heap operation";
+                case 12: return "free lists corruption";
+                case 13: return "list entry corruption";
+                case 14: return "LFH bitmap mismatch";
+                default: return "other";
+            }
+        }
+        // Exception parameter 0 of STATUS_HEAP_CORRUPTION is ntdll's HEAP_FAILURE_INFORMATION:
+        // FailureType at +0x08, the heap at +0x10, the damaged entry at +0x18 and three
+        // failure-specific pointers after it. For list entry corruption (13) the dumps showed
+        // param2 is the neighbouring free block whose back link was wrong and param1 the value
+        // found there - what the stray write stored. Its bytes say what kind of object wrote it.
+        void describeHeapFailure(CrashSink& sink, uintptr_t infoAddress) {
+            unsigned char raw[0x38];
+            if (!readOwnMemory(infoAddress, raw, sizeof(raw))) {
+                sinkWriteLine(sink, "heap_failure=<HEAP_FAILURE_INFORMATION unreadable>");
+                return;
+            }
+            ULONG failureType = 0;
+            uintptr_t fields[5] = {};  // heap, damaged entry, param1, param2, param3
+            std::memcpy(&failureType, raw + 0x08, sizeof(failureType));
+            std::memcpy(fields, raw + 0x10, sizeof(fields));
+            sinkWriteKeyDec(sink, "heap_failure_type", static_cast<long long>(failureType));
+            sinkWriteKeyText(sink, "heap_failure_name", heapFailureName(failureType));
+            sinkWriteKeyHex(sink, "heap_failure_heap", fields[0]);
+            sinkWriteKeyHex(sink, "heap_failure_param1", fields[2]);
+            sinkWriteKeyHex(sink, "heap_failure_param2", fields[3]);
+            sinkWriteKeyHex(sink, "heap_failure_param3", fields[4]);
+            sinkWriteLine(sink, "-- heap memory around the damaged entry and each parameter --");
+            writeHexWindow(sink, "heap_failure_entry", fields[1], 0x60, 0x40);
+            writeHexWindow(sink, "heap_failure_param1_memory", fields[2], 0x80, 0x80);
+            writeHexWindow(sink, "heap_failure_param2_memory", fields[3], 0x60, 0x40);
+            writeHexWindow(sink, "heap_failure_param3_memory", fields[4], 0x40, 0x40);
+        }
+        BOOL CALLBACK miniDumpCallback(PVOID, const PMINIDUMP_CALLBACK_INPUT input,
+                                       PMINIDUMP_CALLBACK_OUTPUT output) {
+            if (!input || !output) return TRUE;
+            switch (input->CallbackType) {
+                case MemoryCallback:
+                    if (gExtraDumpRangeNext >= gExtraDumpRangeCount) return FALSE;
+                    output->MemoryBase = gExtraDumpRanges[gExtraDumpRangeNext].base;
+                    output->MemorySize = gExtraDumpRanges[gExtraDumpRangeNext].size;
+                    ++gExtraDumpRangeNext;
+                    return TRUE;
+                case CancelCallback:
+                    output->Cancel = FALSE;
+                    output->CheckCancel = FALSE;
+                    return TRUE;
+                case ReadMemoryFailureCallback:
+                    output->Status = S_OK;
+                    return TRUE;
+                default:
+                    return TRUE;
+            }
+        }
         void writeMiniDump(EXCEPTION_POINTERS* exceptionInfo) {
             if (!gWinMiniDumpPath[0]) return;
             const HANDLE dumpFile = CreateFileW(gWinMiniDumpPath, GENERIC_WRITE, 0, nullptr,
@@ -501,8 +625,13 @@ namespace Modularity::CrashReporter {
             const MINIDUMP_TYPE dumpType = static_cast<MINIDUMP_TYPE>(
                 MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithDataSegs |
                 MiniDumpWithHandleData | MiniDumpWithUnloadedModules | MiniDumpWithThreadInfo);
+            MINIDUMP_CALLBACK_INFORMATION callbackInfo;
+            callbackInfo.CallbackRoutine = miniDumpCallback;
+            callbackInfo.CallbackParam = nullptr;
+            gExtraDumpRangeNext = 0;
             MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), dumpFile, dumpType,
-                              exceptionInfo ? &exceptionParam : nullptr, nullptr, nullptr);
+                              exceptionInfo ? &exceptionParam : nullptr, nullptr,
+                              gExtraDumpRangeCount > 0 ? &callbackInfo : nullptr);
             CloseHandle(dumpFile);
         }
         void emitCrashReportBody(CrashSink& sink, EXCEPTION_POINTERS* exceptionInfo) {
@@ -527,6 +656,9 @@ namespace Modularity::CrashReporter {
                         writeAddressLine(sink, "fault_address", faultAddress);
                         describeFaultMemory(sink, faultAddress);
                     }
+                }
+                if (code == 0xC0000374u && record->NumberParameters >= 1) {
+                    describeHeapFailure(sink, static_cast<uintptr_t>(record->ExceptionInformation[0]));
                 }
             }
             writeRegisters(sink, exceptionInfo ? exceptionInfo->ContextRecord : nullptr);

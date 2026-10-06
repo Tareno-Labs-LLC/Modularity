@@ -5,8 +5,9 @@
 #include <cstdio>
 #include <iostream>
 #include <sstream>
-bool readMaterialFile(const std::string& path, MaterialFileData& outData) {
-    std::ifstream f(path); if (!f.is_open()) {return false;} std::string line;
+// `path` only anchors a relative shaderPack reference; the text comes from `f`.
+static bool readMaterialStream(std::istream& f, const std::string& path, MaterialFileData& outData) {
+    std::string line;
     while (std::getline(f, line)) {
         line.erase(0, line.find_first_not_of(" \t\r\n"));
         if (line.empty() || line[0] == '#') continue;
@@ -70,6 +71,14 @@ bool readMaterialFile(const std::string& path, MaterialFileData& outData) {
         ShaderPackAssetData shaderPackData;
         if (ReadShaderPackFile(outData.shaderPack, shaderPackData)) {outData.vertexShader = shaderPackData.vertexShaderPath; outData.fragmentShader = shaderPackData.fragmentShaderPath;}}
     return true;
+}
+bool readMaterialFile(const std::string& path, MaterialFileData& outData) {
+    std::ifstream f(path); if (!f.is_open()) {return false;}
+    return readMaterialStream(f, path, outData);
+}
+bool parseMaterialText(const std::string& text, const std::string& path, MaterialFileData& outData) {
+    std::istringstream f(text);
+    return readMaterialStream(f, path, outData);
 }
 bool writeMaterialFile(const MaterialFileData& data, const std::string& path) {
     // Built in memory and written through WriteFileDurably: the Inspector autosaves a material

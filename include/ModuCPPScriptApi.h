@@ -464,7 +464,7 @@ inline glm::vec2 UIPosition(const std::string& ref) {
 
 inline void SetUIPosition(const std::string& ref, const glm::vec2& value) {
     SceneObject* o = SmartResolveRef(ref);
-    if (!o) return;
+    if (!o || o->IsInvariable) return;
     if (o->ui.position != value) {
         o->ui.position = value;
         if (auto* c = ctxPtr()) c->MarkDirty();
@@ -478,7 +478,7 @@ inline glm::vec2 UISize(const std::string& ref) {
 
 inline void SetUISize(const std::string& ref, const glm::vec2& value) {
     SceneObject* o = SmartResolveRef(ref);
-    if (!o) return;
+    if (!o || o->IsInvariable) return;
     if (o->ui.size != value) {
         o->ui.size = value;
         if (auto* c = ctxPtr()) c->MarkDirty();
@@ -499,6 +499,61 @@ inline bool PlayOneShot(const std::string& refOrPath, float volumeScale = 1.0f) 
     return c->PlayAudioOneShot(refOrPath, volumeScale);
 }
 } // namespace Audio
+
+// Particles.*(ref): drive a scene object's Particle System. All are safe with an empty or
+// unresolved ref, or an object without a Particle System.
+//   Play(ref)        restarts emission from time zero, so its start delay and bursts fire
+//                    again. Particles already in flight are kept: two quick hits overlap
+//                    instead of the second one cutting the first off.
+//   Emit(ref, n)     spawns n particles on the next frame with the system's start settings,
+//                    whether or not it is playing - one-off bursts from an idle system.
+//   Stop(ref)        stops emitting and clears every live particle.
+//   IsAlive(ref)     still emitting, or particles still on screen.
+// Give an on-demand effect Looping off and Play On Awake off, or it also fires on its own.
+namespace Particles {
+namespace detail {
+inline ParticleSystem2DComponent* Find(const std::string& ref) {
+    if (ref.empty()) return nullptr;
+    SceneObject* o = SmartResolveRef(ref);
+    if (!o || !o->hasParticleSystem2D) return nullptr;
+    return &o->particleSystem2D;
+}
+} // namespace detail
+
+inline bool Play(const std::string& ref) {
+    ParticleSystem2DComponent* ps = detail::Find(ref);
+    if (!ps) return false;
+    ps->runtimeTime = 0.0f;
+    ps->runtimeAccumulator = 0.0f;
+    ps->runtimeInitialized = true; // already "started": the engine must not restart it over us
+    ps->playing = true;
+    ps->paused = false;
+    ++ps->runtimeEmitSalt;
+    return true;
+}
+
+inline bool Emit(const std::string& ref, int count) {
+    ParticleSystem2DComponent* ps = detail::Find(ref);
+    if (!ps || count <= 0) return false;
+    ps->runtimePendingEmit += count;
+    ++ps->runtimeEmitSalt;
+    return true;
+}
+
+inline void Stop(const std::string& ref) {
+    ParticleSystem2DComponent* ps = detail::Find(ref);
+    if (!ps) return;
+    ps->playing = false;
+    ps->paused = false;
+    ps->particles.clear();
+    ps->runtimePendingEmit = 0;
+}
+
+inline bool IsAlive(const std::string& ref) {
+    const ParticleSystem2DComponent* ps = detail::Find(ref);
+    return ps && (ps->playing || !ps->particles.empty() || ps->runtimePendingEmit > 0);
+}
+} // namespace Particles
 
 template <typename T>
 inline T& Config() {
@@ -1026,6 +1081,27 @@ struct PhysicsAccess {
                     Vector3& outHitPos, Vector3& outHitNormal) const;
 };
 
+// Read/write proxy for the object's transform lock. It intentionally remains
+// writable even while the object is locked so scripts can unlock it again.
+// Examples: obj.Invariable = true;  target.Invariable = false;
+struct InvariableAccess {
+    SceneObject* const* pp = nullptr;
+
+    InvariableAccess() = default;
+    explicit InvariableAccess(SceneObject* const* p) : pp(p) {}
+
+    SceneObject* target() const { return detail::resolveAccessTarget(pp); }
+    bool get() const { auto* t = target(); return t && t->IsInvariable; }
+    void set(bool value) const {
+        SceneObject* t = target();
+        if (!t || t->IsInvariable == value) return;
+        t->IsInvariable = value;
+        if (ScriptContext* c = ctxPtr()) c->MarkDirty();
+    }
+    operator bool() const { return get(); }
+    InvariableAccess& operator=(bool value) { set(value); return *this; }
+};
+
 struct ObjectFacade {
     ScriptContext* scriptCtx = nullptr;
     UILabelProxy UILabel{};
@@ -1033,6 +1109,7 @@ struct ObjectFacade {
     Rigidbody3DAccess Rigidbody3D{};
     TransformAccess   Transform{};
     PhysicsAccess     Physics{};
+    InvariableAccess  Invariable{};
 
     explicit ObjectFacade(ScriptContext& ctx)
         : scriptCtx(&ctx), UILabel{ &ctx },
@@ -1057,6 +1134,9 @@ struct ObjectFacade {
     SceneObject* operator->() const {
         return raw();
     }
+
+    bool IsInvariable() const { return Invariable.get(); }
+    void SetInvariable(bool value) { Invariable.set(value); }
 };
 
 inline ObjectFacade MakeObjectFacade(ScriptContext& ctx) {
@@ -1107,6 +1187,7 @@ struct SceneObj {
     TransformAccess   Transform{&ptr};
     PhysicsAccess     Physics{&ptr};
     AudioAccess       Audio{&ptr};
+    InvariableAccess  Invariable{&ptr};
 
     // Direct-read identity/state (C#-like, no ctx round-trip).
     int Id() const { return ptr ? ptr->id : -1; }
@@ -1114,6 +1195,8 @@ struct SceneObj {
     bool Enabled() const { return ptr && ptr->enabled; }
     bool HasRigidbody() const { return ptr && ptr->hasRigidbody; }
     bool HasAudio() const { return ptr && ptr->hasAudioSource; }
+    bool IsInvariable() const { return Invariable.get(); }
+    void SetInvariable(bool value) { Invariable.set(value); }
     // Enable/disable this object, mirroring the list `each X.state(b)` form.
     void State(bool enabled) const {
         if (ptr && ptr->enabled != enabled) {
@@ -1127,13 +1210,13 @@ struct SceneObj {
     SceneObj(std::nullptr_t) : ptr(nullptr) {}
 
     SceneObj(const SceneObj& o)
-        : ptr(o.ptr), Rigidbody3D(&ptr), Transform(&ptr), Physics(&ptr), Audio(&ptr) {}
+        : ptr(o.ptr), Rigidbody3D(&ptr), Transform(&ptr), Physics(&ptr), Audio(&ptr), Invariable(&ptr) {}
     SceneObj& operator=(const SceneObj& o) {
         ptr = o.ptr;
         return *this;
     }
     SceneObj(SceneObj&& o) noexcept
-        : ptr(o.ptr), Rigidbody3D(&ptr), Transform(&ptr), Physics(&ptr), Audio(&ptr) {}
+        : ptr(o.ptr), Rigidbody3D(&ptr), Transform(&ptr), Physics(&ptr), Audio(&ptr), Invariable(&ptr) {}
     SceneObj& operator=(SceneObj&& o) noexcept {
         ptr = o.ptr;
         return *this;
@@ -1278,7 +1361,7 @@ inline void TransformAccess::PositionProxy::set(const Vector3& v) const {
     ScriptContext* c = ctxPtr();
     if (!c) return;
     SceneObject* t = detail::resolveAccessTarget(pp);
-    if (!t) return;
+    if (!t || t->IsInvariable) return;
     if (detail::isAccessTargetCurrentCtx(pp)) {
         c->SetPosition(v);
     } else {
@@ -1302,7 +1385,7 @@ inline void TransformAccess::RotationProxy::set(const Vector3& v) const {
     ScriptContext* c = ctxPtr();
     if (!c) return;
     SceneObject* t = detail::resolveAccessTarget(pp);
-    if (!t) return;
+    if (!t || t->IsInvariable) return;
     if (detail::isAccessTargetCurrentCtx(pp)) {
         c->SetRotation(v);
     } else {

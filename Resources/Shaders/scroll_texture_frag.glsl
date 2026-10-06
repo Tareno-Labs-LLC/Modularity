@@ -17,6 +17,9 @@ uniform float uScrollSpeed = 0.5;          // UV units per second
 uniform vec2 uScrollDir = vec2(1.0, 0.3);  // drift axis, normalized below
 uniform vec3 materialColor = vec3(1.0);
 uniform float materialAlpha = 1.0;
+// Same contract as frag.glsl: fragments below this alpha are discarded, 0 disables
+// the test. The renderer's transparent depth prepass relies on it.
+uniform float alphaCutoff = 0.0;
 uniform float ambientStrength = 0.2;
 uniform float specularStrength = 0.5;
 uniform float shininess = 32.0;
@@ -40,6 +43,9 @@ void main()
     }
     color *= materialColor;
     float alpha = baseSample.a * materialAlpha;
+    if (alphaCutoff > 0.0 && alpha < alphaCutoff) {
+        discard;
+    }
     if (alpha <= 0.001) {
         discard;
     }

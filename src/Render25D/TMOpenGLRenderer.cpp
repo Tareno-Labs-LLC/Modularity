@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cmath>
+#include <array>
 
 namespace Modularity::Render25D {
 
@@ -62,6 +63,15 @@ bool SkyboxSettingsEqual(const SkyboxSettings& a, const SkyboxSettings& b) {
            a.scrollingRepeatY == b.scrollingRepeatY &&
            a.scrollingLookSensitivity == b.scrollingLookSensitivity &&
            a.scrollingVerticalInfluence == b.scrollingVerticalInfluence;
+}
+
+template <size_t N>
+std::array<std::string, N> BuildIndexedUniformNames(const char* prefix) {
+    std::array<std::string, N> names;
+    for (size_t i = 0; i < N; ++i) {
+        names[i] = std::string(prefix) + "[" + std::to_string(i) + "]";
+    }
+    return names;
 }
 
 } // namespace
@@ -223,7 +233,9 @@ bool TMOpenGLRenderer::renderToTarget(RenderTarget& target,
     activeContext = &drawContext;
     activeBackendStats = &backendStats;
 
+    activePointLights = &scene.pointLights;
     const bool ok = renderer.render(drawContext, scene, *this, outStats, error);
+    activePointLights = nullptr;
 
     activeTarget = nullptr;
     activeContext = nullptr;
@@ -466,6 +478,32 @@ void TMOpenGLRenderer::beginFrame(const TMRenderContext& context) {
     glDepthMask(GL_TRUE);
     glClearColor(0.09f, 0.11f, 0.16f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    if (spriteShader && spriteShader->ID != 0) {
+        constexpr int kMaxSpritePointLights = 16;
+        static const auto positionNames =
+            BuildIndexedUniformNames<kMaxSpritePointLights>("u_pointLightPosition");
+        static const auto colorNames =
+            BuildIndexedUniformNames<kMaxSpritePointLights>("u_pointLightColor");
+        static const auto intensityNames =
+            BuildIndexedUniformNames<kMaxSpritePointLights>("u_pointLightIntensity");
+        static const auto rangeNames =
+            BuildIndexedUniformNames<kMaxSpritePointLights>("u_pointLightRange");
+
+        const int lightCount = (activePointLights != nullptr)
+                                   ? std::min(kMaxSpritePointLights,
+                                              static_cast<int>(activePointLights->size()))
+                                   : 0;
+        spriteShader->use();
+        spriteShader->setInt("u_pointLightCount", lightCount);
+        for (int i = 0; i < lightCount; ++i) {
+            const TMPointLightInstance& light = (*activePointLights)[static_cast<size_t>(i)];
+            spriteShader->setVec3(positionNames[static_cast<size_t>(i)], light.position);
+            spriteShader->setVec3(colorNames[static_cast<size_t>(i)], light.color);
+            spriteShader->setFloat(intensityNames[static_cast<size_t>(i)], light.intensity);
+            spriteShader->setFloat(rangeNames[static_cast<size_t>(i)], light.range);
+        }
+    }
 
     if (skybox) {
         skybox->setTimeOfDay(context.skyboxTimeOfDay);

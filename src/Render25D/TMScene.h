@@ -92,11 +92,21 @@ struct TMSprite25DInstance {
     bool enabled = true;
 };
 
+// Runtime 3D point lights made available to the 2.5D sprite pass. Keeping this
+// deliberately small mirrors the subset the billboard shader can meaningfully use.
+struct TMPointLightInstance {
+    glm::vec3 position = glm::vec3(0.0f);
+    glm::vec3 color = glm::vec3(1.0f);
+    float intensity = 1.0f;
+    float range = 10.0f;
+};
+
 struct TMScene {
     std::vector<TMTileLayer> tileLayers;
     std::vector<TMSegment> segments;
     std::vector<TMSectorModelInstance> sectorModels;
     std::vector<TMSprite25DInstance> sprites25D;
+    std::vector<TMPointLightInstance> pointLights;
 };
 
 struct TMRenderContext {

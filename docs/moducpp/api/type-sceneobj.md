@@ -24,7 +24,21 @@ In practice, this means:
 - helper code can later resolve it into a runtime object when the script runs
 
 ## Members / Parameters
-`SceneObj` is primarily a script-facing declaration type. It is not documented as a rich runtime object wrapper with its own standalone methods.
+`SceneObj` is both a script-facing declaration type and a lightweight runtime object handle. Resolved handles expose common object state and component proxies without requiring raw `SceneObject*` access.
+
+The Invariable transform lock is available on both a `SceneObj` and the current `obj` facade:
+
+```cpp
+SceneObj door = FindObject("Cabin Front");
+
+door.Invariable = true;          // property-style write
+bool locked = door.Invariable;   // property-style read
+door.SetInvariable(false);       // method-style write
+
+obj.SetInvariable(true);         // lock the object running this script
+```
+
+While locked, editor transform fields and gizmos, 2D/3D physics, and the normal ModuCPP transform/UI-position setters cannot move, rotate, or resize the object. References and non-transform properties remain usable. The Invariable property itself stays writable so a script can always unlock the object.
 
 The most important thing to understand is where it is used:
 

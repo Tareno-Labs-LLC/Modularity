@@ -398,6 +398,82 @@ void Engine::renderBuildSettingsWindow() {
                                BuildSettingsHints::kExportArchive)) {
                 changed = true;
             }
+
+            ImGui::Spacing();
+            ImGui::SeparatorText("Runtime Packaging");
+            const char* pkgLabels[] = {"Loose files", "Bundle (extract on first run)",
+                                       "Bundle (mounted / read in place)"};
+            const char* pkgValues[] = {"loose", "extract", "mount"};
+            int pkgIndex = 1;
+            for (int i = 0; i < 3; ++i) {
+                if (buildSettings.packagingMode == pkgValues[i]) { pkgIndex = i; break; }
+            }
+            ImGui::SetNextItemWidth(-ImGui::CalcTextSize("Packaging Mode").x - ImGui::GetStyle().ItemInnerSpacing.x);
+            if (ImGui::Combo("Packaging Mode", &pkgIndex, pkgLabels, 3)) {
+                buildSettings.packagingMode = pkgValues[pkgIndex];
+                changed = true;
+            }
+            DrawHint("How runtime content ships (desktop). Loose: files sit next to the exe. "
+                     "Extract: one content.modbundle unpacked to a cache folder on first launch. "
+                     "Mounted: assets are read straight out of the single content.modbundle "
+                     "(data.win style) with no unpack; project, scenes and script binaries stay "
+                     "loose next to it so the direct loaders still find them.");
+            ImGui::BeginDisabled(buildSettings.packagingMode == "loose");
+            if (HintedCheckbox("Verify Bundle Integrity (SHA-256)", &buildSettings.bundleVerifyIntegrity,
+                               "Store per-file and whole-bundle SHA-256 in the bundle and re-check it "
+                               "when a mounted bundle is opened, so a corrupted or altered bundle is "
+                               "caught at launch.")) {
+                changed = true;
+            }
+            ImGui::EndDisabled();
+            ImGui::EndTabItem();
+        }
+
+        if (ImGui::BeginTabItem("Protection")) {
+            ImGui::TextWrapped("Optional hardening applied after the build is staged. The obfuscation "
+                               "and anti-tamper steps invoke your own external tools; leave a command "
+                               "blank to record intent without running anything.");
+            ImGui::Spacing();
+            ImGui::SeparatorText("Integrity");
+            ImGui::TextDisabled("Built-in SHA-256 integrity lives in the Compression tab "
+                                "(Verify Bundle Integrity).");
+
+            auto commandField = [&](const char* id, const char* label, std::string& value) {
+                char buf[512];
+                std::snprintf(buf, sizeof(buf), "%s", value.c_str());
+                ImGui::TextDisabled("%s  ({exe}, {bundle}, {dir} are substituted)", label);
+                ImGui::SetNextItemWidth(-1);
+                if (ImGui::InputText(id, buf, sizeof(buf))) {
+                    value = buf;
+                    changed = true;
+                }
+            };
+
+            ImGui::Spacing();
+            ImGui::SeparatorText("Obfuscation");
+            if (HintedCheckbox("Obfuscate Scripts (Obscura)", &buildSettings.obfuscateScripts,
+                               "Run a code/script obfuscator (e.g. Obscura) over the staged output "
+                               "as a post-build step.")) {
+                changed = true;
+            }
+            ImGui::BeginDisabled(!buildSettings.obfuscateScripts);
+            commandField("##obfCommand", "Command", buildSettings.obfuscationToolCommand);
+            ImGui::EndDisabled();
+
+            ImGui::Spacing();
+            ImGui::SeparatorText("Anti-Tamper");
+            if (HintedCheckbox("Anti-Tamper (NativeShield / RMG)", &buildSettings.antiTamper,
+                               "Run an anti-tamper / runtime memory guard tool (e.g. NativeShield or "
+                               "RMG) over the exe as a post-build step.")) {
+                changed = true;
+            }
+            ImGui::BeginDisabled(!buildSettings.antiTamper);
+            commandField("##antiTamperCommand", "Command", buildSettings.antiTamperToolCommand);
+            ImGui::EndDisabled();
+
+            ImGui::Spacing();
+            ImGui::TextDisabled("A non-zero exit from either tool fails the export, so a protected "
+                                "build never ships unprotected without notice.");
             ImGui::EndTabItem();
         }
 

@@ -529,7 +529,7 @@
 	"COMPONENT_PARALLAX_LAYER2_D": "Parallax-Ebene 2D",
 	"COMPONENT_AUDIO_FX": "Audio-FX",
 	"COMPONENT_VIDEO_PLAYER": "Videoplayer",
-	"COMPONENT_PARTICLE_SYSTEM2_D": "Partikelsystem 2D",
+	"COMPONENT_PARTICLE_SYSTEM2_D": "Partikelsystem",
 	"COMPONENT_GROUND_BAKED_TYPE": "GroundBakedType",
 	"COMPONENT_MAP_ROOT": "Kartenwurzel",
 	"COMPONENT_MAP_SECTOR": "Sektor",

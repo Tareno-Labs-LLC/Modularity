@@ -52,6 +52,8 @@ namespace Loc = Modularity::Loc;
 #include <ctime>
 #include <regex>
 #include "../include/Textures/TextureTranscode.h"
+#include "../include/Textures/StbFlipScope.h"
+#include "ParticleSystemRuntime.h"
 #include <set>
 #include <sstream>
 #if defined(_WIN32)
@@ -5423,14 +5425,7 @@ void ResetParticleSystem2DRuntime(SceneObject& obj) {
     if (!obj.hasParticleSystem2D) {
         return;
     }
-    ParticleSystem2DComponent& ps = obj.particleSystem2D;
-    ps.particles.clear();
-    ps.runtimeAccumulator = 0.0f;
-    ps.runtimeTime = 0.0f;
-    ps.runtimeLastUpdateTime = 0.0;
-    ps.runtimeInitialized = false;
-    ps.playing = ps.playOnAwake;
-    ps.paused = false;
+    ParticleRuntime::ResetRuntime(obj.particleSystem2D);
 }
 
 void ResetParticleSystem2DRuntimes(std::vector<SceneObject>& objects) {
@@ -6023,7 +6018,39 @@ bool Engine::init() {
     if (playerMode) {
         showGameProfiler = false;
     }
-    if (autoStartRequested && !autoStartBundlePath.empty()) {
+    if (autoStartRequested && !autoStartBundlePath.empty() && autoStartBundleMode == "mount") {
+        // data.win-style: read assets straight out of the single file. project.modu, scene files and
+        // script binaries were shipped loose next to it, so the direct loaders still find them; the
+        // fallback source resolves those from disk while the bundle serves everything else.
+        const fs::path bundlePath = fs::path(autoStartBundlePath);
+        const fs::path exportRoot = bundlePath.parent_path();
+        std::string mountError;
+        auto fallback = Modularity::Platform::MakeDesktopAssetSource(exportRoot.string());
+        auto mounted = Modularity::Platform::MakeBundleAssetSource(
+            std::move(fallback), bundlePath.string(), autoStartVerifyIntegrity, mountError);
+        if (!mounted) {
+            addConsoleMessage("Failed to mount packaged content: " + mountError,
+                              ConsoleMessageType::Error);
+            autoStartRequested = false;
+            showLauncher = true;
+        } else {
+            Modularity::Platform::SetAssetSource(std::move(mounted));
+            std::error_code cwdEc;
+            fs::current_path(exportRoot, cwdEc);
+            if (cwdEc) {
+                addConsoleMessage("Failed to switch to packaged content root: " + cwdEc.message(),
+                                  ConsoleMessageType::Error);
+                autoStartRequested = false;
+                showLauncher = true;
+            } else {
+                Modularity::Platform::SetPortableAssetRoot(exportRoot.string());
+                fs::path projectPath = autoStartProjectPath.empty()
+                    ? fs::path("project.modu")
+                    : fs::path(autoStartProjectPath);
+                autoStartProjectPath = (exportRoot / projectPath).lexically_normal().string();
+            }
+        }
+    } else if (autoStartRequested && !autoStartBundlePath.empty()) {
         const fs::path bundlePath = fs::path(autoStartBundlePath);
         const fs::path runtimeCacheRoot = BuildRuntimeCacheRoot(projectManager.appDataPath, bundlePath);
         std::string bundleError;
@@ -6446,6 +6473,16 @@ void Engine::run() {
             }
         }
 
+        // Entering or leaving play restarts every Particle System, so Play On Awake means what
+        // it says and an editor preview does not carry into the game. Before the scripts run,
+        // so a Particles.Play from a Begin on the first play frame is not undone straight after.
+        if (isPlaying != particlesLastPlaying) {
+            particlesLastPlaying = isPlaying;
+            for (SceneObject& obj : sceneObjects) {
+                if (obj.hasParticleSystem2D) ParticleRuntime::ResetRuntime(obj.particleSystem2D);
+            }
+        }
+
         // Run scripts only in play/spec/test modes to avoid edit-time side effects (e.g., cursor grabs)
         if (projectManager.currentProject.isLoaded) {
             bool runScripts = isPlaying || specMode || testMode;
@@ -6560,6 +6597,10 @@ void Engine::run() {
         if (hasActiveSkeletal) {
             MODU_PROFILE_SCOPE("Skinning", ProfilerSampleCategory::Animation);
             updateSkinningMatrices();
+        }
+        {
+            MODU_PROFILE_SCOPE("Particles", ProfilerSampleCategory::Engine);
+            updateParticleSystems(runtimeAnimDelta);
         }
         if (runtime2DProfileThisFrame) {
             gRuntime2DProfileFrame.update2DTotalMs += Runtime2DMsSince(update2DStart, Runtime2DClock::now());
@@ -7085,6 +7126,7 @@ void Engine::run() {
         }
 
         // Enforce cursor lock state at the end of the frame based on latest flags.
+        updateRuntimeMouseCapture();
         bool anyLock = cursorLocked || gameViewCursorLocked;
         int desiredMode = anyLock ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL;
         if (glfwGetInputMode(editorWindow, GLFW_CURSOR) != desiredMode) {
@@ -7095,6 +7137,7 @@ void Engine::run() {
                 glfwSetInputMode(editorWindow, GLFW_RAW_MOUSE_MOTION, GLFW_FALSE);
             }
         }
+        updateRuntimeCursorImage();
 
         if (!usingVulkan()) {
             static int presentProbe = -1;
@@ -10507,13 +10550,19 @@ void Engine::updatePlayerMovementAudio(SceneObject& player,
 }
 
 void Engine::releasePlayerViewMotionChildren(PlayerControllerRuntimeState& runtime) {
-    for (const auto& [childId, baseRotation] : runtime.attachedBaseRotation) {
+    for (const auto& [childId, base] : runtime.attachedBase) {
         if (SceneObject* child = findObjectById(childId)) {
-            child->localRotation = baseRotation;
+            child->localRotation = base.localRotation;
+            if (base.movedPosition) child->localPosition = base.localPosition;
             child->localInitialized = true;
         }
     }
-    runtime.attachedBaseRotation.clear();
+    runtime.attachedBase.clear();
+    runtime.heldAirLift = 0.0f;
+    runtime.heldDip = 0.0f;
+    runtime.heldDipVelocity = 0.0f;
+    runtime.heldTilt = 0.0f;
+    runtime.heldTiltVelocity = 0.0f;
 }
 
 void Engine::updatePlayerViewMotion(SceneObject& player,
@@ -10613,35 +10662,6 @@ void Engine::updatePlayerViewMotion(SceneObject& player,
     springStep(runtime.landingDip, runtime.landingDipVelocity,
                vm.landingStiffness, vm.landingDamping, dt);
 
-    if (vm.attachedSwayEnabled) {
-        runtime.attachedSwayVelocity +=
-            glm::vec2(-lookAngleDelta.x, -lookAngleDelta.y) * vm.attachedSway;
-        springStep(runtime.attachedSwayOffset.x, runtime.attachedSwayVelocity.x,
-                   vm.attachedStiffness, vm.attachedDamping, dt);
-        springStep(runtime.attachedSwayOffset.y, runtime.attachedSwayVelocity.y,
-                   vm.attachedStiffness, vm.attachedDamping, dt);
-        const float attachedMax = std::max(0.0f, vm.attachedMax);
-        runtime.attachedSwayOffset.x = std::clamp(runtime.attachedSwayOffset.x, -attachedMax, attachedMax);
-        runtime.attachedSwayOffset.y = std::clamp(runtime.attachedSwayOffset.y, -attachedMax, attachedMax);
-
-        const glm::vec3 attachedOffset(runtime.attachedSwayOffset.x,
-                                       runtime.attachedSwayOffset.y,
-                                       0.0f);
-        for (int childId : player.childIds) {
-            SceneObject* child = findObjectById(childId);
-            if (!child) continue;
-            if (child->hasCamera && child->camera.type == SceneCameraType::Player) continue;
-            auto base = runtime.attachedBaseRotation.find(childId);
-            if (base == runtime.attachedBaseRotation.end()) {
-                base = runtime.attachedBaseRotation.emplace(childId, child->localRotation).first;
-            }
-            child->localRotation = base->second + attachedOffset;
-            child->localInitialized = true;
-        }
-    } else {
-        releasePlayerViewMotionChildren(runtime);
-    }
-
     outAngleOffsetDeg = glm::vec3(runtime.lookSwayOffset.x + idlePitchDeg + runLeanDeg,
                                   runtime.lookSwayOffset.y,
                                   runtime.roll + bobRollDeg);
@@ -10659,6 +10679,155 @@ void Engine::updatePlayerViewMotion(SceneObject& player,
             const SceneObject* node = findObjectById(walk);
             walk = node ? node->parentId : -1;
         }
+    }
+
+    glm::vec2 swayDeg(0.0f);
+    if (vm.attachedSwayEnabled) {
+        runtime.attachedSwayVelocity +=
+            glm::vec2(-lookAngleDelta.x, -lookAngleDelta.y) * vm.attachedSway;
+        springStep(runtime.attachedSwayOffset.x, runtime.attachedSwayVelocity.x,
+                   vm.attachedStiffness, vm.attachedDamping, dt);
+        springStep(runtime.attachedSwayOffset.y, runtime.attachedSwayVelocity.y,
+                   vm.attachedStiffness, vm.attachedDamping, dt);
+        const float attachedMax = std::max(0.0f, vm.attachedMax);
+        runtime.attachedSwayOffset.x = std::clamp(runtime.attachedSwayOffset.x, -attachedMax, attachedMax);
+        runtime.attachedSwayOffset.y = std::clamp(runtime.attachedSwayOffset.y, -attachedMax, attachedMax);
+        swayDeg = runtime.attachedSwayOffset;
+    } else {
+        runtime.attachedSwayOffset = glm::vec2(0.0f);
+        runtime.attachedSwayVelocity = glm::vec2(0.0f);
+    }
+
+    // Held item: what an arm carrying a flashlight does. It rides the camera's own bob so it
+    // stays in the hand instead of floating in front of the face, then adds a figure-eight that
+    // trails the stride, a slow breath at rest, a tuck while sprinting and lag through a jump.
+    // Positions are units and angles degrees (pitch, yaw, roll), both in the player's frame.
+    glm::vec3 heldPos(0.0f);
+    glm::vec3 heldRotDeg(0.0f);
+    glm::vec3 tuckPos(0.0f);
+    glm::vec3 tuckRotDeg(0.0f);
+    if (vm.heldItemEnabled) {
+        const float bobScale = std::max(0.0f, vm.heldItemBob);
+        const float idleScale = std::max(0.0f, vm.heldItemIdle);
+        const float jumpScale = std::max(0.0f, vm.heldItemJump);
+
+        const float armPhase = runtime.bobPhase - 0.9f;
+        const float swing = std::sin(armPhase);
+        const float step = std::sin(armPhase * 2.0f);
+        const float stride = bobWeight * bobScale;
+        heldPos += glm::vec3(swing * 0.02f, step * 0.012f, 0.0f) * stride;
+        heldRotDeg += glm::vec3(step * 1.5f, swing * 2.0f, -swing * 3.0f) * stride;
+        heldPos.x -= strafeRatio * 0.012f * bobScale;
+
+        // Detuned from the camera's breath so the hand and the head drift apart.
+        const float breathA = std::sin(runtime.idlePhase * kTau * vm.idleFrequency * 0.83f + 0.7f);
+        const float breathB = std::sin(runtime.idlePhase * kTau * vm.idleFrequency * 0.41f + 2.1f);
+        const float rest = idleWeight * idleScale;
+        heldPos += glm::vec3(breathB * 0.003f, breathA * 0.005f, 0.0f) * rest;
+        heldRotDeg += glm::vec3(breathA * 0.8f, breathB * 0.6f, breathB * 0.7f) * rest;
+
+        // Airborne it lags the body: sinks while rising, floats while falling. Take-off and
+        // landing kick a spring, so it drops and settles back rather than snapping.
+        const float airTarget = runtime.wasGrounded
+            ? 0.0f
+            : std::clamp(-pc.verticalVelocity * 0.004f, -0.045f, 0.045f);
+        runtime.heldAirLift = smoothTo(runtime.heldAirLift, airTarget, 9.0f, dt);
+        if (jumpLaunched) {
+            runtime.heldDipVelocity -= 0.3f;
+            runtime.heldTiltVelocity -= 25.0f;
+        }
+        if (landed) {
+            const float impact = std::clamp(landingImpactSpeed / 12.0f, 0.0f, 1.5f);
+            runtime.heldDipVelocity -= 0.55f * impact;
+            runtime.heldTiltVelocity -= 55.0f * impact;
+        }
+        springStep(runtime.heldDip, runtime.heldDipVelocity, 110.0f, 10.0f, dt);
+        springStep(runtime.heldTilt, runtime.heldTiltVelocity, 90.0f, 9.0f, dt);
+        heldPos.y += (runtime.heldAirLift + runtime.heldDip) * jumpScale;
+        heldRotDeg.x += (runtime.heldAirLift * 90.0f + runtime.heldTilt) * jumpScale;
+
+        // Authored for a right-hand item; mirrored per child for one held on the left.
+        const float runPose = std::max(0.0f, vm.heldItemRunPose) * runWeight;
+        tuckPos = glm::vec3(-0.025f, -0.04f, 0.02f) * runPose;
+        tuckRotDeg = glm::vec3(-8.0f, 5.0f, 7.0f) * runPose;
+
+        if (playerViewMotionCameraId != -1) {
+            heldPos += playerViewMotionOffset;
+        }
+    } else {
+        runtime.heldAirLift = 0.0f;
+        runtime.heldDip = 0.0f;
+        runtime.heldDipVelocity = 0.0f;
+        runtime.heldTilt = 0.0f;
+        runtime.heldTiltVelocity = 0.0f;
+    }
+
+    // A light inside the child (the usual flashlight: a model with its spot light parented in)
+    // or a light on a child that also draws a mesh. A bare light is swayed but not "held".
+    const auto subtreeHasLight = [this](const SceneObject& node, int depth, const auto& self) -> bool {
+        if (depth > 32) return false;
+        for (int id : node.childIds) {
+            const SceneObject* descendant = findObjectById(id);
+            if (!descendant) continue;
+            if (descendant->hasLight || self(*descendant, depth + 1, self)) return true;
+        }
+        return false;
+    };
+    const auto carriesLight = [&](const SceneObject& child) {
+        if (child.hasLight && child.hasRenderer && child.renderType != RenderType::None) return true;
+        return subtreeHasLight(child, 0, subtreeHasLight);
+    };
+    const auto safeScale = [](float s) { return std::abs(s) > 1e-4f ? s : 1.0f; };
+    const glm::vec3 parentScale(safeScale(player.scale.x), safeScale(player.scale.y),
+                                safeScale(player.scale.z));
+
+    // Every offset is a rotation about the PLAYER's axes composed onto the child's authored
+    // rotation. Adding degrees to the child's Euler angles instead turns about whatever axes
+    // its own rotation leaves behind: a torch modelled lying down (X = 270) rolled around the
+    // view axis when the mouse moved sideways instead of swinging with it.
+    for (int childId : player.childIds) {
+        SceneObject* child = findObjectById(childId);
+        if (!child) continue;
+        if (child->hasCamera && child->camera.type == SceneCameraType::Player) continue;
+        const bool held = vm.heldItemEnabled && carriesLight(*child);
+        auto base = runtime.attachedBase.find(childId);
+        if (!vm.attachedSwayEnabled && !held) {
+            if (base != runtime.attachedBase.end()) {
+                child->localRotation = base->second.localRotation;
+                if (base->second.movedPosition) child->localPosition = base->second.localPosition;
+                child->localInitialized = true;
+                runtime.attachedBase.erase(base);
+            }
+            continue;
+        }
+        if (base == runtime.attachedBase.end()) {
+            PlayerControllerRuntimeState::AttachedChildBase captured;
+            captured.localPosition = child->localPosition;
+            captured.localRotation = child->localRotation;
+            base = runtime.attachedBase.emplace(childId, captured).first;
+        }
+
+        glm::vec3 rotDeg(swayDeg.x, swayDeg.y, 0.0f);
+        if (held) {
+            const float side = (base->second.localPosition.x < 0.0f) ? -1.0f : 1.0f;
+            rotDeg += heldRotDeg + tuckRotDeg * glm::vec3(1.0f, side, side);
+            const glm::vec3 offset = heldPos + tuckPos * glm::vec3(side, 1.0f, 1.0f);
+            child->localPosition = base->second.localPosition + offset / parentScale;
+            base->second.movedPosition = true;
+        } else if (base->second.movedPosition) {
+            child->localPosition = base->second.localPosition;
+            base->second.movedPosition = false;
+        }
+
+        const glm::quat offsetRot =
+            glm::angleAxis(glm::radians(rotDeg.y), glm::vec3(0.0f, 1.0f, 0.0f)) *
+            glm::angleAxis(glm::radians(rotDeg.x), glm::vec3(1.0f, 0.0f, 0.0f)) *
+            glm::angleAxis(glm::radians(rotDeg.z), glm::vec3(0.0f, 0.0f, 1.0f));
+        const glm::quat localRot = offsetRot * QuatFromEulerXYZ(base->second.localRotation);
+        child->localRotation = ChooseContinuousEulerDegrees(
+            glm::degrees(ExtractEulerXYZ(glm::mat3_cast(localRot), &child->localRotation)),
+            child->localRotation);
+        child->localInitialized = true;
     }
 }
 
@@ -10808,6 +10977,7 @@ void Engine::updateRigidbody2D(float delta) {
     struct Body2DRef {
         int index = -1;
         bool dynamic = false;
+        bool isTrigger = false;
         glm::vec2 pivotWorld = glm::vec2(0.0f);
         float rotationRad = 0.0f;
         std::vector<glm::vec2> poly;
@@ -10823,7 +10993,10 @@ void Engine::updateRigidbody2D(float delta) {
     size_t broadPhaseExtentCount = 0;
     for (auto& obj : sceneObjects) {
         if (!IsObjectEnabledInHierarchy(obj) || !UsesUIOnly2DPhysics(obj)) continue;
-        bool hasDynamic = obj.hasRigidbody2D && obj.rigidbody2D.enabled;
+        if (obj.IsInvariable && obj.hasRigidbody2D && obj.rigidbody2D.enabled) {
+            obj.rigidbody2D.velocity = glm::vec2(0.0f);
+        }
+        bool hasDynamic = obj.hasRigidbody2D && obj.rigidbody2D.enabled && !obj.IsInvariable;
         bool hasCollider2D = obj.hasCollider2D && obj.collider2D.enabled;
         if (!hasDynamic && !hasCollider2D) continue;
 
@@ -10843,6 +11016,7 @@ void Engine::updateRigidbody2D(float delta) {
         Body2DRef body;
         body.index = static_cast<int>(&obj - &sceneObjects[0]);
         body.dynamic = hasDynamic;
+        body.isTrigger = hasCollider2D && obj.collider2D.isTrigger;
         body.pivotWorld = uiHierarchyCache.getParentOffset(obj) + obj.ui.position;
         body.rotationRad = glm::radians(obj.ui.rotation);
         float c = std::cos(body.rotationRad);
@@ -11052,6 +11226,7 @@ void Engine::updateRigidbody2D(float delta) {
             glm::vec2 axis(0.0f);
             float depth = 0.0f;
             if (!satOverlap(pA.poly, pB.poly, axis, depth)) return;
+            if (pA.isTrigger || pB.isTrigger) return;
             glm::vec2 sep = axis * depth;
             if (pA.dynamic && pB.dynamic) {
                 applySeparation(pA, -sep * 0.5f, -axis);
@@ -11083,6 +11258,7 @@ void Engine::updateRigidbody2D(float delta) {
                 glm::vec2 axis(0.0f);
                 float depth = 0.0f;
                 if (!satOverlap(polyBody.poly, rect, axis, depth)) continue;
+                if (polyBody.isTrigger || edgeBody.isTrigger) continue;
                 glm::vec2 sep = axis * depth;
                 if (polyBody.dynamic && edgeBody.dynamic) {
                     applySeparation(polyBody, -sep * 0.5f, -axis);
@@ -11986,7 +12162,8 @@ void Engine::updateHierarchyWorldTransforms(bool rebuildWorldFromLocal) {
             }
 
             bool useWorldAuthoritative = !rebuildWorldFromLocal &&
-                obj.hasRigidbody && obj.rigidbody.enabled && !obj.rigidbody.isKinematic;
+                obj.hasRigidbody && obj.rigidbody.enabled && !obj.rigidbody.isKinematic &&
+                !obj.IsInvariable;
             if (useWorldAuthoritative) {
                 updateLocalFromWorld(obj, rootPos, rootRot, rootScale);
                 continue;
@@ -12033,7 +12210,8 @@ void Engine::updateHierarchyWorldTransforms(bool rebuildWorldFromLocal) {
         }
 
         bool useWorldAuthoritative = !rebuildWorldFromLocal &&
-            obj.hasRigidbody && obj.rigidbody.enabled && !obj.rigidbody.isKinematic;
+            obj.hasRigidbody && obj.rigidbody.enabled && !obj.rigidbody.isKinematic &&
+            !obj.IsInvariable;
         glm::vec3 worldPos = obj.position;
         glm::quat worldRot = QuatFromEulerXYZ(obj.rotation);
         glm::vec3 worldScale = obj.scale;
@@ -12576,6 +12754,8 @@ void Engine::loadAutoStartConfig() {
     autoStartRequested = false;
     autoStartPlayerMode = false;
     autoStartBundlePath.clear();
+    autoStartBundleMode = "extract";
+    autoStartVerifyIntegrity = false;
     autoStartProjectPath.clear();
     autoStartSceneName.clear();
 
@@ -12632,6 +12812,13 @@ void Engine::loadAutoStartConfig() {
             autoStartProjectPath = value;
         } else if (key == "bundle") {
             autoStartBundlePath = value;
+        } else if (key == "bundleMode") {
+            autoStartBundleMode = (value == "mount") ? "mount" : "extract";
+        } else if (key == "verifyIntegrity") {
+            std::string lower = value;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            autoStartVerifyIntegrity = (lower == "1" || lower == "true" || lower == "yes");
         } else if (key == "scene") {
             autoStartSceneName = value;
         } else if (key == "mode") {
@@ -12692,7 +12879,10 @@ void Engine::applyAutoStartMode() {
     specMode = false;
     testMode = false;
     clearSelection();
-    gameViewCursorLocked = true;
+    // Not captured yet: updateRuntimeMouseCapture grabs it once something steers with the
+    // mouse, so a game that never does (menus, 2D) keeps its pointer from the start.
+    gameViewCursorLocked = false;
+    runtimeMouseCaptureArmed = true;
     gameViewportFocused = true;
     showHierarchy = false;
     showInspector = false;
@@ -12713,10 +12903,6 @@ void Engine::applyAutoStartMode() {
     viewportFullscreen = true;
     if (editorWindow) {
         glfwFocusWindow(editorWindow);
-        glfwSetInputMode(editorWindow, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
-        if (glfwRawMouseMotionSupported()) {
-            glfwSetInputMode(editorWindow, GLFW_RAW_MOUSE_MOTION, GLFW_TRUE);
-        }
     }
     updateHierarchyWorldTransforms();
     physics->onPlayStart(sceneObjects);
@@ -12803,6 +12989,12 @@ void Engine::resetBuildSettings() {
     buildSettings.splashEnabled = false;
     buildSettings.splashDurationSeconds = 2.5f;
     buildSettings.packageStandaloneArchive = true;
+    buildSettings.packagingMode = "extract";
+    buildSettings.bundleVerifyIntegrity = true;
+    buildSettings.obfuscateScripts = false;
+    buildSettings.obfuscationToolCommand.clear();
+    buildSettings.antiTamper = false;
+    buildSettings.antiTamperToolCommand.clear();
     buildSettings.developmentBuild = false;
     buildSettings.autoConnectProfiler = false;
     buildSettings.scriptDebugging = false;
@@ -13000,6 +13192,24 @@ void Engine::loadBuildSettings() {
             trim(buildSettings.compressionMethod);
         } else if (line.rfind("package.enabled=", 0) == 0) {
             buildSettings.packageStandaloneArchive = line.substr(16) == "1";
+        } else if (line.rfind("packagingMode=", 0) == 0) {
+            buildSettings.packagingMode = line.substr(14);
+            trim(buildSettings.packagingMode);
+            if (buildSettings.packagingMode != "loose" && buildSettings.packagingMode != "mount") {
+                buildSettings.packagingMode = "extract";
+            }
+        } else if (line.rfind("bundleVerifyIntegrity=", 0) == 0) {
+            buildSettings.bundleVerifyIntegrity = line.substr(22) == "1";
+        } else if (line.rfind("obfuscateScripts=", 0) == 0) {
+            buildSettings.obfuscateScripts = line.substr(17) == "1";
+        } else if (line.rfind("obfuscationToolCommand=", 0) == 0) {
+            buildSettings.obfuscationToolCommand = line.substr(23);
+            trim(buildSettings.obfuscationToolCommand);
+        } else if (line.rfind("antiTamper=", 0) == 0) {
+            buildSettings.antiTamper = line.substr(11) == "1";
+        } else if (line.rfind("antiTamperToolCommand=", 0) == 0) {
+            buildSettings.antiTamperToolCommand = line.substr(22);
+            trim(buildSettings.antiTamperToolCommand);
         } else if (line.rfind("rendererAmbient=", 0) == 0) {
             std::string value = line.substr(16);
             trim(value);
@@ -13156,6 +13366,12 @@ void Engine::saveBuildSettings() {
         file << "packageStandaloneArchive=" << (buildSettings.packageStandaloneArchive ? "1" : "0") << "\n";
         file << "package.enabled=" << (buildSettings.packageStandaloneArchive ? "1" : "0") << "\n";
         file << "package.compression=" << buildSettings.compressionMethod << "\n";
+        file << "packagingMode=" << buildSettings.packagingMode << "\n";
+        file << "bundleVerifyIntegrity=" << (buildSettings.bundleVerifyIntegrity ? "1" : "0") << "\n";
+        file << "obfuscateScripts=" << (buildSettings.obfuscateScripts ? "1" : "0") << "\n";
+        file << "obfuscationToolCommand=" << buildSettings.obfuscationToolCommand << "\n";
+        file << "antiTamper=" << (buildSettings.antiTamper ? "1" : "0") << "\n";
+        file << "antiTamperToolCommand=" << buildSettings.antiTamperToolCommand << "\n";
         file << "developmentBuild=" << (buildSettings.developmentBuild ? "1" : "0") << "\n";
         file << "autoConnectProfiler=" << (buildSettings.autoConnectProfiler ? "1" : "0") << "\n";
         file << "scriptDebugging=" << (buildSettings.scriptDebugging ? "1" : "0") << "\n";
@@ -13520,6 +13736,12 @@ void Engine::startExportBuild(const fs::path& outputDir, bool runAfter) {
     }
     bool packageStandaloneArchive = buildSettings.packageStandaloneArchive;
     bool leanRuntimeExport = buildSettings.leanRuntimeExport;
+    std::string packagingMode = buildSettings.packagingMode;   // "loose" / "extract" / "mount"
+    bool bundleVerifyIntegrity = buildSettings.bundleVerifyIntegrity;
+    bool obfuscateScripts = buildSettings.obfuscateScripts;
+    std::string obfuscationToolCommand = buildSettings.obfuscationToolCommand;
+    bool antiTamper = buildSettings.antiTamper;
+    std::string antiTamperToolCommand = buildSettings.antiTamperToolCommand;
     bool compressAudio = buildSettings.compressAudio;
     float audioVorbisQuality = buildSettings.audioVorbisQuality;
     bool includeEditorInExport = buildSettings.includeEditor;
@@ -14075,6 +14297,8 @@ void Engine::startExportBuild(const fs::path& outputDir, bool runAfter) {
          assignedNativeScriptSources,
          packageStandaloneArchive, executableStem, executableFileName, packageStem,
          buildConfiguration, includeEditorInExport, shipScriptSdk, leanRuntimeExport,
+         packagingMode, bundleVerifyIntegrity, obfuscateScripts, obfuscationToolCommand,
+         antiTamper, antiTamperToolCommand,
          compressAudio, audioVorbisQuality,
          appendCMakeModuleFlags]() {
         ExportJobResult result;
@@ -14740,17 +14964,82 @@ void Engine::startExportBuild(const fs::path& outputDir, bool runAfter) {
             result.message = "Runtime bundle staging produced no files.";
             return result;
         }
-        if (!WriteRuntimeContentBundle(exportRoot / "content.modbundle", bundleEntries, copyError)) {
-            result.message = copyError;
-            return result;
+
+        // Packaging mode decides how runtime content ships. The direct loaders (project.modu and
+        // scene files via std::ifstream, script binaries via LoadLibrary/dlopen) cannot read out of
+        // a mounted bundle, so in "mount" they stay loose on disk while the bulk assets live in the
+        // single file that the engine reads in place (data.win style).
+        auto isDirectLoad = [](const fs::path& archivePath) {
+            std::string ext = archivePath.extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            return ext == ".modu" || ext == ".scene" || ext == ".dll" ||
+                   ext == ".so" || ext == ".dylib";
+        };
+        auto copyEntriesLoose = [&](const std::vector<RuntimeBundleEntry>& list) -> bool {
+            for (const RuntimeBundleEntry& e : list) {
+                const fs::path dest = exportRoot / e.archivePath;
+                std::error_code cec;
+                fs::create_directories(dest.parent_path(), cec);
+                fs::copy_file(e.sourcePath, dest, fs::copy_options::overwrite_existing, cec);
+                if (cec) {
+                    copyError = "Failed to copy loose runtime file: " + e.archivePath.generic_string() +
+                                " (" + cec.message() + ")";
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        const fs::path bundleFile = exportRoot / "content.modbundle";
+        std::string autoStartBundleLine;   // empty in loose mode (no bundle= key)
+        std::string autoStartModeLines;    // bundleMode / verifyIntegrity keys
+        std::vector<RuntimeBundleEntry> reportBundleEntries = bundleEntries;
+
+        if (packagingMode == "loose") {
+            setStatus(0.94f, "Copying loose runtime content...");
+            if (!copyEntriesLoose(bundleEntries)) { result.message = copyError; return result; }
+            reportBundleEntries.clear();
+        } else if (packagingMode == "mount") {
+            setStatus(0.94f, "Packing mounted bundle...");
+            std::vector<RuntimeBundleEntry> looseList, bundleList;
+            for (const RuntimeBundleEntry& e : bundleEntries) {
+                (isDirectLoad(e.archivePath) ? looseList : bundleList).push_back(e);
+            }
+            if (!copyEntriesLoose(looseList)) { result.message = copyError; return result; }
+            if (bundleList.empty()) {
+                result.message = "Mounted bundle produced no asset files to pack.";
+                return result;
+            }
+            RuntimeBundleWriteOptions opt;
+            opt.includeIntegrity = bundleVerifyIntegrity;
+            // The CODE section is reserved for future ModuCPP bytecode; empty for now.
+            std::vector<RuntimeBundleCodeUnit> codeUnits;
+            if (!WriteRuntimeContentBundleV2(bundleFile, bundleList, codeUnits, opt, copyError)) {
+                result.message = copyError;
+                return result;
+            }
+            autoStartBundleLine = "bundle=content.modbundle\n";
+            autoStartModeLines = std::string("bundleMode=mount\n") +
+                                 "verifyIntegrity=" + (bundleVerifyIntegrity ? "1" : "0") + "\n";
+            reportBundleEntries = bundleList;
+            appendLog("Packaged " + std::to_string(bundleList.size()) + " asset(s) into a mounted bundle; " +
+                      std::to_string(looseList.size()) + " project/scene/script file(s) left loose.");
+        } else {  // "extract" (default): the proven v1 unpack-on-first-run path.
+            setStatus(0.94f, "Packing runtime bundle...");
+            if (!WriteRuntimeContentBundle(bundleFile, bundleEntries, copyError)) {
+                result.message = copyError;
+                return result;
+            }
+            autoStartBundleLine = "bundle=content.modbundle\n";
+            autoStartModeLines = "bundleMode=extract\n";
         }
+
         {
-            std::vector<fs::path> looseFiles = {
-                destExe,
-                exportRoot / "content.modbundle"
-            };
+            std::vector<fs::path> looseFiles = { destExe };
+            if (!autoStartBundleLine.empty()) looseFiles.push_back(bundleFile);
             std::string reportError;
-            if (!WriteBuildSizeReports(exportRoot, bundleEntries, looseFiles, {},
+            if (!WriteBuildSizeReports(exportRoot, reportBundleEntries, looseFiles, {},
                                        projectRoot, reportError)) {
                 appendLog("Warning: " + reportError);
             }
@@ -14768,13 +15057,57 @@ void Engine::startExportBuild(const fs::path& outputDir, bool runAfter) {
             result.message = "Failed to write autostart.modu.";
             return result;
         }
-        autoStart << "bundle=content.modbundle\n";
+        autoStart << autoStartBundleLine;
+        autoStart << autoStartModeLines;
         autoStart << "project=project.modu\n";
         if (!startScene.empty()) {
             autoStart << "scene=" << startScene << "\n";
         }
         autoStart << "mode=player\n";
         autoStart.close();
+
+        // Protection post-build steps. These invoke the developer's own tools (Obscura for script
+        // obfuscation, NativeShield / RMG for anti-tamper) over the staged output. {exe}, {bundle}
+        // and {dir} are substituted; a non-zero exit fails the export so a "protected" build never
+        // ships unprotected without notice.
+        {
+            auto runProtectionTool = [&](const char* label, bool enabled,
+                                         const std::string& cmdTemplate) -> bool {
+                if (!enabled) return true;
+                if (cmdTemplate.empty()) {
+                    appendLog(std::string("Warning: ") + label +
+                              " is enabled but no tool command is set; skipping.");
+                    return true;
+                }
+                std::string cmd = cmdTemplate;
+                auto sub = [&](const std::string& token, const std::string& value) {
+                    for (size_t p = cmd.find(token); p != std::string::npos; p = cmd.find(token, p)) {
+                        cmd.replace(p, token.size(), value);
+                        p += value.size();
+                    }
+                };
+                sub("{exe}", quotePath(destExe));
+                sub("{bundle}", quotePath(autoStartBundleLine.empty() ? exportRoot : bundleFile));
+                sub("{dir}", quotePath(exportRoot));
+                appendLog(std::string("Running ") + label + ": " + cmd);
+                int toolExit = 0;
+                if (!runCommandStreaming(cmd + " 2>&1", appendLog, &toolExit) || toolExit != 0) {
+                    result.message = std::string(label) + " failed (exit code " +
+                                     std::to_string(toolExit) + ").";
+                    return false;
+                }
+                return true;
+            };
+            setStatus(0.96f, "Applying protection...");
+            if (!runProtectionTool("Script obfuscation (Obscura)", obfuscateScripts,
+                                   obfuscationToolCommand)) {
+                return result;
+            }
+            if (!runProtectionTool("Anti-tamper (NativeShield/RMG)", antiTamper,
+                                   antiTamperToolCommand)) {
+                return result;
+            }
+        }
 
         if (packageStandaloneArchive) {
 #ifdef _WIN32
@@ -16538,6 +16871,401 @@ glm::vec2 Engine::getRuntimeMouseDelta() const {
 }
 #pragma endregion
 
+#pragma region Runtime Mouse Capture + Cursor
+void Engine::requestRuntimeMouseCapture() {
+    runtimeMouseCaptureRequestFrame = ImGui::GetFrameCount();
+    runtimeMouseCaptureRequestTime = glfwGetTime();
+}
+
+bool Engine::runtimeWantsMouseCapture() const {
+    if (!isPlaying || isPaused) return false;
+    if (runtimePlayerControllerWantsMouse) return true;
+    // A request holds for two frames or 0.1 s, so a script steering from a fixed-rate hook
+    // (which skips render frames at high FPS) does not make the capture flicker.
+    return ImGui::GetFrameCount() - runtimeMouseCaptureRequestFrame <= 2 ||
+           glfwGetTime() - runtimeMouseCaptureRequestTime < 0.1;
+}
+
+void Engine::updateRuntimeMouseCapture() {
+    if (!isPlaying) {
+        runtimePlayerControllerWantsMouse = false;
+        runtimeMouseCaptureRequestFrame = -1000;
+        runtimeMouseCaptureRequestTime = -1000.0;
+        runtimeMouseCaptureArmed = true;
+        return;
+    }
+
+    // The built-in FPS PlayerController looks around with the mouse whenever it runs.
+    bool playerControllerActive = false;
+    for (const SceneObject& obj : sceneObjects) {
+        if (obj.hasPlayerController && obj.playerController.enabled &&
+            IsObjectEnabledInHierarchy(obj)) {
+            playerControllerActive = true;
+            break;
+        }
+    }
+    runtimePlayerControllerWantsMouse = playerControllerActive;
+
+    if (!runtimeWantsMouseCapture()) {
+        // Nothing steers with the mouse any more (a menu opened, the look script was
+        // disabled, play paused): hand the pointer back instead of keeping it hidden.
+        gameViewCursorLocked = false;
+        runtimeMouseCaptureArmed = true;
+        return;
+    }
+    if (gameViewCursorLocked) {
+        runtimeMouseCaptureArmed = false;
+        return;
+    }
+    if (!runtimeMouseCaptureArmed) {
+        return; // released with Escape: stays free until the player clicks back in
+    }
+
+    // Grab only where the player is already looking at the game - never from under an
+    // editor panel, an unfocused window, the startup splash or a scene-view freelook.
+    bool canGrab = false;
+    if (playerMode) {
+        const bool splashShowing =
+            buildSettings.splashEnabled && buildSettings.splashDurationSeconds > 0.0f &&
+            (startupSplashStartTime < 0.0 ||
+             glfwGetTime() - startupSplashStartTime <
+                 static_cast<double>(buildSettings.splashDurationSeconds));
+        canGrab = editorWindow && glfwGetWindowAttrib(editorWindow, GLFW_FOCUSED) &&
+                  !splashShowing;
+    } else {
+        GLFWwindow* gameWindow = runtimeCursorGameWindow ? runtimeCursorGameWindow : editorWindow;
+        canGrab = showGameViewport && gameViewportFocused && !cursorLocked && gameWindow &&
+                  glfwGetWindowAttrib(gameWindow, GLFW_FOCUSED);
+    }
+    if (canGrab) {
+        gameViewCursorLocked = true;
+        runtimeMouseCaptureArmed = false;
+    }
+}
+
+void Engine::setRuntimeCursorImage(const std::string& path, float hotspotX, float hotspotY,
+                                   float heightPx) {
+    runtimeCursorImagePath = path;
+    runtimeCursorHotspot = glm::clamp(glm::vec2(hotspotX, hotspotY), glm::vec2(0.0f), glm::vec2(1.0f));
+    runtimeCursorHeightPx = std::clamp(heightPx, 8.0f, 256.0f);
+}
+
+void Engine::clearRuntimeCursorImage() {
+    runtimeCursorImagePath.clear();
+}
+
+namespace {
+// Area-weighted RGBA resample for cursor images. Colour is weighted by alpha so the
+// transparent surround cannot bleed a dark fringe into a downscaled outline.
+std::vector<unsigned char> ResampleCursorRgba(const unsigned char* src, int srcW, int srcH,
+                                              int dstW, int dstH) {
+    std::vector<unsigned char> dst(static_cast<size_t>(dstW) * static_cast<size_t>(dstH) * 4u, 0);
+    const float stepX = static_cast<float>(srcW) / static_cast<float>(dstW);
+    const float stepY = static_cast<float>(srcH) / static_cast<float>(dstH);
+    for (int dy = 0; dy < dstH; ++dy) {
+        const float y0 = static_cast<float>(dy) * stepY;
+        const float y1 = y0 + stepY;
+        const int yEnd = std::min(srcH, static_cast<int>(std::ceil(y1)));
+        for (int dx = 0; dx < dstW; ++dx) {
+            const float x0 = static_cast<float>(dx) * stepX;
+            const float x1 = x0 + stepX;
+            const int xEnd = std::min(srcW, static_cast<int>(std::ceil(x1)));
+            float rgb[3] = {0.0f, 0.0f, 0.0f};
+            float alpha = 0.0f;
+            float area = 0.0f;
+            for (int y = static_cast<int>(y0); y < yEnd; ++y) {
+                const float wy = std::min(y1, y + 1.0f) - std::max(y0, static_cast<float>(y));
+                if (wy <= 0.0f) continue;
+                for (int x = static_cast<int>(x0); x < xEnd; ++x) {
+                    const float wx = std::min(x1, x + 1.0f) - std::max(x0, static_cast<float>(x));
+                    if (wx <= 0.0f) continue;
+                    const unsigned char* p = src + (static_cast<size_t>(y) * srcW + x) * 4u;
+                    const float weight = wx * wy;
+                    const float a = (static_cast<float>(p[3]) / 255.0f) * weight;
+                    rgb[0] += static_cast<float>(p[0]) * a;
+                    rgb[1] += static_cast<float>(p[1]) * a;
+                    rgb[2] += static_cast<float>(p[2]) * a;
+                    alpha += a;
+                    area += weight;
+                }
+            }
+            unsigned char* out = dst.data() + (static_cast<size_t>(dy) * dstW + dx) * 4u;
+            if (alpha > 1e-6f) {
+                for (int c = 0; c < 3; ++c) {
+                    out[c] = static_cast<unsigned char>(std::clamp(std::lround(rgb[c] / alpha), 0L, 255L));
+                }
+            }
+            if (area > 0.0f) {
+                out[3] = static_cast<unsigned char>(
+                    std::clamp(std::lround(alpha / area * 255.0f), 0L, 255L));
+            }
+        }
+    }
+    return dst;
+}
+} // namespace
+
+GLFWcursor* Engine::getRuntimeCursor(float contentScale) {
+#if defined(__ANDROID__)
+    (void)contentScale;
+    return nullptr;
+#else
+    const int targetHeight = std::clamp(
+        static_cast<int>(std::lround(runtimeCursorHeightPx * std::max(contentScale, 0.5f))), 8, 256);
+    const std::string key = runtimeCursorImagePath + "|" + std::to_string(targetHeight) + "|" +
+                            std::to_string(runtimeCursorHotspot.x) + "," +
+                            std::to_string(runtimeCursorHotspot.y);
+    auto found = runtimeCursorCache.find(key);
+    if (found != runtimeCursorCache.end()) {
+        return found->second; // nullptr: this one failed already, don't re-read it every frame
+    }
+
+    // Dragging an inspector slider mints a cursor per value; drop all but the live one.
+    if (runtimeCursorCache.size() >= 16) {
+        for (auto it = runtimeCursorCache.begin(); it != runtimeCursorCache.end();) {
+            if (it->second && it->second == runtimeCursorApplied) {
+                ++it;
+                continue;
+            }
+            if (it->second) glfwDestroyCursor(it->second);
+            it = runtimeCursorCache.erase(it);
+        }
+    }
+
+    std::vector<uint8_t> bytes = Modularity::Platform::GetAssetSource().ReadAll(runtimeCursorImagePath);
+    if (bytes.empty()) {
+        const std::string resolved = resolveProjectAssetPath(runtimeCursorImagePath).string();
+        if (!resolved.empty() && resolved != runtimeCursorImagePath) {
+            bytes = Modularity::Platform::GetAssetSource().ReadAll(resolved);
+        }
+    }
+
+    GLFWcursor* cursor = nullptr;
+    int width = 0;
+    int height = 0;
+    int channels = 0;
+    unsigned char* pixels = nullptr;
+    if (!bytes.empty()) {
+        const StbFlipScope topDown(false); // GLFW cursor rows run top to bottom
+        pixels = stbi_load_from_memory(bytes.data(), static_cast<int>(bytes.size()),
+                                       &width, &height, &channels, 4);
+    }
+    if (pixels && width > 0 && height > 0) {
+        const int targetWidth = std::max(
+            1, static_cast<int>(std::lround(static_cast<double>(width) * targetHeight / height)));
+        std::vector<unsigned char> scaled =
+            ResampleCursorRgba(pixels, width, height, targetWidth, targetHeight);
+        GLFWimage image;
+        image.width = targetWidth;
+        image.height = targetHeight;
+        image.pixels = scaled.data();
+        const int hotX = std::clamp(
+            static_cast<int>(std::lround(runtimeCursorHotspot.x * (targetWidth - 1))), 0, targetWidth - 1);
+        const int hotY = std::clamp(
+            static_cast<int>(std::lround(runtimeCursorHotspot.y * (targetHeight - 1))), 0, targetHeight - 1);
+        cursor = glfwCreateCursor(&image, hotX, hotY);
+    }
+    if (pixels) {
+        stbi_image_free(pixels);
+    }
+    if (!cursor) {
+        addConsoleMessage("Cursor image could not be loaded: " + runtimeCursorImagePath,
+                          ConsoleMessageType::Warning);
+    }
+    runtimeCursorCache[key] = cursor;
+    return cursor;
+#endif
+}
+
+void Engine::updateRuntimeCursorImage() {
+    // The game/player viewport reports afresh each frame, so a hidden game view reports nothing.
+    const bool overGame = playerMode || runtimeCursorOverGame;
+    GLFWwindow* gameWindow = playerMode ? editorWindow : runtimeCursorGameWindow;
+    runtimeCursorOverGame = false;
+    runtimeCursorGameWindow = nullptr;
+    if (!isPlaying) {
+        runtimeCursorImagePath.clear();
+    }
+
+#if !defined(__ANDROID__)
+    // A floating game view lives in its own OS window, which ImGui destroys when it docks
+    // back - never hand GLFW a window that is no longer one of ImGui's viewports.
+    auto windowAlive = [&](GLFWwindow* window) {
+        if (!window) return false;
+        if (window == editorWindow) return true;
+        const ImGuiPlatformIO& platformIo = ImGui::GetPlatformIO();
+        for (int i = 0; i < platformIo.Viewports.Size; ++i) {
+            if (platformIo.Viewports[i]->PlatformHandle == window) return true;
+        }
+        return false;
+    };
+
+    GLFWcursor* wanted = nullptr;
+    if (isPlaying && !gameViewCursorLocked && !runtimeCursorImagePath.empty() && overGame &&
+        windowAlive(gameWindow)) {
+        float scaleX = 1.0f;
+        float scaleY = 1.0f;
+        glfwGetWindowContentScale(gameWindow, &scaleX, &scaleY);
+        wanted = getRuntimeCursor(std::max(scaleX, scaleY));
+    }
+
+    ImGuiIO& io = ImGui::GetIO();
+    if (wanted) {
+        // Stop the ImGui backend putting its own arrow back over ours at the next NewFrame.
+        if (!runtimeCursorOwnsImGuiFlag &&
+            !(io.ConfigFlags & ImGuiConfigFlags_NoMouseCursorChange)) {
+            io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+            runtimeCursorOwnsImGuiFlag = true;
+        }
+        if (runtimeCursorApplied != wanted || runtimeCursorAppliedWindow != gameWindow) {
+            if (runtimeCursorAppliedWindow && runtimeCursorAppliedWindow != gameWindow &&
+                windowAlive(runtimeCursorAppliedWindow)) {
+                glfwSetCursor(runtimeCursorAppliedWindow, nullptr);
+            }
+            glfwSetCursor(gameWindow, wanted);
+            runtimeCursorApplied = wanted;
+            runtimeCursorAppliedWindow = gameWindow;
+        }
+        return;
+    }
+
+    if (runtimeCursorApplied) {
+        if (windowAlive(runtimeCursorAppliedWindow)) {
+            glfwSetCursor(runtimeCursorAppliedWindow, nullptr);
+        }
+        runtimeCursorApplied = nullptr;
+        runtimeCursorAppliedWindow = nullptr;
+    }
+    if (runtimeCursorOwnsImGuiFlag) {
+        io.ConfigFlags &= ~ImGuiConfigFlags_NoMouseCursorChange;
+        runtimeCursorOwnsImGuiFlag = false;
+    }
+#endif
+}
+#pragma endregion
+
+#pragma region Particle Systems
+namespace {
+// An asset's modification stamp for hot reload, or 0 when it is not a plain file on disk
+// (inside a mounted bundle, or missing). 0 never equals a real stamp, so a file that
+// appears later is still picked up.
+long long ParticleAssetStamp(const fs::path& path) {
+    if (path.empty()) return 0;
+    std::error_code ec;
+    const auto time = fs::last_write_time(path, ec);
+    if (ec) return 0;
+    return static_cast<long long>(time.time_since_epoch().count());
+}
+
+// Reads an asset the way a built game will - through AssetSource, which sees inside a
+// mounted .modbundle - falling back to the project-resolved path in the editor.
+std::string ReadParticleAssetText(const std::string& path, const fs::path& resolved) {
+    auto& source = Modularity::Platform::GetAssetSource();
+    std::vector<uint8_t> bytes;
+    if (source.Exists(path)) {
+        bytes = source.ReadAll(path);
+    } else if (!resolved.empty() && source.Exists(resolved.string())) {
+        bytes = source.ReadAll(resolved.string());
+    }
+    return std::string(bytes.begin(), bytes.end());
+}
+
+void ClearParticleMaterial(ParticleSystem2DComponent& ps) {
+    ps.runtimeMaterialTexture.clear();
+    ps.runtimeMaterialTint = glm::vec4(1.0f);
+    ps.runtimeMaterialEmission = glm::vec3(0.0f);
+    ps.runtimeMaterialFilter = -1;
+}
+} // namespace
+
+void Engine::updateParticleSystems(float dt) {
+    const double now = glfwGetTime();
+    for (SceneObject& obj : sceneObjects) {
+        if (!obj.hasParticleSystem2D || !obj.particleSystem2D.enabled ||
+            !IsObjectEnabledInHierarchy(obj)) {
+            continue;
+        }
+        refreshParticleAssets(obj, now);
+        ParticleRuntime::Simulate(obj, dt);
+    }
+}
+
+void Engine::refreshParticleAssets(SceneObject& obj, double now) {
+    ParticleSystem2DComponent& ps = obj.particleSystem2D;
+    // In the editor a material or .spritesheet can be edited under a running preview, so the
+    // files are re-stamped twice a second. A built game's assets cannot change; there each
+    // is read once, when its path first appears.
+    const bool restamp = !playerMode &&
+                         (ps.runtimeAssetCheckTime < 0.0 || now - ps.runtimeAssetCheckTime >= 0.5);
+    if (restamp) ps.runtimeAssetCheckTime = now;
+
+    if (ps.materialPath.empty()) {
+        if (!ps.runtimeMaterialKey.empty()) {
+            ps.runtimeMaterialKey.clear();
+            ps.runtimeMaterialStamp = 0;
+            ClearParticleMaterial(ps);
+        }
+    } else {
+        const fs::path resolved = resolveMaterialAssetPath(ps.materialPath);
+        const bool keyChanged = ps.runtimeMaterialKey != ps.materialPath;
+        const long long stamp =
+            (keyChanged || restamp) ? ParticleAssetStamp(resolved) : ps.runtimeMaterialStamp;
+        if (keyChanged || stamp != ps.runtimeMaterialStamp) {
+            ps.runtimeMaterialKey = ps.materialPath;
+            ps.runtimeMaterialStamp = stamp;
+            MaterialFileData data;
+            const std::string text = ReadParticleAssetText(ps.materialPath, resolved);
+            if (!text.empty() && parseMaterialText(text, resolved.string(), data)) {
+                ps.runtimeMaterialTexture = data.albedo;
+                ps.runtimeMaterialTint = glm::vec4(data.props.color, data.props.alpha);
+                ps.runtimeMaterialEmission = data.props.emissionColor * data.props.emissionStrength;
+                ps.runtimeMaterialFilter = static_cast<int>(data.props.textureFilter);
+            } else {
+                ClearParticleMaterial(ps);
+                addConsoleMessage("Particle System \"" + obj.name + "\": could not read material " +
+                                      ps.materialPath,
+                                  ConsoleMessageType::Warning);
+            }
+        }
+    }
+
+    // Copied: TexturePath can hand back a field this function is about to rewrite.
+    const std::string texture = ParticleRuntime::TexturePath(obj);
+    const bool wantsClips = ps.textureSheetEnabled &&
+                            ps.textureSheetMode == ParticleSystem2DComponent::SheetSpriteClips &&
+                            !texture.empty();
+    if (!wantsClips) {
+        if (!ps.runtimeSheetKey.empty() || !ps.runtimeSheetRects.empty()) {
+            ps.runtimeSheetKey.clear();
+            ps.runtimeSheetRects.clear();
+            ps.runtimeSheetStamp = 0;
+        }
+        return;
+    }
+    // The same sidecar a UI Image reads its clips from: "<texture>.spritesheet".
+    const std::string sidecar = texture + ".spritesheet";
+    const fs::path resolvedSidecar(Modularity::Platform::ResolveAssetPath(sidecar));
+    const bool keyChanged = ps.runtimeSheetKey != texture;
+    const long long stamp =
+        (keyChanged || restamp) ? ParticleAssetStamp(resolvedSidecar) : ps.runtimeSheetStamp;
+    if (keyChanged || stamp != ps.runtimeSheetStamp) {
+        ps.runtimeSheetKey = texture;
+        ps.runtimeSheetStamp = stamp;
+        ps.runtimeSheetRects.clear();
+        const std::string text = ReadParticleAssetText(sidecar, resolvedSidecar);
+        if (!text.empty()) {
+            ps.runtimeSheetRects = ParseSpritesheet(text).document.rects;
+        }
+        if (ps.runtimeSheetRects.empty()) {
+            addConsoleMessage("Particle System \"" + obj.name +
+                                  "\": Sprite Clips needs a .spritesheet next to " + texture +
+                                  " - showing the whole texture instead",
+                              ConsoleMessageType::Warning);
+        }
+    }
+}
+#pragma endregion
+
 #pragma region Object Lookup
 SceneObject* Engine::findObjectByName(const std::string& name) {
     auto it = std::find_if(sceneObjects.begin(), sceneObjects.end(), [&](const SceneObject& o) {
@@ -18102,7 +18830,7 @@ bool Engine::setSceneObjectParentFromScript(int objectId, int parentId) {
 bool Engine::setSceneObjectTransformFromScript(int objectId, const glm::vec3& position,
                                                const glm::vec3& rotationDeg, const glm::vec3& scale) {
     SceneObject* obj = findObjectById(objectId);
-    if (!obj) {
+    if (!obj || obj->IsInvariable) {
         return false;
     }
     recordState("ai-set-transform");
@@ -20405,6 +21133,8 @@ void Engine::loadEditorUserSettings() {
             gizmoShowLightOverlays = (value == "1" || value == "true" || value == "yes");
         } else if (key == "gizmoShowLightIntensityLabels") {
             gizmoShowLightIntensityLabels = (value == "1" || value == "true" || value == "yes");
+        } else if (key == "gizmoShowInvariableLocks") {
+            gizmoShowInvariableLocks = (value == "1" || value == "true" || value == "yes");
         } else if (key == "showViewportHintOverlay") {
             showViewportHintOverlay = (value == "1" || value == "true" || value == "yes");
         } else if (key == "showLight2DStatsOverlay") {
@@ -20967,6 +21697,7 @@ void Engine::saveEditorUserSettings() const {
     file << "gizmoShowCameraFrustumLabels=" << (gizmoShowCameraFrustumLabels ? "1" : "0") << "\n";
     file << "gizmoShowLightOverlays=" << (gizmoShowLightOverlays ? "1" : "0") << "\n";
     file << "gizmoShowLightIntensityLabels=" << (gizmoShowLightIntensityLabels ? "1" : "0") << "\n";
+    file << "gizmoShowInvariableLocks=" << (gizmoShowInvariableLocks ? "1" : "0") << "\n";
     file << "showViewportHintOverlay=" << (showViewportHintOverlay ? "1" : "0") << "\n";
     file << "showLight2DStatsOverlay=" << (showLight2DStatsOverlay ? "1" : "0") << "\n";
     file << "showLightmappingWindow=" << (showLightmappingWindow ? "1" : "0") << "\n";

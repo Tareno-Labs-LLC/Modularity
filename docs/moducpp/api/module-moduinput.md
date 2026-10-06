@@ -227,6 +227,45 @@ public class ConfirmExample : ModuNode
 }
 ```
 
+## The `Cursor` Facade
+
+### Overview
+The game captures the mouse (hidden, locked to the window, deltas only) **only while something steers with it**:
+
+- an enabled PlayerController component
+- `ApplyMouseLook(...)` while it is applying look (with `requireMouseButton`, only while the button is held)
+- a script calling `Cursor.Capture()`
+
+Requests are per frame. Stop asking and the pointer comes back on its own, so a menu opening, a look script being disabled or play being paused all release the mouse. Clicking the game only recaptures it while something is still asking, and Escape releases it until the next click.
+
+### `Cursor.Capture()`
+Keeps the mouse captured this frame. Call it every frame the mouse drives the camera or character.
+
+### `Cursor.IsCaptured()`
+`true` while the game holds the mouse.
+
+### `Cursor.IsButtonDown(button)`
+Mouse button state: `0` = left, `1` = right, `2` = middle.
+
+### `Cursor.SetImage(path, hotspotX, hotspotY, height)` / `Cursor.ClearImage()`
+Replaces the OS pointer with a project image while the pointer is visible over the game. `hotspotX`/`hotspotY` set the click point as a fraction of the image (`0, 0` = top-left), and `height` is on-screen pixels at 100% display scaling (Windows' own arrow is 32). The image stays until `ClearImage()` or play stops, and repeating the same call every frame costs nothing, so swapping a pressed pose in is just:
+
+```cpp
+add ModuCPP;
+add ModuInput;
+
+public class HandCursor : ModuNode
+{
+    public string handImage = "Assets/UI/Hand.png";
+    public string pressedImage = "Assets/UI/HandPressed.png";
+
+    void TickUpdate()
+    {
+        Cursor.SetImage(Cursor.IsButtonDown(0) ? pressedImage : handImage, 0.05f, 0.05f, 40.0f);
+    }
+}
+```
+
 ## Common Mistakes
 - Forgetting `add ModuInput;`.
 - Using `input.WASD()` when normalized movement was intended.

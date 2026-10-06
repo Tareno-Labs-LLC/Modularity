@@ -49,6 +49,10 @@ uniform bool hasOcclusionMap = false;
 // Fragments below this alpha are discarded outright. 0 disables the test, which
 // leaves every material authored before this on the ordinary blended path.
 uniform float alphaCutoff = 0.0;
+// Set for the depth-only draw that gives a texture-transparent surface its solid
+// pixels in the depth buffer (colour writes are masked off). Only the alpha test
+// above matters there, so the lighting is skipped.
+uniform bool depthPrepass = false;
 // Units 12-14. Units 0-11 are already spoken for (albedo, overlay, normal, four
 // shadow cubes, four directional shadows, reflection cube), which leaves one
 // spare against the 16 the GL 3.3 core spec guarantees. Anything added here in
@@ -645,6 +649,10 @@ void main()
     }
     if (alpha <= 0.001) {
         discard;
+    }
+    if (depthPrepass) {
+        FragColor = vec4(0.0);
+        return;
     }
 
     if (unlit) {

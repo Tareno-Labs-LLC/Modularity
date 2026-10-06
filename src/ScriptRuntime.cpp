@@ -655,7 +655,7 @@ bool ScriptContext::IsInLayer(int layer) const {
 }
 
 void ScriptContext::SetPosition(const glm::vec3& pos) {
-    if (object) {
+    if (object && !object->IsInvariable) {
         object->position = pos;
         if (engine) {
             engine->syncLocalTransform(*object);
@@ -675,13 +675,13 @@ void ScriptContext::SyncObjectLocalTransform(int objectId) {
 }
 
 void ScriptContext::SetPosition2D(const glm::vec2& pos) {
-    if (!object) return;
+    if (!object || object->IsInvariable) return;
     object->ui.position = pos;
     MarkDirty();
 }
 
 void ScriptContext::SetRotation(const glm::vec3& rot) {
-    if (object) {
+    if (object && !object->IsInvariable) {
         object->rotation = NormalizeEulerDegrees(rot);
         if (engine) {
             engine->syncLocalTransform(*object);
@@ -697,7 +697,7 @@ void ScriptContext::SetRotation(const glm::vec3& rot) {
 }
 
 void ScriptContext::SetScale(const glm::vec3& scl) {
-    if (object) {
+    if (object && !object->IsInvariable) {
         object->scale = scl;
         if (engine) {
             engine->syncLocalTransform(*object);
@@ -743,6 +743,9 @@ bool ScriptContext::ApplyMouseLook(float& pitchDeg, float& yawDeg, float sensiti
         !(ImGui::IsMouseDown(ImGuiMouseButton_Right) || isScriptMouseDown(this, GLFW_MOUSE_BUTTON_RIGHT))) {
         return false;
     }
+    // The mouse is steering right now, so keep it captured; once look stops being applied
+    // (script disabled, look turned off, button released) the pointer comes back.
+    if (engine) engine->requestRuntimeMouseCapture();
     glm::vec2 delta = getScriptMouseDelta(this);
     float len = glm::length(delta);
     if (len > maxDelta) delta *= (maxDelta / len);
@@ -750,6 +753,28 @@ bool ScriptContext::ApplyMouseLook(float& pitchDeg, float& yawDeg, float sensiti
     pitchDeg -= delta.y * 50.0f * sensitivity * deltaTime;
     pitchDeg = std::clamp(pitchDeg, -89.0f, 89.0f);
     return true;
+}
+
+void ScriptContext::RequestMouseCapture() {
+    if (engine) engine->requestRuntimeMouseCapture();
+}
+
+bool ScriptContext::IsMouseCaptured() const {
+    return engine && engine->isRuntimeMouseCaptured();
+}
+
+bool ScriptContext::IsMouseButtonDown(int glfwButton) const {
+    if (glfwButton < 0 || glfwButton > GLFW_MOUSE_BUTTON_LAST) return false;
+    if (glfwButton < ImGuiMouseButton_COUNT && ImGui::IsMouseDown(glfwButton)) return true;
+    return isScriptMouseDown(this, glfwButton);
+}
+
+void ScriptContext::SetCursorImage(const std::string& path, float hotspotX, float hotspotY, float heightPx) {
+    if (engine) engine->setRuntimeCursorImage(path, hotspotX, hotspotY, heightPx);
+}
+
+void ScriptContext::ClearCursorImage() {
+    if (engine) engine->clearRuntimeCursorImage();
 }
 
 int ScriptContext::GetSelectedObjectId() const {

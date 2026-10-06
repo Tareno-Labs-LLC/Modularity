@@ -651,6 +651,11 @@ void Engine::renderPlayerViewport() {
         if (!(obj.ui.type == UIElementType::Image ||
               obj.ui.type == UIElementType::Sprite2D))
           continue;
+        if (ViewportRenderHelpers::HasUiImageMaterialShader(obj)) {
+          setLight2DRoutingReason(
+              obj.id, "Material shader: rendered by the UI image shader path.");
+          continue;
+        }
         if (obj.ui.nineSliceEnabled) {
           setLight2DRoutingReason(obj.id, "Legacy path: nine-slice sprites are "
                                           "not routed through Light2D yet.");
@@ -855,7 +860,9 @@ void Engine::renderPlayerViewport() {
                                       particleParentOffset,
                                       particleRectOutsideOverlay, lightRequest,
                                       drawOrder);
-      } else {
+      } else if (isProject25DPipeline()) {
+        // A 3D camera's particles are drawn into the frame by the Renderer; only the 2.5D
+        // pipeline's TM renderer lacks a particle pass and still needs them here.
         auto projectedParticleOutside = [&](const ImVec2 &min,
                                             const ImVec2 &max) {
           return max.x < 0.0f || min.x > overlaySize.x || max.y < 0.0f ||
@@ -1193,18 +1200,35 @@ void Engine::renderPlayerViewport() {
         Texture *spriteTex = spriteTextureResolver.resolveTexture(obj);
         unsigned int texId = (spriteTex != nullptr) ? spriteTex->GetID() : 0;
         std::array<ImVec2, 4> uvQuad = buildSpriteSheetUvs(obj);
+        bool renderedMaterialShader = false;
+        if (ViewportRenderHelpers::HasUiImageMaterialShader(obj)) {
+          spriteBatch.flush();
+          const unsigned int shadedTexture =
+              ViewportRenderHelpers::RenderUiImageMaterialShader(
+                  renderer, obj, drawSize, uvQuad, texId, ImGui::GetTime());
+          if (shadedTexture != 0) {
+            texId = shadedTexture;
+            uvQuad = {ImVec2(0.0f, 1.0f), ImVec2(1.0f, 1.0f),
+                      ImVec2(1.0f, 0.0f), ImVec2(0.0f, 0.0f)};
+            renderedMaterialShader = true;
+          }
+        }
         const int frame = resolveSpriteSheetFrame(obj);
         const ImVec2 sourceFrameSizePx =
             ResolveUiSourceFrameSizePx(obj, frame, spriteTex);
         ImVec4 tint(obj.ui.color.r, obj.ui.color.g, obj.ui.color.b,
                     obj.ui.color.a);
-        const ImU32 tintColor = ImGui::GetColorU32(tint);
+        const ImU32 tintColor = renderedMaterialShader
+                                    ? IM_COL32_WHITE
+                                    : ImGui::GetColorU32(tint);
         float angle = uiSceneLookup.getWorldParentRotationRad(obj) +
                       glm::radians(obj.ui.rotation);
-        if (DrawScrollingUiSprite(spriteBatch, (ImTextureID)(intptr_t)texId,
+        if (!renderedMaterialShader &&
+            DrawScrollingUiSprite(spriteBatch, (ImTextureID)(intptr_t)texId,
                                   obj, drawMin, drawMax, angle, tintColor,
                                   ImGui::GetTime())) {
-        } else if (DrawNineSliceSprite(spriteBatch, (ImTextureID)(intptr_t)texId, obj,
+        } else if (!renderedMaterialShader &&
+                   DrawNineSliceSprite(spriteBatch, (ImTextureID)(intptr_t)texId, obj,
                                 drawMin, drawMax, uvQuad, sourceFrameSizePx,
                                 angle, tintColor)) {
         } else if (std::abs(angle) > 1e-4f) {
@@ -1787,7 +1811,9 @@ void Engine::renderPlayerViewport() {
     bool clicked = imageHovered && isPlaying && !showingStartupSplash &&
                    ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
                    !uiInteracting;
-    if (clicked && !gameViewCursorLocked) {
+    // Same rule as the editor's game view: clicking only recaptures a mouse that
+    // something steers with.
+    if (clicked && !gameViewCursorLocked && runtimeWantsMouseCapture()) {
       gameViewCursorLocked = true;
     }
     if (gameViewCursorLocked &&

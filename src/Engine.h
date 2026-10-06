@@ -302,6 +302,10 @@ private:
     bool deferInspectorRefresh = false;
     std::string startupProjectPath;
     std::string autoStartBundlePath;
+    // How the packaged bundle is consumed: "extract" (unpack to a cache dir, the default and only
+    // v1 option) or "mount" (read assets in place out of the single file, data.win style).
+    std::string autoStartBundleMode = "extract";
+    bool autoStartVerifyIntegrity = false;
     std::string autoStartProjectPath;
     std::string autoStartSceneName;
     struct ConsoleEntry {
@@ -630,6 +634,7 @@ private:
     bool gizmoShowCameraFrustumLabels = true;
     bool gizmoShowLightOverlays = true;
     bool gizmoShowLightIntensityLabels = true;
+    bool gizmoShowInvariableLocks = true;
     bool showViewportHintOverlay = true;
     bool showLight2DStatsOverlay = true;
     bool gizmoShowLight2DBounds = true;
@@ -672,7 +677,19 @@ private:
         glm::vec2 pendingLook = glm::vec2(0.0f);
         float jumpCharge = 0.0f;
         bool jumpCharging = false;
-        std::unordered_map<int, glm::vec3> attachedBaseRotation;
+
+        // Authored local transform of each child the view motion moves, restored when it stops.
+        struct AttachedChildBase {
+            glm::vec3 localPosition = glm::vec3(0.0f);
+            glm::vec3 localRotation = glm::vec3(0.0f);
+            bool movedPosition = false;
+        };
+        std::unordered_map<int, AttachedChildBase> attachedBase;
+        float heldAirLift = 0.0f;
+        float heldDip = 0.0f;
+        float heldDipVelocity = 0.0f;
+        float heldTilt = 0.0f;
+        float heldTiltVelocity = 0.0f;
     };
     PlayerControllerGroundProbeDebug playerControllerGroundProbeDebug;
     std::unordered_map<int, PlayerControllerRuntimeState> playerControllerRuntimeStates;
@@ -683,6 +700,27 @@ private:
     int previewCameraId = -1;
     bool gameViewCursorLocked = false;
     bool gameViewportFocused = false;
+    // Mouse capture on demand (see requestRuntimeMouseCapture). The last script request,
+    // whether an enabled PlayerController is steering, and whether the next stretch of
+    // wanting capture may grab the mouse by itself. Disarmed once it grabs, so Escape
+    // sticks until the player clicks back in instead of being re-grabbed next frame.
+    int runtimeMouseCaptureRequestFrame = -1000;
+    double runtimeMouseCaptureRequestTime = -1000.0;
+    bool runtimePlayerControllerWantsMouse = false;
+    bool runtimeMouseCaptureArmed = true;
+    // Custom runtime pointer (setRuntimeCursorImage). The game/player viewport reports
+    // each frame whether the mouse is over the game image and which OS window that is in.
+    std::string runtimeCursorImagePath;
+    glm::vec2 runtimeCursorHotspot = glm::vec2(0.0f);
+    float runtimeCursorHeightPx = 32.0f;
+    std::unordered_map<std::string, GLFWcursor*> runtimeCursorCache;
+    GLFWcursor* runtimeCursorApplied = nullptr;
+    GLFWwindow* runtimeCursorAppliedWindow = nullptr;
+    bool runtimeCursorOverGame = false;
+    GLFWwindow* runtimeCursorGameWindow = nullptr;
+    bool runtimeCursorOwnsImGuiFlag = false;
+    // Play enter/exit restarts every Particle System (main loop, just before the scripts run).
+    bool particlesLastPlaying = false;
     bool showGameProfiler = true;
     bool revealDebugSectionsAndMenus = false;
     bool uiCanvasPreviewEnabled = true;
@@ -1139,6 +1177,19 @@ private:
         bool splashEnabled = false;
         float splashDurationSeconds = 2.5f;
         bool packageStandaloneArchive = true;
+        // How desktop runtime content is shipped:
+        //  "loose"   - assets copied next to the exe, no bundle
+        //  "extract" - one content.modbundle unpacked to a cache dir on first run (default)
+        //  "mount"   - one content.modbundle read in place, data.win style (assets in the file,
+        //              project/scene/script files stay loose so the direct loaders still find them)
+        std::string packagingMode = "extract";
+        bool bundleVerifyIntegrity = true;   // write + check the whole-bundle SHA-256
+        // Protection post-build hooks. The commands run after the exe + content are staged.
+        // {exe},{bundle},{dir} are substituted. Empty command with the toggle on just warns.
+        bool obfuscateScripts = false;
+        std::string obfuscationToolCommand;  // e.g. Obscura: obscura --in {dir} --out {dir}
+        bool antiTamper = false;
+        std::string antiTamperToolCommand;   // e.g. NativeShield/RMG: nshield {exe} --guard
         bool developmentBuild = false;
         bool autoConnectProfiler = false;
         bool scriptDebugging = false;
@@ -1901,6 +1952,14 @@ private:
     void applyBuildWindowTitle();
     void loadAutoStartConfig();
     void applyAutoStartMode();
+    void updateRuntimeMouseCapture();
+    void updateRuntimeCursorImage();
+    GLFWcursor* getRuntimeCursor(float contentScale);
+    // Particle Systems: one simulation step per frame on game time (edit-mode preview
+    // included), after scripts, physics and transforms have moved the emitters.
+    void updateParticleSystems(float dt);
+    // Reads a system's material and its texture's .spritesheet clips into runtime fields.
+    void refreshParticleAssets(SceneObject& obj, double now);
     void startExportBuild(const fs::path& outputDir, bool runAfter);
     void pollExportBuild();
 
@@ -2166,6 +2225,18 @@ public:
     bool isRuntimeKeyDown(int key) const;
     bool isRuntimeMouseDown(int button) const;
     glm::vec2 getRuntimeMouseDelta() const;
+    // The game only captures the mouse (hidden + locked) while something steers with it:
+    // an enabled PlayerController, or a script that asked within the last couple of frames
+    // (ScriptContext::ApplyMouseLook asks while it is applying). Menus and 2D games that
+    // never ask keep a visible pointer, and a capture nobody asks for any more is released.
+    void requestRuntimeMouseCapture();
+    bool runtimeWantsMouseCapture() const;
+    bool isRuntimeMouseCaptured() const { return isPlaying && gameViewCursorLocked; }
+    // Replace the OS pointer with an image while it is visible over the running game.
+    // Hotspot is a 0..1 fraction of the image, height is in pixels at 100% display scale.
+    // Sticky until cleared or play stops; repeating the same call each frame is free.
+    void setRuntimeCursorImage(const std::string& path, float hotspotX, float hotspotY, float heightPx);
+    void clearRuntimeCursorImage();
     int getSelectedObjectId() const;
     // Script-accessible physics helpers
     bool setRigidbodyVelocityFromScript(int id, const glm::vec3& velocity);

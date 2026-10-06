@@ -452,8 +452,9 @@ struct UIProxy {
     struct PositionProp {
         UIProxy* p;
         PositionProp& operator=(const glm::vec2& v) {
-            if (p->_hasUI()) p->ctx_->object->ui.position = v;
-            else detail::uiWarnOnce(p->ctx_, "Position");
+            if (p->_hasUI()) {
+                if (!p->ctx_->object->IsInvariable) p->ctx_->object->ui.position = v;
+            } else detail::uiWarnOnce(p->ctx_, "Position");
             return *this;
         }
         operator glm::vec2() const {
@@ -466,8 +467,9 @@ struct UIProxy {
     struct SizeProp {
         UIProxy* p;
         SizeProp& operator=(const glm::vec2& v) {
-            if (p->_hasUI()) p->ctx_->object->ui.size = glm::max(v, glm::vec2(0.01f));
-            else detail::uiWarnOnce(p->ctx_, "Size");
+            if (p->_hasUI()) {
+                if (!p->ctx_->object->IsInvariable) p->ctx_->object->ui.size = glm::max(v, glm::vec2(0.01f));
+            } else detail::uiWarnOnce(p->ctx_, "Size");
             return *this;
         }
         operator glm::vec2() const {
@@ -496,8 +498,9 @@ struct UIProxy {
     struct RotationProp {
         UIProxy* p;
         RotationProp& operator=(float v) {
-            if (p->_hasUI()) p->ctx_->object->ui.rotation = v;
-            else detail::uiWarnOnce(p->ctx_, "Rotation");
+            if (p->_hasUI()) {
+                if (!p->ctx_->object->IsInvariable) p->ctx_->object->ui.rotation = v;
+            } else detail::uiWarnOnce(p->ctx_, "Rotation");
             return *this;
         }
         operator float() const {
@@ -511,6 +514,7 @@ struct UIProxy {
         UIProxy* p;
         ScaleProp& operator=(const glm::vec2& v) {
             if (p->_hasUI()) {
+                if (p->ctx_->object->IsInvariable) return *this;
                 // Apply as uniform scale on size, or textScale for text elements
                 if (p->ctx_->object->ui.type == UIElementType::Text) {
                     p->ctx_->object->ui.textScale = std::max(0.01f, (v.x + v.y) * 0.5f);

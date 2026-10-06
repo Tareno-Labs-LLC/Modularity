@@ -1230,8 +1230,8 @@ void Engine::renderSceneObjectCreateMenu(int parentId) {
       addObject(ObjectType::Sprite, "Sprite");
     if (ImGui::MenuItem("2.5D Sprite"))
       addObject(ObjectType::Sprite25D, "2.5D Sprite");
-    if (ImGui::MenuItem("Particle System 2D"))
-      addObject(ObjectType::ParticleSystem2D, "Particle System 2D");
+    if (ImGui::MenuItem("Particle System"))
+      addObject(ObjectType::ParticleSystem2D, "Particle System");
     if (ImGui::MenuItem("Mirror"))
       addObject(ObjectType::Mirror, "Mirror");
     ImGui::EndMenu();

@@ -627,7 +627,8 @@ PhysicsSystem::ActorRecord PhysicsSystem::createActorFor(const SceneObject& obj)
     record.actor = actor;
     actor->userData = reinterpret_cast<void*>(static_cast<intptr_t>(obj.id) + 1);
     record.isDynamic = wantsDynamic;
-    record.isKinematic = wantsDynamic && obj.rigidbody.isKinematic;
+    const bool transformLocked = obj.rigidbody.isKinematic || obj.IsInvariable;
+    record.isKinematic = wantsDynamic && transformLocked;
     record.hasWorldBakedStaticMesh = bakeWorldSpaceStaticMesh;
     record.hasAuthoringPose = true;
     record.lastAuthoringPosition = obj.position;
@@ -641,7 +642,7 @@ PhysicsSystem::ActorRecord PhysicsSystem::createActorFor(const SceneObject& obj)
     if (PxRigidDynamic* dyn = actor->is<PxRigidDynamic>()) {
         dyn->setAngularDamping(obj.rigidbody.angularDamping);
         dyn->setLinearDamping(obj.rigidbody.linearDamping);
-        dyn->setRigidBodyFlag(PxRigidBodyFlag::eKINEMATIC, obj.rigidbody.isKinematic);
+        dyn->setRigidBodyFlag(PxRigidBodyFlag::eKINEMATIC, transformLocked);
         dyn->setActorFlag(PxActorFlag::eDISABLE_GRAVITY, !obj.rigidbody.useGravity);
         PxRigidDynamicLockFlags lockFlags = BuildAngularLockFlags(obj);
         dyn->setRigidDynamicLockFlags(lockFlags);
@@ -649,7 +650,7 @@ PhysicsSystem::ActorRecord PhysicsSystem::createActorFor(const SceneObject& obj)
             dyn->setRigidBodyFlag(PxRigidBodyFlag::eENABLE_CCD, true);
             dyn->setMaxDepenetrationVelocity(1.5f);
         }
-        if (!obj.rigidbody.isKinematic) {
+        if (!transformLocked) {
             const float massKg = EffectiveMassKilograms(obj, mProjectSettings);
             const PxVec3 com = ToPxVec3(obj.rigidbody.centerOfMass);
             const PxVec3* comPtr = obj.rigidbody.useCustomCenterOfMass ? &com : nullptr;
@@ -1033,8 +1034,12 @@ void PhysicsSystem::simulate(float deltaTime, std::vector<SceneObject>& objects)
         }
         if (!enabledInHierarchy) continue;
         if (PxRigidDynamic* dyn = rec.actor->is<PxRigidDynamic>()) {
-            const bool isKinematic = obj.rigidbody.isKinematic;
+            const bool isKinematic = obj.rigidbody.isKinematic || obj.IsInvariable;
             if (rec.isKinematic != isKinematic) {
+                if (isKinematic) {
+                    dyn->setLinearVelocity(PxVec3(0.0f));
+                    dyn->setAngularVelocity(PxVec3(0.0f));
+                }
                 dyn->setRigidBodyFlag(PxRigidBodyFlag::eKINEMATIC, isKinematic);
                 rec.isKinematic = isKinematic;
             }
