@@ -12,7 +12,13 @@
 
 class Window {
 public:
+    Window() = default;
+    ~Window() { if (initialized) glfwTerminate(); }
+    Window(const Window&) = delete;
+    Window& operator=(const Window&) = delete;
     GLFWwindow* makeWindow(Modularity::GraphicsBackend backend);
+private:
+    bool initialized = false;
 };
 
 #endif

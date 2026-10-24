@@ -78,6 +78,13 @@ void Engine::updateXRComponents(float deltaTime) {
     (void)deltaTime;
 #else
     if (!isXRRequestedByProject()) return;
+#if !MODULARITY_RUNTIME_ONLY
+    // Editing must never write tracked poses into the saved scene rig.
+    if (vrEditor.requested && !playerMode && !isPlaying) {
+        xrSystem.setOriginToWorld(vrEditor.sceneFromTracking);
+        return;
+    }
+#endif
 
     const Modularity::XR::XRInputState& input = Modularity::XR::InputState();
 
@@ -157,6 +164,9 @@ void Engine::updateXRComponents(float deltaTime) {
         c.uiPressHeld = readButton(c.uiPressButton).first;
     }
 
+    // Tracking writes local poses. Publish their world poses before interaction
+    // and scripts read them, rather than leaving them one tracking sample behind.
+    updateHierarchyWorldTransforms();
     updateXRInteraction(deltaTime);
 #endif
 }

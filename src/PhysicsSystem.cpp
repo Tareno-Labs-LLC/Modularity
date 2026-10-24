@@ -3,6 +3,7 @@
 #include "PxPhysicsAPI.h"
 #include "ModelLoader.h"
 #include "Rendering.h"
+#include "PhysicsContactNormal.h"
 #include <numeric>
 #include <algorithm>
 #include <new>
@@ -36,7 +37,7 @@ public:
         }
     }
 
-    void recordNormal(const PxContactPairHeader& pairHeader, const PxContactPair& pair,
+    void recordNormal(const PxContactPairHeader& /*pairHeader*/, const PxContactPair& pair,
                       int idA, int idB) {
         constexpr PxU32 kMaxPoints = 16;
         PxContactPairPoint points[kMaxPoints];
@@ -49,15 +50,9 @@ public:
         if (lengthSq < 0.000001f) return;
         normal /= std::sqrt(lengthSq);
 
-        const PxRigidActor* actor0 = pairHeader.actors[0]->is<PxRigidActor>();
-        const PxRigidActor* actor1 = pairHeader.actors[1]->is<PxRigidActor>();
-        if (!actor0 || !actor1) return;
-        const PxVec3 centre0 = actor0->getGlobalPose().p;
-        const PxVec3 centre1 = actor1->getGlobalPose().p;
-        glm::vec3 lowToHigh(centre1.x - centre0.x, centre1.y - centre0.y, centre1.z - centre0.z);
-        if (idA > idB) lowToHigh = -lowToHigh;
-        if (glm::dot(normal, lowToHigh) < 0.0f) normal = -normal;
-        mOwner.noteContactNormal(idA, idB, normal);
+        // PhysX normals point from the second callback shape toward the first.
+        mOwner.noteContactNormal(idA, idB,
+            PhysicsContacts::LowToHighNormal(idA, idB, -normal));
     }
 
     void onTrigger(PxTriggerPair* pairs, PxU32 count) override {

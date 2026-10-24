@@ -1,0 +1,11 @@
+# Values match the configured Index materials. Specular is not a detail-color overlay.
+mesh=Resources/VR-Engine-Root/Valve-Index-Knuckles/valve-index-knuckle-left/source/valve_controller_knu_1_0_left/valve_controller_knu_1_0_left.obj
+albedo=Resources/VR-Engine-Root/Valve-Index-Knuckles/valve-index-knuckle-left/textures/valve_controller_knu_1_0_left_diff.png
+specular=Resources/VR-Engine-Root/Valve-Index-Knuckles/valve-index-knuckle-left/textures/valve_controller_knu_1_0_left_spec.png
+metallic=0.391
+roughness=0.323
+ambient=0.28
+scale=1
+# The source origin is at the controls; recenter its handle on the OpenXR grip.
+offset=0,0,-0.11
+rotation=0,0,0

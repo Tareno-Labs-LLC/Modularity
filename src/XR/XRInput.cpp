@@ -104,6 +104,9 @@ bool XRInput::initialize(const XRSession& session, const ProjectOpenXRSettings& 
 
     instance_ = session.instance();
     session_ = session.handle();
+#if !MODULARITY_RUNTIME_ONLY
+    editorWorkspace_ = settings.interaction.editorWorkspace;
+#endif
 
     for (int i = 0; i < 2; ++i) {
         handPaths_[i] = stringToPath(kHandPathStrings[i]);
@@ -191,6 +194,12 @@ bool XRInput::createActions(std::string& outError) {
         !makeAction("haptic", "Haptic Feedback", XR_ACTION_TYPE_VIBRATION_OUTPUT, hapticAction_)) {
         return false;
     }
+#if !MODULARITY_RUNTIME_ONLY
+    if (editorWorkspace_ &&
+        (!makeAction("editor_touchpad", "Editor Touchpad Scroll", XR_ACTION_TYPE_VECTOR2F_INPUT, editorTouchpadAction_) ||
+         !makeAction("editor_touchpad_touch", "Editor Touchpad Touch", XR_ACTION_TYPE_BOOLEAN_INPUT, editorTouchpadTouchAction_) ||
+         !makeAction("editor_touchpad_click", "Editor Context Menu", XR_ACTION_TYPE_FLOAT_INPUT, editorTouchpadClickAction_)))return false;
+#endif
     return true;
 }
 
@@ -223,7 +232,7 @@ bool XRInput::suggestBindings(const ProjectOpenXRSettings& settings, std::string
 
     int suggested = 0;
     for (XRInteractionProfile profile : profiles) {
-        const XRProfileBindings* table = GetProfileBindings(profile);
+        const XRProfileBindings* table = GetProfileBindings(profile, settings.interaction.editorWorkspace);
         if (!table) continue;
 
         const XrPath profilePath = stringToPath(table->profilePath);
@@ -243,6 +252,16 @@ bool XRInput::suggestBindings(const ProjectOpenXRSettings& settings, std::string
                 bindings.push_back(XrActionSuggestedBinding{ action, binding });
             }
         }
+#if !MODULARITY_RUNTIME_ONLY
+        if (editorWorkspace_ && profile == XRInteractionProfile::ValveIndex) {
+            const XrAction actions[]={editorTouchpadAction_,editorTouchpadTouchAction_,editorTouchpadClickAction_};
+            const char* suffixes[]={"/input/trackpad","/input/trackpad/touch","/input/trackpad/force"};
+            for(int hand=0;hand<2;++hand)for(int i=0;i<3;++i) {
+                const auto path=stringToPath((std::string(kHandPathStrings[hand])+suffixes[i]).c_str());
+                if(path!=XR_NULL_PATH)bindings.push_back({actions[i],path});
+            }
+        }
+#endif
         if (bindings.empty()) continue;
 
         XrInteractionProfileSuggestedBinding suggestion{};
@@ -406,6 +425,18 @@ void XRInput::readController(const XRSession& session, XRDevice device,
         }
         return state.currentState == XR_TRUE;
     };
+#if !MODULARITY_RUNTIME_ONLY
+    const bool padWasClicked=out.editorTouchpadClicked;
+    out.editorTouchpad=glm::vec2(0);out.editorTouchpadTouched=false;out.editorTouchpadClicked=false;
+    if(editorWorkspace_) {
+        getInfo.action=editorTouchpadAction_;
+        XrActionStateVector2f pad{};pad.type=XR_TYPE_ACTION_STATE_VECTOR2F;
+        if(XR_SUCCEEDED(fns.GetActionStateVector2f(session_,&getInfo,&pad)) && pad.isActive)
+            out.editorTouchpad={pad.currentState.x,pad.currentState.y};
+        out.editorTouchpadTouched=readBool(editorTouchpadTouchAction_);
+        out.editorTouchpadClicked=readFloat(editorTouchpadClickAction_) >= (padWasClicked?.2f:.35f);
+    }
+#endif
 
     for (int i = 0; i < static_cast<int>(XRButton::Count); ++i) {
         const auto button = static_cast<XRButton>(i);
@@ -568,6 +599,10 @@ void XRInput::shutdown() {
     secondaryButtonAction_ = XR_NULL_HANDLE;
     menuButtonAction_ = XR_NULL_HANDLE;
     hapticAction_ = XR_NULL_HANDLE;
+#if !MODULARITY_RUNTIME_ONLY
+    editorWorkspace_=false;
+    editorTouchpadAction_=editorTouchpadTouchAction_=editorTouchpadClickAction_=XR_NULL_HANDLE;
+#endif
 
     instance_ = XR_NULL_HANDLE;
     session_ = XR_NULL_HANDLE;

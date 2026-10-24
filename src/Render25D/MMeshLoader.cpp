@@ -34,6 +34,16 @@ bool ReadValue(std::ifstream& in, T& value) {
     return static_cast<bool>(in);
 }
 
+bool HasRemainingBytes(std::ifstream& in, uint64_t bytes) {
+    const std::streampos current = in.tellg();
+    if (current == std::streampos(-1)) return false;
+    in.seekg(0, std::ios::end);
+    const std::streampos end = in.tellg();
+    in.seekg(current);
+    return in && end != std::streampos(-1) && end >= current &&
+        bytes <= static_cast<uint64_t>(end - current);
+}
+
 bool WriteString(std::ofstream& out, const std::string& value) {
     const uint32_t length = static_cast<uint32_t>(value.size());
     return WriteValue(out, length) &&
@@ -46,6 +56,7 @@ bool ReadString(std::ifstream& in, std::string& value) {
         return false;
     }
 
+    if (!HasRemainingBytes(in, length)) return false;
     value.resize(length);
     if (length == 0u) {
         return true;
@@ -198,6 +209,24 @@ bool MMeshLoader::loadAsset(const std::string& path, MMeshAsset& outAsset, std::
 
     if (header.version == 0u || header.version > kMMeshVersion) {
         error = "Unsupported .MMesh version: " + std::to_string(header.version);
+        return false;
+    }
+
+    // Reject impossible counts before allocating. All arithmetic is widened
+    // before multiplication; string records include at least their lengths.
+    const uint64_t vertexBytes = sizeof(glm::vec3) +
+        ((header.flags & kMMeshFlagUVs) ? sizeof(glm::vec2) : 0u) +
+        ((header.flags & kMMeshFlagNormals) ? sizeof(glm::vec3) : 0u);
+    const uint64_t materialBytes = 2u * sizeof(uint32_t) +
+        (header.version >= 2u ? sizeof(glm::vec4) + sizeof(uint32_t) + sizeof(bool) + sizeof(float) : 0u);
+    const uint64_t minimumBytes = 2u * sizeof(glm::vec3) +
+        uint64_t(header.vertexCount) * vertexBytes +
+        uint64_t(header.indexCount) * sizeof(uint32_t) +
+        uint64_t(header.materialCount) * materialBytes +
+        uint64_t(header.surfaceCount) * (2u * sizeof(uint32_t) + sizeof(int)) +
+        uint64_t(header.metadataCount) * (2u * sizeof(uint32_t));
+    if (!HasRemainingBytes(in, minimumBytes)) {
+        error = ".MMesh counts exceed the remaining file data: " + path;
         return false;
     }
 

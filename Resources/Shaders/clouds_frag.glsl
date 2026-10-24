@@ -73,7 +73,8 @@ void main()
     // pure direction; a zero vector just parks the scroll instead of NaN-ing
     vec2 dir = (length(uScrollDir) > 0.0001) ? normalize(uScrollDir) : vec2(0.0);
 
-    int octaves = clamp(uCloudDetail, 1, 8);
+    // Float clamp: GLSL ES 1.00 has no integer clamp().
+    int octaves = int(clamp(float(uCloudDetail), 1.0, 8.0));
     float scale = max(uCloudScale, 0.0001);
     vec2 p = uv * scale + dir * (uTime * uScrollSpeed * scale);
     float evolve = uTime * uCloudSpeed;

@@ -3,6 +3,7 @@
 #include "Common.h"
 #include "ScriptCompiler.h"
 #include <cctype>
+#include <unordered_map>
 
 struct PackageInfo {
     std::string id;
@@ -110,6 +111,7 @@ private:
     static std::string slugify(const std::string& value);
     static bool runCommand(const std::string& command, std::string& output);
     bool ensureProjectRoot() const;
+    void invalidateInstallationStateCache();
     std::vector<std::string> split(const std::string& input, char delim) const;
     std::string join(const std::vector<std::string>& vals, char delim) const;
     fs::path packagesFolder() const;
@@ -124,4 +126,7 @@ private:
     std::string registryLastUpdated;
     std::string registryUpdatedBy;
     fs::path registryRoot;
+    mutable std::unordered_map<std::string, bool> projectPayloadCache;
+    mutable std::unordered_map<std::string, bool> globalInstallCache;
+    mutable std::unordered_map<std::string, bool> updateAvailableCache;
 };

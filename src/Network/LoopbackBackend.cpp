@@ -11,6 +11,7 @@ public:
     const char* name() const override { return "Offline"; }
 
     bool initialize(const SessionConfig& config, const BackendCallbacks& callbacks) override {
+        stopped = false;
         cfg = config;
         cb = callbacks;
 
@@ -26,6 +27,7 @@ public:
     }
 
     void shutdown() override {
+        stopped = true;
         playerList.clear();
         rooms.clear();
         pending.clear();
@@ -36,7 +38,10 @@ public:
     void tick(float) override {
         std::deque<std::function<void()>> work;
         work.swap(pending);
-        for (auto& fn : work) fn();
+        for (auto& fn : work) {
+            if (stopped) break;
+            fn();
+        }
     }
 
     bool connect() override {
@@ -213,6 +218,7 @@ public:
     const NetworkError& lastError() const override { return error; }
 
 private:
+    bool stopped = true;
     struct BufferedEvent {
         uint8_t code;
         std::vector<uint8_t> payload;

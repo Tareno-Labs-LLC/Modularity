@@ -133,7 +133,7 @@ void appendBundledScriptSdkIncludeDirs(std::vector<fs::path>& includeDirs, const
     appendIfExists(includeDirs, sdkRoot / "src/ThirdParty/glfw/include");
     appendIfExists(includeDirs, sdkRoot / "src/ThirdParty/ModuGUI");
     appendIfExists(includeDirs, sdkRoot / "src/ThirdParty/ModuGUI/backends");
-    appendIfExists(includeDirs, sdkRoot / "src/ThirdParty/ImGuizmo");
+    appendIfExists(includeDirs, sdkRoot / "src/ThirdParty/ModuGuizmo");
     appendIfExists(includeDirs, sdkRoot / "src/ThirdParty/assimp/include");
 }
 
@@ -372,6 +372,12 @@ PackageManager::PackageManager() {
 #endif
 }
 
+void PackageManager::invalidateInstallationStateCache() {
+    projectPayloadCache.clear();
+    globalInstallCache.clear();
+    updateAvailableCache.clear();
+}
+
 void PackageManager::setProjectRoot(const fs::path& root) {
     const auto __t0 = std::chrono::steady_clock::now();
 #if !MODULARITY_RUNTIME_ONLY
@@ -383,6 +389,7 @@ void PackageManager::setProjectRoot(const fs::path& root) {
 #if !MODULARITY_RUNTIME_ONLY
     loadManifest();
 #endif
+    invalidateInstallationStateCache();
     const auto __t2 = std::chrono::steady_clock::now();
     const double buildMs = std::chrono::duration<double, std::milli>(__t1 - __t0).count();
     const double manifestMs = std::chrono::duration<double, std::milli>(__t2 - __t1).count();
@@ -403,6 +410,7 @@ void PackageManager::refreshRegistry() {
         manifestPath = projectRoot / "packages.modu";
         loadManifest();
     }
+    invalidateInstallationStateCache();
 #endif
 }
 #pragma endregion
@@ -413,27 +421,44 @@ bool PackageManager::isInstalled(const std::string& id) const {
 }
 
 bool PackageManager::hasProjectInstallPayload(const std::string& id) const {
+    if (const auto cached = projectPayloadCache.find(id); cached != projectPayloadCache.end()) {
+        return cached->second;
+    }
     const PackageInfo* pkg = findPackage(id);
-    return pkg && pkg->registryPackage && hasVersionedPackageAtAnyVersion(packagesFolder(), *pkg);
+    const bool installed = pkg && pkg->registryPackage && hasVersionedPackageAtAnyVersion(packagesFolder(), *pkg);
+    projectPayloadCache.emplace(id, installed);
+    return installed;
 }
 
 bool PackageManager::isGloballyInstalled(const std::string& id) const {
+    if (const auto cached = globalInstallCache.find(id); cached != globalInstallCache.end()) {
+        return cached->second;
+    }
     const PackageInfo* pkg = findPackage(id);
     if (!pkg || !pkg->registryPackage) {
+        globalInstallCache.emplace(id, false);
         return false;
     }
-    return findVersionedPackageAtAnyVersion(globalPackagesFolder(), *pkg).has_value();
+    const bool installed = findVersionedPackageAtAnyVersion(globalPackagesFolder(), *pkg).has_value();
+    globalInstallCache.emplace(id, installed);
+    return installed;
 }
 
 bool PackageManager::hasUpdateAvailable(const std::string& id) const {
+    if (const auto cached = updateAvailableCache.find(id); cached != updateAvailableCache.end()) {
+        return cached->second;
+    }
     const PackageInfo* pkg = findPackage(id);
     if (!pkg || !pkg->registryPackage) {
+        updateAvailableCache.emplace(id, false);
         return false;
     }
     const bool hasProjectLegacy = hasLegacyVersionedPackageAt(packagesFolder(), *pkg);
     const bool hasGlobalLegacy = hasLegacyVersionedPackageAt(globalPackagesFolder() / currentEngineVersion() / pkg->author, *pkg) ||
                                  hasLegacyVersionedPackageAt(globalPackagesFolder(), *pkg);
-    return hasProjectLegacy || hasGlobalLegacy;
+    const bool available = hasProjectLegacy || hasGlobalLegacy;
+    updateAvailableCache.emplace(id, available);
+    return available;
 }
 
 bool PackageManager::isCompatible(const std::string& id) const {
@@ -460,6 +485,7 @@ bool PackageManager::install(const std::string& id) {
     }
     installedIds.push_back(id);
     saveManifest();
+    invalidateInstallationStateCache();
     return true;
 }
 
@@ -501,11 +527,14 @@ bool PackageManager::installRegistryPackageToProject(const std::string& id) {
         }
     }
 
-    return install(id);
+    const bool installed = install(id);
+    invalidateInstallationStateCache();
+    return installed;
 }
 
 bool PackageManager::installRegistryPackageGlobally(const std::string& id) {
     lastError.clear();
+    invalidateInstallationStateCache();
 
     const PackageInfo* pkg = findPackage(id);
     if (!pkg || !pkg->registryPackage) {
@@ -538,6 +567,7 @@ bool PackageManager::installRegistryPackageGlobally(const std::string& id) {
         lastError = copyError;
         return false;
     }
+    invalidateInstallationStateCache();
     return true;
 }
 
@@ -593,6 +623,7 @@ bool PackageManager::remove(const std::string& id) {
         }
     }
 
+    invalidateInstallationStateCache();
     auto it = std::remove(installedIds.begin(), installedIds.end(), id);
     if (it == installedIds.end()) {
         return true;
@@ -607,6 +638,7 @@ bool PackageManager::remove(const std::string& id) {
 
 bool PackageManager::removeRegistryPackageGlobally(const std::string& id) {
     lastError.clear();
+    invalidateInstallationStateCache();
     const PackageInfo* pkg = findPackage(id);
     if (!pkg || !pkg->registryPackage) {
         lastError = "Package is not available in the ModuEngine registry: " + id;
@@ -723,6 +755,7 @@ void PackageManager::applyToBuildConfig(ScriptBuildConfig& config) const {
 
 #pragma region Registry
 void PackageManager::buildRegistry() {
+    invalidateInstallationStateCache();
     registry.clear();
     registryAvailable = false;
     registryStatus.clear();
@@ -783,13 +816,13 @@ void PackageManager::buildRegistry() {
 
     PackageInfo imguizmo;
     imguizmo.id = "imguizmo";
-    imguizmo.name = "ImGuizmo";
+    imguizmo.name = "ModuGuizmo";
     imguizmo.description = "Gizmo/transform helpers used by the editor";
     imguizmo.builtIn = false;
     if (!engineSourceRoot.empty()) {
-        appendIfExists(imguizmo.includeDirs, engineSourceRoot / "src/ThirdParty/ImGuizmo");
+        appendIfExists(imguizmo.includeDirs, engineSourceRoot / "src/ThirdParty/ModuGuizmo");
     } else if (!sdkRoot.empty()) {
-        appendIfExists(imguizmo.includeDirs, sdkRoot / "src/ThirdParty/ImGuizmo");
+        appendIfExists(imguizmo.includeDirs, sdkRoot / "src/ThirdParty/ModuGuizmo");
     }
     add(imguizmo);
 

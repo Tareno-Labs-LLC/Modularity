@@ -1,6 +1,8 @@
 #include "../../EditorLocalization.h"
 #include "Engine.h"
 #include "ViewportRenderHelpers.h"
+#include "UIControls.h"
+#include "UILayout.h"
 #include "GizmoToolbar.h"
 #include "ModelLoader.h"
 #include <algorithm>
@@ -872,6 +874,7 @@ void Engine::renderGameViewportWindow() {
       }
     };
 
+    const UILayout::Context uiLayout(sceneObjects);
     auto resolveUIRect = [&](const SceneObject &obj, ImVec2 &outMin,
                              ImVec2 &outMax, ImVec2 *parentMin = nullptr,
                              ImVec2 *parentMax = nullptr,
@@ -910,18 +913,20 @@ void Engine::renderGameViewportWindow() {
                                     *parentMin, *parentMax);
         }
         glm::vec2 nodeSizeWorld = getSpriteDisplaySize(*node);
+        const auto placement = uiLayout.Resolve(*node, regionMaxRender - regionMinRender, nodeSizeWorld);
+        nodeSizeWorld = placement.size;
         ImVec2 size = ImVec2(std::max(1.0f, nodeSizeWorld.x),
                              std::max(1.0f, nodeSizeWorld.y));
         ImVec2 anchorPoint = anchorToPoint(
-            node->ui.anchor, ImVec2(regionMinRender.x, regionMinRender.y),
+            placement.anchor, ImVec2(regionMinRender.x, regionMinRender.y),
             ImVec2(regionMaxRender.x, regionMaxRender.y));
         glm::vec2 anchorWorld = rotateAbout(
             glm::vec2(anchorPoint.x, anchorPoint.y), parentCenter, accumRot);
         glm::vec2 off = ViewportRenderHelpers::RotateUiVec2(
-            glm::vec2(node->ui.position.x, node->ui.position.y), accumRot);
+            glm::vec2(placement.position.x, placement.position.y), accumRot);
         glm::vec2 pivot = anchorWorld + off;
         const float nodeRot = accumRot + glm::radians(node->ui.rotation);
-        ImVec2 pivotOffset = anchorToPivot(node->ui.anchor, size);
+        ImVec2 pivotOffset = anchorToPivot(placement.anchor, size);
         glm::vec2 centerOff = ViewportRenderHelpers::RotateUiVec2(
             glm::vec2(size.x * 0.5f - pivotOffset.x,
                       size.y * 0.5f - pivotOffset.y),
@@ -1129,7 +1134,7 @@ void Engine::renderGameViewportWindow() {
       float factor = std::clamp(obj.parallaxLayer2D.factor, 0.0f, 1.0f);
       return uiWorldCamera.position * (1.0f - factor);
     };
-    auto resolveUIRectWorld = [&](const SceneObject &obj, ImVec2 &outMin,
+    auto resolveUIRectWorldLegacy = [&](const SceneObject &obj, ImVec2 &outMin,
                                   ImVec2 &outMax) {
       if (obj.type == ObjectType::Sprite25D && hasProjectedUiCamera) {
         ImVec2 renderMin;
@@ -1164,6 +1169,10 @@ void Engine::renderGameViewportWindow() {
       outMin = ImVec2(std::min(s0.x, s1.x), std::min(s0.y, s1.y));
       outMax = ImVec2(std::max(s0.x, s1.x), std::max(s0.y, s1.y));
       return true;
+    };
+    auto resolveUIRectWorld = [&](const SceneObject& obj, ImVec2& outMin, ImVec2& outMax) {
+      return UILayout::ResolveWorldRect(uiLayout, obj, outMin, outMax, resolveUIRectWorldLegacy,
+          [&](const SceneObject& node) { return getSpriteDisplaySize(node); });
     };
     auto resolveUIRectWorldRender = [&](const SceneObject &obj,
                                         glm::vec2 &outMin, glm::vec2 &outMax) {
@@ -1338,6 +1347,7 @@ void Engine::renderGameViewportWindow() {
         continue;
       if (!isUIType(obj) && !ViewportRenderHelpers::IsAssemblageLayerDrawable(obj))
         continue;
+      if (!UIControls::ContentVisible(obj, sceneObjects)) continue;
       uiDrawList.push_back(&obj);
     }
     if (uiDrawList.size() > 1) {
@@ -1363,8 +1373,7 @@ void Engine::renderGameViewportWindow() {
         current = uiSceneLookup.find(current->parentId);
         if (!current)
           break;
-        if (!(current->hasUI && current->ui.type == UIElementType::Canvas &&
-              current->ui.maskChildren)) {
+        if (!(current->hasUI && ClipsUIChildren(current->ui))) {
           continue;
         }
 
@@ -1396,7 +1405,7 @@ void Engine::renderGameViewportWindow() {
         return false;
       outMin = maskMin;
       outMax = maskMax;
-      return (outMax.x > outMin.x) && (outMax.y > outMin.y);
+      return true; // An empty intersection remains an active clip.
     };
 
     std::unordered_set<int> light2DRenderedObjectIds;
@@ -2030,7 +2039,15 @@ void Engine::renderGameViewportWindow() {
         spriteBatch.flush();
         EmitRuntimeUiBackdropBlur(ImGui::GetWindowDrawList(), obj, drawMin, drawMax);
       }
-      if (obj.ui.type == UIElementType::Image ||
+      if (IsExtendedUIType(obj.ui.type)) {
+        spriteBatch.flush();
+        Texture* panelTexture = rendererInitialized && obj.ui.type == UIElementType::Panel && !obj.albedoTexturePath.empty()
+            ? renderer.getTexture(obj.albedoTexturePath, obj.material.textureFilter) : nullptr;
+        // Like the legacy Button/Slider: a live control only while playing; otherwise an inert preview.
+        UIControls::Draw(obj, sceneObjects, drawMin, drawMax, isPlaying && !uiWorldCameraActive,
+            panelTexture ? (ImTextureID)(intptr_t)panelTexture->GetID() : (ImTextureID)0,
+            [&](SceneObject& panel, ImVec2 min, ImVec2 max) { renderDockedUiCanvas(panel, min, max); });
+      } else if (obj.ui.type == UIElementType::Image ||
           obj.ui.type == UIElementType::Sprite2D) {
         if (light2DRenderedObjectIds.find(obj.id) !=
             light2DRenderedObjectIds.end()) {
@@ -2413,6 +2430,8 @@ void Engine::renderGameViewportWindow() {
           ImGui::PopClipRect();
         }
       }
+      if (!IsExtendedUIType(obj.ui.type) && !obj.ui.tooltip.empty() && ImGui::IsMouseHoveringRect(drawMin, drawMax))
+        ImGui::SetTooltip("%s", obj.ui.tooltip.c_str());
       if (pushedCanvasMask) {
         spriteBatch.flush();
         ImGui::PopClipRect();
@@ -2534,20 +2553,22 @@ void Engine::renderGameViewportWindow() {
       ImVec2 regionMin = baseRegionMin;
       ImVec2 regionMax = baseRegionMax;
       for (const SceneObject *node : chain) {
+        const auto placement = uiLayout.Resolve(*node,
+            glm::vec2((regionMax.x - regionMin.x) / std::max(.001f, scaleX), (regionMax.y - regionMin.y) / std::max(.001f, scaleY)), getSpriteDisplaySize(*node));
         ImVec2 size(1.0f, 1.0f);
         if (node->id == canvas.id) {
           size = ImVec2(std::max(1.0f, layoutSizePx.x * scaleX),
                         std::max(1.0f, layoutSizePx.y * scaleY));
         } else {
-          const glm::vec2 nodeSize = getSpriteDisplaySize(*node);
+          const glm::vec2 nodeSize = placement.size;
           size = ImVec2(std::max(1.0f, nodeSize.x * scaleX),
                         std::max(1.0f, nodeSize.y * scaleY));
         }
         const ImVec2 anchorPoint =
-            anchorToPoint(node->ui.anchor, regionMin, regionMax);
-        const ImVec2 pivot(anchorPoint.x + node->ui.position.x * scaleX,
-                           anchorPoint.y + node->ui.position.y * scaleY);
-        const ImVec2 pivotOffset = anchorToPivot(node->ui.anchor, size);
+            anchorToPoint(placement.anchor, regionMin, regionMax);
+        const ImVec2 pivot(anchorPoint.x + placement.position.x * scaleX,
+                           anchorPoint.y + placement.position.y * scaleY);
+        const ImVec2 pivotOffset = anchorToPivot(placement.anchor, size);
         regionMin = ImVec2(pivot.x - pivotOffset.x, pivot.y - pivotOffset.y);
         regionMax = ImVec2(regionMin.x + size.x, regionMin.y + size.y);
       }
@@ -2560,7 +2581,7 @@ void Engine::renderGameViewportWindow() {
       if (!IsObjectEnabledInHierarchy(canvas) || !canvas.hasUI ||
           canvas.ui.type != UIElementType::Canvas || canvas.ui.renderIn3D ||
           !canvas.ui.pseudo3DEnabled ||
-          !canvas.ui.pseudo3DUseOffscreenSurface) {
+          !canvas.ui.pseudo3DUseOffscreenSurface || UIControls::IsDockedCanvas(canvas, sceneObjects)) {
         continue;
       }
 

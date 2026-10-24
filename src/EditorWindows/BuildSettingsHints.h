@@ -75,6 +75,19 @@ inline constexpr const char* kAutomaticModules =
     "model and audio files in Assets, the C# scripts the build scenes run, and the target platform.\n"
     "Turn off to force modules on or off by hand.";
 
+inline constexpr const char* kGles2Shaders =
+    "Also ship GLSL ES 1.00 versions of the material, scrolling texture, procedural clouds and "
+    "skybox shaders (as <name>.es2.glsl), for GLES 2.0-only GPUs such as the original Anbernic "
+    "RG35XX.\n"
+    "The ES 2 versions are unshadowed, have no voxel GI or parallax, and light at most 4 lights. "
+    "The export log lists any shader that could not be converted. The player does not have a "
+    "GLES 2.0 renderer yet, so today these files are prepared but not used.";
+
+inline constexpr const char* kPreloadShaders =
+    "Compile every shader the build scenes use while the player boots, instead of the first time "
+    "something draws with it, so there is no hitch mid-game. Costs a little startup time.\n"
+    "Always on when GLES 2.0 Shaders is enabled.";
+
 inline constexpr const char* kSplash =
     "Show an image while the player starts. The image is copied into the build.";
 

@@ -1560,6 +1560,7 @@ Renderer::~Renderer() {
     releaseVoxelVolume();
     releaseXREyePreviews();
     releaseRenderTarget(polarizationTarget);
+    releaseRenderTarget(externalSceneTarget);
     releaseRenderTarget(overlayCaptureTarget);
     releaseRenderTarget(bandLayerTarget);
     releaseRenderTarget(bandCaptureTarget);
@@ -3612,6 +3613,7 @@ unsigned int Renderer::findFramebufferForTexture(unsigned int texture) const {
     };
 
     if (unsigned int match = findTargetMatch(previewTarget)) return match;
+    if (unsigned int match = findTargetMatch(externalSceneTarget)) return match;
     if (unsigned int match = findTargetMatch(postTarget)) return match;
     if (unsigned int match = findTargetMatch(previewPostTarget)) return match;
     if (unsigned int match = findTargetMatch(historyTarget)) return match;
@@ -8930,36 +8932,73 @@ void Renderer::renderSceneToTarget(const Camera& camera,
                                    const glm::mat4& projection,
                                    float nearPlane, float farPlane,
                                    bool clearTarget) {
+    renderSceneToTarget(camera, sceneObjects, targetFramebuffer, width, height,
+                        projection, nearPlane, farPlane, clearTarget, false);
+}
+
+void Renderer::renderSceneToTarget(const Camera& camera,
+                                   const std::vector<SceneObject>& sceneObjects,
+                                   unsigned int targetFramebuffer,
+                                   int width, int height,
+                                   const glm::mat4& projection,
+                                   float nearPlane, float farPlane,
+                                   bool clearTarget, bool applyPostFX) {
     if (!moduRenderContextLive() || width <= 0 || height <= 0) {
         return;
     }
 
     GLint previousFramebuffer = 0;
+    GLint previousReadFramebuffer = 0;
     GLint previousViewport[4] = {0, 0, 0, 0};
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previousFramebuffer);
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &previousReadFramebuffer);
     glGetIntegerv(GL_VIEWPORT, previousViewport);
+    const GLboolean previousScissor = glIsEnabled(GL_SCISSOR_TEST);
+    if (applyPostFX) glDisable(GL_SCISSOR_TEST);
     struct TargetRenderStateRestore {
         GLint framebuffer = 0;
+        GLint readFramebuffer = 0;
         GLint viewport[4] = {0, 0, 0, 0};
+        GLboolean scissor = GL_FALSE;
         Renderer* renderer = nullptr;
 
         ~TargetRenderStateRestore() {
             glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, readFramebuffer);
             glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+            if (scissor) glEnable(GL_SCISSOR_TEST);
+            else glDisable(GL_SCISSOR_TEST);
             if (renderer) {
                 renderer->sceneProjectionOverride = nullptr;
                 renderer->activeStats = nullptr;
             }
         }
     } restore{previousFramebuffer,
+              previousReadFramebuffer,
               {previousViewport[0], previousViewport[1], previousViewport[2], previousViewport[3]},
-              this};
+              previousScissor, this};
 
     resetStats(viewportStats);
     activeStats = &viewportStats;
     sceneProjectionOverride = &projection;
 
-    glBindFramebuffer(GL_FRAMEBUFFER, targetFramebuffer);
+    unsigned int sceneFramebuffer = targetFramebuffer;
+    if (applyPostFX) {
+        RenderTargetOptions options;
+        options.hdr = true;
+        options.depthSampleable = true;
+        ensureRenderTarget(externalSceneTarget, width, height, options);
+        if (externalSceneTarget.fbo == 0 || externalSceneTarget.texture == 0) return;
+        sceneFramebuffer = externalSceneTarget.fbo;
+        if (!clearTarget) {
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, targetFramebuffer);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, sceneFramebuffer);
+            glBlitFramebuffer(0, 0, width, height, 0, 0, width, height,
+                              GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+        }
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, sceneFramebuffer);
     glViewport(0, 0, width, height);
     if (clearTarget) {
         if (camera.solidBackground) {
@@ -8974,15 +9013,30 @@ void Renderer::renderSceneToTarget(const Camera& camera,
     if (!camera.orthographic) {
         MODU_PROFILE_SCOPE("Mirror Targets", ProfilerSampleCategory::RenderDetail);
         updateMirrorTargets(camera, sceneObjects, width, height, FOV, nearPlane, farPlane);
-        glBindFramebuffer(GL_FRAMEBUFFER, targetFramebuffer);
+        glBindFramebuffer(GL_FRAMEBUFFER, sceneFramebuffer);
         glViewport(0, 0, width, height);
     }
     {
         MODU_PROFILE_SCOPE("Scene Draw", ProfilerSampleCategory::RenderDetail);
-        sceneDepthTextureForPass = 0;
-        sceneColorTextureForPass = 0;
+        sceneDepthTextureForPass = applyPostFX ? externalSceneTarget.depthTexture : 0;
+        sceneColorTextureForPass = applyPostFX ? externalSceneTarget.texture : 0;
         renderSceneInternal(camera, sceneObjects, width, height, false, FOV, nearPlane, farPlane,
                             true, true);
+        sceneDepthTextureForPass = 0;
+        sceneColorTextureForPass = 0;
+    }
+    if (applyPostFX) {
+        // Do not share temporal history between the left eye, right eye and
+        // desktop viewport. Each eye is processed before its swapchain releases.
+        const unsigned int processed = applyPostProcessing(
+            camera, sceneObjects, externalSceneTarget.texture, width, height, false);
+        const unsigned int presented = processed ? processed : externalSceneTarget.texture;
+        const unsigned int sourceFramebuffer = findFramebufferForTexture(presented);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, sourceFramebuffer ? sourceFramebuffer : sceneFramebuffer);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, targetFramebuffer);
+        glBlitFramebuffer(0, 0, width, height, 0, 0, width, height,
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
     }
 }
 
@@ -9231,10 +9285,35 @@ void Renderer::renderCollisionOverlay(const Camera& camera, const std::vector<Sc
 #endif
 }
 
-void Renderer::renderSelectionOutline(const Camera& camera, const std::vector<SceneObject>& sceneObjects, const std::vector<int>& selectedIds, float fovDeg, float nearPlane, float farPlane) {
+bool Renderer::getObjectLocalBounds(const SceneObject& object,glm::vec3& center,glm::vec3& extents) {
+    return TryGetObjectLocalBounds(object,center,extents);
+}
+
+void Renderer::renderSelectionOutline(const Camera& camera, const std::vector<SceneObject>& objects,
+    const std::vector<int>& ids, float fovDeg, float nearPlane, float farPlane) {
+    renderSelectionOutlinePass(camera, objects, ids,
+        BuildCameraProjection(camera,currentWidth,currentHeight,fovDeg,nearPlane,farPlane),
+        framebuffer,currentWidth,currentHeight,nearPlane,2.7f,.95f,true,framebuffer);
+}
+
+#if !MODULARITY_RUNTIME_ONLY
+void Renderer::renderSelectionOutlineToTarget(const Camera& camera, const std::vector<SceneObject>& objects,
+    const std::vector<int>& ids, const glm::mat4& projection, unsigned int targetFramebuffer,
+    int width, int height, float nearPlane, float radiusPx, float opacity, bool animateSelection) {
+    renderSelectionOutlinePass(camera,objects,ids,projection,targetFramebuffer,width,height,nearPlane,
+                              std::clamp(radiusPx,.5f,8.f),std::clamp(opacity,0.f,1.f),animateSelection,
+                              externalSceneTarget.fbo ? externalSceneTarget.fbo : targetFramebuffer);
+}
+#endif
+
+void Renderer::renderSelectionOutlinePass(const Camera& camera, const std::vector<SceneObject>& sceneObjects,
+    const std::vector<int>& selectedIds, const glm::mat4& projection, unsigned int targetFramebuffer,
+    int width, int height, float nearPlane, float radiusPx, float opacity, bool animateSelection,
+    unsigned int depthFramebuffer) {
     if (camera.orthographic) {
         return;
     }
+    if (animateSelection) {
     const double nowSec = glfwGetTime();
     if (selectionOutlineLastUpdateSec <= 0.0 || nowSec < selectionOutlineLastUpdateSec) {
         selectionOutlineLastUpdateSec = nowSec;
@@ -9296,8 +9375,9 @@ void Renderer::renderSelectionOutline(const Camera& camera, const std::vector<Sc
         selectionOutlineSwapBlend = 1.0f;
         return;
     }
-    if (!defaultShader || currentWidth <= 0 || currentHeight <= 0) return;
-    if (selectionOutlineVisualIds.empty() || selectionOutlineBlend <= 0.001f) return;
+    }
+    if (!defaultShader || width <= 0 || height <= 0) return;
+    if (animateSelection && (selectionOutlineVisualIds.empty() || selectionOutlineBlend <= 0.001f)) return;
 
     auto resolveMesh = [this](const SceneObject& obj) -> Mesh* {
         if (obj.renderType == RenderType::Cube) return cubeMesh;
@@ -9357,18 +9437,18 @@ void Renderer::renderSelectionOutline(const Camera& camera, const std::vector<Sc
         }
     };
 
-    buildDrawItems(selectionOutlineVisualIds, selectionOutlineCurrentDrawScratch);
+    buildDrawItems(animateSelection ? selectionOutlineVisualIds : selectedIds, selectionOutlineCurrentDrawScratch);
     selectionOutlinePreviousDrawScratch.clear();
-    if (!selectionOutlinePrevIds.empty() && selectionOutlineSwapBlend < 0.999f) {
+    if (animateSelection && !selectionOutlinePrevIds.empty() && selectionOutlineSwapBlend < 0.999f) {
         buildDrawItems(selectionOutlinePrevIds, selectionOutlinePreviousDrawScratch);
     }
-    if (selectionOutlinePreviousDrawScratch.empty()) {
+    if (animateSelection && selectionOutlinePreviousDrawScratch.empty()) {
         selectionOutlinePrevIds.clear();
         selectionOutlineSwapBlend = 1.0f;
     }
     if (selectionOutlineCurrentDrawScratch.empty() && selectionOutlinePreviousDrawScratch.empty()) return;
 
-    ensureRenderTarget(selectionMaskTarget, currentWidth, currentHeight);
+    ensureRenderTarget(selectionMaskTarget, width, height);
     if (selectionMaskTarget.fbo == 0 || selectionMaskTarget.texture == 0) return;
 
     Shader* staticMaskShader = getShader(selectionMaskVertPath, selectionMaskFragPath);
@@ -9396,7 +9476,7 @@ void Renderer::renderSelectionOutline(const Camera& camera, const std::vector<Sc
 
     GLint prevDrawFbo = 0;
     GLint prevReadFbo = 0;
-    GLint prevViewport[4] = { 0, 0, currentWidth, currentHeight };
+    GLint prevViewport[4] = { 0, 0, width, height };
     GLint prevActiveTex = GL_TEXTURE0;
     GLint prevBlendSrcRGB = GL_ONE;
     GLint prevBlendDstRGB = GL_ZERO;
@@ -9432,14 +9512,13 @@ void Renderer::renderSelectionOutline(const Camera& camera, const std::vector<Sc
     GLboolean blendEnabled = glIsEnabled(GL_BLEND);
     GLboolean stencilEnabled = glIsEnabled(GL_STENCIL_TEST);
     GLboolean scissorEnabled = glIsEnabled(GL_SCISSOR_TEST);
-    GLint prevScissorBox[4] = { 0, 0, currentWidth, currentHeight };
+    GLint prevScissorBox[4] = { 0, 0, width, height };
     glGetIntegerv(GL_SCISSOR_BOX, prevScissorBox);
     GLboolean polyOffsetFill = glIsEnabled(GL_POLYGON_OFFSET_FILL);
     GLboolean prevColorMask[4] = { GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE };
     glGetBooleanv(GL_COLOR_WRITEMASK, prevColorMask);
 
     const glm::mat4 view = camera.getViewMatrix();
-    const glm::mat4 projection = BuildCameraProjection(camera, currentWidth, currentHeight, fovDeg, nearPlane, farPlane);
     const glm::mat4 viewProjection = projection * view;
 
     // The outline shader searches a neighbourhood of the mask per pixel, so run over the whole
@@ -9448,7 +9527,7 @@ void Renderer::renderSelectionOutline(const Camera& camera, const std::vector<Sc
     // pass is alpha blended, so every pixel outside that box writes alpha 0 and leaves the target
     // untouched: restricting the pass to the box is the same image for a fraction of the fill.
     // These match the uniforms the pass sets below.
-    constexpr float kOutlineRadiusPx = 2.7f;
+    const float kOutlineRadiusPx = radiusPx;
     constexpr float kOutlineSoftnessPx = 1.15f;
     const int outlineMarginPx =
         static_cast<int>(std::ceil(kOutlineRadiusPx + kOutlineSoftnessPx)) + 1;
@@ -9471,8 +9550,8 @@ void Renderer::renderSelectionOutline(const Camera& camera, const std::vector<Sc
         float minX = FLT_MAX, minY = FLT_MAX, maxX = -FLT_MAX, maxY = -FLT_MAX;
         bool anyInFront = false;
         auto accumulate = [&](const glm::vec4& clip) {
-            const float sx = (clip.x / clip.w * 0.5f + 0.5f) * static_cast<float>(currentWidth);
-            const float sy = (clip.y / clip.w * 0.5f + 0.5f) * static_cast<float>(currentHeight);
+            const float sx = (clip.x / clip.w * 0.5f + 0.5f) * static_cast<float>(width);
+            const float sy = (clip.y / clip.w * 0.5f + 0.5f) * static_cast<float>(height);
             if (!std::isfinite(sx) || !std::isfinite(sy)) return false;
             minX = std::min(minX, sx);
             minY = std::min(minY, sy);
@@ -9523,8 +9602,8 @@ void Renderer::renderSelectionOutline(const Camera& camera, const std::vector<Sc
         const float marginF = static_cast<float>(marginPx);
         const float fx0 = std::max(0.0f, std::floor(minX) - marginF);
         const float fy0 = std::max(0.0f, std::floor(minY) - marginF);
-        const float fx1 = std::min(static_cast<float>(currentWidth), std::ceil(maxX) + marginF);
-        const float fy1 = std::min(static_cast<float>(currentHeight), std::ceil(maxY) + marginF);
+        const float fx1 = std::min(static_cast<float>(width), std::ceil(maxX) + marginF);
+        const float fy1 = std::min(static_cast<float>(height), std::ceil(maxY) + marginF);
         box.empty = (fx1 <= fx0 || fy1 <= fy0);
         box.x = static_cast<int>(fx0);
         box.y = static_cast<int>(fy0);
@@ -9552,14 +9631,14 @@ void Renderer::renderSelectionOutline(const Camera& camera, const std::vector<Sc
             glDisable(GL_SCISSOR_TEST);
         }
 
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, depthFramebuffer);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, selectionMaskTarget.fbo);
-        glBlitFramebuffer(0, 0, currentWidth, currentHeight,
-                          0, 0, currentWidth, currentHeight,
+        glBlitFramebuffer(0, 0, width, height,
+                          0, 0, width, height,
                           GL_DEPTH_BUFFER_BIT, GL_NEAREST);
 
         glBindFramebuffer(GL_FRAMEBUFFER, selectionMaskTarget.fbo);
-        glViewport(0, 0, currentWidth, currentHeight);
+        glViewport(0, 0, width, height);
         glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
@@ -9635,8 +9714,8 @@ void Renderer::renderSelectionOutline(const Camera& camera, const std::vector<Sc
 
         unsigned int coarseMaskTexture = 0;
         if (coarseMaskShader) {
-            const int coarseWidth = (currentWidth + kCoarseBlockSize - 1) / kCoarseBlockSize;
-            const int coarseHeight = (currentHeight + kCoarseBlockSize - 1) / kCoarseBlockSize;
+            const int coarseWidth = (width + kCoarseBlockSize - 1) / kCoarseBlockSize;
+            const int coarseHeight = (height + kCoarseBlockSize - 1) / kCoarseBlockSize;
             RenderTarget& coarseTarget = extraPreviewTargets[kSelectionCoarseMaskSlot];
             extraPreviewTargetLastUsed[kSelectionCoarseMaskSlot] = ++previewTargetUseSerial;
             RenderTargetOptions coarseOptions;
@@ -9659,8 +9738,8 @@ void Renderer::renderSelectionOutline(const Camera& camera, const std::vector<Sc
                 glClear(GL_COLOR_BUFFER_BIT);
                 coarseMaskShader->use();
                 coarseMaskShader->setInt("maskTex", 0);
-                coarseMaskShader->setVec2("maskSize", glm::vec2(static_cast<float>(currentWidth),
-                                                                static_cast<float>(currentHeight)));
+                coarseMaskShader->setVec2("maskSize", glm::vec2(static_cast<float>(width),
+                                                                static_cast<float>(height)));
                 glActiveTexture(GL_TEXTURE0);
                 glBindTexture(GL_TEXTURE_2D, selectionMaskTarget.texture);
                 drawFullscreenQuad();
@@ -9668,22 +9747,22 @@ void Renderer::renderSelectionOutline(const Camera& camera, const std::vector<Sc
             }
         }
 
-        glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
-        glViewport(0, 0, currentWidth, currentHeight);
+        glBindFramebuffer(GL_FRAMEBUFFER, targetFramebuffer);
+        glViewport(0, 0, width, height);
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
         outlineShader->use();
         outlineShader->setInt("maskTex", 0);
-        outlineShader->setVec2("texelSize", glm::vec2(1.0f / (float)currentWidth, 1.0f / (float)currentHeight));
+        outlineShader->setVec2("texelSize", glm::vec2(1.0f / (float)width, 1.0f / (float)height));
         outlineShader->setVec3("outlineColor", glm::vec3(0.48f, 0.43f, 1.0f));
-        outlineShader->setFloat("outlineRadiusPx", 2.7f);
+        outlineShader->setFloat("outlineRadiusPx", radiusPx);
         outlineShader->setFloat("outlineSoftnessPx", 1.15f);
-        outlineShader->setFloat("outlineOpacity", 0.95f * selectionOutlineBlend * passWeight);
+        outlineShader->setFloat("outlineOpacity", opacity * (animateSelection ? selectionOutlineBlend : 1.f) * passWeight);
         outlineShader->setInt("coarseMaskTex", 1);
         outlineShader->setBool("useCoarseMask", coarseMaskTexture != 0);
-        outlineShader->setVec2("maskSize", glm::vec2(static_cast<float>(currentWidth),
-                                                     static_cast<float>(currentHeight)));
+        outlineShader->setVec2("maskSize", glm::vec2(static_cast<float>(width),
+                                                     static_cast<float>(height)));
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, coarseMaskTexture);
         glActiveTexture(GL_TEXTURE0);

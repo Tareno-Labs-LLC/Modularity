@@ -1,5 +1,7 @@
 #include "Engine.h"
 #include "ViewportRenderHelpers.h"
+#include "UIControls.h"
+#include "UILayout.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -57,7 +59,8 @@ void Engine::renderUiCanvas3DTargets() {
   // no redraw. Its ImGui context is kept (retained) so re-enabling the branch
   // doesn't pay for context creation and font preloading again.
   auto isOffscreenCanvas = [&](const SceneObject &canvas) {
-    return isOffscreenCanvasType(canvas) && IsObjectEnabledInHierarchy(canvas);
+    return isOffscreenCanvasType(canvas) && IsObjectEnabledInHierarchy(canvas) &&
+        (!UIControls::IsDockedCanvas(canvas, sceneObjects) || canvas.ui.open);
   };
 
   std::unordered_set<int> activeCanvasIds;
@@ -65,7 +68,7 @@ void Engine::renderUiCanvas3DTargets() {
   for (const auto &canvas : sceneObjects) {
     if (canvas.enabled && isOffscreenCanvasType(canvas)) {
       retainedCanvasIds.insert(canvas.id);
-      if (IsObjectEnabledInHierarchy(canvas)) {
+      if (isOffscreenCanvas(canvas)) {
         activeCanvasIds.insert(canvas.id);
       }
     }
@@ -119,6 +122,14 @@ void Engine::renderUiCanvas3DTargets() {
 	    }
 	  }
 
+  bool pressedCanvas = false;
+  for (const auto& entry : uiCanvas3DInputs) {
+    if (entry.second.hasInput && entry.second.mouseDown[0] && activeCanvasIds.count(entry.first)) {
+      uiKeyboardCanvasId = entry.first; pressedCanvas = true; break;
+    }
+  }
+  if ((!pressedCanvas && mainIo.MouseClicked[0]) || !activeCanvasIds.count(uiKeyboardCanvasId)) uiKeyboardCanvasId = -1;
+
   auto hashCombine64 = [](uint64_t seed, uint64_t value) {
     return seed ^ (value + 0x9e3779b97f4a7c15ull + (seed << 6) + (seed >> 2));
   };
@@ -151,6 +162,25 @@ void Engine::renderUiCanvas3DTargets() {
     seed = addVec2(seed, obj.ui.position);
     seed = addVec2(seed, obj.ui.size);
     seed = hashCombine64(seed, static_cast<uint64_t>(obj.ui.maskChildren ? 1 : 0));
+    seed = hashCombine64(seed, static_cast<uint64_t>(obj.ui.clipChildren));
+    seed = hashCombine64(seed, static_cast<uint64_t>(obj.ui.responsive));
+    seed = hashCombine64(seed, static_cast<uint64_t>(obj.ui.fitWidth));
+    seed = hashCombine64(seed, static_cast<uint64_t>(obj.ui.fitHeight));
+    seed = hashCombine64(seed, static_cast<uint64_t>(obj.ui.layout));
+    seed = hashCombine64(seed, static_cast<uint64_t>(obj.ui.gridColumns));
+    seed = hashCombine64(seed, hashFloat64(obj.ui.flexibleSize));
+    seed = hashCombine64(seed, hashFloat64(obj.ui.aspectRatio));
+    seed = addVec2(seed, obj.ui.spacing);
+    seed = addVec2(seed, obj.ui.minimumSize);
+    seed = addVec2(seed, obj.ui.preferredSize);
+    seed = addVec2(seed, obj.ui.maximumSize);
+    seed = addVec2(seed, obj.ui.anchorMin);
+    seed = addVec2(seed, obj.ui.anchorMax);
+    seed = addVec2(seed, obj.ui.pivot);
+    seed = addVec2(seed, obj.ui.scrollOffset);
+    seed = addVec2(seed, obj.ui.contentSize);
+    seed = addVec4(seed, obj.ui.padding);
+    seed = addVec4(seed, obj.ui.margin);
     seed = hashCombine64(seed, hashFloat64(obj.ui.rotation));
     seed = hashCombine64(seed, hashFloat64(obj.ui.sliderValue));
     seed = hashCombine64(seed, hashFloat64(obj.ui.sliderMin));
@@ -220,6 +250,7 @@ void Engine::renderUiCanvas3DTargets() {
   };
   // Elements whose pixels change with time alone, so the signature can't see it.
   auto isTimeAnimatedElement = [](const SceneObject &obj) {
+    if (IsExtendedUIType(obj.ui.type)) return true;
     if (obj.ui.type == UIElementType::Text)
       return obj.ui.textEffectFlags != 0;
     if (obj.ui.type == UIElementType::Image ||
@@ -402,8 +433,8 @@ void Engine::renderUiCanvas3DTargets() {
           ctxIt != uiCanvas3DContexts.end() && ctxIt->second.backendReady &&
           ctxIt->second.hasRenderedTarget;
       auto skipInputIt = uiCanvas3DInputs.find(canvas.id);
-      const bool inputNow = skipInputIt != uiCanvas3DInputs.end() &&
-                            skipInputIt->second.hasInput;
+      const bool inputNow = uiKeyboardCanvasId == canvas.id ||
+          (skipInputIt != uiCanvas3DInputs.end() && skipInputIt->second.hasInput);
       const bool contentChanged =
           !everRendered || ctxIt->second.lastContentSignature != plan.contentSignature;
 	      if (!targetInvalidated && everRendered && !inputNow &&
@@ -493,6 +524,10 @@ void Engine::renderUiCanvas3DTargets() {
       ctxEntry.hadInputLastFrame = false;
     }
 
+    // A click gives one offscreen canvas keyboard ownership until focus moves.
+    // Release keys on all other contexts so they cannot retain stuck modifiers.
+    UIControls::ForwardKeyboardInput(io, mainIo, uiKeyboardCanvasId == canvas.id);
+
     ImGui::GetStyle() = mainStyle;
     ImGui_ImplOpenGL3_NewFrame();
     ImGui::NewFrame();
@@ -549,6 +584,7 @@ void Engine::renderUiCanvas3DTargets() {
       const float c = std::cos(rad), s = std::sin(rad);
       return ImVec2(v.x * c - v.y * s, v.x * s + v.y * c);
     };
+    const UILayout::Context uiLayout(sceneObjects);
     auto resolveUIRect = [&](const SceneObject &obj, ImVec2 &outMin,
                              ImVec2 &outMax, float *outRotRad = nullptr) {
       std::vector<const SceneObject *> chain;
@@ -575,16 +611,18 @@ void Engine::renderUiCanvas3DTargets() {
                           (regionMin.y + regionMax.y) * 0.5f);
       for (const SceneObject *node : chain) {
         glm::vec2 nodeSize = getSpriteDisplaySize(*node);
+        const auto placement = uiLayout.Resolve(*node, glm::vec2(regionMax.x - regionMin.x, regionMax.y - regionMin.y), nodeSize);
+        nodeSize = placement.size;
         ImVec2 size =
             ImVec2(std::max(1.0f, nodeSize.x), std::max(1.0f, nodeSize.y));
         ImVec2 anchorLocal =
-            anchorToPoint(node->ui.anchor, regionMin, regionMax);
+            anchorToPoint(placement.anchor, regionMin, regionMax);
         ImVec2 anchorWorld = rotateAbout(anchorLocal, parentCenter, accumRot);
         ImVec2 off = rotateDir(
-            ImVec2(node->ui.position.x, node->ui.position.y), accumRot);
+            ImVec2(placement.position.x, placement.position.y), accumRot);
         ImVec2 pivot(anchorWorld.x + off.x, anchorWorld.y + off.y);
         const float nodeRot = accumRot + glm::radians(node->ui.rotation);
-        ImVec2 pivotOffset = anchorToPivot(node->ui.anchor, size);
+        ImVec2 pivotOffset = anchorToPivot(placement.anchor, size);
         ImVec2 centerOff = rotateDir(
             ImVec2(size.x * 0.5f - pivotOffset.x, size.y * 0.5f - pivotOffset.y),
             nodeRot);
@@ -636,8 +674,7 @@ void Engine::renderUiCanvas3DTargets() {
         current = findSceneObject(current->parentId);
         if (!current)
           break;
-        if (!(current->hasUI && current->ui.type == UIElementType::Canvas &&
-              current->ui.maskChildren)) {
+        if (!(current->hasUI && ClipsUIChildren(current->ui))) {
           continue;
         }
 
@@ -658,7 +695,7 @@ void Engine::renderUiCanvas3DTargets() {
         return false;
       outMin = maskMin;
       outMax = maskMax;
-      return (outMax.x > outMin.x) && (outMax.y > outMin.y);
+      return true; // An empty intersection remains an active clip.
     };
 
     std::vector<SceneObject *> &canvasDrawList = elementsByCanvas[canvas.id];
@@ -678,6 +715,7 @@ void Engine::renderUiCanvas3DTargets() {
       ImVec2 rectMin, rectMax;
       float elementRotRad = 0.0f;
       resolveUIRect(obj, rectMin, rectMax, &elementRotRad);
+      if (!UIControls::ContentVisible(obj, sceneObjects)) return;
       geom.rectMin = rectMin;
       geom.rectMax = rectMax;
       geom.rotRad = elementRotRad;
@@ -746,7 +784,14 @@ void Engine::renderUiCanvas3DTargets() {
         animState.sliderValue = obj.ui.sliderValue;
         animState.initialized = true;
       }
-      if (obj.ui.type == UIElementType::Image ||
+      if (IsExtendedUIType(obj.ui.type)) {
+        spriteBatch.flush();
+        Texture* panelTexture = rendererInitialized && obj.ui.type == UIElementType::Panel && !obj.albedoTexturePath.empty()
+            ? renderer.getTexture(obj.albedoTexturePath, obj.material.textureFilter) : nullptr;
+        UIControls::Draw(obj, sceneObjects, drawMin, drawMax, true,
+            panelTexture ? (ImTextureID)(intptr_t)panelTexture->GetID() : (ImTextureID)0,
+            [&](SceneObject& panel, ImVec2 min, ImVec2 max) { renderDockedUiCanvas(panel, min, max); });
+      } else if (obj.ui.type == UIElementType::Image ||
           obj.ui.type == UIElementType::Sprite2D) {
         Texture *spriteTex = nullptr;
         unsigned int texId = 0;
@@ -979,6 +1024,8 @@ void Engine::renderUiCanvas3DTargets() {
           ImGui::PopClipRect();
         }
       }
+      if (!IsExtendedUIType(obj.ui.type) && !obj.ui.tooltip.empty() && ImGui::IsMouseHoveringRect(drawMin, drawMax))
+        ImGui::SetTooltip("%s", obj.ui.tooltip.c_str());
       if (pushedCanvasMask) {
         spriteBatch.flush();
         ImGui::PopClipRect();
@@ -1291,3 +1338,30 @@ void Engine::renderUiCanvas3DTargets() {
   ImGui::SetCurrentContext(mainContext);
 }
 #pragma endregion
+
+// Dock hosts composite the same retained Canvas targets used by pseudo-3D UI.
+// Content/input stays in the canvas context; no second control renderer exists.
+void Engine::renderDockedUiCanvas(SceneObject& canvas, ImVec2 min, ImVec2 max) {
+    const glm::vec2 size(std::max(1.f, max.x - min.x), std::max(1.f, max.y - min.y));
+    canvas.ui.pseudo3DEnabled = true;
+    canvas.ui.pseudo3DUseOffscreenSurface = true;
+    canvas.ui.pseudo3DPanelSize = size;
+    canvas.ui.renderTargetSize = glm::ivec2(std::clamp(static_cast<int>(std::ceil(size.x)), 16, 4096),
+                                           std::clamp(static_cast<int>(std::ceil(size.y)), 16, 4096));
+    const auto target = renderer.getUiTargetInfo(canvas.id);
+    if (target.texture != 0) {
+        ImGui::GetWindowDrawList()->AddImage((ImTextureID)(intptr_t)target.texture, min, max,
+                                            ImVec2(target.uvTransform.z, target.uvTransform.w + target.uvTransform.y),
+                                            ImVec2(target.uvTransform.z + target.uvTransform.x, target.uvTransform.w));
+    }
+    ImGui::Dummy(ImVec2(size.x, size.y));
+    if (ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows) && ImGui::IsMouseHoveringRect(min, max)) {
+        const auto& io = ImGui::GetIO();
+        auto& input = uiCanvas3DInputs[canvas.id];
+        input.mousePos = ImVec2(io.MousePos.x - min.x, io.MousePos.y - min.y);
+        for (int button = 0; button < 3; ++button) input.mouseDown[button] = io.MouseDown[button];
+        input.mouseWheel = io.MouseWheel;
+        input.hasInput = true;
+        input.hitT = -2000.f;
+    }
+}

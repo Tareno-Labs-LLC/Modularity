@@ -1,6 +1,9 @@
 #include "../../EditorLocalization.h"
 #include "Engine.h"
 #include "ViewportRenderHelpers.h"
+#include "UIControls.h"
+#include "UILayout.h"
+#include "../ScenePicking.h"
 #include "GizmoToolbar.h"
 #include "MapMaker.h"
 #include "MeshEditOperations.h"
@@ -54,16 +57,17 @@ static constexpr std::array<ObjectType, static_cast<size_t>(RenderType::Sprite) 
         ObjectType::Sprite   // RenderType::Sprite
     }};
 
-static constexpr std::array<ObjectType, static_cast<size_t>(UIElementType::Sprite2D) + 1>
-    kUiTypeMainObjectMap = {{
-        ObjectType::Empty,    // UIElementType::None
-        ObjectType::Canvas,   // UIElementType::Canvas
-        ObjectType::UIImage,  // UIElementType::Image
-        ObjectType::UISlider, // UIElementType::Slider
-        ObjectType::UIButton, // UIElementType::Button
-        ObjectType::UIText,   // UIElementType::Text
-        ObjectType::Sprite2D  // UIElementType::Sprite2D
-    }};
+static const auto kUiTypeMainObjectMap = [] {
+  std::array<ObjectType, static_cast<size_t>(UIElementType::DockContainer) + 1> mapping;
+  mapping.fill(ObjectType::UIImage);
+  mapping[0] = ObjectType::Empty;
+  mapping[1] = ObjectType::Canvas;
+  mapping[3] = ObjectType::UISlider;
+  mapping[4] = ObjectType::UIButton;
+  mapping[5] = ObjectType::UIText;
+  mapping[6] = ObjectType::Sprite2D;
+  return mapping;
+}();
 
 static constexpr std::array<ObjectType, static_cast<size_t>(LightType::Area) + 1>
     kLightTypeMainObjectMap = {{
@@ -267,10 +271,12 @@ bool IsPointWithinRadius(const ImVec2 &point, const ImVec2 &center,
 // what a drop lands on is always what a click there would select. `filter` skips objects the
 // caller cannot use (a material drop passes objects without a renderer through to what is
 // behind them). Returns -1 on a miss.
+#if !MODULARITY_RUNTIME_ONLY
 int Engine::pickSceneObjectAtScreen(const glm::mat4 &view, const glm::mat4 &proj,
                                     const ImVec2 &imageMin, const ImVec2 &imageMax,
                                     const ImVec2 &screenPos,
                                     const std::function<bool(const SceneObject &)> &filter) {
+  if(imageMax.x<=imageMin.x || imageMax.y<=imageMin.y)return -1;
   glm::mat4 invViewProj = glm::inverse(proj * view);
   const ImVec2 mousePos = screenPos;
 
@@ -289,6 +295,19 @@ int Engine::pickSceneObjectAtScreen(const glm::mat4 &view, const glm::mat4 &proj
     glm::vec3 dir = glm::normalize(glm::vec3(farPt - nearPt));
     return std::make_pair(origin, dir);
   };
+
+  const auto ray=makeRay(mousePos);
+  return EditorScenePicking::PickRay(sceneObjects,ray.first,ray.second,view,filter);
+}
+
+int EditorScenePicking::PickRay(const std::vector<SceneObject>& sceneObjects,
+                               const glm::vec3& origin,const glm::vec3& direction,
+                               const glm::mat4& view,
+                               const std::function<bool(const SceneObject&)>& filter, float* hitDistance) {
+  if(hitDistance)*hitDistance=FLT_MAX;
+  const float length=glm::length(direction);
+  if(!std::isfinite(length) || length<.000001f)return -1;
+  const auto ray=std::make_pair(origin,direction/length);
 
   auto rayAabb = [](const glm::vec3 &orig, const glm::vec3 &dir,
                     const glm::vec3 &bmin, const glm::vec3 &bmax,
@@ -358,7 +377,6 @@ int Engine::pickSceneObjectAtScreen(const glm::mat4 &view, const glm::mat4 &proj
     return true;
   };
 
-  auto ray = makeRay(mousePos);
   float closest = FLT_MAX;
   int hitId = -1;
   glm::mat4 invView = glm::inverse(view);
@@ -545,8 +563,16 @@ int Engine::pickSceneObjectAtScreen(const glm::mat4 &view, const glm::mat4 &proj
       }
     }
   }
+  if(hitDistance)*hitDistance=closest;
   return hitId;
 }
+#else
+int Engine::pickSceneObjectAtScreen(const glm::mat4&,const glm::mat4&,
+                                   const ImVec2&,const ImVec2&,const ImVec2&,
+                                   const std::function<bool(const SceneObject&)>&) {
+  return -1;
+}
+#endif
 
 #pragma region Scene Viewport
 // Final scene output for the editor viewport.
@@ -584,6 +610,7 @@ void Engine::renderViewport() {
       focusViewportOnSelection();
     }
     if (ImGui::GetIO().KeyShift && !ImGui::GetIO().KeyCtrl &&
+        !ImGui::IsMouseDown(ImGuiMouseButton_Right) &&
         ImGui::IsKeyPressed(ImGuiKey_A, false)) {
       viewportCreateMenuRequested = true;
     }
@@ -1396,7 +1423,8 @@ void Engine::renderViewport() {
         float factor = std::clamp(obj.parallaxLayer2D.factor, 0.0f, 1.0f);
         return uiWorldCamera.position * (1.0f - factor);
       };
-      auto resolveUIRectWorld = [&](const SceneObject &obj, ImVec2 &outMin, ImVec2 &outMax) {
+      const UILayout::Context uiLayout(sceneObjects);
+      auto resolveUIRectWorldLegacy = [&](const SceneObject &obj, ImVec2 &outMin, ImVec2 &outMax) {
         if (obj.type == ObjectType::Sprite25D) {return ResolveProjectedSprite25DRect(obj, view, proj, overlayPos,overlaySize, outMin, outMax);}
         glm::vec2 parentOffset = uiSceneLookup.getWorldParentOffset(obj);
         float parentRot = uiSceneLookup.getWorldParentRotationRad(obj);
@@ -1418,6 +1446,10 @@ void Engine::renderViewport() {
         outMax = ImVec2(std::max(s0.x, s1.x), std::max(s0.y, s1.y));
         return true;
       };
+    auto resolveUIRectWorld = [&](const SceneObject& obj, ImVec2& outMin, ImVec2& outMax) {
+      return UILayout::ResolveWorldRect(uiLayout, obj, outMin, outMax, resolveUIRectWorldLegacy,
+          [&](const SceneObject& node) { return getSpriteDisplaySize(node); });
+    };
       auto rectOutsideOverlay = [&](const ImVec2 &min, const ImVec2 &max) {
         return (max.x < overlayPos.x || min.x > overlayPos.x + overlaySize.x || max.y < overlayPos.y || min.y > overlayPos.y + overlaySize.y);
       };
@@ -1635,7 +1667,8 @@ void Engine::renderViewport() {
         if (!IsObjectEnabledInHierarchy(obj)) continue;
         if (!isUIType(obj) && !ViewportRenderHelpers::IsAssemblageLayerDrawable(obj))
           continue;
-        uiDrawList.push_back(&obj);
+        if (!UIControls::ContentVisible(obj, sceneObjects)) continue;
+      uiDrawList.push_back(&obj);
         needsSort =
             needsSort ||
             (obj.hasParallaxLayer2D && obj.parallaxLayer2D.enabled &&
@@ -1662,7 +1695,7 @@ void Engine::renderViewport() {
         while (current && current->parentId >= 0) {
           current = uiSceneLookup.find(current->parentId);
           if (!current) break;
-          if (!(current->hasUI && current->ui.type == UIElementType::Canvas && current->ui.maskChildren)) continue;
+          if (!(current->hasUI && ClipsUIChildren(current->ui))) continue;
 
           ImVec2 canvasMin, canvasMax;
           if (!resolveUIRectWorld(*current, canvasMin, canvasMax)) continue;
@@ -1682,7 +1715,7 @@ void Engine::renderViewport() {
         if (!hasMask) return false;
         outMin = maskMin;
         outMax = maskMax;
-        return (outMax.x > outMin.x) && (outMax.y > outMin.y);
+        return true; // An empty intersection remains an active clip.
       };
 
       std::unordered_set<int> light2DRenderedObjectIds;
@@ -2111,7 +2144,15 @@ void Engine::renderViewport() {
           animState.sliderValue = obj.ui.sliderValue;
           animState.initialized = true;
         }
-        if (obj.ui.type == UIElementType::Image ||
+        if (IsExtendedUIType(obj.ui.type)) {
+        spriteBatch.flush();
+        Texture* panelTexture = rendererInitialized && obj.ui.type == UIElementType::Panel && !obj.albedoTexturePath.empty()
+            ? renderer.getTexture(obj.albedoTexturePath, obj.material.textureFilter) : nullptr;
+        // Like the legacy Button/Slider: a live control only while playing; otherwise an inert preview.
+        UIControls::Draw(obj, sceneObjects, drawMin, drawMax, isPlaying && !uiWorldCameraActive,
+            panelTexture ? (ImTextureID)(intptr_t)panelTexture->GetID() : (ImTextureID)0,
+            [&](SceneObject& panel, ImVec2 min, ImVec2 max) { renderDockedUiCanvas(panel, min, max); });
+      } else if (obj.ui.type == UIElementType::Image ||
             obj.ui.type == UIElementType::Sprite2D) {
           if (light2DRenderedObjectIds.find(obj.id) != light2DRenderedObjectIds.end()) {
             if (pushedCanvasMask) ImGui::PopClipRect();
@@ -2406,6 +2447,8 @@ void Engine::renderViewport() {
                 textRotationRad);
           } else ImGui::PopClipRect();
         }
+      if (!IsExtendedUIType(obj.ui.type) && !obj.ui.tooltip.empty() && ImGui::IsMouseHoveringRect(drawMin, drawMax))
+        ImGui::SetTooltip("%s", obj.ui.tooltip.c_str());
         if (pushedCanvasMask) {
           spriteBatch.flush();
           ImGui::PopClipRect();

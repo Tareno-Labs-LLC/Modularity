@@ -806,9 +806,8 @@ static void DrawHelpTooltip(const char* text) {
     if (!text || !*text) {
         return;
     }
-    ImGui::SameLine();
     ImGui::TextDisabled("(?)");
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort | ImGuiHoveredFlags_AllowWhenDisabled)) {
         ImGui::BeginTooltip();
         ImGui::PushTextWrapPos(ImGui::GetFontSize() * 28.0f);
         ImGui::TextUnformatted(text);
@@ -829,7 +828,7 @@ struct ProjectSettingsColumnFlowState {
 };
 static ProjectSettingsColumnFlowState g_projectSettingsColumnFlow;
 
-static constexpr float kProjectSettingsTwoColumnMinWidth = 900.0f;
+static constexpr float kProjectSettingsTwoColumnMinWidth = 1200.0f;
 
 static int PickBalancedColumnSplit(const std::vector<float>& heights) {
     const int count = static_cast<int>(heights.size());
@@ -849,11 +848,12 @@ static int PickBalancedColumnSplit(const std::vector<float>& heights) {
     return bestSplit;
 }
 
-static void BeginProjectSettingsColumns(std::vector<float>& sectionHeights) {
+static void BeginProjectSettingsColumns(std::vector<float>& sectionHeights, bool allowTwoColumns) {
     ProjectSettingsColumnFlowState& flow = g_projectSettingsColumnFlow;
     flow = ProjectSettingsColumnFlowState{};
-    flow.twoColumns = sectionHeights.size() >= 2 &&
-                      ImGui::GetContentRegionAvail().x >= kProjectSettingsTwoColumnMinWidth;
+    flow.twoColumns = allowTwoColumns && sectionHeights.size() >= 2 &&
+                      ImGui::GetContentRegionAvail().x >=
+                          kProjectSettingsTwoColumnMinWidth * (ImGui::GetFontSize() / 16.0f);
     if (flow.twoColumns) {
         flow.splitIndex = PickBalancedColumnSplit(sectionHeights);
     }
@@ -1001,20 +1001,42 @@ static bool DrawSettingRow(const char* label,
     ImGui::PushID(static_cast<int>(idLocation.line()));
     ImGui::PushID(static_cast<int>(idLocation.column()));
     ImGui::PushID(label ? label : "");
-    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(0.0f, 1.0f));
-    if (ImGui::BeginTable("##SettingRow", 2, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoSavedSettings)) {
-        ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthStretch, 0.34f);
-        ImGui::TableSetupColumn("Control", ImGuiTableColumnFlags_WidthStretch, 0.66f);
+    const float scale = ImGui::GetFontSize() / 16.0f;
+    const float rowWidth = ImGui::GetContentRegionAvail().x;
+    const bool stacked = rowWidth < 500.0f * scale;
+    const float labelWidth = std::clamp(rowWidth * 0.44f, 180.0f * scale, 320.0f * scale);
+    // Keep property rows compact; wrapped labels and compound controls still grow naturally.
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(4.0f, scale));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(ImGui::GetStyle().FramePadding.x, scale));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ImGui::GetStyle().ItemSpacing.x, 2.0f * scale));
+    if (ImGui::BeginTable("##SettingRow", stacked ? 1 : 2,
+                          ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_NoSavedSettings |
+                          ImGuiTableFlags_NoPadOuterX)) {
+        if (!stacked) {
+            ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthFixed, labelWidth);
+            ImGui::TableSetupColumn("Control", ImGuiTableColumnFlags_WidthStretch);
+        }
         ImGui::TableNextRow();
         ImGui::TableSetColumnIndex(0);
-        ImGui::TextColored(ImVec4(0.86f, 0.90f, 0.96f, 1.0f), "%s", label ? label : "");
-        DrawHelpTooltip(helper);
-        ImGui::TableSetColumnIndex(1);
-        ImGui::SetNextItemWidth(-1);
+        ImGui::AlignTextToFramePadding();
+        if (helper && *helper) {
+            DrawHelpTooltip(helper);
+        } else {
+            ImGui::Dummy(ImVec2(ImGui::CalcTextSize("(?)").x, ImGui::GetTextLineHeight()));
+        }
+        ImGui::SameLine(0.0f, ImGui::GetStyle().ItemInnerSpacing.x + 4.0f);
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + std::max(1.0f, ImGui::GetContentRegionAvail().x));
+        ImGui::TextUnformatted(label ? label : "");
+        ImGui::PopTextWrapPos();
+        if (stacked) ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(stacked ? 0 : 1);
+        // Apply to every widget in a compound control, not only its first item.
+        ImGui::PushItemWidth(-1.0f);
         changed = drawControl ? drawControl() : false;
+        ImGui::PopItemWidth();
         ImGui::EndTable();
     }
-    ImGui::PopStyleVar();
+    ImGui::PopStyleVar(3);
     ImGui::PopID();
     ImGui::PopID();
     ImGui::PopID();
@@ -1194,6 +1216,7 @@ struct ProjectFileMetadata {
     std::string name;
     ProjectPipeline pipeline = ProjectPipeline::Pipeline3D;
     Modularity::GraphicsBackend rendererBackend = Modularity::GraphicsBackend::OpenGL;
+    bool vrEnabled = false;
     bool found = false;
 };
 
@@ -1245,6 +1268,9 @@ static ProjectFileMetadata ReadProjectFileMetadata(const fs::path& projectFile) 
         } else if (line.rfind("renderer=", 0) == 0) {
             metadata.rendererBackend = Modularity::GraphicsBackendFromString(TrimCopy(line.substr(9)));
             metadata.found = true;
+        } else if (line.rfind("openXREnabled=", 0) == 0) {
+            const std::string value = ProjectSettingsLowerCopy(TrimCopy(line.substr(14)));
+            metadata.vrEnabled = value == "1" || value == "true" || value == "yes" || value == "on";
         }
     }
 
@@ -2183,7 +2209,7 @@ void Engine::renderLauncher() {
             }
         };
 
-        auto launchRecentProject = [&](const RecentProject& rp, const ImVec2& focus) {
+        auto launchRecentProject = [&](const RecentProject& rp, const ImVec2& focus, bool inVR = false) {
             if (launcherBusy) return;
             // One-shot so the click sits on top of the intro/wind sounds instead of
             // stopping them via the single preview slot.
@@ -2198,6 +2224,9 @@ void Engine::renderLauncher() {
             }
             launcherTransitionStartTime = glfwGetTime();
             OpenProjectPath(rp.path);
+#if !MODULARITY_RUNTIME_ONLY
+            openProjectInVR = inVR;
+#endif
         };
 
         ImDrawList* drawList = ImGui::GetWindowDrawList();
@@ -3125,7 +3154,12 @@ void Engine::renderLauncher() {
                         ImGui::Dummy(ImVec2(0.0f, 5.0f * uiScale));
                     }
 
-                    const float footerH = 92.0f * uiScale;
+                    float footerH = 92.0f * uiScale;
+#if !MODULARITY_RUNTIME_ONLY
+                    if (sel.metadata.vrEnabled) {
+                        footerH += 32.0f * uiScale + ImGui::GetStyle().ItemSpacing.y;
+                    }
+#endif
                     const float remaining = ImGui::GetContentRegionAvail().y;
                     if (remaining > footerH) {
                         ImGui::Dummy(ImVec2(0.0f, remaining - footerH));
@@ -3139,6 +3173,23 @@ void Engine::renderLauncher() {
                                            windowPos.y + windowSize.y * 0.5f);
                         launchRecentProject(sel.recent, focus);
                     }
+#if !MODULARITY_RUNTIME_ONLY
+                    if (sel.metadata.vrEnabled) {
+                        const bool vrSupported = MODULARITY_HAS_OPENXR &&
+                            sel.metadata.rendererBackend == Modularity::GraphicsBackend::OpenGL;
+                        ImGui::BeginDisabled(!vrSupported);
+                        if (LauncherButton("Open Project in VR", LauncherButtonKind::Accent,
+                                           ImVec2(-1.0f, 32.0f * uiScale))) {
+                            const ImVec2 focus(windowPos.x + windowSize.x * 0.5f,
+                                               windowPos.y + windowSize.y * 0.5f);
+                            launchRecentProject(sel.recent, focus, true);
+                        }
+                        if (!vrSupported && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                            ImGui::SetTooltip("Opening in VR requires OpenGL and an OpenXR-enabled build.");
+                        }
+                        ImGui::EndDisabled();
+                    }
+#endif
                     ImGui::EndDisabled();
                     const float halfW = (ImGui::GetContentRegionAvail().x -
                                          ImGui::GetStyle().ItemSpacing.x) * 0.5f;
@@ -5959,18 +6010,46 @@ void Engine::renderProjectBrowserPanel() {
         return;
     }
 
-    ImGui::TextColored(ImVec4(0.4f, 0.7f, 0.95f, 1.0f), "%s: %s",
-                       Loc::T("SETTINGS_PROJECT_NAME", "Project Name"),
-                       projectManager.currentProject.name.c_str());
-    if (projectManager.currentProject.hasUnsavedChanges) {
-        ImGui::SameLine();
-        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "*");
+    ImGui::TextWrapped("%s: %s%s", Loc::T("SETTINGS_PROJECT_NAME", "Project Name"),
+                       projectManager.currentProject.name.c_str(),
+                       projectManager.currentProject.hasUnsavedChanges ? " *" : "");
+    if (ImGui::Button(Loc::T("SETTINGS_VIEW_OPTIONS", "View Options"))) {
+        ImGui::OpenPopup("##SettingsViewOptions");
     }
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Open Modupak Manager")) {
+    if (ImGui::BeginPopup("##SettingsViewOptions")) {
+        bool viewChanged = false;
+        ImGui::TextDisabled("%s", Loc::T("SETTINGS_NAVIGATION", "Navigation"));
+        if (ImGui::MenuItem(Loc::T("SETTINGS_NAV_SIDEBAR", "Left sidebar with names"), nullptr,
+                            !projectSettingsCompactSidebar)) {
+            projectSettingsCompactSidebar = false;
+            viewChanged = true;
+        }
+        if (ImGui::MenuItem(Loc::T("SETTINGS_NAV_TOP", "Top icon tabs"), nullptr,
+                            projectSettingsCompactSidebar)) {
+            projectSettingsCompactSidebar = true;
+            viewChanged = true;
+        }
+        ImGui::Separator();
+        viewChanged |= ImGui::Checkbox(Loc::T("SETTINGS_TWO_COLUMNS", "Two columns on wide windows"),
+                                        &projectSettingsTwoColumns);
+        if (viewChanged) {
+            saveEditorUserSettings();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+    const char* packagesLabel = Loc::T("SETTINGS_OPEN_PACKAGES", "Open Modupak Manager");
+    const float packagesWidth = ImGui::CalcTextSize(packagesLabel).x + ImGui::GetStyle().FramePadding.x * 2.0f;
+    const float viewOptionsWidth = ImGui::CalcTextSize(Loc::T("SETTINGS_VIEW_OPTIONS", "View Options")).x +
+                                   ImGui::GetStyle().FramePadding.x * 2.0f;
+    if (ImGui::GetContentRegionAvail().x >= viewOptionsWidth + packagesWidth + ImGui::GetStyle().ItemSpacing.x) {
+        ImGui::SameLine();
+    }
+    if (ImGui::Button(packagesLabel)) {
         showRegistryPackagesWindow = true;
         saveEditorUserSettings();
     }
+    ImGui::Separator();
 
     struct ProjectSettingsUiIcon {
         ImTextureID id = static_cast<ImTextureID>(0);
@@ -6008,41 +6087,40 @@ void Engine::renderProjectBrowserPanel() {
         const char* label;
         const char* iconPath;
         const char* fallback;
+        const char* description;
     };
 
     static constexpr ProjectSettingsTabInfo tabs[] = {
-        { "SETTINGS_TAB_SCENES", "Scenes", "Resources/Engine-Root/Project Settings/Tabs/Scenes.png", "S" },
-        { "SETTINGS_TAB_ASSETS", "Assets", "Resources/Engine-Root/Project Settings/Tabs/Assets.png", "A" },
-        { "SETTINGS_TAB_INPUT_MANAGER", "Input Manager", "Resources/Engine-Root/Project Settings/Tabs/Input Manager.png", "I" },
-        { "SETTINGS_TAB_PHYSICS_MANAGER", "Physics Manager", "Resources/Engine-Root/Project Settings/Tabs/Physics Manager.png", "P" },
-        { "SETTINGS_TAB_GRAPHICS_MANAGER", "Graphics Manager", "Resources/Engine-Root/Project Settings/Tabs/Graphics.png", "G" },
-        { "SETTINGS_TAB_LIGHTING_MANAGER", "Lighting Manager", "Resources/Engine-Root/Project Settings/Tabs/Lighting Manager.png", "L" },
-        { "SETTINGS_TAB_TAGS_LAYERS", "Tags & Layers", "Resources/Engine-Root/Project Settings/Tabs/Tags And Layers.png", "T" },
-        { "SETTINGS_TAB_CONSOLE_CONFIG", "Console Config", "Resources/Engine-Root/Project Settings/Tabs/Console Config.png", "C" },
-        { "SETTINGS_TAB_AUDIO_CONFIG", "Audio Config", "Resources/Engine-Root/Project Settings/Tabs/Audio.png", "A" },
-        { "SETTINGS_TAB_PLAYER_CONFIG", "Player Config", "Resources/Engine-Root/Project Settings/Tabs/Player Config.png", "P" },
-        { "SETTINGS_TAB_EDITOR", "Editor", "Resources/Engine-Root/Project Settings/Tabs/Editor.png", "E" },
-        { "SETTINGS_TAB_BUILD", "Build", "Resources/Engine-Root/Project Settings/Tabs/Build.png", "B" },
-        { "SETTINGS_TAB_COMPILATION", "Compilation", "Resources/Engine-Root/Project Settings/Tabs/Compilation.png", "C" },
-        { "SETTINGS_TAB_LANGUAGE_MANAGER", "Language Manager", "Resources/Engine-Root/Project Settings/Tabs/Language Manager.png", "L" },
-        { "SETTINGS_TAB_OPEN_XR", "OpenXR Manager", "Resources/Engine-Root/Project Settings/Tabs/ModuVR Manager.png", "X" }
+        { "SETTINGS_TAB_PLAYER_CONFIG", "Player Config", "Resources/Engine-Root/Project Settings/Tabs/Player Config.png", "P", "Game identity, startup window, cursor, and save data." },
+        { "SETTINGS_TAB_EDITOR", "Editor", "Resources/Engine-Root/Project Settings/Tabs/Editor.png", "E", "Editing workflow, viewport previews, camera navigation, and developer tools." },
+        { "SETTINGS_TAB_INPUT_MANAGER", "Input Manager", "Resources/Engine-Root/Project Settings/Tabs/Input Manager.png", "I", "Action maps and keyboard or gamepad bindings used by scripts." },
+        { "SETTINGS_TAB_PHYSICS_MANAGER", "Physics Manager", "Resources/Engine-Root/Project Settings/Tabs/Physics Manager.png", "P", "Simulation, gravity, raycasts, and defaults for new physics components." },
+        { "SETTINGS_TAB_GRAPHICS_MANAGER", "Graphics Manager", "Resources/Engine-Root/Project Settings/Tabs/Graphics.png", "G", "Rendering quality, display options, and performance." },
+        { "SETTINGS_TAB_LIGHTING_MANAGER", "Lighting Manager", "Resources/Engine-Root/Project Settings/Tabs/Lighting Manager.png", "L", "Realtime lights, shadows, and lighting quality." },
+        { "SETTINGS_TAB_AUDIO_CONFIG", "Audio Config", "Resources/Engine-Root/Project Settings/Tabs/Audio.png", "A", "Volume, spatial audio, and playback defaults." },
+        { "SETTINGS_TAB_TAGS_LAYERS", "Tags & Layers", "Resources/Engine-Root/Project Settings/Tabs/Tags And Layers.png", "T", "Names used to organize objects and control layer interactions." },
+        { "SETTINGS_TAB_BUILD", "Build", "Resources/Engine-Root/Project Settings/Tabs/Build.png", "B", "Target platform, scenes, packaging, and export options." },
+        { "SETTINGS_TAB_COMPILATION", "Compilation", "Resources/Engine-Root/Project Settings/Tabs/Compilation.png", "C", "Script compilation, reload behavior, and toolchain paths." },
+        { "SETTINGS_TAB_LANGUAGE_MANAGER", "Language Manager", "Resources/Engine-Root/Project Settings/Tabs/Language Manager.png", "L", "Editor language and translated ModuCPP keywords." },
+        { "SETTINGS_TAB_CONSOLE_CONFIG", "Console Config", "Resources/Engine-Root/Project Settings/Tabs/Console Config.png", "C", "Console messages, logging, and diagnostics." },
+        { "SETTINGS_TAB_OPEN_XR", "OpenXR Manager", "Resources/Engine-Root/Project Settings/Tabs/ModuVR Manager.png", "X", "VR platform targets, session setup, and runtime diagnostics." }
     };
 
+    static constexpr int kPlayerConfigTab = 0;
+    static constexpr int kEditorTab = 1;
     static constexpr int kInputManagerTab = 2;
     static constexpr int kPhysicsManagerTab = 3;
     static constexpr int kGraphicsManagerTab = 4;
     static constexpr int kLightingManagerTab = 5;
-    static constexpr int kTagsLayersTab = 6;
-    static constexpr int kConsoleConfigTab = 7;
-    static constexpr int kAudioConfigTab = 8;
-    static constexpr int kPlayerConfigTab = 9;
-    static constexpr int kEditorTab = 10;
-    static constexpr int kBuildTab = 11;
-    static constexpr int kCompilationTab = 12;
-    static constexpr int kLanguageManagerTab = 13;
-    static constexpr int kOpenXRTab = 14;
+    static constexpr int kAudioConfigTab = 6;
+    static constexpr int kTagsLayersTab = 7;
+    static constexpr int kBuildTab = 8;
+    static constexpr int kCompilationTab = 9;
+    static constexpr int kLanguageManagerTab = 10;
+    static constexpr int kConsoleConfigTab = 11;
+    static constexpr int kOpenXRTab = 12;
 
-    static int selectedTab = 0;
+    static int selectedTab = kPlayerConfigTab;
     static bool pendingLanguageFileReload = false;
     if (pendingLanguageFileReload) {
         pendingLanguageFileReload = false;
@@ -6052,198 +6130,181 @@ void Engine::renderProjectBrowserPanel() {
         addConsoleMessage("Reloaded language files from Resources/Languages.", ConsoleMessageType::Success);
     }
     constexpr int tabCount = static_cast<int>(IM_ARRAYSIZE(tabs));
+    if (selectedTab < 0 || selectedTab >= tabCount) selectedTab = kPlayerConfigTab;
+    const float settingsUiScale = ImGui::GetFontSize() / 16.0f;
+    const float navIconSize = ImGui::GetFontSize() + 6.0f;
+    const float navPadding = 8.0f * settingsUiScale;
+    const float topTabSize = 44.0f * settingsUiScale;
+    const bool animateTabs = uiAnimationMode != UIAnimationMode::Off;
+    const float tabMotionScale = uiAnimationMode == UIAnimationMode::Snappy ? 0.45f : 1.0f;
+    const float tabDeltaTime = std::clamp(ImGui::GetIO().DeltaTime, 0.0f, 0.1f);
     static std::array<float, tabCount> tabSelectionAnim = {};
-    if (selectedTab < 0 || selectedTab >= tabCount) {
-        selectedTab = 0;
+    static std::array<float, tabCount> tabHoverAnim = {};
+    static bool tabAnimationInitialized = false;
+    if (!tabAnimationInitialized) {
+        tabSelectionAnim[selectedTab] = 1.0f;
+        tabAnimationInitialized = true;
     }
-
-    const float tabAnimLerpSelected = std::clamp(ImGui::GetIO().DeltaTime * 10.0f, 0.0f, 1.0f);
-    const float tabAnimLerpDeselected = std::clamp(ImGui::GetIO().DeltaTime * 16.0f, 0.0f, 1.0f);
     for (int i = 0; i < tabCount; ++i) {
-        const float target = (selectedTab == i) ? 1.0f : 0.0f;
-        const float lerpT = (selectedTab == i) ? tabAnimLerpSelected : tabAnimLerpDeselected;
-        tabSelectionAnim[i] = ImLerp(tabSelectionAnim[i], target, lerpT);
+        const float target = selectedTab == i ? 1.0f : 0.0f;
+        const float speed = selectedTab == i ? 10.0f : 16.0f;
+        const float blend = animateTabs ? 1.0f - std::exp(-tabDeltaTime * speed / tabMotionScale) : 1.0f;
+        tabSelectionAnim[i] = ImLerp(tabSelectionAnim[i], target, blend);
     }
 
-    auto drawProjectSettingsTab = [&](int index, bool compactSidebar) {
+    auto drawProjectSettingsTab = [&](int index, bool iconsOnly) {
         const ProjectSettingsTabInfo& tab = tabs[index];
-        const bool isCurrentSelection = (selectedTab == index);
-        const float selectedBlend = tabSelectionAnim[index];
-        const float pulse = isCurrentSelection ? std::sin(static_cast<float>(ImGui::GetTime()) * 7.5f) : 0.0f;
-        const float brighten = std::max(0.0f, pulse) * selectedBlend;
-        const float darken = std::max(0.0f, -pulse) * selectedBlend;
-
-        const ImVec2 slotPos = ImGui::GetCursorScreenPos();
-        const float compactButtonSize = 44.0f;
-        const ImVec2 slotSize = compactSidebar
-            ? ImVec2(compactButtonSize, compactButtonSize)
-            : ImVec2(ImGui::GetContentRegionAvail().x, 44.0f);
+        const bool selected = selectedTab == index;
+        const char* label = Loc::T(tab.key, tab.label);
+        const float width = iconsOnly ? topTabSize : std::max(1.0f, ImGui::GetContentRegionAvail().x);
+        // Reserve the largest animated icon footprint so names never move or lose wrapping space.
+        const float textWidth = std::max(1.0f, width - navIconSize - navPadding * 3.0f - 4.0f * settingsUiScale);
+        const float textHeight = iconsOnly ? 0.0f : ImGui::CalcTextSize(label, nullptr, false, textWidth).y;
+        const float height = iconsOnly ? topTabSize : std::max(navIconSize, textHeight) + navPadding * 2.0f;
         ImGui::PushID(index);
-        const bool pressed = ImGui::InvisibleButton("##ProjectSettingsNavTab", slotSize);
+        const bool pressed = ImGui::InvisibleButton("##ProjectSettingsNavTab", ImVec2(width, height),
+                                                    ImGuiButtonFlags_EnableNav);
         ImGui::ReportItemHoverFeedback();
         const bool hovered = ImGui::IsItemHovered();
+        const bool tooltipHovered = ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort);
         const bool held = ImGui::IsItemActive();
-        ImGui::PopID();
-
+        const bool focused = ImGui::IsItemFocused() && ImGui::GetIO().NavVisible;
+        const ImVec2 min = ImGui::GetItemRectMin();
+        const ImVec2 max = ImGui::GetItemRectMax();
+        const float hoverBlend = animateTabs ? 1.0f - std::exp(-tabDeltaTime * 18.0f / tabMotionScale) : 1.0f;
+        tabHoverAnim[index] = ImLerp(tabHoverAnim[index], hovered ? 1.0f : 0.0f, hoverBlend);
+        const float selection = tabSelectionAnim[index];
+        const float hover = tabHoverAnim[index];
+        const float pulse = animateTabs && selected
+            ? std::sin(static_cast<float>(ImGui::GetTime()) * 3.2f) * tabMotionScale : 0.0f;
+        const float expand = animateTabs ? selection * (0.7f + pulse * 0.25f) + hover * 0.25f : 0.0f;
+        const float inset = (3.0f - expand * 0.55f) * settingsUiScale;
+        const ImVec2 cardMin(min.x + inset, min.y + inset);
+        const ImVec2 cardMax(max.x - inset, max.y - inset);
+        const float rounding = (iconsOnly ? 13.0f : 8.0f) * settingsUiScale;
+        const ImGuiStyle& style = ImGui::GetStyle();
+        const ImVec4 accent = ImLerp(style.Colors[ImGuiCol_CheckMark], ImVec4(0.45f, 0.80f, 1.0f, 1.0f), 0.60f);
         ImDrawList* drawList = ImGui::GetWindowDrawList();
-        const ImRect slot(slotPos, ImVec2(slotPos.x + slotSize.x, slotPos.y + slotSize.y));
-        const float expand = isCurrentSelection
-            ? selectedBlend * (0.75f + brighten * 1.35f - darken * 0.55f)
-            : selectedBlend * 0.2f;
-        const float insetX = compactSidebar ? std::max(1.5f, 2.5f - expand * 0.45f) : std::max(3.0f, 5.0f - expand);
-        const float insetY = std::max(1.5f, 2.5f - expand * 0.45f);
-        const ImVec2 cardMin(slot.Min.x + insetX, slot.Min.y + insetY);
-        const ImVec2 cardMax(slot.Max.x - insetX, slot.Max.y - insetY);
-        const float rounding = 13.0f;
 
-        ImVec4 bg = ImVec4(0.12f, 0.14f, 0.19f, 0.92f);
-        ImVec4 border = ImVec4(0.22f, 0.27f, 0.36f, 0.90f);
-        ImVec4 accent = ImVec4(0.38f, 0.63f, 0.98f, 0.95f);
-        if (hovered) {
-            bg = ImVec4(0.15f, 0.18f, 0.24f, 0.95f);
-            border = ImVec4(0.32f, 0.42f, 0.56f, 0.95f);
+        // A few translucent rim strokes give a soft halo without a bloom pass or extra textures.
+        if (selection > 0.01f) {
+            const float glow = selection * (0.94f + pulse * 0.06f);
+            for (int layer = 4; layer >= 1; --layer) {
+                const float spread = static_cast<float>(layer) * 0.9f * settingsUiScale;
+                const ImVec4 halo(accent.x, accent.y, accent.z,
+                                  glow * (0.055f - static_cast<float>(layer) * 0.009f));
+                drawList->AddRect(ImVec2(cardMin.x - spread, cardMin.y - spread),
+                                  ImVec2(cardMax.x + spread, cardMax.y + spread),
+                                  ImGui::GetColorU32(halo), rounding + spread, 0, 1.6f * settingsUiScale);
+            }
         }
-        if (selectedBlend > 0.001f) {
-            bg = ImVec4(0.14f + brighten * 0.06f - darken * 0.03f,
-                        0.20f + brighten * 0.08f - darken * 0.05f,
-                        0.30f + brighten * 0.12f - darken * 0.06f,
-                        0.96f);
-            border = ImVec4(0.32f + brighten * 0.10f,
-                            0.58f + brighten * 0.10f,
-                            0.95f,
-                            0.98f);
-            accent = ImVec4(0.45f + brighten * 0.10f,
-                            0.78f + brighten * 0.08f,
-                            1.0f,
-                            0.98f);
-        }
-        if (held) {
-            bg.x += 0.03f;
-            bg.y += 0.03f;
-            bg.z += 0.03f;
-        }
-
-        if (isCurrentSelection && selectedBlend > 0.05f) {
-            drawList->AddRectFilled(
-                ImVec2(cardMin.x + 1.0f, cardMin.y + 3.0f),
-                ImVec2(cardMax.x + 1.0f, cardMax.y + 3.0f),
-                ImGui::GetColorU32(ImVec4(0.02f, 0.04f, 0.08f, 0.16f + 0.08f * selectedBlend)),
-                rounding);
-        }
-        drawList->AddRectFilled(cardMin, cardMax, ImGui::GetColorU32(bg), rounding);
-        drawList->AddRect(cardMin, cardMax, ImGui::GetColorU32(border), rounding, 0, 1.0f + selectedBlend);
-        if (selectedBlend > 0.02f) {
-            const float stripeWidth = isCurrentSelection ? 3.0f + brighten * 1.4f : 2.0f;
-            if (compactSidebar) {
-                drawList->AddRectFilled(
-                    ImVec2(cardMin.x + 8.0f, cardMax.y - stripeWidth),
-                    ImVec2(cardMax.x - 8.0f, cardMax.y),
-                    ImGui::GetColorU32(accent),
-                    4.0f);
+        drawList->AddRectFilled(ImVec2(cardMin.x, cardMin.y + 2.0f * settingsUiScale),
+                                ImVec2(cardMax.x, cardMax.y + 2.0f * settingsUiScale),
+                                ImGui::GetColorU32(ImVec4(0, 0, 0, 0.16f + selection * 0.06f)), rounding);
+        ImVec4 surface = ImLerp(style.Colors[ImGuiCol_FrameBg], accent,
+                                0.05f + hover * 0.06f + selection * (0.24f + pulse * 0.015f));
+        if (held) surface = ImLerp(surface, style.Colors[ImGuiCol_FrameBgActive], 0.25f);
+        const ImVec4 topColor = ImLerp(surface, ImVec4(1, 1, 1, 1), 0.045f + selection * 0.075f);
+        const ImVec4 bottomColor = ImLerp(surface, ImVec4(0, 0, 0, 1), 0.12f);
+        const int surfaceStart = drawList->VtxBuffer.Size;
+        drawList->AddRectFilled(cardMin, cardMax, ImGui::GetColorU32(surface), rounding);
+        ImGui::ShadeVertsLinearColorGradientKeepAlpha(drawList, surfaceStart, drawList->VtxBuffer.Size,
+                                                      cardMin, ImVec2(cardMin.x, cardMax.y),
+                                                      ImGui::GetColorU32(topColor), ImGui::GetColorU32(bottomColor));
+        const ImVec4 rim(accent.x, accent.y, accent.z, 0.15f + hover * 0.16f + selection * 0.46f);
+        drawList->AddRect(cardMin, cardMax, ImGui::GetColorU32(rim), rounding, 0, settingsUiScale);
+        // Inner highlight and a lit lower/left edge make the selected surface feel gently convex.
+        const float inner = 1.0f * settingsUiScale;
+        drawList->AddRect(ImVec2(cardMin.x + inner, cardMin.y + inner),
+                          ImVec2(cardMax.x - inner, cardMax.y - inner),
+                          ImGui::GetColorU32(ImVec4(1, 1, 1, 0.025f + selection * 0.085f)),
+                          std::max(0.0f, rounding - inner), 0, settingsUiScale);
+        if (selection > 0.01f) {
+            const float stripe = (2.0f + pulse * 0.25f) * settingsUiScale;
+            const ImVec4 light(accent.x, accent.y, accent.z, selection * 0.85f);
+            if (iconsOnly) {
+                drawList->AddRectFilled(ImVec2(cardMin.x + navPadding, cardMax.y - stripe - inner),
+                                        ImVec2(cardMax.x - navPadding, cardMax.y - inner),
+                                        ImGui::GetColorU32(light), stripe);
             } else {
-                drawList->AddRectFilled(
-                    ImVec2(cardMin.x, cardMin.y + 7.0f),
-                    ImVec2(cardMin.x + stripeWidth, cardMax.y - 7.0f),
-                    ImGui::GetColorU32(accent),
-                    4.0f);
+                drawList->AddRectFilled(ImVec2(cardMin.x + inner, cardMin.y + navPadding),
+                                        ImVec2(cardMin.x + inner + stripe, cardMax.y - navPadding),
+                                        ImGui::GetColorU32(light), stripe);
             }
         }
 
+        const float centerY = (min.y + max.y) * 0.5f;
+        const float baseIconSize = iconsOnly ? topTabSize - 16.0f * settingsUiScale : navIconSize;
+        const float iconSize = baseIconSize + (animateTabs
+            ? selection * (2.2f + pulse * 0.55f) + hover * 0.8f : selection * 2.2f) * settingsUiScale;
+        const float iconLift = animateTabs ? (selection * (0.7f + pulse * 0.3f) + hover * 0.4f) * settingsUiScale : 0.0f;
+        const float iconX = iconsOnly ? (min.x + max.x - iconSize) * 0.5f
+                                     : min.x + navPadding + (navIconSize - iconSize) * 0.5f;
+        const ImVec2 iconMin(iconX, centerY - iconSize * 0.5f - iconLift);
+        const ImVec2 iconMax(iconX + iconSize, centerY + iconSize * 0.5f - iconLift);
         const ProjectSettingsUiIcon icon = resolveProjectSettingsIcon(tab.iconPath);
-        const float cardHeight = cardMax.y - cardMin.y;
-        const float baseIconSize = compactSidebar
-            ? std::max(24.0f, cardHeight - 11.0f)
-            : std::max(24.0f, cardHeight - 9.0f);
-        const float iconSize = isCurrentSelection
-            ? baseIconSize + selectedBlend * (2.0f + brighten * 1.2f - darken * 0.5f)
-            : baseIconSize + selectedBlend * 0.4f;
-        const float iconX = compactSidebar
-            ? cardMin.x + (cardMax.x - cardMin.x - iconSize) * 0.5f
-            : cardMin.x + 10.0f;
-        const ImVec2 iconMin(iconX, cardMin.y + (cardMax.y - cardMin.y - iconSize) * 0.5f);
-        const ImVec2 iconMax(iconMin.x + iconSize, iconMin.y + iconSize);
-        const int iconAlpha = selectedBlend > 0.05f ? 255 : hovered ? 235 : 214;
-        if (icon.id != static_cast<ImTextureID>(0)) {
-            const ImVec2 uvMin = icon.flipY ? ImVec2(0.0f, 1.0f) : ImVec2(0.0f, 0.0f);
-            const ImVec2 uvMax = icon.flipY ? ImVec2(1.0f, 0.0f) : ImVec2(1.0f, 1.0f);
-            drawList->AddImage(icon.id, iconMin, iconMax, uvMin, uvMax, IM_COL32(255, 255, 255, iconAlpha));
+        const ImU32 iconTint = ImGui::GetColorU32(ImVec4(1, 1, 1, 0.84f + selection * 0.16f));
+        if (icon.id) {
+            const ImVec2 uvMin = icon.flipY ? ImVec2(0, 1) : ImVec2(0, 0);
+            const ImVec2 uvMax = icon.flipY ? ImVec2(1, 0) : ImVec2(1, 1);
+            drawList->AddImage(icon.id, iconMin, iconMax, uvMin, uvMax, iconTint);
         } else {
-            drawList->AddText(
-                ImVec2(cardMin.x + 13.0f, cardMin.y + (cardMax.y - cardMin.y - ImGui::GetTextLineHeight()) * 0.5f),
-                IM_COL32(255, 255, 255, iconAlpha),
-                tab.fallback);
+            drawList->AddText(ImVec2(iconX, centerY - ImGui::GetTextLineHeight() * 0.5f - iconLift),
+                              ImGui::GetColorU32(ImGuiCol_Text), tab.fallback);
         }
-
-        const char* tabLabel = Loc::T(tab.key, tab.label);
-        if (compactSidebar) {
-            if (hovered) {
-                ImGui::BeginTooltip();
-                ImGui::TextUnformatted(tabLabel);
-                ImGui::EndTooltip();
-            }
-        } else {
-            const ImVec2 textSize = ImGui::CalcTextSize(tabLabel);
-            const float textX = iconMax.x + 10.0f;
-            const float textY = cardMin.y + (cardMax.y - cardMin.y - textSize.y) * 0.5f;
-            const ImU32 textColor = ImGui::GetColorU32(
-                selectedBlend > 0.05f
-                    ? ImVec4(0.95f, 0.98f, 1.0f, 1.0f)
-                    : hovered
-                        ? ImVec4(0.90f, 0.94f, 0.98f, 1.0f)
-                        : ImVec4(0.78f, 0.83f, 0.89f, 1.0f));
-            drawList->AddText(ImVec2(textX, textY), textColor, tabLabel);
+        if (!iconsOnly) {
+            drawList->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
+                              ImVec2(min.x + navIconSize + navPadding * 2.0f + 2.0f * settingsUiScale,
+                                     centerY - textHeight * 0.5f),
+                              ImGui::GetColorU32(ImGuiCol_Text), label, nullptr, textWidth);
         }
-        return pressed;
-    };
-
-    auto selectProjectSettingsTab = [&](int index) {
-        if (selectedTab != index) {
+        if (focused) {
+            drawList->AddRect(cardMin, cardMax, ImGui::GetColorU32(accent), rounding, 0, 2.0f * settingsUiScale);
+        }
+        if (tooltipHovered) {
+            ImGui::BeginTooltip();
+            ImGui::TextUnformatted(label);
+            ImGui::PushTextWrapPos(ImGui::GetFontSize() * 28.0f);
+            ImGui::TextUnformatted(tab.description);
+            ImGui::PopTextWrapPos();
+            ImGui::EndTooltip();
+        }
+        ImGui::PopID();
+        if (pressed && !selected) {
             selectedTab = index;
             playEditorSound(EditorSoundCue::Tick, 0.95f);
         }
     };
+
     if (projectSettingsCompactSidebar) {
-        ImGui::BeginGroup();
+        // Wrap the strip instead of leaving categories off the edge of a narrow dock.
         for (int i = 0; i < tabCount; ++i) {
-            if (drawProjectSettingsTab(i, true)) {
-                selectProjectSettingsTab(i);
+            const float rightEdge = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
+            if (i > 0 && ImGui::GetItemRectMax().x + ImGui::GetStyle().ItemSpacing.x + topTabSize <= rightEdge) {
+                ImGui::SameLine();
             }
-            if (i + 1 < tabCount) {
-                const float spacing = (i == 1 || i == kAudioConfigTab || i == kBuildTab) ? 6.0f : 2.0f;
-                ImGui::SameLine(0.0f, spacing);
-            }
-        }
-        ImGui::EndGroup();
-        ImGui::Spacing();
-        ImGui::BeginChild("SettingsBody", ImVec2(0, 0), false);
-    } else {
-        ImGui::BeginChild("SettingsNav", ImVec2(214.0f, 0), true);
-        if (ImGui::SmallButton("<")) {
-            projectSettingsCompactSidebar = true;
-            saveEditorUserSettings();
-        }
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
-            ImGui::BeginTooltip();
-            ImGui::TextUnformatted("Compact settings categories");
-            ImGui::EndTooltip();
+            drawProjectSettingsTab(i, true);
         }
         ImGui::Separator();
-        for (int i = 0; i < tabCount; ++i) {
-            if (drawProjectSettingsTab(i, false)) {
-                selectProjectSettingsTab(i);
-            }
-            if (i + 1 < tabCount) {
-                ImGui::Dummy(ImVec2(0.0f, 0.0f));
-            }
+    } else {
+        float idealNavWidth = 200.0f * settingsUiScale;
+        for (const auto& tab : tabs) {
+            idealNavWidth = std::max(idealNavWidth, ImGui::CalcTextSize(Loc::T(tab.key, tab.label)).x +
+                                                       navIconSize + navPadding * 4.0f + ImGui::GetStyle().ScrollbarSize);
         }
+        const float navWidth = std::min(idealNavWidth, ImGui::GetContentRegionAvail().x * 0.38f);
+        ImGui::BeginChild("SettingsNav", ImVec2(std::max(1.0f, navWidth), 0), true);
+        for (int i = 0; i < tabCount; ++i) drawProjectSettingsTab(i, false);
         ImGui::EndChild();
-
         ImGui::SameLine();
-        ImGui::BeginChild("SettingsBody", ImVec2(0, 0), false);
     }
+    ImGui::BeginChild("SettingsBody", ImVec2(0, 0), false);
+    ImGui::TextUnformatted(Loc::T(tabs[selectedTab].key, tabs[selectedTab].label));
+    DrawHelpText(tabs[selectedTab].description);
+    ImGui::Spacing();
 
     static char settingsSearch[160] = "";
-    static int settingsModeIndex = 0;
+    int& settingsModeIndex = projectSettingsVisibilityMode;
     settingsModeIndex = std::clamp(settingsModeIndex, 0, 2);
     const ProjectSettingsVisibilityMode settingsMode =
         static_cast<ProjectSettingsVisibilityMode>(settingsModeIndex);
@@ -6269,25 +6330,34 @@ void Engine::renderProjectBrowserPanel() {
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.0f, 2.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(5.0f, 2.0f));
     const float controlsWidth = ImGui::GetContentRegionAvail().x;
-    ImGui::SetNextItemWidth(std::max(180.0f, controlsWidth * 0.36f));
-    ImGui::InputTextWithHint("##ProjectSettingsSearch", Loc::T("SETTINGS_SEARCH", "Search settings"),
-                             settingsSearch, sizeof(settingsSearch));
-    ImGui::SameLine();
     const char* modeOptions[] = { Loc::T("SETTINGS_MODE_SIMPLE", "Simple"),
                                   Loc::T("SETTINGS_MODE_ADVANCED", "Advanced"),
                                   Loc::T("SETTINGS_MODE_DEVELOPER", "Developer") };
-    ImGui::SetNextItemWidth(148.0f);
-    ImGui::Combo("##ProjectSettingsMode", &settingsModeIndex, modeOptions, IM_ARRAYSIZE(modeOptions));
+    float modeWidth = 0.0f;
+    for (const char* mode : modeOptions) modeWidth = std::max(modeWidth, ImGui::CalcTextSize(mode).x);
+    modeWidth += ImGui::GetFrameHeight() + ImGui::GetStyle().FramePadding.x * 2.0f;
+    const bool inlineMode = controlsWidth >= modeWidth + 200.0f * settingsUiScale;
+    ImGui::SetNextItemWidth(std::max(1.0f, inlineMode ? controlsWidth - modeWidth - ImGui::GetStyle().ItemSpacing.x : controlsWidth));
+    ImGui::InputTextWithHint("##ProjectSettingsSearch", Loc::T("SETTINGS_SEARCH_CATEGORY", "Search this category"),
+                             settingsSearch, sizeof(settingsSearch));
+    if (inlineMode) ImGui::SameLine();
+    ImGui::SetNextItemWidth(std::min(modeWidth, controlsWidth));
+    if (ImGui::Combo("##ProjectSettingsMode", &settingsModeIndex, modeOptions, IM_ARRAYSIZE(modeOptions))) {
+        saveEditorUserSettings();
+    }
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
         ImGui::BeginTooltip();
-        ImGui::TextUnformatted(ProjectSettingsModeHelp(settingsMode));
+        ImGui::TextUnformatted(ProjectSettingsModeHelp(static_cast<ProjectSettingsVisibilityMode>(settingsModeIndex)));
         ImGui::Separator();
-        ImGui::TextUnformatted("Simple: common safe settings.");
-        ImGui::TextUnformatted("Advanced: technical user settings.");
-        ImGui::TextUnformatted("Developer: debug and internal settings.");
+        ImGui::TextUnformatted("Simple: common settings.");
+        ImGui::TextUnformatted("Advanced: common and technical settings.");
+        ImGui::TextUnformatted("Developer: all settings, including diagnostics.");
         ImGui::EndTooltip();
     }
     ImGui::Separator();
+    // Keep navigation, search, and the detail filter visible while scrolling settings.
+    ImGui::PushID(selectedTab);
+    ImGui::BeginChild("SettingsContent", ImVec2(0, 0), false);
 
     static int openXRPlatformTabIndex = 0;
     openXRPlatformTabIndex =
@@ -6377,138 +6447,9 @@ void Engine::renderProjectBrowserPanel() {
     }
 
     static std::array<std::vector<float>, tabCount> settingsSectionHeights;
-    BeginProjectSettingsColumns(settingsSectionHeights[selectedTab]);
+    BeginProjectSettingsColumns(settingsSectionHeights[selectedTab], projectSettingsTwoColumns);
 
-    if (selectedTab == 0) {
-        if (ImGui::Button("+ New Scene")) {
-            showNewSceneDialog = true;
-            memset(newSceneName, 0, sizeof(newSceneName));
-        }
-
-        ImGui::Spacing();
-
-        // Listing the scenes folder every frame was a directory scan per editor frame; a short
-        // refresh interval still picks up scenes created or deleted outside this panel.
-        struct SceneListCache {
-            fs::path scenesPath;
-            std::vector<std::string> scenes;
-            double refreshTime = -1.0;
-        };
-        static SceneListCache sSceneListCache;
-        const double sceneListNow = ImGui::GetTime();
-        if (sSceneListCache.refreshTime < 0.0 || sceneListNow - sSceneListCache.refreshTime > 1.0 ||
-            sSceneListCache.scenesPath != projectManager.currentProject.scenesPath) {
-            sSceneListCache.scenesPath = projectManager.currentProject.scenesPath;
-            sSceneListCache.scenes = projectManager.currentProject.getSceneList();
-            sSceneListCache.refreshTime = sceneListNow;
-        }
-        const std::vector<std::string>& scenes = sSceneListCache.scenes;
-        for (const auto& scene : scenes) {
-            if (!ProjectSettingsMatchesSearch(settingsSearch, "Scenes", scene.c_str(), "scene load duplicate delete")) {
-                continue;
-            }
-            ++visibleSettingCount;
-            bool isCurrentScene = (scene == projectManager.currentProject.currentSceneName);
-
-            ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_Leaf |
-                                      ImGuiTreeNodeFlags_SpanAvailWidth |
-                                      ImGuiTreeNodeFlags_NoTreePushOnOpen;
-            if (isCurrentScene) flags |= ImGuiTreeNodeFlags_Selected;
-
-            ImGui::TreeNodeEx(scene.c_str(), flags, "[S] %s", scene.c_str());
-
-            if (ImGui::IsItemClicked() && !isCurrentScene) {
-                loadScene(scene);
-            }
-
-            if (ImGui::BeginPopupContextItem()) {
-                if (ImGui::MenuItem("Load") && !isCurrentScene) {
-                    loadScene(scene);
-                }
-                if (ImGui::MenuItem("Duplicate")) {
-                    addConsoleMessage("Scene duplication not yet implemented.", ConsoleMessageType::Info);
-                }
-                ImGui::Separator();
-                if (ImGui::MenuItem("Delete") && !isCurrentScene) {
-                    fs::remove(projectManager.currentProject.getSceneFilePath(scene));
-                    addConsoleMessage("Deleted scene: " + scene, ConsoleMessageType::Info);
-                    sSceneListCache.refreshTime = -1.0;
-                }
-                ImGui::EndPopup();
-            }
-        }
-
-        if (scenes.empty()) {
-            ImGui::TextDisabled("No scenes yet");
-        } else if (settingsSearch[0] != '\0' && visibleSettingCount == 0) {
-            ImGui::TextDisabled("No scenes match this search.");
-        }
-    } else if (selectedTab == 1) {
-        if (DrawSettingSection("[M]", Loc::T("SETTINGS_ASSETS_LOADED_OBJ_MESHES", "Loaded OBJ Meshes"), Loc::T("SETTINGS_ASSETS_LOADED_OBJ_MESHES_DESC", "Imported .obj meshes available to this project."))) {
-            const auto& meshesObj = g_objLoader.getAllMeshes();
-            if (meshesObj.empty()) {
-                ImGui::TextDisabled("No meshes loaded");
-                ImGui::TextDisabled("Import .obj files from File Browser");
-            } else {
-                for (size_t i = 0; i < meshesObj.size(); i++) {
-                    const auto& mesh = meshesObj[i];
-                    if (!ProjectSettingsMatchesSearch(settingsSearch, "Assets", mesh.name.c_str(), mesh.path.c_str())) {
-                        continue;
-                    }
-                    ++visibleSettingCount;
-                    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_Leaf |
-                                              ImGuiTreeNodeFlags_SpanAvailWidth |
-                                              ImGuiTreeNodeFlags_NoTreePushOnOpen;
-
-                    ImGui::TreeNodeEx((void*)(intptr_t)i, flags, "[M] %s", mesh.name.c_str());
-
-                    if (ImGui::IsItemHovered()) {
-                        ImGui::BeginTooltip();
-                        ImGui::Text("Vertices: %d", mesh.vertexCount);
-                        ImGui::Text("Faces: %d", mesh.faceCount);
-                        ImGui::Text("Has Normals: %s", mesh.hasNormals ? "Yes" : "No");
-                        ImGui::Text("Has UVs: %s", mesh.hasTexCoords ? "Yes" : "No");
-                        ImGui::TextDisabled("%s", mesh.path.c_str());
-                        ImGui::EndTooltip();
-                    }
-                }
-            }
-        }
-
-        if (DrawSettingSection("[A]", Loc::T("SETTINGS_ASSETS_LOADED_MODELS", "Loaded Models"), Loc::T("SETTINGS_ASSETS_LOADED_MODELS_DESC", "Imported Assimp-supported model assets available to this project."))) {
-            const auto& meshesAssimp = getModelLoader().getAllMeshes();
-            if (meshesAssimp.empty()) {
-                ImGui::TextDisabled("No models loaded");
-                ImGui::TextDisabled("Import FBX/GLTF/other supported models from File Browser");
-            } else {
-                for (size_t i = 0; i < meshesAssimp.size(); i++) {
-                    const auto& mesh = meshesAssimp[i];
-                    if (!ProjectSettingsMatchesSearch(settingsSearch, "Assets", mesh.name.c_str(), mesh.path.c_str())) {
-                        continue;
-                    }
-                    ++visibleSettingCount;
-                    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_Leaf |
-                                              ImGuiTreeNodeFlags_SpanAvailWidth |
-                                              ImGuiTreeNodeFlags_NoTreePushOnOpen;
-
-                    ImGui::TreeNodeEx((void*)(intptr_t)(10000 + i), flags, "[A] %s", mesh.name.c_str());
-
-                    if (ImGui::IsItemHovered()) {
-                        ImGui::BeginTooltip();
-                        ImGui::Text("Vertices: %d", mesh.vertexCount);
-                        ImGui::Text("Faces: %d", mesh.faceCount);
-                        ImGui::Text("Has Normals: %s", mesh.hasNormals ? "Yes" : "No");
-                        ImGui::Text("Has UVs: %s", mesh.hasTexCoords ? "Yes" : "No");
-                        ImGui::TextDisabled("%s", mesh.path.c_str());
-                        ImGui::EndTooltip();
-                    }
-                }
-            }
-        }
-        if (settingsSearch[0] != '\0' && visibleSettingCount == 0) {
-            ImGui::TextDisabled("No assets match this search.");
-        }
-    } else if (selectedTab == kInputManagerTab) {
+    if (selectedTab == kInputManagerTab) {
         struct InputBindingEntry {
             std::string label;
             std::string keyName;
@@ -6590,12 +6531,14 @@ void Engine::renderProjectBrowserPanel() {
         ImGui::TextDisabled("All Control Schemes  |  All Devices  |  Auto-Save");
         ImGui::Separator();
 
-        const float availY = std::max(260.0f, ImGui::GetContentRegionAvail().y - 6.0f);
-        const float colMaps = 150.0f;
-        const float colActions = std::max(220.0f, ImGui::GetContentRegionAvail().x * 0.36f);
+        const float inputWidth = ImGui::GetContentRegionAvail().x;
+        const bool sideBySide = inputWidth >= 800.0f * settingsUiScale;
+        const float availY = std::max(260.0f * settingsUiScale, ImGui::GetContentRegionAvail().y - 6.0f);
+        const float colMaps = sideBySide ? 150.0f * settingsUiScale : inputWidth;
+        const float colActions = sideBySide ? inputWidth * 0.36f : inputWidth;
 
         // Action Maps
-        ImGui::BeginChild("##InputActionMaps", ImVec2(colMaps, availY), true);
+        ImGui::BeginChild("##InputActionMaps", ImVec2(colMaps, sideBySide ? availY : 150.0f * settingsUiScale), true);
         ImGui::TextDisabled("Action Maps");
         ImGui::Separator();
         for (int i = 0; i < (int)inputActionMaps.size(); ++i) {
@@ -6614,10 +6557,10 @@ void Engine::renderProjectBrowserPanel() {
             selectedActionIndex = 0;
         }
         ImGui::EndChild();
-        ImGui::SameLine();
+        if (sideBySide) ImGui::SameLine();
 
         // Actions
-        ImGui::BeginChild("##InputActions", ImVec2(colActions, availY), true);
+        ImGui::BeginChild("##InputActions", ImVec2(colActions, sideBySide ? availY : 300.0f * settingsUiScale), true);
         ImGui::TextDisabled("Actions");
         ImGui::Separator();
         if (selectedMapIndex >= 0 && selectedMapIndex < (int)inputActionMaps.size()) {
@@ -6641,8 +6584,7 @@ void Engine::renderProjectBrowserPanel() {
                         ImGui::PushID(b);
                         ImGui::Bullet();
                         ImGui::SameLine();
-                        ImGui::TextDisabled("%s:", bind.label.c_str());
-                        ImGui::SameLine();
+                        ImGui::TextWrapped("%s:", bind.label.c_str());
                         char buf[64] = {};
                         std::snprintf(buf, sizeof(buf), "%s", bind.keyName.c_str());
                         ImGui::SetNextItemWidth(-58.0f);
@@ -6678,10 +6620,10 @@ void Engine::renderProjectBrowserPanel() {
             ImGui::TextDisabled("Select an action map.");
         }
         ImGui::EndChild();
-        ImGui::SameLine();
+        if (sideBySide) ImGui::SameLine();
 
         // Properties
-        ImGui::BeginChild("##InputActionProperties", ImVec2(0, availY), true);
+        ImGui::BeginChild("##InputActionProperties", ImVec2(0, sideBySide ? availY : 380.0f * settingsUiScale), true);
         ImGui::TextDisabled("Action Properties");
         ImGui::Separator();
         if (selectedMapIndex >= 0 && selectedMapIndex < (int)inputActionMaps.size() &&
@@ -6722,7 +6664,7 @@ void Engine::renderProjectBrowserPanel() {
             ImGui::TextDisabled("Processors");
             ImGui::TextDisabled("(No processors configured)");
             ImGui::Separator();
-            ImGui::TextDisabled("Scripts use: Input.ButtonDown(\"%s\"), .ButtonHeld, .ButtonUp", action.name.c_str());
+            ImGui::TextWrapped("Scripts use: Input.ButtonDown(\"%s\"), .ButtonHeld, .ButtonUp", action.name.c_str());
         } else {
             ImGui::TextDisabled("Select an action to edit its properties.");
         }
@@ -7873,11 +7815,46 @@ void Engine::renderProjectBrowserPanel() {
             });
             changed |= drawStringSetting("Application Icon", "Path to the icon asset used by supported build targets.", player.applicationIconPath, 512);
         }
+        if (DrawSettingSection("[D]", "Discord Rich Presence",
+                               "Activity shown by Discord while this project is running in Play Mode or as an exported player.")) {
+            ProjectDiscordPresenceSettings& discord =
+                projectManager.currentProject.discordPresenceSettings;
+            changed |= DrawSettingRow("Enabled",
+                                      "Switch from Modularity's editor activity to this game's Discord application while playing.",
+                                      [&]() {
+                return ImGui::Checkbox("##DiscordRichPresenceEnabled", &discord.enabled);
+            });
+
+            ImGui::BeginDisabled(!discord.enabled);
+            changed |= drawStringSetting(
+                "Application ID",
+                "Public client/application ID from the game's Discord Developer Portal application.",
+                discord.applicationId, 32);
+            changed |= drawStringSetting("State", "Party or location text, for example: Exploring Nightfall's Town.",
+                                         discord.state, 129);
+            changed |= drawStringSetting("Details", "What the player is doing, for example: Chapter 1 - Story Mode.",
+                                         discord.details, 129);
+            changed |= drawStringSetting("Large Image Key", "Rich Presence art asset key uploaded to this game's Discord application.",
+                                         discord.largeImageKey, 301);
+            changed |= drawStringSetting("Large Image Text", "Tooltip shown over the large image.",
+                                         discord.largeImageText, 129);
+            changed |= drawStringSetting("Small Image Key", "Optional secondary art asset key.",
+                                         discord.smallImageKey, 301);
+            changed |= drawStringSetting("Small Image Text", "Optional tooltip shown over the small image.",
+                                         discord.smallImageText, 129);
+            changed |= drawStringSetting("Party ID", "Optional stable identifier shared by players in the same party.",
+                                         discord.partyId, 129);
+            ImGui::EndDisabled();
+
+            DrawHelpText("Discord must have User Settings > Activity Privacy > Share my activity enabled. Client secrets are server credentials and are never stored or shipped; Rich Presence only needs the public Application ID.");
+        }
         if (drawSettingSectionIcon("Resources/Engine-Root/Project Settings/Dropdowns/Player Config/Window and cursor.png",
                                    "[W]", Loc::T("SETTINGS_PLAYER_WINDOW_AND_CURSOR", "Window and Cursor"), Loc::T("SETTINGS_PLAYER_WINDOW_AND_CURSOR_DESC", "Startup resolution, fullscreen mode, and cursor defaults."))) {
             changed |= DrawSettingRow(Loc::T("SETTINGS_PLAYER_STARTUP_RESOLUTION", "Startup Resolution"), Loc::T("SETTINGS_PLAYER_STARTUP_RESOLUTION_DESC", "Default player window size."), [&]() {
-                bool rowChanged = ImGui::DragInt("Width##PlayerStartupWidth", &player.startupWidth, 1.0f, 64, 8192);
-                rowChanged |= ImGui::DragInt("Height##PlayerStartupHeight", &player.startupHeight, 1.0f, 64, 8192);
+                ImGui::TextUnformatted("Width");
+                bool rowChanged = ImGui::DragInt("##PlayerStartupWidth", &player.startupWidth, 1.0f, 64, 8192);
+                ImGui::TextUnformatted("Height");
+                rowChanged |= ImGui::DragInt("##PlayerStartupHeight", &player.startupHeight, 1.0f, 64, 8192);
                 if (rowChanged) {
                     player.startupWidth = std::clamp(player.startupWidth, 64, 8192);
                     player.startupHeight = std::clamp(player.startupHeight, 64, 8192);
@@ -7894,7 +7871,6 @@ void Engine::renderProjectBrowserPanel() {
             });
             changed |= DrawSettingRow(Loc::T("SETTINGS_PLAYER_CURSOR_DEFAULTS", "Cursor Defaults"), Loc::T("SETTINGS_PLAYER_CURSOR_DEFAULTS_DESC", "Initial cursor lock and visibility."), [&]() {
                 bool rowChanged = ImGui::Checkbox("Locked##CursorLocked", &player.cursorLocked);
-                ImGui::SameLine();
                 rowChanged |= ImGui::Checkbox("Visible##CursorVisible", &player.cursorVisible);
                 return rowChanged;
             });
@@ -8069,14 +8045,11 @@ void Engine::renderProjectBrowserPanel() {
             }
             if (visible(ProjectSettingsVisibilityMode::Developer, "Build", "Profiling", "profiler script debugging deep profiling")) {
                 buildSettingsChanged |= DrawSettingRow(Loc::T("SETTINGS_EDITOR_PROFILING", "Profiling"), Loc::T("SETTINGS_EDITOR_PROFILING_DESC", "Developer build diagnostics and profiling options."), [&]() {
-                    bool changed = false;
-                    changed |= ImGui::Checkbox("Script Debug##ScriptDebuggingQuick", &buildSettings.scriptDebugging);
+                    bool changed = ImGui::Checkbox("Script Debugging##ScriptDebuggingQuick", &buildSettings.scriptDebugging);
                     ImGui::SetItemTooltip("%s", BuildSettingsHints::kScriptDebugging);
-                    ImGui::SameLine();
-                    changed |= ImGui::Checkbox("Profiler##AutoProfilerQuick", &buildSettings.autoConnectProfiler);
+                    changed |= ImGui::Checkbox("Connect Profiler##AutoProfilerQuick", &buildSettings.autoConnectProfiler);
                     ImGui::SetItemTooltip("%s", BuildSettingsHints::kAutoconnectProfiler);
-                    ImGui::SameLine();
-                    changed |= ImGui::Checkbox("Deep##DeepProfilingQuick", &buildSettings.deepProfiling);
+                    changed |= ImGui::Checkbox("Deep Profiling##DeepProfilingQuick", &buildSettings.deepProfiling);
                     ImGui::SetItemTooltip("%s", BuildSettingsHints::kDeepProfiling);
                     return changed;
                 });
@@ -8138,17 +8111,23 @@ void Engine::renderProjectBrowserPanel() {
                 });
             }
             if (visible(ProjectSettingsVisibilityMode::Developer, "Editor", "Camera Projection", "fov near far clip")) {
-                buildSettingsChanged |= DrawSettingRow(Loc::T("SETTINGS_EDITOR_CAMERA_PROJECTION", "Camera Projection"), Loc::T("SETTINGS_EDITOR_CAMERA_PROJECTION_DESC", "Developer controls for the editor camera projection."), [&]() {
-                    bool changed = false;
-                    changed |= ImGui::SliderFloat("FOV##EditorCameraFov", &buildSettings.editorCameraFov, 20.0f, 140.0f, "%.1f");
-                    changed |= ImGui::DragFloat("Near##EditorCameraNear", &buildSettings.editorCameraNear, 0.01f, 0.01f, buildSettings.editorCameraFar - 0.01f, "%.3f");
-                    changed |= ImGui::DragFloat("Far##EditorCameraFar", &buildSettings.editorCameraFar, 0.1f, buildSettings.editorCameraNear + 0.05f, 5000.0f, "%.1f");
-                    if (changed) {
-                        buildSettings.editorCameraNear = std::max(0.01f, std::min(buildSettings.editorCameraNear, buildSettings.editorCameraFar - 0.01f));
-                        buildSettings.editorCameraFar = std::max(buildSettings.editorCameraNear + 0.05f, buildSettings.editorCameraFar);
-                    }
-                    return changed;
-                });
+                bool projectionChanged = DrawSettingRow(Loc::T("SETTINGS_EDITOR_CAMERA_FOV", "Camera Field of View"),
+                    Loc::T("SETTINGS_EDITOR_CAMERA_PROJECTION_DESC", "Developer controls for the editor camera projection."), [&]() {
+                        return ImGui::SliderFloat("##EditorCameraFov", &buildSettings.editorCameraFov, 20.0f, 140.0f, "%.1f deg");
+                    });
+                projectionChanged |= DrawSettingRow(Loc::T("SETTINGS_EDITOR_CAMERA_NEAR", "Near Clip Plane"),
+                    "Closest distance the editor camera can see.", [&]() {
+                        return ImGui::DragFloat("##EditorCameraNear", &buildSettings.editorCameraNear, 0.01f, 0.01f, buildSettings.editorCameraFar - 0.01f, "%.3f");
+                    });
+                projectionChanged |= DrawSettingRow(Loc::T("SETTINGS_EDITOR_CAMERA_FAR", "Far Clip Plane"),
+                    "Farthest distance the editor camera can see.", [&]() {
+                        return ImGui::DragFloat("##EditorCameraFar", &buildSettings.editorCameraFar, 0.1f, buildSettings.editorCameraNear + 0.05f, 5000.0f, "%.1f");
+                    });
+                if (projectionChanged) {
+                    buildSettings.editorCameraNear = std::max(0.01f, std::min(buildSettings.editorCameraNear, buildSettings.editorCameraFar - 0.01f));
+                    buildSettings.editorCameraFar = std::max(buildSettings.editorCameraNear + 0.05f, buildSettings.editorCameraFar);
+                    buildSettingsChanged = true;
+                }
             }
             if (visible(ProjectSettingsVisibilityMode::Simple, "Editor", "Hierarchy Texture Preview", "hierarchy texture thumbnails")) {
                 editorSettingsChanged |= DrawSettingRow(Loc::T("SETTINGS_EDITOR_HIERARCHY_TEXTURE_PREVIEW", "Hierarchy Texture Preview"), Loc::T("SETTINGS_EDITOR_HIERARCHY_TEXTURE_PREVIEW_DESC", "Shows small material texture thumbnails in the Hierarchy panel."), [&]() {
@@ -8165,13 +8144,16 @@ void Engine::renderProjectBrowserPanel() {
                 editorSettingsChanged |= DrawSettingRow(Loc::T("SETTINGS_EDITOR_FAKE_3_D", "Fake 3D"), Loc::T("SETTINGS_EDITOR_FAKE_3_D_DESC", "Glue3D-style low-res mode7 presentation (tile+seg+m7,tsm)."), [&]() {
                     bool changed = ImGui::Checkbox("##TMFake3D", &tmPresentation.fake3DEnabled);
                     ImGui::BeginDisabled(!tmPresentation.fake3DEnabled);
-                    changed |= ImGui::DragInt("Lines##TMFake3DHeight", &tmPresentation.fake3DInternalHeight, 1.0f, 64, 2160);
+                    ImGui::TextUnformatted("Lines");
+                    changed |= ImGui::DragInt("##TMFake3DHeight", &tmPresentation.fake3DInternalHeight, 1.0f, 64, 2160);
                     changed |= ImGui::Checkbox("Point Sampling##TMFake3DPoint", &tmPresentation.fake3DPointSampling);
                     changed |= ImGui::Checkbox("Flat Shading##TMFake3DFlat", &tmPresentation.fake3DFlatShading);
-                    changed |= ImGui::DragInt("Shade Levels##TMFake3DShadeLevels", &tmPresentation.fake3DShadeLevels, 0.1f, 0, 16);
+                    ImGui::TextUnformatted("Shade Levels");
+                    changed |= ImGui::DragInt("##TMFake3DShadeLevels", &tmPresentation.fake3DShadeLevels, 0.1f, 0, 16);
                     changed |= ImGui::Checkbox("Affine Textures##TMFake3DAffine", &tmPresentation.fake3DAffineTextures);
                     ImGui::BeginDisabled(!tmPresentation.fake3DAffineTextures);
-                    changed |= ImGui::SliderFloat("Warp##TMFake3DAffineStrength", &tmPresentation.fake3DAffineStrength, 0.0f, 1.0f, "%.2f");
+                    ImGui::TextUnformatted("Warp");
+                    changed |= ImGui::SliderFloat("##TMFake3DAffineStrength", &tmPresentation.fake3DAffineStrength, 0.0f, 1.0f, "%.2f");
                     ImGui::EndDisabled();
                     ImGui::EndDisabled();
                     if (changed) {
@@ -8191,12 +8173,18 @@ void Engine::renderProjectBrowserPanel() {
                 editorSettingsChanged |= DrawSettingRow(Loc::T("SETTINGS_EDITOR_PITCH_STRENGTH", "Pitch Strength"), Loc::T("SETTINGS_EDITOR_PITCH_STRENGTH_DESC", "Internal stretch, compression, and shear tuning."), [&]() {
                     bool changed = false;
                     ImGui::BeginDisabled(!tmPresentation.lookPitchStretchEnabled);
-                    changed |= ImGui::DragFloat("Stretch##TMPitchStretchStrength", &tmPresentation.lookPitchStretchStrength, 0.01f, 0.0f, 1.5f, "%.2f");
-                    changed |= ImGui::DragFloat("Compress##TMPitchCompressStrength", &tmPresentation.lookPitchCompressStrength, 0.01f, 0.0f, 1.5f, "%.2f");
-                    changed |= ImGui::DragFloat("Shear##TMPitchShearStrength", &tmPresentation.lookPitchShearStrength, 0.01f, 0.0f, 1.0f, "%.2f");
-                    changed |= ImGui::DragFloat("Curve##TMPitchCurve", &tmPresentation.lookPitchCurve, 0.01f, 0.1f, 4.0f, "%.2f");
-                    changed |= ImGui::DragFloat("Depth Range##TMPitchDepthRange", &tmPresentation.lookPitchDepthRange, 0.25f, 1.0f, 256.0f, "%.1f");
-                    changed |= ImGui::DragFloatRange2("Pitch Range##TMPitchRange",
+                    ImGui::TextUnformatted("Stretch");
+                    changed |= ImGui::DragFloat("##TMPitchStretchStrength", &tmPresentation.lookPitchStretchStrength, 0.01f, 0.0f, 1.5f, "%.2f");
+                    ImGui::TextUnformatted("Compress");
+                    changed |= ImGui::DragFloat("##TMPitchCompressStrength", &tmPresentation.lookPitchCompressStrength, 0.01f, 0.0f, 1.5f, "%.2f");
+                    ImGui::TextUnformatted("Shear");
+                    changed |= ImGui::DragFloat("##TMPitchShearStrength", &tmPresentation.lookPitchShearStrength, 0.01f, 0.0f, 1.0f, "%.2f");
+                    ImGui::TextUnformatted("Curve");
+                    changed |= ImGui::DragFloat("##TMPitchCurve", &tmPresentation.lookPitchCurve, 0.01f, 0.1f, 4.0f, "%.2f");
+                    ImGui::TextUnformatted("Depth Range");
+                    changed |= ImGui::DragFloat("##TMPitchDepthRange", &tmPresentation.lookPitchDepthRange, 0.25f, 1.0f, 256.0f, "%.1f");
+                    ImGui::TextUnformatted("Pitch Range");
+                    changed |= ImGui::DragFloatRange2("##TMPitchRange",
                                                       &tmPresentation.presentationPitchMinDegrees,
                                                       &tmPresentation.presentationPitchMaxDegrees,
                                                       0.5f, -89.0f, 89.0f, "%.0f deg");
@@ -8244,19 +8232,23 @@ void Engine::renderProjectBrowserPanel() {
                     bool changed = false;
                     changed |= ImGui::Checkbox("World##TMPresentationWorldSnap", &tmPresentation.presentationSnapEnabled);
                     ImGui::BeginDisabled(!tmPresentation.presentationSnapEnabled);
-                    changed |= ImGui::DragFloat("World Step##TMPresentationWorldSnapStep", &tmPresentation.presentationSnapStep, 0.005f, 0.001f, 8.0f, "%.3f");
+                    ImGui::TextUnformatted("World Step");
+                    changed |= ImGui::DragFloat("##TMPresentationWorldSnapStep", &tmPresentation.presentationSnapStep, 0.005f, 0.001f, 8.0f, "%.3f");
                     ImGui::EndDisabled();
                     changed |= ImGui::Checkbox("Camera##TMPresentationCameraSnap", &tmPresentation.cameraRelativeSnapEnabled);
                     ImGui::BeginDisabled(!tmPresentation.cameraRelativeSnapEnabled);
-                    changed |= ImGui::DragFloat("Camera Step##TMPresentationCameraSnapStep", &tmPresentation.cameraRelativeSnapStep, 0.005f, 0.001f, 8.0f, "%.3f");
+                    ImGui::TextUnformatted("Camera Step");
+                    changed |= ImGui::DragFloat("##TMPresentationCameraSnapStep", &tmPresentation.cameraRelativeSnapStep, 0.005f, 0.001f, 8.0f, "%.3f");
                     ImGui::EndDisabled();
                     changed |= ImGui::Checkbox("Vertex##TMPresentationVertexSnap", &tmPresentation.vertexSnapEnabled);
                     ImGui::BeginDisabled(!tmPresentation.vertexSnapEnabled);
-                    changed |= ImGui::DragFloat("Vertex Step##TMPresentationVertexSnapStep", &tmPresentation.vertexSnapStep, 0.0025f, 0.0005f, 4.0f, "%.4f");
+                    ImGui::TextUnformatted("Vertex Step");
+                    changed |= ImGui::DragFloat("##TMPresentationVertexSnapStep", &tmPresentation.vertexSnapStep, 0.0025f, 0.0005f, 4.0f, "%.4f");
                     ImGui::EndDisabled();
                     changed |= ImGui::Checkbox("Screen##TMPresentationScreenSnap", &tmPresentation.screenSnapEnabled);
                     ImGui::BeginDisabled(!tmPresentation.screenSnapEnabled);
-                    changed |= ImGui::DragFloat("Screen Step##TMPresentationScreenSnapStep", &tmPresentation.screenSnapStep, 0.25f, 0.25f, 16.0f, "%.2f");
+                    ImGui::TextUnformatted("Screen Step");
+                    changed |= ImGui::DragFloat("##TMPresentationScreenSnapStep", &tmPresentation.screenSnapStep, 0.25f, 0.25f, 16.0f, "%.2f");
                     ImGui::EndDisabled();
                     if (changed) {
                         tmPresentation.presentationSnapStep = std::clamp(tmPresentation.presentationSnapStep, 0.001f, 8.0f);
@@ -8302,24 +8294,32 @@ void Engine::renderProjectBrowserPanel() {
             }
             if (visible(ProjectSettingsVisibilityMode::Developer, "Debug / Developer", "FPS Cap", "performance frame rate limit")) {
                 editorSettingsChanged |= DrawSettingRow(Loc::T("SETTINGS_EDITOR_FPS_CAP", "FPS Cap"), Loc::T("SETTINGS_EDITOR_FPS_CAP_DESC", "Limits frame rate when VSync is off. It is bypassed while presentation is already synchronized."), [&]() {
-                    bool changed = ImGui::Checkbox("Enabled##FpsCapEnabled", &fpsCapEnabled);
-                    ImGui::BeginDisabled(!fpsCapEnabled);
-                    changed |= ImGui::DragFloat("Target##FpsCapTarget", &fpsCap, 1.0f, 1.0f, 500.0f, "%.0f");
-                    ImGui::EndDisabled();
-                    if (changed) fpsCap = std::max(1.0f, fpsCap);
-                    return changed;
+                    return ImGui::Checkbox("##FpsCapEnabled", &fpsCapEnabled);
                 });
+                editorSettingsChanged |= DrawSettingRow(Loc::T("SETTINGS_EDITOR_FPS_TARGET", "Target Frame Rate"),
+                    "Maximum editor frames per second when the FPS cap is enabled and VSync is off.", [&]() {
+                        ImGui::BeginDisabled(!fpsCapEnabled);
+                        const bool changed = ImGui::DragFloat("##FpsCapTarget", &fpsCap, 1.0f, 1.0f, 500.0f, "%.0f FPS");
+                        ImGui::EndDisabled();
+                        if (changed) fpsCap = std::max(1.0f, fpsCap);
+                        return changed;
+                    });
             }
             if (visible(ProjectSettingsVisibilityMode::Developer, "Debug / Developer", "2D Light Debug", "stats buffer scale lighting resolution")) {
-                editorSettingsChanged |= DrawSettingRow(Loc::T("SETTINGS_EDITOR_2_D_LIGHT_DEBUG", "2D Light Debug"), Loc::T("SETTINGS_EDITOR_2_D_LIGHT_DEBUG_DESC", "Lighting stats overlay and internal render resolution (ships with the game)."), [&]() {
-                    bool statsChanged = ImGui::Checkbox("Stats##Light2DStatsOverlay", &showLight2DStatsOverlay);
-                    bool resAuto = ImGui::Checkbox("Auto##Light2DResAutoDbg", &buildSettings.light2DLightingResolutionAuto);
-                    ImGui::SameLine();
-                    bool resSlider = ImGui::SliderFloat("Res##Light2DResDbg", &buildSettings.light2DLightingResolution, 0.25f, 1.0f, "%.2fx");
-                    if (resSlider) buildSettings.light2DLightingResolution = std::clamp(buildSettings.light2DLightingResolution, 0.25f, 1.0f);
-                    if (resAuto || resSlider) buildSettingsChanged = true;
-                    return statsChanged;
-                });
+                editorSettingsChanged |= DrawSettingRow(Loc::T("SETTINGS_EDITOR_LIGHTING_STATS", "2D Lighting Statistics"),
+                    Loc::T("SETTINGS_EDITOR_2_D_LIGHT_DEBUG_DESC", "Lighting stats overlay and internal render resolution (ships with the game)."), [&]() {
+                        return ImGui::Checkbox("##Light2DStatsOverlay", &showLight2DStatsOverlay);
+                    });
+                buildSettingsChanged |= DrawSettingRow(Loc::T("SETTINGS_EDITOR_LIGHTING_AUTO_RES", "Auto Lighting Resolution"),
+                    "Let the renderer choose the 2D lighting buffer resolution.", [&]() {
+                        return ImGui::Checkbox("##Light2DResAutoDbg", &buildSettings.light2DLightingResolutionAuto);
+                    });
+                buildSettingsChanged |= DrawSettingRow(Loc::T("SETTINGS_EDITOR_LIGHTING_RES", "Lighting Resolution Scale"),
+                    "Manual scale for the 2D lighting buffer, saved in build settings.", [&]() {
+                        const bool changed = ImGui::SliderFloat("##Light2DResDbg", &buildSettings.light2DLightingResolution, 0.25f, 1.0f, "%.2fx");
+                        if (changed) buildSettings.light2DLightingResolution = std::clamp(buildSettings.light2DLightingResolution, 0.25f, 1.0f);
+                        return changed;
+                    });
             }
             if (revealDebugSectionsAndMenus &&
                 visible(ProjectSettingsVisibilityMode::Developer, "Debug / Developer", "Game Profiler", "internal performance details")) {
@@ -8842,10 +8842,11 @@ void Engine::renderProjectBrowserPanel() {
             }
             if (visible(ProjectSettingsVisibilityMode::Developer, "Editor Language",
                         "Missing Keys", "localization missing untranslated keys diagnostics")) {
-                ImGui::TextColored(ImVec4(0.86f, 0.90f, 0.96f, 1.0f), "%s",
-                                   Loc::T("LANGUAGE_MANAGER_EDITOR_MISSING", "Missing Keys"));
                 DrawHelpTooltip(Loc::T("LANGUAGE_MANAGER_EDITOR_MISSING_DESC",
                                        "Keys requested this session that no language defined. They render as the key itself."));
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.86f, 0.90f, 0.96f, 1.0f), "%s",
+                                   Loc::T("LANGUAGE_MANAGER_EDITOR_MISSING", "Missing Keys"));
                 const std::vector<std::string>& missing = Loc::MissingKeys();
                 if (missing.empty()) {
                     ImGui::TextDisabled("%s", Loc::T("LANGUAGE_MANAGER_EDITOR_MISSING_NONE",
@@ -8951,10 +8952,11 @@ void Engine::renderProjectBrowserPanel() {
 
             if (visible(ProjectSettingsVisibilityMode::Advanced, "ModuCPP Code Language",
                         "Keyword Dictionary", "keywords mapping table dictionary")) {
-                ImGui::TextColored(ImVec4(0.86f, 0.90f, 0.96f, 1.0f), "%s",
-                                   Loc::T("LANGUAGE_MANAGER_MODUCPP_DICTIONARY", "Keyword Dictionary"));
                 DrawHelpTooltip(Loc::T("LANGUAGE_MANAGER_MODUCPP_DICTIONARY_DESC",
                                        "The dictionary this language compiles through. It is the only part of the compiler that changes between languages."));
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.86f, 0.90f, 0.96f, 1.0f), "%s",
+                                   Loc::T("LANGUAGE_MANAGER_MODUCPP_DICTIONARY", "Keyword Dictionary"));
                 if (activePack.aliases.empty()) {
                     ImGui::TextDisabled("%s", Loc::T("LANGUAGE_MANAGER_MODUCPP_DICTIONARY_NONE",
                                                      "English is the canonical ModuCPP syntax, so it has no aliases."));
@@ -9183,9 +9185,9 @@ void Engine::renderProjectBrowserPanel() {
                 changed |= DrawSettingRow(
                     Loc::T("SETTINGS_OPENXR_RENDER_MODE", "Render Mode"),
                     Loc::T("SETTINGS_OPENXR_RENDER_MODE_DESC",
-                           "Single Pass draws both eyes in one pass into a 2-layer array texture "
-                           "(needs GL_OVR_multiview2) and falls back to Multi Pass at runtime when "
-                           "the extension is missing. Multi Pass draws one pass per eye and always works."),
+                           "Multi Pass renders each eye separately. Single Pass requests multiview, "
+                           "but currently falls back to Multi Pass because the scene shaders do not "
+                           "yet support multiview. Runtime Diagnostics shows the mode actually in use."),
                     [&]() {
                         int mode = (target.renderMode == XR::XRRenderMode::MultiPass) ? 1 : 0;
                         const char* modes[] = { "Single Pass / Multiview", "Multi Pass" };
@@ -9197,14 +9199,8 @@ void Engine::renderProjectBrowserPanel() {
                         return false;
                     });
                 if (target.renderMode == XR::XRRenderMode::SinglePassMultiview) {
-                    if (diag.systemAcquired && !diag.multiviewSupported) {
-                        DrawHelpText("This runtime did not report multiview support, so the session "
-                                     "will run Multi Pass.");
-                    } else if (isPCTab) {
-                        /*DrawHelpText("GL_OVR_multiview2 is not available on every desktop GL "
-                                     "driver. If it is missing the session runs Multi Pass, and "
-                                     "Runtime Diagnostics below reports which one is in use.");*/
-                    }
+                    DrawHelpText("The current scene renderer uses Multi Pass for this request. "
+                                 "Each eye keeps its own camera and receives post-processing.");
                 }
             }
             if (visible(ProjectSettingsVisibilityMode::Advanced, "Rendering", "Depth Submission",
@@ -9695,8 +9691,10 @@ void Engine::renderProjectBrowserPanel() {
 
     EndProjectSettingsColumns();
 
+    ImGui::EndChild(); // SettingsContent
+    ImGui::PopID();
     ImGui::PopStyleVar(2);
-    ImGui::EndChild();
+    ImGui::EndChild(); // SettingsBody
 
     ImGui::End();
     if (wasOpen != showProjectBrowser) {

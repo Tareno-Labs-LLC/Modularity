@@ -408,12 +408,18 @@ bool XRSwapchainSetGL::create(XrSession session, const std::vector<XRViewInfo>& 
     }
 
     const bool wantsMultiview = (requestedMode == XRRenderMode::SinglePassMultiview);
-    const bool canMultiview = wantsMultiview && viewCount_ == 2 && XRMultiviewSupported();
+    // The scene renderer currently issues per-eye draws with ordinary shaders.
+    // A multiview attachment also requires multiview shader variants; accepting
+    // the GL extension alone otherwise produces invalid draws or identical eyes.
+    constexpr bool rendererHasMultiviewShaders = false;
+    const bool canMultiview = wantsMultiview && viewCount_ == 2 &&
+                              XRMultiviewSupported() && rendererHasMultiviewShaders;
     multiviewFellBack_ = wantsMultiview && !canMultiview;
     resolvedMode_ = canMultiview ? XRRenderMode::SinglePassMultiview : XRRenderMode::MultiPass;
     if (multiviewFellBack_) {
-        XRLogWarn("Single Pass / Multiview was requested but GL_OVR_multiview2 is not "
-                  "available; falling back to Multi Pass.");
+        XRLogWarn("Single Pass / Multiview was requested, but the scene renderer "
+                  "does not yet supply multiview shader variants; using Multi Pass "
+                  "so each eye receives its own view and post-processing.");
     }
 
     const size_t swapchainCount = canMultiview ? 1u : viewCount_;

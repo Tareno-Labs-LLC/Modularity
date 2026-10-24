@@ -7,6 +7,7 @@
 #include "../../Modu2DStats.h"
 #include "../../SceneAssetReferences.h"
 #include "../SceneObjectIcons.h"
+#include "../HierarchySnapshot.h"
 #include "imgui.h"
 #include <algorithm>
 #include <array>
@@ -100,10 +101,6 @@ namespace {
         return state;
     }
 
-    ImGuiID HierarchyExpandStorageKey(int objectId) {
-        return static_cast<ImGuiID>(0x40000000u + static_cast<uint32_t>(objectId));
-    }
-
     ImU32 GetHierarchyTypeColor(const SceneObject& obj) {
         if (!obj.scripts.empty()) return IM_COL32(255, 175, 90, 235);
         if (obj.hasCamera) return IM_COL32(110, 175, 235, 220);
@@ -135,22 +132,6 @@ namespace {
         return IM_COL32(130, 150, 170, 220);
     }
 
-    bool HierarchyNameMatchesFilter(const std::string& name, const std::string& lowerFilter) {
-        if (lowerFilter.empty()) return true;
-        const size_t filterSize = lowerFilter.size();
-        if (filterSize > name.size()) return false;
-        for (size_t start = 0; start + filterSize <= name.size(); ++start) {
-            size_t i = 0;
-            for (; i < filterSize; ++i) {
-                const unsigned char c = static_cast<unsigned char>(name[start + i]);
-                const char lower = static_cast<char>(std::tolower(c));
-                if (lower != lowerFilter[i]) break;
-            }
-            if (i == filterSize) return true;
-        }
-        return false;
-    }
-
     struct HierarchyNavRow {
         int id = -1;
         int parentId = -1;
@@ -172,23 +153,13 @@ namespace {
 
     int gHierarchyNavCaptureSuppress = 0;
 
-    struct HierarchyRowCacheEntry {
-        int id = -1;
-        int depth = 0;
-        int parentId = -1;
-        uint64_t ancestorHasNextMask = 0;
-        bool isLast = false;
-        bool hasChildren = false;
-        bool expanded = false;
-        ImU32 iconColor = 0;
-        std::string name;
-    };
-
     struct HierarchyPanelCache {
-        std::vector<HierarchyRowCacheEntry> rows;
-        std::string filter;
-        uint64_t sceneFingerprint = 0;
-        bool dirty = true;
+        Modularity::HierarchySnapshot snapshot;
+        std::vector<int> revealAncestors;
+        std::vector<bool> ancestorHasNext;
+        std::vector<int> renderPath;
+        const Engine* owner = nullptr;
+        int lastSelectedId = -1;
     };
 
     struct ConsoleRowMetrics {
@@ -625,65 +596,6 @@ namespace {
         drawList->AddCircleFilled(ImVec2(connectorX, rowTop + 1.0f), 1.1f, trunkColor, 8);
     }
 
-    void appendHierarchyCacheRowRecursive(const SceneObject& obj,
-                                          const std::string& filter,
-                                          uint64_t ancestorHasNextMask,
-                                          bool isLast,
-                                          int depth,
-                                          ImGuiStorage* storage,
-                                          std::unordered_map<int, size_t>& sceneObjectIndexById,
-                                          const std::vector<SceneObject>& sceneObjects,
-                                          std::vector<HierarchyRowCacheEntry>& rows) {
-        if (!HierarchyNameMatchesFilter(obj.name, filter)) {
-            return;
-        }
-
-        HierarchyRowCacheEntry row;
-        row.id = obj.id;
-        row.depth = depth;
-        row.parentId = obj.parentId;
-        row.ancestorHasNextMask = ancestorHasNextMask;
-        row.isLast = isLast;
-        row.hasChildren = !obj.childIds.empty();
-        row.iconColor = GetHierarchyTypeColor(obj);
-        row.name = obj.name;
-        if (storage && row.hasChildren) {
-            row.expanded = storage->GetInt(HierarchyExpandStorageKey(obj.id), 0) != 0;
-        }
-        rows.push_back(std::move(row));
-
-        if (!rows.back().expanded || obj.childIds.empty()) {
-            return;
-        }
-
-        std::vector<const SceneObject*> visibleChildren;
-        visibleChildren.reserve(obj.childIds.size());
-        for (int childId : obj.childIds) {
-            auto idxIt = sceneObjectIndexById.find(childId);
-            if (idxIt == sceneObjectIndexById.end() || idxIt->second >= sceneObjects.size()) {
-                continue;
-            }
-            const SceneObject& child = sceneObjects[idxIt->second];
-            if (HierarchyNameMatchesFilter(child.name, filter)) {
-                visibleChildren.push_back(&child);
-            }
-        }
-
-        const uint64_t childMask = isLast
-            ? ancestorHasNextMask
-            : (ancestorHasNextMask | (1ull << depth));
-        for (size_t i = 0; i < visibleChildren.size(); ++i) {
-            appendHierarchyCacheRowRecursive(*visibleChildren[i],
-                                            filter,
-                                            childMask,
-                                            i + 1 == visibleChildren.size(),
-                                            depth + 1,
-                                            storage,
-                                            sceneObjectIndexById,
-                                            sceneObjects,
-                                            rows);
-        }
-    }
 
 }
 
@@ -739,7 +651,9 @@ void Engine::renderHierarchyPanel() {
     if (ImGui::Button("+", ImVec2(headerButtonSize, headerButtonSize))) {
         ImGui::OpenPopup("HierarchyCreatePopup");
     }
-    if (hierarchyKeysActive && ImGui::GetIO().KeyShift && !ImGui::GetIO().KeyCtrl &&
+    if (hierarchyKeysActive && !cursorLocked &&
+        !ImGui::IsMouseDown(ImGuiMouseButton_Right) &&
+        ImGui::GetIO().KeyShift && !ImGui::GetIO().KeyCtrl &&
         ImGui::IsKeyPressed(ImGuiKey_A, false)) {
         ImGui::OpenPopup("HierarchyCreatePopup");
     }
@@ -809,24 +723,64 @@ void Engine::renderHierarchyPanel() {
     }
 
     refreshSceneObjectIndexCache();
-    std::vector<size_t> rootIndices;
-    rootIndices.reserve(sceneObjects.size());
-    for (size_t i = 0; i < sceneObjects.size(); i++) {
-        int parentId = sceneObjects[i].parentId;
-        if (parentId == -1 || sceneObjectIndexById.find(parentId) == sceneObjectIndexById.end()) {
-            rootIndices.push_back(i);
+    auto& cache = gHierarchyPanelCache;
+    if (cache.owner != this) {
+        cache.owner = this;
+        cache.lastSelectedId = -1;
+    }
+    // Refresh once before drawing. Row storage, names and child links remain
+    // owned by this snapshot for the complete traversal, even if actions mutate
+    // the scene vector. Reuse capacities on steady-state frames.
+    cache.snapshot.refresh(sceneObjects, filter, [&](auto& row, const SceneObject& source) {
+        row.enabled = IsObjectEnabledInHierarchy(source);
+        row.iconColor = GetHierarchyTypeColor(source);
+        row.editorIconPath = source.editorIconPath;
+        row.componentIconPath = SceneObjectComponentIconPath(source);
+        row.editorIconTint = source.editorIconTint;
+        row.previewPath = !source.albedoTexturePath.empty() ? source.albedoTexturePath
+            : (source.useOverlay ? source.overlayTexturePath : std::string());
+        row.previewFilter = source.material.textureFilter;
+        row.hasParallaxLayer2D = source.hasParallaxLayer2D && source.parallaxLayer2D.enabled;
+        row.parallaxOrder = source.parallaxLayer2D.order;
+        if (row.drawnLastFrame || source.id == selectedObjectId) {
+            const auto& missing = GetHierarchyMissingAssetState(source);
+            row.firstMissingAsset = missing.firstMissing;
+            row.missingAssetCount = missing.missingCount;
+        }
+        row.drawnLastFrame = false;
+    });
+    cache.revealAncestors.clear();
+    if (cache.lastSelectedId != selectedObjectId) {
+        cache.lastSelectedId = selectedObjectId;
+        if (const auto* selected = cache.snapshot.find(selectedObjectId)) {
+            gHierarchyFrameCache.scrollToObjectId = selectedObjectId;
+            int parentId = selected->parentId;
+            while (const auto* parent = cache.snapshot.find(parentId)) {
+                if (std::find(cache.revealAncestors.begin(), cache.revealAncestors.end(), parentId) !=
+                    cache.revealAncestors.end()) break;
+                cache.revealAncestors.push_back(parentId);
+                parentId = parent->parentId;
+            }
         }
     }
 
     hierarchyVisibleOrder.clear();
     hierarchyVisibleOrder.reserve(sceneObjects.size());
-    std::vector<bool> ancestorHasNext;
-    std::unordered_set<int> renderPath;
-    renderPath.reserve(sceneObjects.size());
-    for (size_t i = 0; i < rootIndices.size(); ++i) {
-        const bool isLastRoot = (i + 1 == rootIndices.size());
-        renderObjectNode(sceneObjects[rootIndices[i]], filter, ancestorHasNext, renderPath, isLastRoot, 0, animStep);
+    auto& ancestorHasNext = cache.ancestorHasNext;
+    auto& renderPath = cache.renderPath;
+    ancestorHasNext.clear();
+    renderPath.clear();
+    ancestorHasNext.reserve(257);
+    renderPath.reserve(257);
+    for (size_t i = 0; i < cache.snapshot.rootIds.size(); ++i) {
+        const bool isLastRoot = i + 1 == cache.snapshot.rootIds.size();
+        renderObjectNode(cache.snapshot.rootIds[i], filter, ancestorHasNext, renderPath, isLastRoot, 0, animStep);
     }
+    // A later row may have deleted a row already drawn this frame.
+    auto& navRows = gHierarchyFrameCache.navRows;
+    navRows.erase(std::remove_if(navRows.begin(), navRows.end(), [&](const auto& row) {
+        return findObjectById(row.id) == nullptr;
+    }), navRows.end());
 
     {
         ImGuiWindow* listWindow = ImGui::GetCurrentWindow();
@@ -968,18 +922,15 @@ void Engine::renderHierarchyPanel() {
     ImGui::End();
 }
 
-void Engine::renderObjectNode(SceneObject& obj, const std::string& filter,
-                              std::vector<bool>& ancestorHasNext, std::unordered_set<int>& renderPath,
+void Engine::renderObjectNode(int objectId, const std::string& filter,
+                              std::vector<bool>& ancestorHasNext, std::vector<int>& renderPath,
                               bool isLast, int depth, float animStep) {
-    if (!HierarchyNameMatchesFilter(obj.name, filter)) {
-        return;
-    }
-    if (depth > 256 || !renderPath.insert(obj.id).second) {
-        return;
-    }
-    // Held separately because a context menu further down can mutate sceneObjects and leave
-    // `obj` dangling before the cleanup at the end of this function runs.
-    const int objectId = obj.id;
+    auto* node = gHierarchyPanelCache.snapshot.find(objectId);
+    if (!node || !node->matchesFilter || !findObjectById(objectId)) return;
+    if (depth > 256 || std::find(renderPath.begin(), renderPath.end(), objectId) != renderPath.end()) return;
+    renderPath.push_back(objectId);
+    const auto& obj = *node;
+    node->drawnLastFrame = true;
 
     hierarchyVisibleOrder.push_back(obj.id);
 
@@ -992,6 +943,9 @@ void Engine::renderObjectNode(SceneObject& obj, const std::string& filter,
 
     ImGuiID nodeId = ImGui::GetID((void*)(intptr_t)obj.id);
     ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
+    if (std::find(gHierarchyPanelCache.revealAncestors.begin(), gHierarchyPanelCache.revealAncestors.end(), objectId) !=
+        gHierarchyPanelCache.revealAncestors.end() || (!filter.empty() && hasChildren))
+        ImGui::SetNextItemOpen(true, ImGuiCond_Always);
     bool nodeOpen = ImGui::TreeNodeEx((void*)(intptr_t)obj.id, flags, "%s", "");
     ImGui::PopItemFlag();
 
@@ -1052,8 +1006,8 @@ void Engine::renderObjectNode(SceneObject& obj, const std::string& filter,
     float iconSize = std::max(8.0f, (lineHeight - 6.0f) * iconScale);
     float labelStart = itemMin.x + ImGui::GetTreeNodeToLabelSpacing();
     ImVec2 iconPos(labelStart, itemMin.y + (lineHeight - iconSize) * 0.5f);
-    const float rowDim = IsObjectEnabledInHierarchy(obj) ? 1.0f : 0.42f;
-    ImU32 iconColor = GetHierarchyTypeColor(obj);
+    const float rowDim = obj.enabled ? 1.0f : 0.42f;
+    ImU32 iconColor = obj.iconColor;
     if (rowDim < 1.0f) {
         ImVec4 dimmed = ImGui::ColorConvertU32ToFloat4(iconColor);
         dimmed.x *= rowDim;
@@ -1066,7 +1020,7 @@ void Engine::renderObjectNode(SceneObject& obj, const std::string& filter,
         : renderer.getTexture(obj.editorIconPath,
                               MaterialProperties::TextureFilter::Bilinear);
     if (!componentIcon || !componentIcon->GetID()) {
-        componentIcon = renderer.getTexture(SceneObjectComponentIconPath(obj),
+        componentIcon = renderer.getTexture(obj.componentIconPath,
                                             MaterialProperties::TextureFilter::Bilinear);
     }
     ImU32 iconTintU32 = ImGui::ColorConvertFloat4ToU32(
@@ -1089,19 +1043,19 @@ void Engine::renderObjectNode(SceneObject& obj, const std::string& filter,
     textCol.y = std::min(1.0f, textCol.y + 0.15f * hoverT + 0.2f * activeT);
     textCol.z = std::min(1.0f, textCol.z + 0.15f * hoverT + 0.2f * activeT);
     textCol.w = std::min(1.0f, textCol.w + 0.2f * hoverT + 0.35f * activeT);
-    const HierarchyMissingAssetState& missingAssets = GetHierarchyMissingAssetState(obj);
-    if (!missingAssets.firstMissing.empty()) {
+    const auto& missingAssets = obj;
+    if (!missingAssets.firstMissingAsset.empty()) {
         textCol.x = std::min(1.0f, 0.95f + 0.05f * hoverT);
         textCol.y = std::min(1.0f, 0.36f + 0.15f * hoverT);
         textCol.z = std::min(1.0f, 0.36f + 0.15f * hoverT);
         if (hovered && ImGui::BeginTooltip()) {
             const ImVec4 missingTitleColor(0.95f, 0.45f, 0.45f, 1.0f);
-            if (missingAssets.missingCount == 1) {
+            if (missingAssets.missingAssetCount == 1) {
                 ImGui::TextColored(missingTitleColor, "Missing asset");
             } else {
-                ImGui::TextColored(missingTitleColor, "Missing assets (%d)", missingAssets.missingCount);
+                ImGui::TextColored(missingTitleColor, "Missing assets (%d)", missingAssets.missingAssetCount);
             }
-            ImGui::TextUnformatted(missingAssets.firstMissing.c_str());
+            ImGui::TextUnformatted(missingAssets.firstMissingAsset.c_str());
             ImGui::TextDisabled("Export leaves broken references out and reports them.");
             ImGui::EndTooltip();
         }
@@ -1117,8 +1071,8 @@ void Engine::renderObjectNode(SceneObject& obj, const std::string& filter,
     ImGui::GetWindowDrawList()->AddText(ImGui::GetFont(), fontSize, textPos,
                                         ImGui::GetColorU32(textCol), obj.name.c_str());
 
-    if (obj.hasParallaxLayer2D && obj.parallaxLayer2D.enabled) {
-        std::string badgeText = "L" + std::to_string(obj.parallaxLayer2D.order);
+    if (obj.hasParallaxLayer2D) {
+        std::string badgeText = "L" + std::to_string(obj.parallaxOrder);
         ImVec2 badgeTextSize = ImGui::CalcTextSize(badgeText.c_str());
         ImVec2 labelTextSize = ImGui::CalcTextSize(obj.name.c_str());
         float badgePadX = 6.0f;
@@ -1220,7 +1174,7 @@ void Engine::renderObjectNode(SceneObject& obj, const std::string& filter,
             ? nullptr
             : renderer.getTexture(obj.editorIconPath, MaterialProperties::TextureFilter::Bilinear);
         if (!dragIconTex || !dragIconTex->GetID()) {
-            dragIconTex = renderer.getTexture(SceneObjectComponentIconPath(obj),
+            dragIconTex = renderer.getTexture(obj.componentIconPath,
                                               MaterialProperties::TextureFilter::Bilinear);
         }
         ImTextureID dragIcon = (dragIconTex && dragIconTex->GetID())
@@ -1295,8 +1249,9 @@ void Engine::renderObjectNode(SceneObject& obj, const std::string& filter,
             rowDragKind != ObjectAssetDropKind::None ? ImGuiDragDropFlags_AcceptBeforeDelivery : 0;
         if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("FILE_PATH", rowDropFlags)) {
             const char* path = static_cast<const char*>(payload->Data);
-            if (payload->IsPreview() && canApplyAssetDrop(obj, rowDragKind)) {
-                setAssetDropHover(obj.id);
+            if (payload->IsPreview()) {
+                if (SceneObject* live = findObjectById(objectId); live && canApplyAssetDrop(*live, rowDragKind))
+                    setAssetDropHover(objectId);
             }
             std::error_code ec;
             fs::directory_entry entry;
@@ -1305,13 +1260,19 @@ void Engine::renderObjectNode(SceneObject& obj, const std::string& filter,
                 if (fileBrowser.isModelFile(entry)) {
                     importDroppedModel(fs::path(path), obj.id);
                 } else if (fileBrowser.getFileCategory(entry) == FileCategory::Texture) {
-                    applyTextureAssetToObject(obj, entry.path());
+                    if (SceneObject* live = findObjectById(objectId)) applyTextureAssetToObject(*live, entry.path());
                 } else if (rowDragKind != ObjectAssetDropKind::None) {
-                    applyAssetDropToObject(obj, entry.path(), true);
+                    if (SceneObject* live = findObjectById(objectId)) applyAssetDropToObject(*live, entry.path(), true);
                 }
             }
         }
         ImGui::EndDragDropTarget();
+    }
+
+    if (!findObjectById(objectId)) {
+        if (nodeOpen) ImGui::TreePop();
+        renderPath.pop_back();
+        return;
     }
 
     if (gHierarchyFrameCache.contextMenuKeyRequested && obj.id == selectedObjectId) {
@@ -1319,13 +1280,8 @@ void Engine::renderObjectNode(SceneObject& obj, const std::string& filter,
         gHierarchyFrameCache.contextMenuKeyRequested = false;
     }
 
-    // Menu items here can add or remove SceneOBJs, which reallocates `sceneObjects` and leaves
-    // `obj` dangling for everything below. Work from the id instead of the reference, and bail
-    // out of this node if the vector moved.
     const int contextObjectId = objectId;
     const int contextObjectParentId = obj.parentId;
-    const SceneObject* sceneDataBeforeMenu = sceneObjects.data();
-    const size_t sceneCountBeforeMenu = sceneObjects.size();
 
     if (ImGui::BeginPopupContextItem()) {
         if (ImGui::MenuItem("Rename", "F2")) {
@@ -1373,30 +1329,17 @@ void Engine::renderObjectNode(SceneObject& obj, const std::string& filter,
         ImGui::EndPopup();
     }
 
-    // Reparenting to the root reorders the vector in place, so also check that this slot still
-    // holds the same object. `obj` is only read once the buffer is known not to have moved.
-    const bool sceneVectorMoved = (sceneObjects.data() != sceneDataBeforeMenu ||
-                                   sceneObjects.size() != sceneCountBeforeMenu);
-    if (sceneVectorMoved || obj.id != contextObjectId) {
-        // The menu added, removed or moved SceneOBJs. `obj` may now point at a freed or
-        // shifted element, so stop drawing this node and let the next frame redraw the tree.
-        if (nodeOpen) {
-            ImGui::TreePop();
-        }
-        renderPath.erase(contextObjectId);
+    if (!findObjectById(objectId)) {
+        if (nodeOpen) ImGui::TreePop();
+        renderPath.pop_back();
         return;
     }
 
     if (hierarchyShowTexturePreview) {
-        const std::string* previewPath = nullptr;
-        if (!obj.albedoTexturePath.empty()) {
-            previewPath = &obj.albedoTexturePath;
-        } else if (obj.useOverlay && !obj.overlayTexturePath.empty()) {
-            previewPath = &obj.overlayTexturePath;
-        }
+        const std::string* previewPath = obj.previewPath.empty() ? nullptr : &obj.previewPath;
 
         if (previewPath) {
-            Texture* previewTex = renderer.getTexture(*previewPath, obj.material.textureFilter);
+            Texture* previewTex = renderer.getTexture(*previewPath, obj.previewFilter);
             if (previewTex && previewTex->GetID()) {
                 ImGuiStyle& style = ImGui::GetStyle();
                 ImVec2 itemMin = ImGui::GetItemRectMin();
@@ -1418,14 +1361,8 @@ void Engine::renderObjectNode(SceneObject& obj, const std::string& filter,
     size_t visibleChildCount = 0;
     if (hasChildren) {
         for (int childId : obj.childIds) {
-            auto idxIt = sceneObjectIndexById.find(childId);
-            if (idxIt == sceneObjectIndexById.end()) continue;
-            size_t idx = idxIt->second;
-            if (idx >= sceneObjects.size()) continue;
-            SceneObject& child = sceneObjects[idx];
-            if (HierarchyNameMatchesFilter(child.name, filter)) {
-                ++visibleChildCount;
-            }
+            const auto* child = gHierarchyPanelCache.snapshot.find(childId);
+            if (child && child->matchesFilter && findObjectById(childId)) ++visibleChildCount;
         }
     }
 
@@ -1462,29 +1399,13 @@ void Engine::renderObjectNode(SceneObject& obj, const std::string& filter,
 
             ancestorHasNext.push_back(!isLast);
             if (!treePushed) ++gHierarchyNavCaptureSuppress;
-            // A descendant's context menu can create or delete SceneOBJs mid-walk, which
-            // reallocates sceneObjects and would leave `obj` (and this loop's iterator over
-            // its childIds) dangling. Walk a copy of the ids and stop as soon as the vector
-            // moves; the next frame redraws the new tree.
-            const std::vector<int> childIdsSnapshot = obj.childIds;
-            const SceneObject* sceneDataBeforeChildren = sceneObjects.data();
-            const size_t sceneCountBeforeChildren = sceneObjects.size();
             size_t visibleChildIndex = 0;
-            for (int childId : childIdsSnapshot) {
-                auto idxIt = sceneObjectIndexById.find(childId);
-                if (idxIt == sceneObjectIndexById.end()) continue;
-                size_t idx = idxIt->second;
-                if (idx >= sceneObjects.size()) continue;
-                SceneObject& child = sceneObjects[idx];
-                if (child.id != childId) continue;
-                if (!HierarchyNameMatchesFilter(child.name, filter)) continue;
-                const bool childLast = (visibleChildIndex + 1 == visibleChildCount);
-                ++visibleChildIndex;
-                renderObjectNode(child, filter, ancestorHasNext, renderPath, childLast, depth + 1, animStep);
-                if (sceneObjects.data() != sceneDataBeforeChildren ||
-                    sceneObjects.size() != sceneCountBeforeChildren) {
-                    break;
-                }
+            for (int childId : obj.childIds) {
+                const auto* child = gHierarchyPanelCache.snapshot.find(childId);
+                if (!child || !child->matchesFilter || !findObjectById(childId)) continue;
+                const bool childLast = ++visibleChildIndex == visibleChildCount;
+                renderObjectNode(childId, filter, ancestorHasNext, renderPath, childLast, depth + 1, animStep);
+                if (!findObjectById(objectId)) break;
             }
             if (!treePushed) --gHierarchyNavCaptureSuppress;
             ancestorHasNext.pop_back();
@@ -1519,7 +1440,7 @@ void Engine::renderObjectNode(SceneObject& obj, const std::string& filter,
     } else if (nodeOpen) {
         ImGui::TreePop();
     }
-    renderPath.erase(objectId);
+    renderPath.pop_back();
 }
 
 #pragma endregion

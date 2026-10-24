@@ -64,18 +64,25 @@ uniform sampler2D occlusionMap;
 // these when the driver reports enough fragment texture units and otherwise
 // leaves the has* flags above false, falling back to the packed map. Every
 // 4.3-class part reports 32.
+// GLES 2 parts expose 8 fragment units; albedo, overlay, normal, reflection
+// cube, packed metallic-roughness, emissive, occlusion and opacity fill them, so
+// the ES 2 profile drops the two single-channel maps (the packed map still works).
+#ifndef MODU_ES2
 uniform sampler2D metallicMap;
 uniform sampler2D roughnessMap;
+#endif
 uniform sampler2D opacityMap;
 
 // -- Parallax occlusion mapping --
 // Unit 15, the last one GL 3.3 core guarantees. Any further map has to share a
 // slot or move to an array texture.
+#ifndef MODU_ES2
 uniform bool hasHeightMap = false;
 uniform float heightScale = 0.0;
 uniform int parallaxSteps = 32;
 uniform bool parallaxInvertHeight = false;
 uniform sampler2D heightMap;
+#endif
 
 // -- Voxel cone traced global illumination --
 // Unit 16, past the 16 that GL 3.3 core guarantees. That is deliberate and it is
@@ -83,6 +90,7 @@ uniform sampler2D heightMap;
 // fragment texture units - which every GL 4.3 part does in practice, and 4.3 is
 // already the floor for the voxelization pass. Nothing here is sampled while
 // giEnabled is false, so a 3.3 context simply never touches it.
+#ifndef MODU_ES2
 uniform bool giEnabled = false;
 uniform sampler3D voxelVolume;
 uniform vec3 giVolumeMin = vec3(0.0);
@@ -90,6 +98,7 @@ uniform float giVolumeExtent = 1.0;
 uniform float giVolumeResolution = 128.0;
 uniform float giIntensity = 1.0;
 uniform int giConeSteps = 24;
+#endif
 
 uniform bool fogEnabled = false;
 uniform int fogMode = 0;
@@ -100,7 +109,13 @@ uniform float fogDensity = 0.015;
 uniform float fogHeight = 0.0;
 uniform float fogHeightFalloff = 0.0;
 
+#ifdef MODU_ES2
+// The renderer still uploads every light by name; slots past 4 resolve to
+// location -1 and the driver ignores them.
+const int MAX_LIGHTS = 4;
+#else
 const int MAX_LIGHTS = 32;
+#endif
 const int MAX_SHADOW_MAPS = 4;
 uniform int lightCount = 0; // up to MAX_LIGHTS
 
@@ -115,6 +130,7 @@ uniform float lightInnerCosArr[MAX_LIGHTS];
 uniform float lightOuterCosArr[MAX_LIGHTS];
 uniform vec2 lightAreaSizeArr[MAX_LIGHTS];
 uniform float lightAreaFadeArr[MAX_LIGHTS];
+#ifndef MODU_ES2
 uniform int lightShadowMapArr[MAX_LIGHTS];
 uniform int lightShadowKindArr[MAX_LIGHTS]; // 0 off, 1 cube, 2 directional
 uniform int lightShadowModeArr[MAX_LIGHTS]; // 0 off, 1 hard, 2 soft
@@ -146,7 +162,9 @@ uniform sampler2D dirShadow0;
 uniform sampler2D dirShadow1;
 uniform sampler2D dirShadow2;
 uniform sampler2D dirShadow3;
+#endif
 
+#ifndef MODU_ES2
 float sampleShadowCube(int mapIndex, vec3 sampleDir)
 {
     if (mapIndex == 0) return texture(shadowCube0, sampleDir).r;
@@ -359,6 +377,7 @@ float computeShadowOcclusion(int lightIndex, vec3 lightToFrag, float nl, vec3 wo
     }
     return shadow / max(weightSum, 0.0001);
 }
+#endif // !MODU_ES2 (shadows)
 
 const float PI = 3.14159265359;
 
@@ -471,6 +490,7 @@ vec3 applyFog(vec3 color)
 // Front-to-back accumulation with an opacity term, so the first surface a cone
 // meets occludes what is behind it instead of every voxel along the line summing
 // together.
+#ifndef MODU_ES2
 vec4 traceGiCone(vec3 origin, vec3 dir, float aperture)
 {
     float voxelSize = giVolumeExtent / max(giVolumeResolution, 1.0);
@@ -532,6 +552,7 @@ vec3 gatherGiDiffuse(vec3 P, vec3 N)
     }
     return total;
 }
+#endif // !MODU_ES2 (voxel GI)
 
 // Tangent frame from screen-space derivatives rather than a vertex attribute.
 // The mesh vertex format is pos/normal/uv with no tangent, and adding one would
@@ -550,6 +571,7 @@ mat3 computeTBN(vec2 uv, vec3 N)
     return mat3(tangent, bitangent, N);
 }
 
+#ifndef MODU_ES2
 float sampleSurfaceDepth(vec2 uv)
 {
     // Stored as height (white high); the march works in depth (white deep).
@@ -565,7 +587,7 @@ vec2 parallaxOcclusionUv(vec2 uv, vec3 viewTangent)
 {
     // Grazing rays cross many texels and need the steps; head-on rays barely
     // move and would only be paying for them.
-    float maxSteps = float(clamp(parallaxSteps, 4, 256));
+    float maxSteps = clamp(float(parallaxSteps), 4.0, 256.0);
     float minSteps = max(4.0, maxSteps * 0.25);
     float numLayers = mix(maxSteps, minSteps, clamp(abs(viewTangent.z), 0.0, 1.0));
 
@@ -596,6 +618,7 @@ vec2 parallaxOcclusionUv(vec2 uv, vec3 viewTangent)
     float weight = (abs(denom) < 1e-5) ? 0.0 : afterDepth / denom;
     return mix(currentUv, previousUv, clamp(weight, 0.0, 1.0));
 }
+#endif // !MODU_ES2 (parallax)
 
 void main()
 {
@@ -607,7 +630,11 @@ void main()
     // controls while Physically Based is off, so the shader must not keep
     // displacing with values the user can no longer see. gbuffer_frag.glsl
     // mirrors this gate.
+#ifdef MODU_ES2
+    bool wantsParallax = false;
+#else
     bool wantsParallax = usePbr && hasHeightMap && heightScale > 0.0;
+#endif
 
     // Both parallax and normal mapping want the same tangent frame, so it is
     // built once here. The condition is uniform across the draw, which keeps the
@@ -621,12 +648,14 @@ void main()
     // Displacement runs before every other fetch: albedo, overlay, normal and
     // the PBR maps all have to be read at the displaced coordinate or the
     // surface detail slides against the silhouette.
+#ifndef MODU_ES2
     if (wantsParallax) {
         // TBN is orthonormal enough that its transpose inverts it, which is the
         // cheap way to get the view ray into tangent space.
         vec3 viewTangent = normalize(transpose(TBN) * viewDir);
         uv = parallaxOcclusionUv(uv, viewTangent);
     }
+#endif
 
     // Texture mixing (corrected)
     vec4 tex1 = texture(texture1, uv);
@@ -702,12 +731,14 @@ void main()
         // Dedicated single-channel maps win over the packed one, per channel, so
         // a project can mix a glTF ORM on one material with the separate
         // greyscale files Poly Haven and ambientCG ship on the next.
+#ifndef MODU_ES2
         if (hasMetallicMap) {
             metallic = clamp(texture(metallicMap, uv).r, 0.0, 1.0);
         }
         if (hasRoughnessMap) {
             roughness = clamp(texture(roughnessMap, uv).r, 0.03, 1.0);
         }
+#endif
         smoothness = 1.0 - roughness;
     } else {
         // Legacy reinterpretation: specular strength stands in for metalness and
@@ -739,8 +770,10 @@ void main()
         specEnergy = mix(0.0, 2.8, pow(smoothness, 0.7));
     }
 
-    int count = min(lightCount, MAX_LIGHTS);
-    for (int i = 0; i < count; ++i) {
+    // Constant trip count with a break: GLSL ES 1.00 only allows loop bounds
+    // known at compile time, and has no integer min().
+    for (int i = 0; i < MAX_LIGHTS; ++i) {
+        if (i >= lightCount) break;
         int ltype = lightTypeArr[i];
         float intensity = lightIntensityArr[i];
         if (intensity <= 0.0) continue;
@@ -835,6 +868,15 @@ void main()
         if (!specularEnabled) {
             specular = vec3(0.0);
         } else if (isArea) {
+#ifdef MODU_ES2
+            specular = evaluateDirectSpecular(
+                norm, viewDir, lDirN, F0,
+                roughness, smoothness,
+                specPower, specEnergy,
+                lightColorArr[i], intensity,
+                usePbr
+            ) * attenuation;
+#else
             vec3 sampleOffsets[9] = vec3[](
                 vec3(0.0),
                 areaTangent * areaHalfSize.x,
@@ -877,6 +919,7 @@ void main()
             if (sampleWeight > 0.0) {
                 specular /= sampleWeight;
             }
+#endif
         } else {
             specular = evaluateDirectSpecular(
                 norm, viewDir, lDirN, F0,
@@ -889,9 +932,11 @@ void main()
         }
 
         float shadow = 0.0;
+#ifndef MODU_ES2
         if (lightShadowKindArr[i] != 0) {
             shadow = computeShadowOcclusion(i, FragPos - lightPosArr[i], nl, FragPos);
         }
+#endif
 
         lighting += (1.0 - shadow) * (attenuation * diffuse + specular);
     }
@@ -899,10 +944,12 @@ void main()
     // Indirect diffuse from the voxel volume. Scaled by the occlusion map for
     // the same reason ambient is: this is indirect light, and the shadow maps
     // have already occluded the direct term.
+#ifndef MODU_ES2
     if (giEnabled && giIntensity > 0.0) {
         vec3 indirect = gatherGiDiffuse(FragPos, norm);
         lighting += diffuseColor * indirect * giIntensity * occlusion;
     }
+#endif
 
     if (specularEnabled && hasReflectionCast && reflectionIntensity > 0.0) {
         vec3 reflectionDir = reflect(-viewDir, norm);

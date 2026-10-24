@@ -34,6 +34,11 @@ struct XRControllerState {
     std::array<bool, static_cast<size_t>(XRButton::Count)> buttonBound{};
 
     std::string interactionProfile;
+#if !MODULARITY_RUNTIME_ONLY
+    glm::vec2 editorTouchpad{0};
+    bool editorTouchpadTouched = false;
+    bool editorTouchpadClicked = false;
+#endif
 
     XRTrackingState trackingState() const {
         if (!gripPose.isValid()) return XRTrackingState::NotTracked;
@@ -119,6 +124,12 @@ private:
     XrAction secondaryButtonAction_ = XR_NULL_HANDLE;
     XrAction menuButtonAction_ = XR_NULL_HANDLE;
     XrAction hapticAction_ = XR_NULL_HANDLE;
+#if !MODULARITY_RUNTIME_ONLY
+    bool editorWorkspace_ = false;
+    XrAction editorTouchpadAction_ = XR_NULL_HANDLE;
+    XrAction editorTouchpadTouchAction_ = XR_NULL_HANDLE;
+    XrAction editorTouchpadClickAction_ = XR_NULL_HANDLE;
+#endif
 
     std::array<XrPath, 2> handPaths_{ XR_NULL_PATH, XR_NULL_PATH };
     std::array<XrSpace, 2> gripSpaces_{ XR_NULL_HANDLE, XR_NULL_HANDLE };

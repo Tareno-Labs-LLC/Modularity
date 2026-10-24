@@ -737,6 +737,74 @@ endif()
 if(MODULARITY_ENABLE_OPENXR)
     message(STATUS "OpenXR backend enabled (headers only, loader resolved at runtime).")
 endif()
+
+# ==================== Discord Social SDK ====================
+# Rich Presence is optional at build time so unsupported targets (Android and
+# MinGW in the currently supplied SDK) continue to build with a no-op backend.
+option(MODULARITY_ENABLE_DISCORD_SOCIAL_SDK "Enable Discord Social SDK Rich Presence" ON)
+set(MODULARITY_DISCORD_SOCIAL_SDK_ROOT
+    "${PROJECT_SOURCE_DIR}/src/ThirdParty/DiscordSocialSdk"
+    CACHE PATH "Discord Social SDK root containing include/, lib/ and bin/")
+set(MODULARITY_HAS_DISCORD_SOCIAL_SDK OFF)
+set(MODULARITY_DISCORD_SOCIAL_RUNTIME "")
+
+if(MODULARITY_ENABLE_DISCORD_SOCIAL_SDK AND NOT ANDROID)
+    set(_discord_header "${MODULARITY_DISCORD_SOCIAL_SDK_ROOT}/include/discordpp.h")
+    set(_discord_arm64 OFF)
+    if(CMAKE_GENERATOR_PLATFORM MATCHES "[Aa][Rr][Mm]64" OR
+       CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+        set(_discord_arm64 ON)
+    endif()
+
+    if(WIN32 AND MSVC)
+        if(_discord_arm64)
+            set(_discord_implib "${MODULARITY_DISCORD_SOCIAL_SDK_ROOT}/lib/release/arm64/discord_partner_sdk.lib")
+            set(_discord_runtime "${MODULARITY_DISCORD_SOCIAL_SDK_ROOT}/bin/release/arm64/discord_partner_sdk.dll")
+        else()
+            set(_discord_implib "${MODULARITY_DISCORD_SOCIAL_SDK_ROOT}/lib/release/discord_partner_sdk.lib")
+            set(_discord_runtime "${MODULARITY_DISCORD_SOCIAL_SDK_ROOT}/bin/release/discord_partner_sdk.dll")
+        endif()
+        if(EXISTS "${_discord_header}" AND EXISTS "${_discord_implib}" AND EXISTS "${_discord_runtime}")
+            add_library(modularity_discord_social SHARED IMPORTED GLOBAL)
+            set_target_properties(modularity_discord_social PROPERTIES
+                IMPORTED_IMPLIB "${_discord_implib}"
+                IMPORTED_LOCATION "${_discord_runtime}"
+                INTERFACE_INCLUDE_DIRECTORIES "${MODULARITY_DISCORD_SOCIAL_SDK_ROOT}/include")
+            set(MODULARITY_DISCORD_SOCIAL_RUNTIME "${_discord_runtime}")
+            set(MODULARITY_HAS_DISCORD_SOCIAL_SDK ON)
+        endif()
+    elseif(APPLE)
+        set(_discord_runtime "${MODULARITY_DISCORD_SOCIAL_SDK_ROOT}/lib/release/libdiscord_partner_sdk.dylib")
+        if(EXISTS "${_discord_header}" AND EXISTS "${_discord_runtime}")
+            add_library(modularity_discord_social SHARED IMPORTED GLOBAL)
+            set_target_properties(modularity_discord_social PROPERTIES
+                IMPORTED_LOCATION "${_discord_runtime}"
+                INTERFACE_INCLUDE_DIRECTORIES "${MODULARITY_DISCORD_SOCIAL_SDK_ROOT}/include")
+            set(MODULARITY_DISCORD_SOCIAL_RUNTIME "${_discord_runtime}")
+            set(MODULARITY_HAS_DISCORD_SOCIAL_SDK ON)
+        endif()
+    elseif(UNIX)
+        set(_discord_runtime "${MODULARITY_DISCORD_SOCIAL_SDK_ROOT}/lib/release/libdiscord_partner_sdk.so")
+        if(EXISTS "${_discord_header}" AND EXISTS "${_discord_runtime}")
+            add_library(modularity_discord_social SHARED IMPORTED GLOBAL)
+            set_target_properties(modularity_discord_social PROPERTIES
+                IMPORTED_LOCATION "${_discord_runtime}"
+                INTERFACE_INCLUDE_DIRECTORIES "${MODULARITY_DISCORD_SOCIAL_SDK_ROOT}/include")
+            set(MODULARITY_DISCORD_SOCIAL_RUNTIME "${_discord_runtime}")
+            set(MODULARITY_HAS_DISCORD_SOCIAL_SDK ON)
+        endif()
+    elseif(WIN32)
+        message(STATUS "Discord Social SDK disabled: the supplied Windows package has MSVC import libraries, not MinGW .dll.a files.")
+    endif()
+
+    if(NOT MODULARITY_HAS_DISCORD_SOCIAL_SDK AND NOT (WIN32 AND NOT MSVC))
+        message(WARNING "Discord Social SDK was requested but no compatible desktop library was found under ${MODULARITY_DISCORD_SOCIAL_SDK_ROOT}; Rich Presence will be disabled.")
+    endif()
+endif()
+
+if(MODULARITY_HAS_DISCORD_SOCIAL_SDK)
+    message(STATUS "Discord Social SDK Rich Presence enabled: ${MODULARITY_DISCORD_SOCIAL_RUNTIME}")
+endif()
 set(MODULARITY_SCRIPT_SDK_COPY_SCRIPT ${CMAKE_SOURCE_DIR}/cmake/CopyScriptSDK.cmake)
 set(MODULARITY_RUNTIME_DLL_COPY_SCRIPT ${CMAKE_SOURCE_DIR}/cmake/CopyRuntimeDlls.cmake)
 set(MODULARITY_FFMPEG_RUNTIME_DLLS)
@@ -1151,11 +1219,11 @@ else()
     target_compile_options(zstddec PRIVATE -w)
 endif()
 
-# ImGuizmo
+# ModuGuizmo (ImGuizmo-compatible API)
 add_library(imguizmo STATIC
-    src/ThirdParty/ImGuizmo/ImGuizmo.cpp
+    src/ThirdParty/ModuGuizmo/ImGuizmo.cpp
 )
-target_include_directories(imguizmo PUBLIC src/ThirdParty/ImGuizmo)
+target_include_directories(imguizmo PUBLIC src/ThirdParty/ModuGuizmo)
 target_link_libraries(imguizmo PUBLIC imgui glm)
 
 # ModuGUI (ImGui fork)
@@ -1247,6 +1315,8 @@ set(MODULARITY_PLAYER_EDITOR_ONLY_SOURCES
     ${PROJECT_SOURCE_DIR}/src/EditorWindows/ProjectManagerWindow.cpp
     ${PROJECT_SOURCE_DIR}/src/EditorWindows/RegistryPackagesWindow.cpp
     ${PROJECT_SOURCE_DIR}/src/EditorWindows/XRPreviewWindow.cpp
+    ${PROJECT_SOURCE_DIR}/src/EditorWindows/VREditor.cpp
+    ${PROJECT_SOURCE_DIR}/src/EditorWindows/VREditorWorkspace.cpp
     ${PROJECT_SOURCE_DIR}/src/EditorWindows/TextureTranscodeTool.cpp
     ${PROJECT_SOURCE_DIR}/src/EditorWindows/VersionControlWindow.cpp
     ${PROJECT_SOURCE_DIR}/src/VersionControl.cpp
@@ -1444,6 +1514,10 @@ target_compile_definitions(core PUBLIC MODULARITY_HAS_SNDFILE=$<BOOL:${SNDFILE_F
 target_compile_definitions(core PUBLIC MODULARITY_HAS_OPUSFILE=$<BOOL:${OPUSFILE_FOUND}>)
 target_compile_definitions(core PUBLIC MODULARITY_OPENGL_ES=$<BOOL:${MODULARITY_USE_OPENGL_ES}>)
 target_compile_definitions(core PUBLIC MODULARITY_HAS_OPENXR=$<BOOL:${MODULARITY_ENABLE_OPENXR}>)
+target_compile_definitions(core PUBLIC MODULARITY_HAS_DISCORD_SOCIAL_SDK=$<BOOL:${MODULARITY_HAS_DISCORD_SOCIAL_SDK}>)
+if(MODULARITY_HAS_DISCORD_SOCIAL_SDK)
+    target_link_libraries(core PUBLIC modularity_discord_social)
+endif()
 if(MODULARITY_ENABLE_OPENXR)
     # Headers only. The loader is dlopen'd, so nothing is added to the link line
     # here; ${CMAKE_DL_LIBS} is already linked by the executable targets below.
@@ -1509,6 +1583,10 @@ target_compile_definitions(core_player PUBLIC MODULARITY_HAS_SNDFILE=$<BOOL:${SN
 target_compile_definitions(core_player PUBLIC MODULARITY_HAS_OPUSFILE=$<BOOL:${OPUSFILE_FOUND}>)
 target_compile_definitions(core_player PUBLIC MODULARITY_OPENGL_ES=$<BOOL:${MODULARITY_USE_OPENGL_ES}>)
 target_compile_definitions(core_player PUBLIC MODULARITY_HAS_OPENXR=$<BOOL:${MODULARITY_ENABLE_OPENXR}>)
+target_compile_definitions(core_player PUBLIC MODULARITY_HAS_DISCORD_SOCIAL_SDK=$<BOOL:${MODULARITY_HAS_DISCORD_SOCIAL_SDK}>)
+if(MODULARITY_HAS_DISCORD_SOCIAL_SDK)
+    target_link_libraries(core_player PUBLIC modularity_discord_social)
+endif()
 if(MODULARITY_ENABLE_OPENXR)
     target_include_directories(core_player PUBLIC ${MODULARITY_OPENXR_INCLUDE_DIR})
     # On Android the player .so is the final link, so it needs dl itself for
@@ -1864,6 +1942,33 @@ else()
     endif()
 endif()
 
+# Keep the Social SDK next to development executables. Windows' exported-build
+# staging already collects every DLL next to ModularityPlayer; installed Unix
+# packages use the lib/ copy below through the existing $ORIGIN/../lib rpath.
+if(MODULARITY_HAS_DISCORD_SOCIAL_SDK)
+    if(APPLE)
+        set(_modularity_discord_build_rpath "@loader_path")
+    else()
+        set(_modularity_discord_build_rpath "$ORIGIN")
+    endif()
+    if(MODULARITY_BUILD_EDITOR)
+        set_property(TARGET Modularity APPEND PROPERTY BUILD_RPATH "${_modularity_discord_build_rpath}")
+        add_custom_command(TARGET Modularity POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:modularity_discord_social>"
+                "$<TARGET_FILE_DIR:Modularity>"
+            COMMENT "Staging Discord Social SDK for Modularity")
+    endif()
+    if(NOT ANDROID)
+        set_property(TARGET ModularityPlayer APPEND PROPERTY BUILD_RPATH "${_modularity_discord_build_rpath}")
+        add_custom_command(TARGET ModularityPlayer POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:modularity_discord_social>"
+                "$<TARGET_FILE_DIR:ModularityPlayer>"
+            COMMENT "Staging Discord Social SDK for ModularityPlayer")
+    endif()
+endif()
+
 # Copy resources once to avoid parallel target races writing the same directory.
 # On Android there is no executable to sit next to — assets will be staged
 # into the APK's assets/ directory by the Stage 4 packager instead.
@@ -2042,6 +2147,22 @@ if(NOT ANDROID)
         RUNTIME DESTINATION "Runtime Manager"
     )
     install(SCRIPT ${MODULARITY_SCRIPT_SDK_INSTALL_SCRIPT})
+endif()
+
+if(MODULARITY_HAS_DISCORD_SOCIAL_SDK)
+    if(WIN32)
+        if(MODULARITY_BUILD_EDITOR)
+            install(FILES "${MODULARITY_DISCORD_SOCIAL_RUNTIME}"
+                DESTINATION ${CMAKE_INSTALL_BINDIR})
+        endif()
+        install(FILES "${MODULARITY_DISCORD_SOCIAL_RUNTIME}"
+            DESTINATION "Runtime Manager")
+    else()
+        install(FILES "${MODULARITY_DISCORD_SOCIAL_RUNTIME}"
+            DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    endif()
+    install(FILES "${MODULARITY_DISCORD_SOCIAL_SDK_ROOT}/License-Notices.txt"
+        DESTINATION "licenses/DiscordSocialSdk")
 endif()
 
 if(NOT WIN32 AND MODULARITY_ENABLE_PHYSX)

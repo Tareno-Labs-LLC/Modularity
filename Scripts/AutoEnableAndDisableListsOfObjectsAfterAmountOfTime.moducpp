@@ -4,7 +4,7 @@ public class AutoEnableAndDisableListsOfObjectsAfterAmountOfTime : ModuNode {
     public SceneObj[] disable;
     public float interval = 1.0f;
     private float timer = 0.0f;
-    void Begin() timer.Start(interval);
+    void Begin() to timer.Start(interval);
     void TickUpdate() {
         if (!timer.Ready) return;
         each enable.state(true);

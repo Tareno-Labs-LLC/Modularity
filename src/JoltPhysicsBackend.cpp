@@ -2,6 +2,7 @@
 #ifdef MODULARITY_ENABLE_JOLT
 #include "ModelLoader.h"
 #include "Rendering.h"
+#include "PhysicsContactNormal.h"
 #include <Jolt/RegisterTypes.h>
 #include <Jolt/Core/Factory.h>
 #include <Jolt/Physics/PhysicsSettings.h>
@@ -68,19 +69,13 @@ private:
         const int idA = objectId(body1);
         const int idB = objectId(body2);
         if (idA < 0 || idB < 0 || idA == idB) return;
-        const JPH::Vec3 centre1 = body1.GetCenterOfMassPosition();
-        const JPH::Vec3 centre2 = body2.GetCenterOfMassPosition();
-        glm::vec3 lowToHigh(centre2.GetX() - centre1.GetX(),
-                            centre2.GetY() - centre1.GetY(),
-                            centre2.GetZ() - centre1.GetZ());
-        if (idA > idB) lowToHigh = -lowToHigh;
         const JPH::Vec3 n = manifold.mWorldSpaceNormal;
         glm::vec3 normal(n.GetX(), n.GetY(), n.GetZ());
         const float lengthSq = glm::dot(normal, normal);
         if (lengthSq < 0.000001f) return;
         normal /= std::sqrt(lengthSq);
-        if (glm::dot(normal, lowToHigh) < 0.0f) normal = -normal;
-        mOwner.noteContactNormal(idA, idB, normal);
+        mOwner.noteContactNormal(idA, idB,
+            PhysicsContacts::LowToHighNormal(idA, idB, normal));
     }
 
     static int objectId(const JPH::Body& body) {

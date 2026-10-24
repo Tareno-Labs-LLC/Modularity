@@ -1,3 +1,5 @@
+#include "../ScriptContextBinding.h"
+#include "UIInspector.h"
 #include "../EditorLocalization.h"
 #include "Engine.h"
 #include "HardwareProfile.h"
@@ -197,6 +199,7 @@ namespace {
                 case UIElementType::Text: target.type = ObjectType::UIText; break;
                 case UIElementType::Sprite2D: target.type = ObjectType::Sprite2D; break;
                 case UIElementType::None: break;
+                default: target.type = ObjectType::UIImage; break;
             }
             return;
         }
@@ -4796,10 +4799,14 @@ void Engine::renderInspectorPanel() {
             eng.inspectorPendingRevealId = 0;
             ImGui::Indent(8.0f);
         }
-        ~InspectorBodyScope() {
+        bool finished = false;
+        void finish() {
+            if (finished) return;
+            finished = true;
             ImGui::Unindent(8.0f);
             reveal.finish();
         }
+        ~InspectorBodyScope() { finish(); }
         InspectorBodyScope(const InspectorBodyScope&) = delete;
         InspectorBodyScope& operator=(const InspectorBodyScope&) = delete;
     };
@@ -5603,6 +5610,14 @@ void Engine::renderInspectorPanel() {
         if (header.open) {
             InspectorBodyScope _ibs(*this);
             ImGui::PushID("UI");
+            UIControls::InspectorHooks uiHooks;
+            uiHooks.section = [&](const char* label, bool defaultOpen, const std::function<void()>& body) {
+                if (InspectorReveal reveal = drawInspectorSubsectionFoldout(label, nullptr, defaultOpen)) body();
+            };
+            uiHooks.objectSlot = [&](const char* id, const char* label, int& objectId, const char* typeName) {
+                return drawObjectReferenceSlot(id, label, objectId, obj.id, typeName);
+            };
+            changed |= UIControls::Inspector(obj.ui, obj.IsInvariable, uiHooks);
 
             if (obj.IsInvariable) {
                 ImGui::TextDisabled("UI transform locked by Invariable");
@@ -11834,6 +11849,9 @@ void Engine::renderInspectorPanel() {
                 ctx.engine = this;
                 ctx.object = &obj;
                 ctx.script = &sc;
+                ScriptContextBinding contextBinding(ctx);
+                const SceneObject* sceneDataBeforeInspector = sceneObjects.data();
+                const size_t sceneCountBeforeInspector = sceneObjects.size();
                 std::string inspectorId = "ScriptInspector##" + std::to_string(obj.id) + sc.path;
                 ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 6.0f));
                 ImGui::Indent(8.0f);
@@ -11913,7 +11931,7 @@ void Engine::renderInspectorPanel() {
                         inspector(ctx);
                         const auto __moduInspEnd = std::chrono::steady_clock::now();
                         ImGui::PopID();
-                        ctx.SaveAutoSettings();
+                        if (ctx.object == &obj && ctx.script == &sc) ctx.SaveAutoSettings();
                         const auto __moduSaveEnd = std::chrono::steady_clock::now();
                         const double __moduInspMs = std::chrono::duration<double, std::milli>(__moduInspEnd - __moduInspStart).count();
                         const double __moduSaveMs = std::chrono::duration<double, std::milli>(__moduSaveEnd - __moduInspEnd).count();
@@ -11949,7 +11967,7 @@ void Engine::renderInspectorPanel() {
                         bool ranInspector = managedRuntime.invokeInspector(assembly, sc.managedType, ctx);
                         ImGui::PopID();
                         if (ranInspector) {
-                            ctx.SaveAutoSettings();
+                            if (ctx.object == &obj && ctx.script == &sc) ctx.SaveAutoSettings();
                         } else if (!managedRuntime.getLastError().empty()) {
                             ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.6f, 1.0f), "Inspector load failed");
                             ImGui::TextWrapped("%s", managedRuntime.getLastError().c_str());
@@ -11963,6 +11981,19 @@ void Engine::renderInspectorPanel() {
                 }
                 ImGui::Unindent(8.0f);
                 ImGui::PopStyleVar();
+                if (ctx.object != &obj || ctx.script != &sc ||
+                    sceneObjects.data() != sceneDataBeforeInspector ||
+                    sceneObjects.size() != sceneCountBeforeInspector) {
+                    // A custom inspector may create/delete/reparent objects or
+                    // attach scripts. Finish UI scopes before touching old refs.
+                    _ibs.finish();
+                    ImGui::PopID(); // script
+                    ImGui::PopID(); // object
+                    if (inspectorWrapText) ImGui::PopTextWrapPos();
+                    ImGui::PopStyleVar(3);
+                    ImGui::End();
+                    return;
+                }
             }
 
             constexpr bool showScriptSettings = false;
@@ -12590,6 +12621,15 @@ void Engine::renderInspectorPanel() {
             UpdateLegacyTypeFromComponents(obj);
             componentChanged = true;
         });
+        for (int value = static_cast<int>(UIElementType::Panel); value <= static_cast<int>(UIElementType::DockContainer); ++value) {
+            const UIElementType controlType = static_cast<UIElementType>(value);
+            addEntry(std::string("UI/Controls/") + UIControls::TypeName(controlType), true, [&, controlType]() {
+                obj.hasUI = true;
+                UIControls::ApplyCreationDefaults(obj.ui, controlType);
+                UpdateLegacyTypeFromComponents(obj);
+                componentChanged = true;
+            });
+        }
         if (has2DWorldPackage()) {
             addEntry("UI/Sprite2D", true, [&]() {
                 obj.hasUI = true;
@@ -13482,6 +13522,48 @@ void Engine::renderInspectorPanel() {
                 APPLY_CHANGED_UI_FIELD(rotation);
             }
             APPLY_CHANGED_UI_FIELD(maskChildren);
+            APPLY_CHANGED_UI_FIELD(clipChildren);
+            APPLY_CHANGED_UI_FIELD(fitWidth);
+            APPLY_CHANGED_UI_FIELD(fitHeight);
+            APPLY_CHANGED_UI_FIELD(responsive);
+            APPLY_CHANGED_UI_FIELD(checked);
+            APPLY_CHANGED_UI_FIELD(multiline);
+            APPLY_CHANGED_UI_FIELD(password);
+            APPLY_CHANGED_UI_FIELD(indeterminate);
+            APPLY_CHANGED_UI_FIELD(vertical);
+            APPLY_CHANGED_UI_FIELD(virtualize);
+            APPLY_CHANGED_UI_FIELD(sortable);
+            APPLY_CHANGED_UI_FIELD(open);
+            APPLY_CHANGED_UI_FIELD(dimBackground);
+            APPLY_CHANGED_UI_FIELD(gridColumns);
+            APPLY_CHANGED_UI_FIELD(selectedIndex);
+            APPLY_CHANGED_UI_FIELD(linkedObjectId);
+            APPLY_CHANGED_UI_FIELD(flexibleSize);
+            APPLY_CHANGED_UI_FIELD(aspectRatio);
+            APPLY_CHANGED_UI_FIELD(rounding);
+            APPLY_CHANGED_UI_FIELD(borderWidth);
+            APPLY_CHANGED_UI_FIELD(rangeUpper);
+            APPLY_CHANGED_UI_FIELD(rowHeight);
+            APPLY_CHANGED_UI_FIELD(numericStep);
+            APPLY_CHANGED_UI_FIELD(spacing);
+            APPLY_CHANGED_UI_FIELD(minimumSize);
+            APPLY_CHANGED_UI_FIELD(preferredSize);
+            APPLY_CHANGED_UI_FIELD(maximumSize);
+            APPLY_CHANGED_UI_FIELD(anchorMin);
+            APPLY_CHANGED_UI_FIELD(anchorMax);
+            APPLY_CHANGED_UI_FIELD(pivot);
+            APPLY_CHANGED_UI_FIELD(scrollOffset);
+            APPLY_CHANGED_UI_FIELD(contentSize);
+            APPLY_CHANGED_UI_FIELD(padding);
+            APPLY_CHANGED_UI_FIELD(margin);
+            APPLY_CHANGED_UI_FIELD(numericValue);
+            APPLY_CHANGED_UI_FIELD(inputText);
+            APPLY_CHANGED_UI_FIELD(placeholder);
+            APPLY_CHANGED_UI_FIELD(tooltip);
+            APPLY_CHANGED_UI_FIELD(items);
+            APPLY_CHANGED_UI_FIELD(itemParents);
+            APPLY_CHANGED_UI_FIELD(expandedItems);
+            APPLY_CHANGED_UI_FIELD(layout);
             APPLY_CHANGED_UI_FIELD(sliderValue);
             APPLY_CHANGED_UI_FIELD(sliderMin);
             APPLY_CHANGED_UI_FIELD(sliderMax);

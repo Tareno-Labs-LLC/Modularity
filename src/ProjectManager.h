@@ -377,6 +377,20 @@ struct ProjectPlayerSettings {
     std::string saveDataPathBehavior = "CompanyAndProduct";
 };
 
+// Per-game Discord activity. The application id is public by design; Discord client
+// secrets are deliberately never stored in project files or shipped player binaries.
+struct ProjectDiscordPresenceSettings {
+    bool enabled = false;
+    std::string applicationId;
+    std::string state;
+    std::string details;
+    std::string largeImageKey;
+    std::string largeImageText;
+    std::string smallImageKey;
+    std::string smallImageText;
+    std::string partyId;
+};
+
 class Project {
 public:
     std::string name;
@@ -397,6 +411,7 @@ public:
     ProjectConsoleSettings consoleSettings;
     ProjectLanguageSettings languageSettings;
     ProjectPlayerSettings playerSettings;
+    ProjectDiscordPresenceSettings discordPresenceSettings;
     Modularity::XR::ProjectOpenXRSettings openXRSettings;
     std::map<std::string, std::string> textureFormatOverrides;
 

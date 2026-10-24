@@ -33,6 +33,6 @@ struct XRProfileBindings {
     size_t entryCount;
 };
 
-const XRProfileBindings* GetProfileBindings(XRInteractionProfile profile);
+const XRProfileBindings* GetProfileBindings(XRInteractionProfile profile, bool editorWorkspace = false);
 
 }

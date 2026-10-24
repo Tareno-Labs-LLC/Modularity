@@ -1,3 +1,4 @@
+#include "UIControls.h"
 #include "../../EditorLocalization.h"
 #include "Engine.h"
 
@@ -160,13 +161,13 @@ void Engine::refreshEditorWindowIcons() {
   }
 }
 
-void Engine::renderMainMenuBar() {
+void Engine::renderMainMenuBar(bool embedded) {
   refreshScriptEditorWindows();
   pollEditorThemeFile();
 
   static bool triggerAboutModularityPopup = false;
 
-  if (ImGui::BeginMainMenuBar()) {
+  if (embedded ? ImGui::BeginMenuBar() : ImGui::BeginMainMenuBar()) {
     const EditorChromeMetrics &chrome = getEditorChromeMetrics(uiChromeScale);
     ImVec2 menuItemSpacing = chrome.menuItemSpacing;
     ImVec2 menuFramePadding = chrome.menuFramePadding;
@@ -216,6 +217,11 @@ void Engine::renderMainMenuBar() {
       }
       ImGui::Separator();
       if (ImGui::MenuItem(Loc::T("MENU_ENGINE_RETURN_TO_PROJECT_MANAGER", "Return to Project Manager"))) {
+#if !MODULARITY_RUNTIME_ONLY
+        if (embedded) {
+          vrEditor.pendingAction = 4;
+        } else
+#endif
         if (projectManager.currentProject.hasUnsavedChanges) {
           requestSceneSave(projectManager.currentProject.currentSceneName,
                            PendingScenePostAction::CloseProject,
@@ -263,7 +269,7 @@ void Engine::renderMainMenuBar() {
     }
 
     if (ImGui::BeginMenu(Loc::T("MENU_WORKFLOW", "Workflow"))) {
-      if (ImGui::BeginMenu(Loc::T("MENU_WORKFLOW_WORKSPACE", "Workspace"))) {
+      if (!embedded && ImGui::BeginMenu(Loc::T("MENU_WORKFLOW_WORKSPACE", "Workspace"))) {
         const bool workspaceTransitionActive =
             pendingWorkspaceReload || workspaceLayoutDirty ||
             glfwGetTime() < workspaceLayoutStabilizeUntil;
@@ -558,6 +564,9 @@ void Engine::renderMainMenuBar() {
                           "by hand is touched.");
       }
       ImGui::Separator();
+#if !MODULARITY_RUNTIME_ONLY
+      renderVREditorEntry();
+#endif
       bool prevXRPreview = showXRPreviewWindow;
       ImGui::MenuItem(Loc::Window("WINDOW_XR_PREVIEW", "Stereo Preview"), nullptr,
                       &showXRPreviewWindow);
@@ -628,14 +637,14 @@ void Engine::renderMainMenuBar() {
       ImGui::EndMenu();
     }
 
-    if (!(ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_IsTouchScreen) ||
-        !mobileEditorLayout) {
+    if (!embedded && (!(ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_IsTouchScreen) ||
+        !mobileEditorLayout)) {
       renderPlayControlsBar();
     }
 
     ImGui::SetWindowFontScale(1.0f);
     ImGui::PopStyleVar(2);
-    ImGui::EndMainMenuBar();
+    if (embedded) ImGui::EndMenuBar(); else ImGui::EndMainMenuBar();
   }
 
   if (triggerAboutModularityPopup) {
@@ -1181,7 +1190,7 @@ void Engine::renderSceneObjectCreateMenu(int parentId) {
     if (parentId >= 0) {
       if (SceneObject *requestedParent = findObjectById(parentId)) {
         if (requestedParent->hasUI &&
-            requestedParent->ui.type == UIElementType::Canvas) {
+            requestedParent->ui.type != UIElementType::None) {
           canvasId = requestedParent->id;
         }
       }
@@ -1202,9 +1211,9 @@ void Engine::renderSceneObjectCreateMenu(int parentId) {
       }
     }
     addObject(type, baseName);
-    if (!sceneObjects.empty() && canvasId >= 0) {
-      setParent(sceneObjects.back().id, canvasId);
-    }
+    const int createdId = sceneObjects.empty() ? -1 : sceneObjects.back().id;
+    if (createdId >= 0 && canvasId >= 0) setParent(createdId, canvasId);
+    return createdId;
   };
 
   if (ImGui::MenuItem("Empty SceneOBJ"))
@@ -1589,18 +1598,161 @@ void Engine::renderSceneObjectCreateMenu(int parentId) {
   }
 
   if (ImGui::BeginMenu("UI")) {
-    if (ImGui::MenuItem("Canvas"))
-      addObject(ObjectType::Canvas, "Canvas");
-    if (ImGui::MenuItem("UI Image"))
-      createUIWithCanvas(ObjectType::UIImage, "UI Image");
-    if (ImGui::MenuItem("UI Slider"))
-      createUIWithCanvas(ObjectType::UISlider, "UI Slider");
-    if (ImGui::MenuItem("UI Button"))
-      createUIWithCanvas(ObjectType::UIButton, "UI Button");
-    if (ImGui::MenuItem("UI Text"))
-      createUIWithCanvas(ObjectType::UIText, "UI Text");
-    if (has2DWorldPackage() && ImGui::MenuItem("Sprite2D"))
-      createUIWithCanvas(ObjectType::Sprite2D, "Sprite2D");
+    auto createControl = [&](UIElementType type, const char* name = nullptr) {
+      int id = createUIWithCanvas(ObjectType::UIImage, name ? name : UIControls::TypeName(type));
+      if (SceneObject* obj = findObjectById(id)) {
+        UIControls::ApplyCreationDefaults(obj->ui, type);
+        if (name) obj->ui.label = name;
+        EnsureInspectorComponentMetadata(*obj);
+      }
+      return id;
+    };
+    auto entry = [&](UIElementType type) {
+      if (ImGui::MenuItem(UIControls::TypeName(type))) createControl(type);
+    };
+    auto addChild = [&](int parent, UIElementType type, const char* name, glm::vec2 position, glm::vec2 size) {
+      addObject(ObjectType::UIImage, name);
+      int id = sceneObjects.back().id;
+      setParent(id, parent);
+      if (auto* obj = findObjectById(id)) {
+        UIControls::ApplyCreationDefaults(obj->ui, type);
+        obj->ui.label = name;
+        obj->ui.anchor = UIAnchor::TopLeft; obj->ui.position = position; obj->ui.size = size;
+      }
+      return id;
+    };
+    if (ImGui::MenuItem("Canvas")) addObject(ObjectType::Canvas, "Canvas");
+    if (ImGui::BeginMenu("Rendering")) {
+      if (ImGui::MenuItem("Image")) createUIWithCanvas(ObjectType::UIImage, "UI Image");
+      if (ImGui::MenuItem("Text")) createUIWithCanvas(ObjectType::UIText, "UI Text");
+      entry(UIElementType::Panel); entry(UIElementType::Separator);
+      if (has2DWorldPackage() && ImGui::MenuItem("Sprite2D")) createUIWithCanvas(ObjectType::Sprite2D, "Sprite2D");
+      ImGui::EndMenu();
+    }
+    if (ImGui::BeginMenu("Controls")) {
+      if (ImGui::MenuItem("Button")) createUIWithCanvas(ObjectType::UIButton, "UI Button");
+      if (ImGui::MenuItem("Slider")) createUIWithCanvas(ObjectType::UISlider, "UI Slider");
+      entry(UIElementType::InputField); entry(UIElementType::SearchField); entry(UIElementType::Toggle);
+      entry(UIElementType::RadioGroup); entry(UIElementType::ProgressBar); entry(UIElementType::RangeSlider); entry(UIElementType::Tooltip);
+      ImGui::EndMenu();
+    }
+    if (ImGui::BeginMenu("Layout")) {
+      auto layoutEntry = [&](const char* label, UILayoutMode mode) {
+        if (ImGui::MenuItem(label)) {
+          int id = createControl(UIElementType::Panel, label);
+          if (auto* obj = findObjectById(id)) { obj->ui.layout = mode; obj->ui.size = glm::vec2(400, 240); obj->ui.padding = glm::vec4(8); }
+        }
+      };
+      layoutEntry("Horizontal Layout Group", UILayoutMode::Horizontal);
+      layoutEntry("Vertical Layout Group", UILayoutMode::Vertical);
+      layoutEntry("Grid Layout Group", UILayoutMode::Grid);
+      if (ImGui::MenuItem("Content Size Fitter")) {
+        int id = createControl(UIElementType::Panel, "Content Size Fitter");
+        if (auto* obj = findObjectById(id)) { obj->ui.layout = UILayoutMode::Vertical; obj->ui.fitWidth = obj->ui.fitHeight = true; }
+      }
+      if (ImGui::MenuItem("Aspect Ratio Fitter")) {
+        int id = createControl(UIElementType::Panel, "Aspect Ratio Fitter");
+        if (auto* obj = findObjectById(id)) obj->ui.aspectRatio = 16.0f / 9.0f;
+      }
+      if (ImGui::MenuItem("Flexible Spacer")) {
+        int id = createControl(UIElementType::Panel, "Flexible Spacer");
+        if (auto* obj = findObjectById(id)) { obj->ui.flexibleSize = 1; obj->ui.size = glm::vec2(1); obj->ui.color.a = 0; obj->ui.borderWidth = 0; }
+      }
+      ImGui::EndMenu();
+    }
+    if (ImGui::BeginMenu("Collections")) {
+      entry(UIElementType::ListView); entry(UIElementType::GridView); entry(UIElementType::MultiColumnListView);
+      entry(UIElementType::TreeView); entry(UIElementType::Scrollbar); entry(UIElementType::ScrollView);
+      ImGui::EndMenu();
+    }
+    if (ImGui::BeginMenu("Menus and Navigation")) {
+      entry(UIElementType::Dropdown); entry(UIElementType::MenuBar); entry(UIElementType::PopupMenu);
+      if (ImGui::MenuItem("Context Menu")) createControl(UIElementType::PopupMenu, "Context Menu");
+      entry(UIElementType::TabView); entry(UIElementType::Foldout); entry(UIElementType::Breadcrumb);
+      entry(UIElementType::Toolbar); entry(UIElementType::Modal);
+      ImGui::EndMenu();
+    }
+    if (ImGui::BeginMenu("Editor Controls")) {
+      entry(UIElementType::ColorPicker); entry(UIElementType::NumericField);
+      entry(UIElementType::Vector2Field); entry(UIElementType::Vector3Field); entry(UIElementType::Vector4Field);
+      entry(UIElementType::EnumDropdown); entry(UIElementType::ReorderableList); entry(UIElementType::ObjectField);
+      entry(UIElementType::LogView); entry(UIElementType::SplitView);
+      entry(UIElementType::PropertyGrid); entry(UIElementType::FileBrowser); entry(UIElementType::DockContainer);
+      ImGui::EndMenu();
+    }
+    if (ImGui::BeginMenu("Templates")) {
+      if (ImGui::MenuItem("Scroll View with Content and Scrollbars")) {
+        int root = createControl(UIElementType::Panel, "Scroll View");
+        if (auto* obj = findObjectById(root)) obj->ui.size = glm::vec2(360, 260);
+        int viewport = addChild(root, UIElementType::ScrollView, "Viewport", glm::vec2(8), glm::vec2(320, 220));
+        int content = addChild(viewport, UIElementType::Panel, "Content", glm::vec2(0), glm::vec2(320, 500));
+        if (auto* obj = findObjectById(viewport)) obj->ui.contentSize = glm::vec2(320, 500);
+        if (auto* obj = findObjectById(content)) {
+          obj->ui.layout = UILayoutMode::Vertical; obj->ui.padding = glm::vec4(8); obj->ui.fitHeight = true;
+          obj->ui.color.a = 0; obj->ui.borderWidth = 0; // the viewport already draws the frame
+        }
+        for (int i = 0; i < 12; ++i) {
+          int item = addChild(content, UIElementType::Toggle, "Item", glm::vec2(0), glm::vec2(290, 32));
+          if (auto* obj = findObjectById(item)) obj->ui.label = "Item " + std::to_string(i + 1);
+        }
+        int bar = addChild(root, UIElementType::Scrollbar, "Vertical Scrollbar", glm::vec2(334, 8), glm::vec2(18, 220));
+        if (auto* obj = findObjectById(bar)) { obj->ui.vertical = true; obj->ui.linkedObjectId = viewport; }
+        bar = addChild(root, UIElementType::Scrollbar, "Horizontal Scrollbar", glm::vec2(8, 234), glm::vec2(320, 18));
+        if (auto* obj = findObjectById(bar)) obj->ui.linkedObjectId = viewport;
+      }
+      if (ImGui::MenuItem("Dropdown with Popup, Viewport and Items")) {
+        int root = createControl(UIElementType::Dropdown);
+        if (auto* obj = findObjectById(root)) {
+          obj->ui.size = glm::vec2(240, 32); obj->ui.items = {"First", "Second", "Third"};
+          obj->ui.open = false; obj->ui.contentSize = glm::vec2(240, 244);
+        }
+        int popup = addChild(root, UIElementType::Panel, "Popup", glm::vec2(0, 36), glm::vec2(240, 240));
+        int viewport = addChild(popup, UIElementType::ScrollView, "Viewport", glm::vec2(4), glm::vec2(232));
+        int list = addChild(viewport, UIElementType::ListView, "Items", glm::vec2(0), glm::vec2(232));
+        if (auto* obj = findObjectById(root)) { obj->ui.linkedObjectId = list; obj->ui.selectedIndex = 0; }
+        if (auto* obj = findObjectById(list)) { obj->ui.linkedObjectId = root; obj->ui.items.clear(); } // rows come from the root
+        for (int id : {popup, viewport, list}) if (auto* obj = findObjectById(id)) obj->ui.sortingOrder = 100;
+      }
+      if (ImGui::MenuItem("Tab View with Pages")) {
+        int root = createControl(UIElementType::TabView);
+        if (auto* obj = findObjectById(root)) { obj->ui.items = {"First", "Second"}; obj->ui.selectedIndex = 0; }
+        for (int i = 0; i < 2; ++i) {
+          int page = addChild(root, UIElementType::Panel, i == 0 ? "First Page" : "Second Page", glm::vec2(0, 36), glm::vec2(320, 200));
+          if (auto* obj = findObjectById(page)) { obj->ui.color.a = 0; obj->ui.borderWidth = 0; } // sits on the tab view's own body
+          int text = addChild(page, UIElementType::InputField, "Page Input", glm::vec2(8), glm::vec2(280, 32));
+          if (auto* obj = findObjectById(text)) obj->ui.placeholder = i == 0 ? "First page input" : "Second page input";
+        }
+      }
+      if (ImGui::MenuItem("Searchable List")) {
+        int root = createControl(UIElementType::Panel, "Searchable List");
+        if (auto* obj = findObjectById(root)) obj->ui.size = glm::vec2(320, 280);
+        int list = addChild(root, UIElementType::ListView, "Results", glm::vec2(8, 48), glm::vec2(304, 224));
+        int search = addChild(root, UIElementType::SearchField, "Search", glm::vec2(8), glm::vec2(304, 32));
+        if (auto* obj = findObjectById(search)) { obj->ui.linkedObjectId = list; obj->ui.placeholder = "Filter items..."; }
+        if (auto* obj = findObjectById(list)) obj->ui.items = {"Apple", "Banana", "Orange", "Pear"};
+      }
+      if (ImGui::MenuItem("Dock Container with Canvas Panels")) {
+        int root = createControl(UIElementType::DockContainer);
+        for (int i = 0; i < 2; ++i) {
+          int panel = addChild(root, UIElementType::Canvas, i == 0 ? "Properties" : "Content", glm::vec2(0), glm::vec2(320, 240));
+          if (auto* obj = findObjectById(panel)) { obj->ui.pseudo3DEnabled = true; obj->ui.pseudo3DUseOffscreenSurface = true; }
+          int input = addChild(panel, UIElementType::InputField, "Input", glm::vec2(12), glm::vec2(280, 36));
+          if (auto* obj = findObjectById(input)) obj->ui.placeholder = "Dockable canvas input";
+          addChild(panel, UIElementType::Toggle, "Toggle", glm::vec2(12, 60), glm::vec2(280, 36));
+        }
+      }
+      if (ImGui::MenuItem("Resizable Split with Two Panels")) {
+        int root = createControl(UIElementType::SplitView);
+        if (auto* obj = findObjectById(root)) obj->ui.size = glm::vec2(480, 240);
+        addChild(root, UIElementType::Panel, "First Panel", glm::vec2(0), glm::vec2(220, 200));
+        addChild(root, UIElementType::Panel, "Second Panel", glm::vec2(0), glm::vec2(220, 200));
+      }
+      if (ImGui::MenuItem("Hierarchy Tree")) {
+        int id = createControl(UIElementType::TreeView);
+        if (auto* obj = findObjectById(id)) { obj->ui.items = {"Root", "Child", "Grandchild", "Other Child"}; obj->ui.itemParents = {-1, 0, 1, 0}; obj->ui.expandedItems = {0}; }
+      }
+      ImGui::EndMenu();
+    }
     ImGui::EndMenu();
   }
 

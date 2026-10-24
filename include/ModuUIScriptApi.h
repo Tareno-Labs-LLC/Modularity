@@ -36,13 +36,22 @@ struct UICallbacks {
     std::function<void()>      onUnclick;
     std::function<void(float)> onValueChanged;   // slider
     std::function<void(bool)>  onToggleChanged;  // toggle
-    std::function<void(const std::string&)> onInputSubmit; // input
+    std::function<void(const std::string&)> onInputSubmit;
+    std::function<void(const std::string&)> onInputChanged;
+    std::function<void(int)> onSelectionChanged;
+    std::function<void()> onControlChanged;
 };
 
 struct UIEventState {
     bool  wasHovered = false;
     bool  wasActive  = false;
     bool  wasClicked = false;
+    bool initializedControl = false;
+    bool lastToggleValue = false;
+    std::string lastInputText;
+    int lastSelection = -1;
+    uint64_t lastSubmitRevision = 0;
+    uint64_t lastChangeRevision = 0;
     float lastSliderValue = -1e38f; // sentinel: uninitialized
 };
 
@@ -311,7 +320,7 @@ struct UIImageProxy {
     TintProp Tint{ this };
 };
 
-// UIToggleProxy  -  obj.UI.Toggle.* (stubbed - no engine type yet)
+// UIToggleProxy - obj.UI.Toggle.*
 
 struct UIToggleProxy {
     ScriptContext* ctx_;
@@ -320,13 +329,17 @@ struct UIToggleProxy {
     UIToggleProxy(ScriptContext* ctx, const std::string* key)
         : ctx_(ctx), instanceKey_(key) {}
 
+    bool hasToggle() const {
+        return ctx_ && ctx_->object && ctx_->object->hasUI && ctx_->object->ui.type == UIElementType::Toggle;
+    }
     struct ValueProp {
         UIToggleProxy* p;
-        ValueProp& operator=(bool) {
-            detail::uiWarnOnce(p->ctx_, "Toggle.Value");
+        ValueProp& operator=(bool value) {
+            if (p->hasToggle()) p->ctx_->object->ui.checked = value;
+            else detail::uiWarnOnce(p->ctx_, "Toggle.Value");
             return *this;
         }
-        operator bool() const { return false; }
+        operator bool() const { return p->hasToggle() && p->ctx_->object->ui.checked; }
     };
     ValueProp Value{ this };
 
@@ -336,7 +349,7 @@ struct UIToggleProxy {
     }
 };
 
-// UIInputProxy  -  obj.UI.Input.* (stubbed - no engine type yet)
+// UIInputProxy - obj.UI.Input.*
 
 struct UIInputProxy {
     ScriptContext* ctx_;
@@ -345,28 +358,37 @@ struct UIInputProxy {
     UIInputProxy(ScriptContext* ctx, const std::string* key)
         : ctx_(ctx), instanceKey_(key) {}
 
+    bool hasInput() const {
+        return ctx_ && ctx_->object && ctx_->object->hasUI &&
+            (ctx_->object->ui.type == UIElementType::InputField || ctx_->object->ui.type == UIElementType::SearchField);
+    }
     struct TextProp {
         UIInputProxy* p;
-        TextProp& operator=(const std::string&) {
-            detail::uiWarnOnce(p->ctx_, "Input.Text");
+        TextProp& operator=(const std::string& value) {
+            if (p->hasInput()) p->ctx_->object->ui.inputText = value;
+            else detail::uiWarnOnce(p->ctx_, "Input.Text");
             return *this;
         }
         TextProp& operator=(const char* v) { return *this = std::string(v ? v : ""); }
-        operator std::string() const { return {}; }
+        operator std::string() const { return p->hasInput() ? p->ctx_->object->ui.inputText : std::string{}; }
     };
     TextProp Text{ this };
 
     struct PlaceholderProp {
         UIInputProxy* p;
-        PlaceholderProp& operator=(const std::string&) {
-            detail::uiWarnOnce(p->ctx_, "Input.Placeholder");
+        PlaceholderProp& operator=(const std::string& value) {
+            if (p->hasInput()) p->ctx_->object->ui.placeholder = value;
+            else detail::uiWarnOnce(p->ctx_, "Input.Placeholder");
             return *this;
         }
         PlaceholderProp& operator=(const char* v) { return *this = std::string(v ? v : ""); }
-        operator std::string() const { return {}; }
+        operator std::string() const { return p->hasInput() ? p->ctx_->object->ui.placeholder : std::string{}; }
     };
     PlaceholderProp Placeholder{ this };
 
+    void OnChanged(std::function<void(const std::string&)> fn) {
+        if (instanceKey_) detail::uiCallbackStore()[*instanceKey_].onInputChanged = std::move(fn);
+    }
     void OnSubmit(std::function<void(const std::string&)> fn) {
         if (!instanceKey_) return;
         detail::uiCallbackStore()[*instanceKey_].onInputSubmit = std::move(fn);
@@ -414,8 +436,48 @@ struct UIProxy {
                (ctx_->object->ui.type == UIElementType::Image ||
                 ctx_->object->ui.type == UIElementType::Sprite2D);
     }
-    bool IsToggle() const { return false; }  // not yet in engine
-    bool IsInput()  const { return false; }  // not yet in engine
+    bool IsToggle() const { return _isType(UIElementType::Toggle); }
+    bool IsInput() const { return _isType(UIElementType::InputField) || _isType(UIElementType::SearchField); }
+
+    void OnChanged(std::function<void()> fn) { detail::uiCallbackStore()[instanceKey_].onControlChanged = std::move(fn); }
+    void SetProgress(float value) { if (_hasUI()) ctx_->object->ui.sliderValue = value; }
+    void SetRange(float lower, float upper) {
+        if (!_hasUI()) return;
+        ctx_->object->ui.sliderValue = std::min(lower, upper); ctx_->object->ui.rangeUpper = std::max(lower, upper);
+    }
+    glm::vec2 GetRange() const { return _hasUI() ? glm::vec2(ctx_->object->ui.sliderValue, ctx_->object->ui.rangeUpper) : glm::vec2(0); }
+    void SetNumericValue(const glm::vec4& value) { if (_hasUI()) ctx_->object->ui.numericValue = value; }
+    glm::vec4 GetNumericValue() const { return _hasUI() ? ctx_->object->ui.numericValue : glm::vec4(0); }
+    void SetLinkedObject(int objectId) { if (_hasUI()) ctx_->object->ui.linkedObjectId = objectId; }
+    void Focus() { if (_hasUI()) ctx_->object->ui.requestFocus = true; }
+    int AddItem(const std::string& label, int parentIndex = -1) {
+        if (!_hasUI()) return -1;
+        auto& u = ctx_->object->ui;
+        int index = static_cast<int>(u.items.size());
+        u.items.push_back(label);
+        u.itemParents.resize(u.items.size(), -1);
+        u.itemParents[index] = parentIndex >= 0 && parentIndex < index ? parentIndex : -1;
+        return index;
+    }
+    void ClearItems() {
+        if (!_hasUI()) return;
+        auto& u = ctx_->object->ui;
+        u.items.clear(); u.itemParents.clear(); u.expandedItems.clear(); u.selectedIndex = -1;
+    }
+    std::string GetSelectedItem() const {
+        if (!_hasUI()) return {};
+        const auto& u = ctx_->object->ui;
+        return u.selectedIndex >= 0 && u.selectedIndex < static_cast<int>(u.items.size()) ? u.items[u.selectedIndex] : std::string{};
+    }
+    int GetSelectedIndex() const { return _hasUI() ? ctx_->object->ui.selectedIndex : -1; }
+    void SetSelectedIndex(int index) {
+        if (_hasUI()) ctx_->object->ui.selectedIndex = std::clamp(index, -1, static_cast<int>(ctx_->object->ui.items.size()) - 1);
+    }
+    void SetOpen(bool open) { if (_hasUI()) ctx_->object->ui.open = open; }
+    void SetFilter(const std::string& filter) { if (_hasUI()) ctx_->object->ui.filterText = filter; }
+    void OnSelectionChanged(std::function<void(int)> fn) {
+        detail::uiCallbackStore()[instanceKey_].onSelectionChanged = std::move(fn);
+    }
 
     // Direct property proxies
 
@@ -845,8 +907,24 @@ private:
 
         detail::UIEventState& state = detail::uiEventStateStore()[instanceKey_];
 
+        if (_hasUI()) {
+            const auto& u = ctx_->object->ui;
+            if (state.initializedControl) {
+                if (cbs.onToggleChanged && IsToggle() && state.lastToggleValue != u.checked) cbs.onToggleChanged(u.checked);
+                if (cbs.onInputChanged && IsInput() && state.lastInputText != u.inputText) cbs.onInputChanged(u.inputText);
+                if (cbs.onSelectionChanged && state.lastSelection != u.selectedIndex) cbs.onSelectionChanged(u.selectedIndex);
+            }
+            if (cbs.onControlChanged && u.valueChangeRevision != state.lastChangeRevision) cbs.onControlChanged();
+            state.lastChangeRevision = u.valueChangeRevision;
+            if (cbs.onInputSubmit && u.inputSubmitRevision != state.lastSubmitRevision) cbs.onInputSubmit(u.inputText);
+            state.lastSubmitRevision = u.inputSubmitRevision;
+            state.lastToggleValue = u.checked;
+            state.lastInputText = u.inputText;
+            state.lastSelection = u.selectedIndex;
+            state.initializedControl = true;
+        }
         // Click
-        if (cbs.onClick && ctx_ && ctx_->IsUIButtonPressed()) {
+        if (cbs.onClick && _hasUI() && ctx_->object->ui.buttonPressed) {
             cbs.onClick();
         }
 

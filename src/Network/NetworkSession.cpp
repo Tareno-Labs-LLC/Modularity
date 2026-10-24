@@ -52,8 +52,11 @@ bool NetworkSession::startWithBackend(const SessionConfig& cfg,
     backend = std::move(injected);
     offline = (std::string(backend->name()) == "Offline");
 
+    const auto activeBackend = backend;
+    const uint64_t generation = backendGeneration;
     BackendCallbacks callbacks;
-    callbacks.onStateChanged = [this](ConnectionState s) {
+    callbacks.onStateChanged = [this, generation](ConnectionState s) {
+        if (generation != backendGeneration) return;
         LogLevel level = LogLevel::Info;
         if (s == ConnectionState::InRoom || s == ConnectionState::ConnectedToMaster) {
             level = LogLevel::Success;
@@ -63,36 +66,48 @@ bool NetworkSession::startWithBackend(const SessionConfig& cfg,
             level = LogLevel::Warning;
         }
         log(level, std::string("[Network] State: ") + ToString(s));
+        if (generation != backendGeneration) return;
         if (onStateChanged) onStateChanged(s);
     };
-    callbacks.onError = [this](const NetworkError& e) {
+    callbacks.onError = [this, generation](const NetworkError& e) {
+        if (generation != backendGeneration) return;
         error = e;
         std::string text = std::string("[Network] ") + ToString(e.code);
         if (!e.message.empty()) text += ": " + e.message;
         if (e.nativeCode != 0) text += " (backend code " + std::to_string(e.nativeCode) + ")";
         log(LogLevel::Error, text);
+        if (generation != backendGeneration) return;
         if (onError) onError(e);
     };
-    callbacks.onPlayerJoined = [this](const NetworkPlayer& p) {
+    callbacks.onPlayerJoined = [this, generation](const NetworkPlayer& p) {
+        if (generation != backendGeneration) return;
         std::string who = p.nickname.empty() ? ("player " + std::to_string(p.id)) : p.nickname;
         log(LogLevel::Success, "[Network] " + who + " joined (id " + std::to_string(p.id) + ")" +
                                (p.isLocal ? " [local]" : "") + (p.isHost ? " [host]" : ""));
+        if (generation != backendGeneration) return;
         if (onPlayerJoined) onPlayerJoined(p);
     };
-    callbacks.onPlayerLeft = [this](PlayerId id) {
+    callbacks.onPlayerLeft = [this, generation](PlayerId id) {
+        if (generation != backendGeneration) return;
         if (isHost()) {
-            for (auto& entry : objects) {
-                if (entry.second.owner != id) continue;
-                entry.second.owner = hostPlayerId();
-                entry.second.hasAuthority = true;
-                if (onOwnershipChanged) onOwnershipChanged(entry.first, entry.second.owner);
+            const auto ids = allObjects();
+            for (NetworkId objectId : ids) {
+                auto it = objects.find(objectId);
+                if (it == objects.end() || it->second.owner != id) continue;
+                const PlayerId owner = hostPlayerId();
+                it->second.owner = owner;
+                it->second.hasAuthority = true;
+                if (onOwnershipChanged) onOwnershipChanged(objectId, owner);
+                if (generation != backendGeneration) return;
             }
         }
         remoteAvatars.erase(id);
         log(LogLevel::Warning, "[Network] Player " + std::to_string(id) + " left the room.");
+        if (generation != backendGeneration) return;
         if (onPlayerLeft) onPlayerLeft(id);
     };
-    callbacks.onJoinedRoom = [this](const std::string& roomName) {
+    callbacks.onJoinedRoom = [this, generation](const std::string& roomName) {
+        if (generation != backendGeneration) return;
         nextLocalNetworkId = FirstIdForPlayer(backend->localPlayerId());
         log(LogLevel::Success,
             "[Network] Joined room \"" + roomName + "\" as player " +
@@ -101,42 +116,50 @@ bool NetworkSession::startWithBackend(const SessionConfig& cfg,
             " via " + backend->name() +
             (region().empty() ? "" : " [" + region() + "]"));
     };
-    callbacks.onLeftRoom = [this]() {
+    callbacks.onLeftRoom = [this, generation]() {
+        if (generation != backendGeneration) return;
         log(LogLevel::Info, "[Network] Left the room; releasing " +
                             std::to_string(objects.size()) + " networked object(s).");
+        if (generation != backendGeneration) return;
         std::vector<NetworkId> ids;
         ids.reserve(objects.size());
         for (const auto& entry : objects) ids.push_back(entry.first);
-        for (NetworkId id : ids) applyDespawn(id);
+        for (NetworkId id : ids) {
+            applyDespawn(id);
+            if (generation != backendGeneration) return;
+        }
         objects.clear();
         remoteAvatars.clear();
         lastAvatarSendTime = -1.0;
     };
-    callbacks.onHostChanged = [this](PlayerId newHost) {
+    callbacks.onHostChanged = [this, generation](PlayerId newHost) {
+        if (generation != backendGeneration) return;
         log(LogLevel::Info, "[Network] Host is now player " + std::to_string(newHost) +
                             (newHost == localPlayerId() ? " (this client)" : ""));
     };
-    callbacks.onEvent = [this](PlayerId sender, uint8_t code, const std::vector<uint8_t>& payload) {
+    callbacks.onEvent = [this, generation](PlayerId sender, uint8_t code, const std::vector<uint8_t>& payload) {
+        if (generation != backendGeneration) return;
         handleEvent(sender, code, payload);
     };
 
-    if (!backend->initialize(config, callbacks)) {
+    const bool initialized = activeBackend->initialize(config, callbacks);
+    if (generation != backendGeneration) return false;
+    if (!initialized) {
         fail(ErrorCode::OperationFailed, "Backend failed to initialize.");
-        backend.reset();
+        if (generation == backendGeneration) backend.reset();
         return false;
     }
 
     nextLocalNetworkId = FirstIdForPlayer(backend->localPlayerId());
     running = true;
     log(LogLevel::Info, "[Network] Session started: " + describeConfig());
-    return true;
+    return generation == backendGeneration;
 }
 
 void NetworkSession::shutdown() {
-    if (backend) {
-        backend->shutdown();
-        backend.reset();
-    }
+    ++backendGeneration; // Reject callbacks still queued by the previous session.
+    auto previousBackend = std::move(backend);
+    if (previousBackend) previousBackend->shutdown();
     objects.clear();
     syncStates.clear();
     rpcHandlers.clear();
@@ -154,7 +177,9 @@ void NetworkSession::shutdown() {
 }
 
 void NetworkSession::tick(float deltaSeconds) {
-    if (!backend) return;
+    const auto activeBackend = backend;
+    const uint64_t generation = backendGeneration;
+    if (!activeBackend) return;
 
     clock += deltaSeconds;
 
@@ -163,7 +188,8 @@ void NetworkSession::tick(float deltaSeconds) {
         budgetWindowBytes = 0;
     }
 
-    backend->tick(deltaSeconds);
+    activeBackend->tick(deltaSeconds);
+    if (generation != backendGeneration) return;
 
     if (inRoom()) {
         sendOwnedTransforms(deltaSeconds);
@@ -195,6 +221,8 @@ SceneObject* NetworkSession::findSceneObject(int sceneObjectId) {
 }
 
 void NetworkSession::sendOwnedTransforms(float) {
+    const auto activeBackend = backend;
+    const uint64_t generation = backendGeneration;
     if (!scene.valid()) return;
 
     for (auto& entry : objects) {
@@ -276,13 +304,15 @@ void NetworkSession::sendOwnedTransforms(float) {
             continue;
         }
 
-        if (backend->sendEvent(EventCode::kStateSync, writer.data(),
+        if (activeBackend->sendEvent(EventCode::kStateSync, writer.data(),
                                RpcTarget::Others, SendMode::Unreliable)) {
+            if (generation != backendGeneration) return;
             budgetWindowBytes += packetBytes;
             stats.bytesSent += packetBytes;
             ++stats.packetsSent;
         }
 
+        if (generation != backendGeneration) return;
         sync.lastSendTime = clock;
         sync.hasLastSent = true;
         std::copy(position, position + 3, sync.lastSentPosition);
@@ -339,6 +369,8 @@ void NetworkSession::clearAvatarPoses(PlayerId player) {
 }
 
 void NetworkSession::sendAvatarPoses() {
+    const auto activeBackend = backend;
+    const uint64_t generation = backendGeneration;
     if (!backend || !localAvatarLive) return;
 
     const int rate = std::max(1, config.serializationRateHz);
@@ -375,13 +407,14 @@ void NetworkSession::sendAvatarPoses() {
         return;
     }
 
-    if (backend->sendEvent(EventCode::kAvatarPose, writer.data(),
+    if (activeBackend->sendEvent(EventCode::kAvatarPose, writer.data(),
                            RpcTarget::Others, SendMode::Unreliable)) {
+        if (generation != backendGeneration) return;
         budgetWindowBytes += packetBytes;
         stats.bytesSent += packetBytes;
         ++stats.packetsSent;
     }
-    lastAvatarSendTime = clock;
+    if (generation == backendGeneration) lastAvatarSendTime = clock;
 }
 
 void NetworkSession::handleAvatarPose(PlayerId sender, Reader& reader) {
@@ -545,9 +578,9 @@ const char* NetworkSession::backendName() const {
     return backend ? backend->name() : "None";
 }
 
-bool NetworkSession::connect() { return backend && backend->connect(); }
-void NetworkSession::disconnect() { if (backend) backend->disconnect(); }
-bool NetworkSession::reconnect() { return backend && backend->reconnect(); }
+bool NetworkSession::connect() { const auto active = backend; return active && active->connect(); }
+void NetworkSession::disconnect() { const auto active = backend; if (active) active->disconnect(); }
+bool NetworkSession::reconnect() { const auto active = backend; return active && active->reconnect(); }
 
 ConnectionState NetworkSession::state() const {
     return backend ? backend->state() : ConnectionState::Disconnected;
@@ -560,8 +593,8 @@ const std::string& NetworkSession::region() const {
     return backend ? backend->region() : kNone;
 }
 
-bool NetworkSession::joinLobby() { return backend && backend->joinLobby(); }
-bool NetworkSession::refreshRoomList() { return backend && backend->refreshRoomList(); }
+bool NetworkSession::joinLobby() { const auto active = backend; return active && active->joinLobby(); }
+bool NetworkSession::refreshRoomList() { const auto active = backend; return active && active->refreshRoomList(); }
 
 const std::vector<RoomInfo>& NetworkSession::roomList() const {
     static const std::vector<RoomInfo> kEmpty;
@@ -569,16 +602,19 @@ const std::vector<RoomInfo>& NetworkSession::roomList() const {
 }
 
 bool NetworkSession::createRoom(const std::string& name, const RoomOptions& options) {
-    return backend && backend->createRoom(name, options);
+    const auto active = backend;
+    return active && active->createRoom(name, options);
 }
 bool NetworkSession::joinRoom(const std::string& name) {
-    return backend && backend->joinRoom(name);
+    const auto active = backend;
+    return active && active->joinRoom(name);
 }
 bool NetworkSession::joinOrCreateRoom(const std::string& name, const RoomOptions& options) {
-    return backend && backend->joinOrCreateRoom(name, options);
+    const auto active = backend;
+    return active && active->joinOrCreateRoom(name, options);
 }
-bool NetworkSession::joinRandomRoom() { return backend && backend->joinRandomRoom(); }
-bool NetworkSession::leaveRoom() { return backend && backend->leaveRoom(); }
+bool NetworkSession::joinRandomRoom() { const auto active = backend; return active && active->joinRandomRoom(); }
+bool NetworkSession::leaveRoom() { const auto active = backend; return active && active->leaveRoom(); }
 
 const std::vector<NetworkPlayer>& NetworkSession::players() const {
     static const std::vector<NetworkPlayer> kEmpty;
@@ -590,13 +626,15 @@ PlayerId NetworkSession::localPlayerId() const {
 PlayerId NetworkSession::hostPlayerId() const {
     return backend ? backend->hostPlayerId() : kInvalidPlayerId;
 }
-bool NetworkSession::isHost() const { return backend && backend->isHost(); }
-bool NetworkSession::setNickname(const std::string& n) { return backend && backend->setNickname(n); }
+bool NetworkSession::isHost() const { const auto active = backend; return active && active->isHost(); }
+bool NetworkSession::setNickname(const std::string& n) { const auto active = backend; return active && active->setNickname(n); }
 bool NetworkSession::setPlayerProperty(const std::string& k, const std::string& v) {
-    return backend && backend->setPlayerProperty(k, v);
+    const auto active = backend;
+    return active && active->setPlayerProperty(k, v);
 }
 bool NetworkSession::setRoomProperty(const std::string& k, const std::string& v) {
-    return backend && backend->setRoomProperty(k, v);
+    const auto active = backend;
+    return active && active->setRoomProperty(k, v);
 }
 
 NetworkId NetworkSession::allocateNetworkId() { return nextLocalNetworkId++; }
@@ -607,6 +645,8 @@ NetworkId NetworkSession::spawn(const std::string& assetId,
                                 const float scale[3],
                                 NetworkId parent,
                                 bool spawnDisabled) {
+    const auto activeBackend = backend;
+    const uint64_t generation = backendGeneration;
     if (!backend) {
         fail(ErrorCode::BackendUnavailable, "No networking backend.");
         return kInvalidNetworkId;
@@ -629,6 +669,7 @@ NetworkId NetworkSession::spawn(const std::string& assetId,
 
     const size_t before = objects.size();
     applySpawn(request, true);
+    if (generation != backendGeneration) return kInvalidNetworkId;
     if (objects.size() == before) {
         return kInvalidNetworkId;
     }
@@ -636,13 +677,15 @@ NetworkId NetworkSession::spawn(const std::string& assetId,
     if (inRoom()) {
         Writer writer;
         writer.writeSpawnRequest(request);
-        backend->sendEvent(EventCode::kSpawn, writer.data(),
+        activeBackend->sendEvent(EventCode::kSpawn, writer.data(),
                            RpcTarget::OthersBuffered, SendMode::Reliable);
     }
     return request.networkId;
 }
 
 void NetworkSession::applySpawn(const SpawnRequest& request, bool local) {
+    const auto activeBackend = backend;
+    const uint64_t generation = backendGeneration;
     if (!scene.valid()) {
         fail(ErrorCode::OperationFailed, "Spawn without a valid scene bridge.");
         return;
@@ -701,10 +744,12 @@ void NetworkSession::applySpawn(const SpawnRequest& request, bool local) {
         "[Network] Spawned network object " + std::to_string(request.networkId) +
         " from " + request.assetId + (local ? " (local)" : " (remote)") +
         ", owner " + std::to_string(request.owner));
-    if (onObjectSpawned) onObjectSpawned(request.networkId);
+    if (generation == backendGeneration && onObjectSpawned) onObjectSpawned(request.networkId);
 }
 
 bool NetworkSession::despawn(NetworkId networkId) {
+    const auto activeBackend = backend;
+    const uint64_t generation = backendGeneration;
     auto it = objects.find(networkId);
     if (it == objects.end()) {
         fail(ErrorCode::OperationFailed, "Despawn: unknown network id.");
@@ -718,9 +763,10 @@ bool NetworkSession::despawn(NetworkId networkId) {
     if (inRoom() && backend) {
         Writer writer;
         writer.writeNetworkId(networkId);
-        backend->sendEvent(EventCode::kDespawn, writer.data(),
+        activeBackend->sendEvent(EventCode::kDespawn, writer.data(),
                            RpcTarget::OthersBuffered, SendMode::Reliable);
     }
+    if (generation != backendGeneration) return false;
     applyDespawn(networkId);
     return true;
 }
@@ -739,6 +785,8 @@ void NetworkSession::applyDespawn(NetworkId networkId) {
 }
 
 bool NetworkSession::transferOwnership(NetworkId networkId, PlayerId newOwner) {
+    const auto activeBackend = backend;
+    const uint64_t generation = backendGeneration;
     auto it = objects.find(networkId);
     if (it == objects.end()) {
         fail(ErrorCode::OperationFailed, "Ownership transfer: unknown network id.");
@@ -756,12 +804,13 @@ bool NetworkSession::transferOwnership(NetworkId networkId, PlayerId newOwner) {
         Writer writer;
         writer.writeNetworkId(networkId);
         writer.writePlayerId(newOwner);
-        backend->sendEvent(EventCode::kOwnershipTransfer, writer.data(),
+        activeBackend->sendEvent(EventCode::kOwnershipTransfer, writer.data(),
                            RpcTarget::OthersBuffered, SendMode::Reliable);
     }
+    if (generation != backendGeneration) return false;
     log(LogLevel::Info, "[Network] Object " + std::to_string(networkId) +
                         " ownership transferred to player " + std::to_string(newOwner) + ".");
-    if (onOwnershipChanged) onOwnershipChanged(networkId, newOwner);
+    if (generation == backendGeneration && onOwnershipChanged) onOwnershipChanged(networkId, newOwner);
     return true;
 }
 
@@ -819,10 +868,16 @@ bool NetworkSession::callRpc(const std::string& name,
         Reader reader(packet.data());
         reader.readString();
         auto it = rpcHandlers.find(name);
-        if (it != rpcHandlers.end()) it->second(localPlayerId(), reader);
+        if (it != rpcHandlers.end()) {
+            // A handler may unregister itself or shut down the session. Keep
+            // its captures alive until the active invocation returns.
+            auto handler = it->second;
+            handler(localPlayerId(), reader);
+        }
         return true;
     }
-    return backend->sendEvent(EventCode::kRpc, packet.data(), target, mode, targetPlayer);
+    const auto active = backend;
+    return active->sendEvent(EventCode::kRpc, packet.data(), target, mode, targetPlayer);
 }
 
 void NetworkSession::handleEvent(PlayerId sender, uint8_t code, const std::vector<uint8_t>& payload) {
@@ -882,7 +937,8 @@ void NetworkSession::handleEvent(PlayerId sender, uint8_t code, const std::vecto
             if (it == rpcHandlers.end()) {
                 return;
             }
-            it->second(sender, reader);
+            auto handler = it->second;
+            handler(sender, reader);
             return;
         }
         default:

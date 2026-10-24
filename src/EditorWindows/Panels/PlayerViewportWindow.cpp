@@ -1,5 +1,7 @@
 #include "Engine.h"
 #include "ViewportRenderHelpers.h"
+#include "UIControls.h"
+#include "UILayout.h"
 #include "GizmoToolbar.h"
 #include <algorithm>
 #include <array>
@@ -277,6 +279,7 @@ void Engine::renderPlayerViewport() {
       }
     };
 
+    const UILayout::Context uiLayout(sceneObjects);
     auto resolveUIRect = [&](const SceneObject &obj, ImVec2 &outMin,
                              ImVec2 &outMax) {
       std::vector<const SceneObject *> chain;
@@ -310,17 +313,19 @@ void Engine::renderPlayerViewport() {
       };
       for (const SceneObject *node : chain) {
         glm::vec2 nodeSizeWorld = getSpriteDisplaySize(*node);
+        const auto placement = uiLayout.Resolve(*node, glm::vec2((regionMax.x - regionMin.x) / std::max(.001f, uiScaleX), (regionMax.y - regionMin.y) / std::max(.001f, uiScaleY)), nodeSizeWorld);
+        nodeSizeWorld = placement.size;
         ImVec2 size = ImVec2(std::max(1.0f, nodeSizeWorld.x * uiScaleX),
                              std::max(1.0f, nodeSizeWorld.y * uiScaleY));
         ImVec2 anchorPoint =
-            anchorToPoint(node->ui.anchor, regionMin, regionMax);
+            anchorToPoint(placement.anchor, regionMin, regionMax);
         ImVec2 anchorWorld = rotAbout(anchorPoint, parentCenter, accumRot);
-        ImVec2 off = rotDir(ImVec2(node->ui.position.x * uiScaleX,
-                                   node->ui.position.y * uiScaleY),
+        ImVec2 off = rotDir(ImVec2(placement.position.x * uiScaleX,
+                                   placement.position.y * uiScaleY),
                             accumRot);
         ImVec2 pivot(anchorWorld.x + off.x, anchorWorld.y + off.y);
         const float nodeRot = accumRot + glm::radians(node->ui.rotation);
-        ImVec2 pivotOffset = anchorToPivot(node->ui.anchor, size);
+        ImVec2 pivotOffset = anchorToPivot(placement.anchor, size);
         ImVec2 centerOff = rotDir(ImVec2(size.x * 0.5f - pivotOffset.x,
                                          size.y * 0.5f - pivotOffset.y),
                                   nodeRot);
@@ -395,7 +400,7 @@ void Engine::renderPlayerViewport() {
     glm::vec2 worldViewMax =
         useWorldUi ? uiWorldCamera.ScreenToWorld(glm::vec2(overlaySize.x, 0.0f))
                    : glm::vec2(0.0f);
-    auto resolveUIRectWorld = [&](const SceneObject &obj, ImVec2 &outMin,
+    auto resolveUIRectWorldLegacy = [&](const SceneObject &obj, ImVec2 &outMin,
                                   ImVec2 &outMax) {
       if (obj.type == ObjectType::Sprite25D && hasProjectedUiCamera) {
         return ResolveProjectedSprite25DRect(obj, projectedUiView,
@@ -419,6 +424,10 @@ void Engine::renderPlayerViewport() {
       outMin = ImVec2(std::min(s0.x, s1.x), std::min(s0.y, s1.y));
       outMax = ImVec2(std::max(s0.x, s1.x), std::max(s0.y, s1.y));
       return true;
+    };
+    auto resolveUIRectWorld = [&](const SceneObject& obj, ImVec2& outMin, ImVec2& outMax) {
+      return UILayout::ResolveWorldRect(uiLayout, obj, outMin, outMax, resolveUIRectWorldLegacy,
+          [&](const SceneObject& node) { return getSpriteDisplaySize(node); });
     };
     struct CachedPlayerUiWorldRect {
       bool resolved = false;
@@ -475,6 +484,7 @@ void Engine::renderPlayerViewport() {
         continue;
       if (!isUIType(obj) && !ViewportRenderHelpers::IsAssemblageLayerDrawable(obj))
         continue;
+      if (!UIControls::ContentVisible(obj, sceneObjects)) continue;
       uiDrawList.push_back(&obj);
     }
     if (uiDrawList.size() > 1) {
@@ -510,8 +520,7 @@ void Engine::renderPlayerViewport() {
             cached.max = parentMask.max;
           }
 
-          if (parent->hasUI && parent->ui.type == UIElementType::Canvas &&
-              parent->ui.maskChildren) {
+          if (parent->hasUI && ClipsUIChildren(parent->ui)) {
             ImVec2 canvasMin, canvasMax;
             bool hasCanvasRect = true;
             if (useWorldUi || parent->type == ObjectType::Sprite25D) {
@@ -536,10 +545,7 @@ void Engine::renderPlayerViewport() {
         }
       }
 
-      if (cached.hasMask &&
-          (cached.max.x <= cached.min.x || cached.max.y <= cached.min.y)) {
-        cached.hasMask = false;
-      }
+
       return cached;
     };
     auto resolveCanvasMaskRectForObject =
@@ -1183,7 +1189,14 @@ void Engine::renderPlayerViewport() {
         spriteBatch.flush();
         EmitRuntimeUiBackdropBlur(ImGui::GetWindowDrawList(), obj, drawMin, drawMax);
       }
-      if (obj.ui.type == UIElementType::Image ||
+      if (IsExtendedUIType(obj.ui.type)) {
+        spriteBatch.flush();
+        Texture* panelTexture = rendererInitialized && obj.ui.type == UIElementType::Panel && !obj.albedoTexturePath.empty()
+            ? renderer.getTexture(obj.albedoTexturePath, obj.material.textureFilter) : nullptr;
+        UIControls::Draw(obj, sceneObjects, drawMin, drawMax, true,
+            panelTexture ? (ImTextureID)(intptr_t)panelTexture->GetID() : (ImTextureID)0,
+            [&](SceneObject& panel, ImVec2 min, ImVec2 max) { renderDockedUiCanvas(panel, min, max); });
+      } else if (obj.ui.type == UIElementType::Image ||
           obj.ui.type == UIElementType::Sprite2D) {
         if (light2DRenderedObjectIds.find(obj.id) !=
             light2DRenderedObjectIds.end()) {
@@ -1472,6 +1485,8 @@ void Engine::renderPlayerViewport() {
           ImGui::PopClipRect();
         }
       }
+      if (!IsExtendedUIType(obj.ui.type) && !obj.ui.tooltip.empty() && ImGui::IsMouseHoveringRect(drawMin, drawMax))
+        ImGui::SetTooltip("%s", obj.ui.tooltip.c_str());
       if (pushedCanvasMask) {
         spriteBatch.flush();
         ImGui::PopClipRect();
@@ -1611,7 +1626,7 @@ void Engine::renderPlayerViewport() {
       if (!IsObjectEnabledInHierarchy(canvas) || !canvas.hasUI ||
           canvas.ui.type != UIElementType::Canvas || canvas.ui.renderIn3D ||
           !canvas.ui.pseudo3DEnabled ||
-          !canvas.ui.pseudo3DUseOffscreenSurface) {
+          !canvas.ui.pseudo3DUseOffscreenSurface || UIControls::IsDockedCanvas(canvas, sceneObjects)) {
         continue;
       }
 

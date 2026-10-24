@@ -114,7 +114,7 @@ bool ValidateMMeshAsset(const MMeshAsset& inputAsset, std::string& error) {
             return false;
         }
         if (surface.indexOffset > asset.indices.size() ||
-            surface.indexOffset + surface.indexCount > asset.indices.size()) {
+            surface.indexCount > asset.indices.size() - surface.indexOffset) {
             error = "MMesh surface range is outside the index buffer";
             return false;
         }

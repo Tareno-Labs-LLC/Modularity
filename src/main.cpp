@@ -162,6 +162,11 @@ static int ModularityMain(int argc, char** argv) {
     logStartupDebug("[DEBUG] Starting engine initialization...");
     Engine engine;
     engine.setStartupProjectPath(startupProjectPathFromArgs(argc, argv));
+#if !MODULARITY_RUNTIME_ONLY
+    for (int i = 1; i < argc; ++i) {
+      if (std::string(argv[i]) == "--vr-editor") engine.setVREditorMode(true);
+    }
+#endif
     for (int i = 1; i < argc; ++i) {
       const std::string a = (argv && argv[i]) ? argv[i] : "";
       if (a == "--play") { engine.setAutoPlayDevMode(true); break; }

@@ -29,7 +29,7 @@ Engine stack and architecture:
 - Windowing and input use GLFW
 - Math uses GLM
 - Editor UI uses ImGui
-- Transform/editor gizmos use ImGuizmo
+- Transform/editor gizmos use ModuGuizmo (ImGuizmo-compatible API)
 - Audio uses miniaudio.h
 - Prefer integrating with these existing libraries instead of introducing replacements
 - Do not replace existing engine subsystems just to solve a local problem

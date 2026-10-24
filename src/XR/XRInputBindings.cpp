@@ -1,4 +1,5 @@
 #include "XRInputBindings.h"
+#include <array>
 
 namespace Modularity::XR {
 
@@ -135,7 +136,20 @@ constexpr XRProfileBindings kProfileTables[] = {
 
 } // namespace
 
-const XRProfileBindings* GetProfileBindings(XRInteractionProfile profile) {
+const XRProfileBindings* GetProfileBindings(XRInteractionProfile profile, bool editorWorkspace) {
+    // Index squeeze/value measures finger closure. Editor grabs need deliberate
+    // pressure, while the project's gameplay bindings keep their original input.
+    static constexpr auto editorIndexEntries = [] {
+        auto entries = std::to_array(kValveIndexEntries);
+        for (auto& entry : entries)if(entry.slot == XRActionSlot::GripValue) {
+            entry.leftPath = "/user/hand/left/input/squeeze/force";
+            entry.rightPath = "/user/hand/right/input/squeeze/force";
+        }
+        return entries;
+    }();
+    static const XRProfileBindings editorIndex = { XRInteractionProfile::ValveIndex,
+        "/interaction_profiles/valve/index_controller", editorIndexEntries.data(), editorIndexEntries.size() };
+    if(editorWorkspace && profile == XRInteractionProfile::ValveIndex)return &editorIndex;
     for (const XRProfileBindings& table : kProfileTables) {
         if (table.profile == profile) return &table;
     }

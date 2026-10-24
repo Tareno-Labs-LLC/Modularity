@@ -241,7 +241,7 @@ Two ways to animate:
 
 ## 13) Editor and Workflow
 ### Core editor areas
-The editor is built on Dear ImGui + ImGuizmo. A typical session moves through:
+The editor is built on Dear ImGui + ModuGuizmo (with an ImGuizmo-compatible API). A typical session moves through:
 - **Launcher**: create or open a project.
 - **Hierarchy**: the scene's object list and parent/child relationships.
 - **Inspector**: edit components and run script inspectors.

@@ -56,8 +56,22 @@ enum class UIElementType {
     Slider = 3,
     Button = 4,
     Text = 5,
-    Sprite2D = 6
+    Sprite2D = 6,
+    Panel = 7, InputField, Toggle, RadioGroup, ProgressBar, RangeSlider,
+    Separator, SearchField, ScrollView, Scrollbar, Dropdown, ListView,
+    GridView, TreeView, MultiColumnListView, TabView, Foldout, Toolbar,
+    Breadcrumb, MenuBar, PopupMenu, Modal, ColorPicker, NumericField,
+    Vector2Field, Vector3Field, Vector4Field, EnumDropdown, ReorderableList,
+    ObjectField, LogView, SplitView, PropertyGrid, FileBrowser, Tooltip, DockContainer
 };
+
+// Append-only scene IDs. Layout is independent of the visual/control type.
+enum class UILayoutMode { None = 0, Horizontal, Vertical, Grid };
+
+inline bool IsExtendedUIType(UIElementType type) {
+    return type >= UIElementType::Panel && type <= UIElementType::DockContainer;
+}
+inline bool ClipsUIChildren(const struct UIElementComponent& ui);
 
 struct MaterialProperties {
     enum class TextureFilter {
@@ -830,7 +844,66 @@ struct UIElementComponent {
     float textRevealChars = -1.0f;
     float textRevealPopScale = 1.0f;
     float textRevealSoftness = 1.0f;
+
+    // Opt-in additions: defaults leave legacy scenes and transforms unchanged.
+    bool clipChildren = false;
+    UILayoutMode layout = UILayoutMode::None;
+    glm::vec2 spacing = glm::vec2(8.0f);
+    glm::vec4 padding = glm::vec4(0.0f); // left, top, right, bottom
+    glm::vec4 margin = glm::vec4(0.0f);
+    glm::vec2 minimumSize = glm::vec2(0.0f);
+    glm::vec2 preferredSize = glm::vec2(-1.0f);
+    glm::vec2 maximumSize = glm::vec2(65536.0f);
+    float flexibleSize = 0.0f;
+    int gridColumns = 2;
+    bool fitWidth = false;
+    bool fitHeight = false;
+    float aspectRatio = 0.0f; // >0 derives height from width
+    bool responsive = false;
+    glm::vec2 anchorMin = glm::vec2(0.0f);
+    glm::vec2 anchorMax = glm::vec2(1.0f);
+    glm::vec2 pivot = glm::vec2(0.5f);
+    float rounding = 4.0f;
+    float borderWidth = 1.0f;
+    bool checked = false;
+    std::string inputText;
+    std::string placeholder;
+    std::string tooltip;
+    bool multiline = false;
+    bool password = false;
+    float rangeUpper = 0.75f;
+    bool indeterminate = false;
+    bool vertical = false;
+    std::vector<std::string> items;
+    std::vector<int> itemParents; // TreeView: parent index, -1 = root
+    std::vector<int> expandedItems;
+    int selectedIndex = -1;
+    bool virtualize = true;
+    bool sortable = false;
+    float rowHeight = 24.0f;
+    glm::vec2 scrollOffset = glm::vec2(0.0f);
+    glm::vec2 contentSize = glm::vec2(0.0f);
+    int linkedObjectId = -1; // Scrollbar -> ScrollView, Search -> collection
+    bool open = true;
+    bool dimBackground = true;
+    glm::vec4 numericValue = glm::vec4(0.0f);
+    float numericStep = 0.1f;
+    std::string filterText; // runtime search filter
+    uint64_t valueChangeRevision = 0;
+    uint64_t inputSubmitRevision = 0;
+    bool inputSubmitted = false; // frame pulse, never serialized
+    bool valueChanged = false; // frame pulse, never serialized
+    bool uiFocused = false;
+    bool requestFocus = false;
+    std::vector<int> visibleItemIndices; // retained scratch storage, never serialized
+    std::vector<int> itemFirstChild;
+    std::vector<int> itemNextSibling;
 };
+
+inline bool ClipsUIChildren(const UIElementComponent& ui) {
+    return (ui.type == UIElementType::Canvas && ui.maskChildren) ||
+           ui.clipChildren || ui.type == UIElementType::ScrollView;
+}
 
 struct Rigidbody2DComponent {
     bool enabled = true;

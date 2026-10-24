@@ -10,6 +10,7 @@ namespace Loc = Modularity::Loc;
 #include <windows.h>
 #endif
 #include "Engine.h"
+#include "ScriptContextBinding.h"
 #include "Modu2DStats.h"
 #ifdef __ANDROID__
 #include "AndroidRuntime/AndroidRuntime.h"
@@ -54,6 +55,8 @@ namespace Loc = Modularity::Loc;
 #include "../include/Textures/TextureTranscode.h"
 #include "../include/Textures/StbFlipScope.h"
 #include "ParticleSystemRuntime.h"
+#include "DiscordPresence.h"
+#include "../include/Shaders/Gles2ShaderTranspiler.h"
 #include <set>
 #include <sstream>
 #if defined(_WIN32)
@@ -1952,7 +1955,9 @@ std::string httpPostWindows(const std::string& url,
                             const std::string& contentType,
                             const std::string& body,
                             const std::string& headers,
-                            const std::function<bool(const std::string&)>& onChunk = {}) {
+                            const std::function<bool(const std::string&)>& onChunk = {},
+                            bool* outSuccess = nullptr) {
+    if (outSuccess) *outSuccess = false;
     std::wstring host;
     std::wstring path;
     INTERNET_PORT port = 0;
@@ -2019,10 +2024,12 @@ std::string httpPostWindows(const std::string& url,
         return "WinHttpReceiveResponse failed";
     }
 
+    bool transportOk = true;
     std::string response;
     for (;;) {
         DWORD available = 0;
         if (!WinHttpQueryDataAvailable(request, &available)) {
+            transportOk = false;
             response = "WinHttpQueryDataAvailable failed";
             break;
         }
@@ -2033,12 +2040,14 @@ std::string httpPostWindows(const std::string& url,
         std::string chunk(static_cast<size_t>(available), '\0');
         DWORD read = 0;
         if (!WinHttpReadData(request, chunk.data(), available, &read)) {
+            transportOk = false;
             response = "WinHttpReadData failed";
             break;
         }
         chunk.resize(static_cast<size_t>(read));
         if (onChunk && !chunk.empty()) {
             if (!onChunk(chunk)) {
+                transportOk = false;
                 response = "HTTP request cancelled";
                 break;
             }
@@ -2048,12 +2057,14 @@ std::string httpPostWindows(const std::string& url,
 
     DWORD statusCode = 0;
     DWORD statusCodeSize = sizeof(statusCode);
-    if (WinHttpQueryHeaders(request,
+    const bool haveStatus = WinHttpQueryHeaders(request,
                             WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
                             WINHTTP_HEADER_NAME_BY_INDEX,
                             &statusCode,
                             &statusCodeSize,
-                            WINHTTP_NO_HEADER_INDEX) && statusCode >= 400) {
+                            WINHTTP_NO_HEADER_INDEX) != FALSE;
+    if (outSuccess) *outSuccess = transportOk && haveStatus && statusCode >= 200 && statusCode < 400;
+    if (haveStatus && statusCode >= 400) {
         response = "HTTP " + std::to_string(statusCode) + "\n" + response;
     }
 
@@ -3524,7 +3535,8 @@ fs::path resolveCurrentExecutablePath() {
 
 bool relaunchEditorWithBackend(Modularity::GraphicsBackend backend,
                                const fs::path& projectFile,
-                               std::string& error) {
+                               std::string& error,
+                               bool inVR = false) {
     std::error_code ec;
     fs::path normalizedProject = projectFile;
     if (normalizedProject.empty()) {
@@ -3568,13 +3580,14 @@ bool relaunchEditorWithBackend(Modularity::GraphicsBackend backend,
 
     const std::string backendValue =
         (backend == Modularity::GraphicsBackend::Vulkan) ? "vulkan" : "opengl";
+    const std::string vrArgument = inVR ? " --vr-editor" : "";
     std::string command;
 #if defined(_WIN32)
     command = "cmd /C \"set MODULARITY_RENDER_BACKEND=" + backendValue + " && start \"\" " +
-              quotePath(executablePath) + " --project " + quotePath(normalizedProject) + "\"";
+              quotePath(executablePath) + " --project " + quotePath(normalizedProject) + vrArgument + "\"";
 #else
     command = "MODULARITY_RENDER_BACKEND=" + backendValue + " " +
-              quotePath(executablePath) + " --project " + quotePath(normalizedProject) +
+              quotePath(executablePath) + " --project " + quotePath(normalizedProject) + vrArgument +
               " >/dev/null 2>&1 &";
 #endif
 
@@ -3935,24 +3948,23 @@ bool CopyCompiledScriptBinaries(const fs::path& sourceDir,
     return true;
 }
 
-// The FFmpeg libraries are LGPL: a game that ships them has to say so, carry the licence, and
-// point at the source its binaries were built from. av_version_info() names the exact upstream
-// revision ("n8.1.2-54-gc573a95381") and avcodec_configuration() the flags it was built with, so
-// the notice stays correct if the vendored build is ever swapped. Nothing is written when this
-// export ships no FFmpeg (Linux links the system libraries; Android has none).
+// Carry the notices for third-party shared libraries copied into a desktop export. The FFmpeg
+// notice also records its exact upstream revision and build configuration.
 bool WriteShippedLibraryLicenses(const fs::path& exportRoot,
                                  const fs::path& sourceRoot,
                                  const std::function<void(const std::string&)>& appendLog) {
     std::error_code ec;
     bool shipsFfmpeg = false;
+    bool shipsDiscord = false;
     for (const auto& entry : fs::directory_iterator(exportRoot, ec)) {
         const std::string name = entry.path().filename().string();
         if (name.rfind("avcodec", 0) == 0 || name.rfind("libavcodec", 0) == 0) {
             shipsFfmpeg = true;
-            break;
         }
+        if (name == "discord_partner_sdk.dll" || name == "libdiscord_partner_sdk.so" ||
+            name == "libdiscord_partner_sdk.dylib") shipsDiscord = true;
     }
-    if (!shipsFfmpeg) return true;
+    if (!shipsFfmpeg && !shipsDiscord) return true;
 
     const fs::path licensesDir = exportRoot / "licenses";
     fs::create_directories(licensesDir, ec);
@@ -3961,37 +3973,57 @@ bool WriteShippedLibraryLicenses(const fs::path& exportRoot,
         return true;
     }
 
-    const fs::path licenseSource = sourceRoot / "Resources" / "Licenses" / "FFmpeg-LICENSE.txt";
-    if (fs::exists(licenseSource, ec)) {
-        fs::copy_file(licenseSource, licensesDir / "FFmpeg-LICENSE.txt",
-                      fs::copy_options::overwrite_existing, ec);
-        if (ec) appendLog("Warning: could not copy FFmpeg-LICENSE.txt into the export.");
-    } else {
-        appendLog("Warning: Resources/Licenses/FFmpeg-LICENSE.txt is missing; the export ships "
-                  "FFmpeg without its licence text.");
+    if (shipsFfmpeg) {
+        const fs::path licenseSource = sourceRoot / "Resources" / "Licenses" / "FFmpeg-LICENSE.txt";
+        if (fs::exists(licenseSource, ec)) {
+            fs::copy_file(licenseSource, licensesDir / "FFmpeg-LICENSE.txt",
+                          fs::copy_options::overwrite_existing, ec);
+            if (ec) appendLog("Warning: could not copy FFmpeg-LICENSE.txt into the export.");
+        } else {
+            appendLog("Warning: Resources/Licenses/FFmpeg-LICENSE.txt is missing; the export ships "
+                      "FFmpeg without its licence text.");
+        }
+
+        std::ofstream notice(licensesDir / "FFmpeg-NOTICE.txt", std::ios::trunc);
+        if (notice.is_open()) {
+            const std::string version = Modularity::AudioExport::FfmpegVersion();
+            notice << "This program uses libraries from the FFmpeg project (libavcodec, libavformat,\n"
+                      "libavutil, libswresample, libswscale) under the GNU Lesser General Public\n"
+                      "License version 3 or later. The full licence is in FFmpeg-LICENSE.txt.\n\n";
+            notice << "FFmpeg version: " << (version.empty() ? "unknown" : version) << "\n";
+            const size_t revision = version.rfind("-g");
+            if (revision != std::string::npos) {
+                const size_t end = version.find('-', revision + 2);
+                notice << "Source code:    https://github.com/FFmpeg/FFmpeg/commit/"
+                       << version.substr(revision + 2, end == std::string::npos ? end : end - revision - 2)
+                       << "\n";
+            }
+            notice << "Also available from https://ffmpeg.org/download.html\n\n";
+            notice << "The libraries are unmodified upstream builds, configured with:\n"
+                   << Modularity::AudioExport::FfmpegConfiguration() << "\n\n";
+            notice << "They ship as separate files beside the executable and may be replaced with\n"
+                      "compatible builds of the same versions.\n";
+        }
+        appendLog("Wrote FFmpeg LGPL licence and notice to the export's licenses folder.");
     }
 
-    std::ofstream notice(licensesDir / "FFmpeg-NOTICE.txt", std::ios::trunc);
-    if (notice.is_open()) {
-        const std::string version = Modularity::AudioExport::FfmpegVersion();
-        notice << "This program uses libraries from the FFmpeg project (libavcodec, libavformat,\n"
-                  "libavutil, libswresample, libswscale) under the GNU Lesser General Public\n"
-                  "License version 3 or later. The full licence is in FFmpeg-LICENSE.txt.\n\n";
-        notice << "FFmpeg version: " << (version.empty() ? "unknown" : version) << "\n";
-        const size_t revision = version.rfind("-g");
-        if (revision != std::string::npos) {
-            const size_t end = version.find('-', revision + 2);
-            notice << "Source code:    https://github.com/FFmpeg/FFmpeg/commit/"
-                   << version.substr(revision + 2, end == std::string::npos ? end : end - revision - 2)
-                   << "\n";
+    if (shipsDiscord) {
+        const fs::path noticeSource = sourceRoot / "src" / "ThirdParty" /
+                                      "DiscordSocialSdk" / "License-Notices.txt";
+        const fs::path discordLicenseDir = licensesDir / "DiscordSocialSdk";
+        bool copiedNotice = false;
+        fs::create_directories(discordLicenseDir, ec);
+        if (!ec && fs::exists(noticeSource, ec)) {
+            fs::copy_file(noticeSource, discordLicenseDir / "License-Notices.txt",
+                          fs::copy_options::overwrite_existing, ec);
+            copiedNotice = !ec;
         }
-        notice << "Also available from https://ffmpeg.org/download.html\n\n";
-        notice << "The libraries are unmodified upstream builds, configured with:\n"
-               << Modularity::AudioExport::FfmpegConfiguration() << "\n\n";
-        notice << "They ship as separate files beside the executable and may be replaced with\n"
-                  "compatible builds of the same versions.\n";
+        if (!copiedNotice) {
+            appendLog("Warning: could not copy Discord Social SDK license notices into the export.");
+        } else {
+            appendLog("Copied Discord Social SDK license notices into the export.");
+        }
     }
-    appendLog("Wrote FFmpeg LGPL licence and notice to the export's licenses folder.");
     return true;
 }
 
@@ -4223,11 +4255,16 @@ bool RemapSkyboxSettingsForRuntime(SkyboxSettings& settings,
     return true;
 }
 
+// The vertex/fragment pair each staged object draws with, as the staged scene spells it, so
+// the player can look them up in its shader cache under the exact same key.
+using RuntimeShaderPairs = std::set<std::pair<std::string, std::string>>;
+
 bool StageRuntimeScene(const fs::path& sourceScenePath,
                        const std::string& sceneName,
                        RuntimeExportStager& stager,
                        const fs::path& runtimeRoot,
-                       std::string& error) {
+                       std::string& error,
+                       RuntimeShaderPairs* shaderPairs = nullptr) {
     std::vector<SceneObject> sceneObjects;
     int nextId = 0;
     int sceneVersion = 20;
@@ -4243,6 +4280,9 @@ bool StageRuntimeScene(const fs::path& sourceScenePath,
         if (!RemapSceneObjectForRuntime(obj, stager, error)) {
             error = "Scene '" + sceneName + "': " + error;
             return false;
+        }
+        if (shaderPairs && obj.hasRenderer && obj.renderType != RenderType::None) {
+            shaderPairs->emplace(obj.vertexShaderPath, obj.fragmentShaderPath);
         }
     }
     stager.setReferenceOwner("Scene '" + sceneName + "' skybox");
@@ -4263,6 +4303,79 @@ bool StageRuntimeScene(const fs::path& sourceScenePath,
         error = "Failed to save staged runtime scene: " + runtimeScenePath.string();
         return false;
     }
+    return true;
+}
+
+// Writes what the player needs to have its shaders ready before the first scene draws:
+//  - Resources/Shaders/preload.list, one "vert|frag" pair per line (empty = the default
+//    material shader), which Engine::preloadRuntimeShaders compiles at boot;
+//  - for GLES 2, a <name>.es2.glsl sibling for every stage those pairs use, plus the skybox.
+// A shader that will not convert is a warning, not a failed export: the rest of the game
+// still runs, and the log says which object's look is affected.
+bool StageRuntimeShaderPrograms(const fs::path& runtimeRoot,
+                                const RuntimeShaderPairs& pairs,
+                                bool gles2Shaders,
+                                bool preloadShaders,
+                                const std::function<void(const std::string&)>& log,
+                                std::string& error) {
+    if (!gles2Shaders && !preloadShaders) return true;
+
+    const fs::path listPath = runtimeRoot / "Resources" / "Shaders" / "preload.list";
+    if (!EnsureDirectoryForFile(listPath, error)) return false;
+    {
+        std::ofstream out(listPath, std::ios::binary | std::ios::trunc);
+        if (!out.is_open()) {
+            error = "Failed to write " + listPath.string();
+            return false;
+        }
+        for (const auto& [vert, frag] : pairs) {
+            out << vert << "|" << frag << "\n";
+        }
+    }
+    log("Shader preload: " + std::to_string(pairs.size()) + " program(s) listed for boot.");
+    if (!gles2Shaders) return true;
+
+    const std::string defaultVert = "Resources/Shaders/vert.glsl";
+    const std::string defaultFrag = "Resources/Shaders/frag.glsl";
+    std::set<std::pair<std::string, Modularity::Gles2ShaderStage>> stages;
+    for (const auto& [vert, frag] : pairs) {
+        stages.emplace(vert.empty() ? defaultVert : vert, Modularity::Gles2ShaderStage::Vertex);
+        stages.emplace(frag.empty() ? defaultFrag : frag, Modularity::Gles2ShaderStage::Fragment);
+    }
+    stages.emplace("Resources/Shaders/skybox_vert.glsl", Modularity::Gles2ShaderStage::Vertex);
+    stages.emplace("Resources/Shaders/skybox_frag.glsl", Modularity::Gles2ShaderStage::Fragment);
+
+    int converted = 0;
+    int failed = 0;
+    for (const auto& [shaderPath, stage] : stages) {
+        fs::path staged(shaderPath);
+        if (staged.is_relative()) staged = runtimeRoot / staged;
+        std::ifstream in(staged, std::ios::binary);
+        if (!in.is_open()) {
+            log("Warning: GLES 2.0: shader '" + shaderPath + "' is not in the build, skipped.");
+            ++failed;
+            continue;
+        }
+        std::stringstream source;
+        source << in.rdbuf();
+        const Modularity::Gles2TranspileResult result =
+            Modularity::TranspileShaderToGles2(source.str(), stage);
+        if (!result.success) {
+            log("Warning: GLES 2.0: '" + shaderPath + "' was not converted: " + result.error);
+            ++failed;
+            continue;
+        }
+        const fs::path es2Path(Modularity::Gles2ShaderSiblingPath(staged.string()));
+        std::ofstream out(es2Path, std::ios::binary | std::ios::trunc);
+        if (!out.is_open()) {
+            error = "Failed to write " + es2Path.string();
+            return false;
+        }
+        out << result.source;
+        ++converted;
+    }
+    log("GLES 2.0 shaders: " + std::to_string(converted) + " converted" +
+        (failed > 0 ? ", " + std::to_string(failed) + " skipped (see warnings above)" : std::string()) + ".");
     return true;
 }
 
@@ -5822,6 +5935,10 @@ void Engine::applyPresentationSettings() {
 }
 
 void Engine::paceFrame(double frameStart) {
+    if (xrSystem.isRunning()) {
+        framePacingDeadline = framePacingInterval = 0.0;
+        return; // xrWaitFrame owns headset pacing, independent of the desktop cap.
+    }
     const bool presentationIsVSyncPaced =
         !usingVulkan() &&
         (playerMode
@@ -5905,6 +6022,11 @@ void Engine::onWindowResized(int width, int height) {
 }
 
 bool Engine::init() {
+#if !MODULARITY_RUNTIME_ONLY
+    // Read preview mode before any OpenXR initialization (including --vr-editor).
+    if(const char* value=std::getenv("MODULARITY_VR_EDITOR");value && *value && *value!='0')vrEditor.requested=true;
+    if(const char* value=std::getenv("MODULARITY_VR_EDITOR_PREVIEW");value && *value && *value!='0')vrEditor.requested=vrEditor.preview=true;
+#endif
 #if defined(_WIN32) && !defined(__ANDROID__)
     {
         // Test the STREAM, not the OS handle.
@@ -6275,6 +6397,9 @@ void Engine::run() {
         const auto __frameWall = std::chrono::steady_clock::now();
         ++renderFrameSerial;
         renderer.setFrameSerial(renderFrameSerial);
+        Modularity::DiscordPresence::Tick(projectManager.currentProject,
+                                          playerMode || isPlaying,
+                                          playerMode);
 
         {
             const double weatherNow = glfwGetTime();
@@ -6395,6 +6520,9 @@ void Engine::run() {
         pollSceneLoad();
 
         updateXRSystem();
+#if !MODULARITY_RUNTIME_ONLY
+        if (!playerMode) updateVREditorShortcut();
+#endif
         updateXRComponents(deltaTime);
 
         if (autoPlayOnLoad_ && !isPlaying && !showLauncher &&
@@ -6490,6 +6618,14 @@ void Engine::run() {
                 updateScripts(gameDeltaTime);
             }
             updateNetworking(deltaTime);
+        }
+
+        // Scripts consume the previous frame's UI events. Clear transient state
+        // once before rendering, including controls that are now hidden or clipped.
+        for (SceneObject& obj : sceneObjects) {
+            if (!obj.hasUI || !IsExtendedUIType(obj.ui.type)) continue;
+            obj.ui.buttonPressed = obj.ui.inputSubmitted = obj.ui.valueChanged = false;
+            obj.ui.uiHovered = obj.ui.uiActive = obj.ui.uiFocused = false;
         }
 
         if (isPlaying) {
@@ -6783,7 +6919,7 @@ void Engine::run() {
         }
 
 #if !MODULARITY_RUNTIME_ONLY
-        if (!playerMode && isPlaying) {
+        if (!playerMode && isPlaying && !vrEditor.requested) {
             xrFrameSubmitted = xrSystem.isRunning() && renderXRFrame();
         }
 #endif
@@ -6879,6 +7015,11 @@ void Engine::run() {
             if (!playerMode) updateVersionControl();
 #endif
 
+#if !MODULARITY_RUNTIME_ONLY
+            if (!playerMode && isVREditorActive()) {
+                renderVREditorMonitor();
+            } else
+#endif
             if (showLauncher) {
                 mainDockspaceId = 0;
                 #ifdef MODULARITY_PLAYER
@@ -6967,6 +7108,7 @@ void Engine::run() {
 
             if (!playerMode) {
 #if !MODULARITY_RUNTIME_ONLY
+                if (!isVREditorActive()) {
                 renderTermsOfServiceModal();
                 renderWindowsDisclaimerPopup();
                 renderLowSpecBenchmarkPopup();
@@ -6979,6 +7121,7 @@ void Engine::run() {
                 renderModuObjExportDialog();
                 renderModuObjImportDialog();
                 renderModuObjEditorBar();
+                }
 #endif
             }
         }
@@ -7004,6 +7147,19 @@ void Engine::run() {
             MODU_PROFILE_SCOPE("ImGui Render", ProfilerSampleCategory::UI);
             ImGui::Render();
         }
+#if !MODULARITY_RUNTIME_ONLY
+        if (!playerMode && vrEditor.requested) {
+            if (xrSystem.isRunning()) xrFrameSubmitted = renderXRFrame();
+            else if (vrEditor.preview) {
+                const auto previewInput=vrEditor.previewInputState();
+                renderVREditorUI(previewInput);
+                const bool previewScene=rendererInitialized && projectManager.currentProject.isLoaded && !showLauncher && !sceneLoadInProgress;
+                vrEditor.renderPreview(renderer,previewScene?&camera:nullptr,previewScene?&sceneObjects:nullptr,
+                                       buildSettings.editorCameraNear,buildSettings.editorCameraFar);
+                applyVREditorActions();
+            } else applyVREditorActions(); // The monitor remains usable while XR is starting.
+        }
+#endif
         const auto __renderImGuiEnd = std::chrono::steady_clock::now();
         {
             const double __c3DMs = std::chrono::duration<double, std::milli>(__renderImGuiStart - __uiC3DStart).count();
@@ -7040,6 +7196,8 @@ void Engine::run() {
 #else
             glfwGetFramebufferSize(editorWindow, &displayW, &displayH);
 #endif
+            // Desktop UI always belongs to the window, never an offscreen/XR eye target.
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
             glViewport(0, 0, displayW, displayH);
             glClearColor(0.1f, 0.1f, 0.12f, 1.00f);
             glClear(GL_COLOR_BUFFER_BIT);
@@ -7353,7 +7511,38 @@ void Engine::run() {
     }
 }
 
+Engine::~Engine() {
+    // Also covers exception unwinding or callers that omit shutdown(). Member
+    // futures otherwise join after the mutexes their workers use are destroyed.
+    waitForBackgroundJobs();
+    // Window is the first member and dies last. Keep the main GL context current
+    // through destruction of the renderer and the other GPU-owning members.
+    if (editorWindow && !usingVulkan()) glfwMakeContextCurrent(editorWindow);
+    g_objLoader.clear(); // These global GPU owners otherwise survive Window.
+    ModelLoader::getInstance().clear();
+}
+
+void Engine::waitForBackgroundJobs() {
+    // Export workers capture this and use exportMutex/status fields. Drain
+    // them while those fields and all backend resources are still alive.
+    // Do not hold exportMutex while waiting: the worker needs it to finish.
+    exportCancelRequested.store(true);
+    if (exportJob.future.valid()) exportJob.future.wait();
+    for (auto& worker : compileWorkers) {
+        if (worker.valid()) worker.wait();
+    }
+    compileWorkers.clear();
+}
+
 void Engine::shutdown() {
+    waitForBackgroundJobs();
+    if (editorWindow && !usingVulkan()) glfwMakeContextCurrent(editorWindow);
+    Modularity::DiscordPresence::Shutdown();
+    shutdownXRSystem();
+#if !MODULARITY_RUNTIME_ONLY
+    uiFontContexts.erase(vrEditor.context());
+    vrEditor.shutdown();
+#endif
     ImGuiContext* mainContext = ImGui::GetCurrentContext();
     if (mainContext && !playerMode && projectManager.currentProject.isLoaded && !showLauncher) {
         saveEditorUserSettings();
@@ -7371,11 +7560,6 @@ void Engine::shutdown() {
     }
     Modularity::FlushDurableWrites();
 
-    for (auto& worker : compileWorkers) {
-        if (worker.valid()) worker.wait();
-    }
-    compileWorkers.clear();
-
     physics->onPlayStop();
     audio.onPlayStop();
     audio.shutdown();
@@ -7392,6 +7576,7 @@ void Engine::shutdown() {
         ImGui::DestroyContext(entry.second.context);
     }
     uiCanvas3DContexts.clear();
+    uiKeyboardCanvasId = -1;
 
     if (mainContext) {
         ImGui::SetCurrentContext(mainContext);
@@ -7419,7 +7604,7 @@ void Engine::shutdown() {
     videoAssetPreviewPlayer.reset();
     videoAssetPreviewPath.clear();
     clearVideoPlayers();
-    glfwTerminate();
+    // GLFW termination belongs to Window, after all Engine GPU owners die.
 }
 #pragma endregion
 
@@ -8957,6 +9142,7 @@ void Engine::updateNetworking(float delta) {
         // Rebuilding is cheap next to a spawn and only happens per spawned object, so
         // this marks everything dirty rather than trying to patch the caches in place.
         auto refreshAfterSceneMutation = [this]() {
+            ScriptSceneMutationScope mutation(this);
             markRuntimeScriptBindingsDirty();
             sceneObjectIndexById.clear();
             sceneObjectIndexData = nullptr;
@@ -9022,7 +9208,12 @@ void Engine::dispatchPhysicsCollisionEvents(float delta) {
         SceneObject* other = findObjectById(otherId);
         if (!object || !other) return;
 
-        for (ScriptComponent& script : object->scripts) {
+        const size_t scriptCount = object->scripts.size();
+        for (size_t scriptIndex = 0; scriptIndex < scriptCount; ++scriptIndex) {
+            object = findObjectById(objectId);
+            other = findObjectById(otherId);
+            if (!object || !other || scriptIndex >= object->scripts.size()) break;
+            ScriptComponent& script = object->scripts[scriptIndex];
             if (!script.enabled || script.path.empty() || script.language == ScriptLanguage::CSharp) continue;
 
             fs::path binary;
@@ -9048,7 +9239,8 @@ void Engine::dispatchPhysicsCollisionEvents(float delta) {
         }
     };
 
-    for (const PhysicsCollisionEvent& event : physicsCollisionEvents) {
+    for (size_t i = 0; i < physicsCollisionEvents.size(); ++i) {
+        const PhysicsCollisionEvent event = physicsCollisionEvents[i];
         dispatchToObject(event.objectAId, event.objectBId, event.phase);
         dispatchToObject(event.objectBId, event.objectAId, event.phase);
     }
@@ -9102,10 +9294,10 @@ void Engine::updateScripts(float delta) {
     ManagedScriptRuntime::GcStats gcEndStats = gcStartStats;
     double gcMs = 0.0;
 
-    for (const RuntimeScriptBinding& binding : runtimeScriptBindings) {
-        auto objIt = sceneObjectIndexById.find(binding.objectId);
-        if (objIt == sceneObjectIndexById.end()) continue;
-        SceneObject& obj = sceneObjects[objIt->second];
+    for (const RuntimeScriptBinding binding : runtimeScriptBindings) {
+        SceneObject* currentObject = findObjectById(binding.objectId);
+        if (!currentObject) continue;
+        SceneObject& obj = *currentObject;
         if (!IsObjectEnabledInHierarchy(obj)) continue;
         if (binding.scriptIndex >= obj.scripts.size()) continue;
         ScriptComponent& sc = obj.scripts[binding.scriptIndex];
@@ -9154,8 +9346,8 @@ void Engine::updateScripts(float delta) {
             const auto managedCallStart = ManagedClock::now();
             managedRuntime.tickModule(assembly, sc.managedType, ctx, delta, specMode, testMode);
             if (traceScripts) {
-                std::cerr << "[RuntimeTrace] script end obj=\"" << obj.name
-                          << "\" id=" << obj.id
+                std::cerr << "[RuntimeTrace] script end obj=\"" << (ctx.object ? ctx.object->name : "<deleted>")
+                          << "\" id=" << binding.objectId
                           << " slot=" << binding.scriptIndex << std::endl;
             }
             const ManagedScriptRuntime::GcStats afterManagedCall = managedRuntime.getGcStats();
@@ -9231,8 +9423,8 @@ void Engine::updateScripts(float delta) {
             }
             scriptRuntime.tickModule(binary, ctx, delta, specMode, testMode);
             if (traceScripts) {
-                std::cerr << "[RuntimeTrace] script end obj=\"" << obj.name
-                          << "\" id=" << obj.id
+                std::cerr << "[RuntimeTrace] script end obj=\"" << (ctx.object ? ctx.object->name : "<deleted>")
+                          << "\" id=" << binding.objectId
                           << " slot=" << binding.scriptIndex << std::endl;
             }
             const std::string& runtimeError = scriptRuntime.getLastError();
@@ -9246,7 +9438,7 @@ void Engine::updateScripts(float delta) {
                         "': " + runtimeError,
                         ConsoleMessageType::Error);
                 }
-                requestRecompileForScriptLoadFailure(fs::path(sc.path),
+                if (ctx.script) requestRecompileForScriptLoadFailure(fs::path(ctx.script->path),
                                                      scriptRuntime.getLastFailure());
             }
         }
@@ -12282,6 +12474,9 @@ void Engine::traceProjectLoad(const char* tag) {
 
 void Engine::startProjectLoad(const std::string& path) {
     if (projectLoadInProgress) return;
+#if !MODULARITY_RUNTIME_ONLY
+    openProjectInVR = false;
+#endif
     projectLoadTraceOrigin = std::chrono::steady_clock::now();
     projectLoadTraceActive = true;
     traceProjectLoad("startProjectLoad: enter");
@@ -12576,6 +12771,11 @@ static void ApplyPlayerStartupWindow(GLFWwindow* window, const ProjectPlayerSett
 #endif
 
 void Engine::finishProjectLoad(ProjectLoadResult& result) {
+    bool inVR = false;
+#if !MODULARITY_RUNTIME_ONLY
+    inVR = openProjectInVR;
+    openProjectInVR = false;
+#endif
     const auto __fpStart = std::chrono::steady_clock::now();
     auto __fpDone = [&](const char* tag) {
         const double ms = std::chrono::duration<double, std::milli>(
@@ -12630,7 +12830,7 @@ void Engine::finishProjectLoad(ProjectLoadResult& result) {
     if (projectManager.currentProject.rendererBackend != graphicsBackend) {
         const Modularity::GraphicsBackend targetBackend = projectManager.currentProject.rendererBackend;
         std::string relaunchError;
-        if (relaunchEditorWithBackend(targetBackend, result.path, relaunchError)) {
+        if (relaunchEditorWithBackend(targetBackend, result.path, relaunchError, inVR)) {
             addConsoleMessage(
                 "Project renderer is " + std::string(Modularity::ToString(targetBackend)) +
                 ". Restarting editor with matching backend...",
@@ -12670,6 +12870,10 @@ void Engine::finishProjectLoad(ProjectLoadResult& result) {
     __fpDone("renderer+physics");
     traceProjectLoad("finishProjectLoad: renderer+physics init done");
     loadBuildSettings();
+    if (autoStartRequested) {
+        // Before the scene load, so the first frame finds every program already linked.
+        preloadRuntimeShaders();
+    }
     if (autoStartRequested && !autoStartSceneName.empty()) {
         beginDeferredSceneLoad(autoStartSceneName);
     } else {
@@ -12737,6 +12941,16 @@ void Engine::finishProjectLoad(ProjectLoadResult& result) {
     traceProjectLoad("finishProjectLoad: script cache reset + launcher state done");
     applyBuildWindowTitle();
     addConsoleMessage("Opened project: " + projectManager.currentProject.name, ConsoleMessageType::Info);
+#if !MODULARITY_RUNTIME_ONLY && MODULARITY_HAS_OPENXR
+    if (inVR && !playerMode && projectManager.currentProject.openXRSettings.enabled && !usingVulkan()) {
+        vrEditor.requested = true;
+        vrEditor.preview = false;
+        vrEditor.recenterPending = true;
+        xrStartupAttempted = false;
+        gameViewCursorLocked = false;
+        cursorLocked = false;
+    }
+#endif
     traceProjectLoad("finishProjectLoad: exit");
 }
 
@@ -12991,6 +13205,8 @@ void Engine::resetBuildSettings() {
     buildSettings.packageStandaloneArchive = true;
     buildSettings.packagingMode = "extract";
     buildSettings.bundleVerifyIntegrity = true;
+    buildSettings.gles2Shaders = false;
+    buildSettings.preloadShaders = false;
     buildSettings.obfuscateScripts = false;
     buildSettings.obfuscationToolCommand.clear();
     buildSettings.antiTamper = false;
@@ -13025,6 +13241,38 @@ bool Engine::addSceneToBuildSettings(const std::string& sceneName, bool enabled)
     buildSettings.scenes.push_back({sceneName, enabled});
     buildSettingsDirty = true;
     return true;
+}
+
+void Engine::preloadRuntimeShaders() {
+    if (!rendererInitialized || usingVulkan()) return;
+    // The list itself is the switch: the export only writes it when preloading is on. The
+    // staged build.modu is not reliable for this, since a project whose mirror only names
+    // its active profile ships without that profile.
+    const char* kListPath = "Resources/Shaders/preload.list";
+    auto& assets = Modularity::Platform::GetAssetSource();
+    if (!assets.Exists(kListPath)) return;
+    const std::vector<uint8_t> bytes = assets.ReadAll(kListPath);
+    const std::string text(bytes.begin(), bytes.end());
+
+    const double start = glfwGetTime();
+    int compiled = 0;
+    std::istringstream lines(text);
+    std::string line;
+    while (std::getline(lines, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const size_t bar = line.find('|');
+        if (bar == std::string::npos) continue;
+        // Same strings the scene objects carry, so the draw finds this exact cache entry.
+        // getShader falls back to the default program on a compile error and reports it.
+        renderer.getShader(line.substr(0, bar), line.substr(bar + 1));
+        ++compiled;
+    }
+    const double ms = (glfwGetTime() - start) * 1000.0;
+    char message[128];
+    std::snprintf(message, sizeof(message), "Precompiled %d shader program(s) at boot in %.1f ms",
+                  compiled, ms);
+    addConsoleMessage(message, ConsoleMessageType::Info);
+    std::fprintf(stderr, "[Shaders] %s\n", message);
 }
 
 void Engine::loadBuildSettings() {
@@ -13200,6 +13448,10 @@ void Engine::loadBuildSettings() {
             }
         } else if (line.rfind("bundleVerifyIntegrity=", 0) == 0) {
             buildSettings.bundleVerifyIntegrity = line.substr(22) == "1";
+        } else if (line.rfind("gles2Shaders=", 0) == 0) {
+            buildSettings.gles2Shaders = line.substr(13) == "1";
+        } else if (line.rfind("preloadShaders=", 0) == 0) {
+            buildSettings.preloadShaders = line.substr(15) == "1";
         } else if (line.rfind("obfuscateScripts=", 0) == 0) {
             buildSettings.obfuscateScripts = line.substr(17) == "1";
         } else if (line.rfind("obfuscationToolCommand=", 0) == 0) {
@@ -13368,6 +13620,8 @@ void Engine::saveBuildSettings() {
         file << "package.compression=" << buildSettings.compressionMethod << "\n";
         file << "packagingMode=" << buildSettings.packagingMode << "\n";
         file << "bundleVerifyIntegrity=" << (buildSettings.bundleVerifyIntegrity ? "1" : "0") << "\n";
+        file << "gles2Shaders=" << (buildSettings.gles2Shaders ? "1" : "0") << "\n";
+        file << "preloadShaders=" << (buildSettings.preloadShaders ? "1" : "0") << "\n";
         file << "obfuscateScripts=" << (buildSettings.obfuscateScripts ? "1" : "0") << "\n";
         file << "obfuscationToolCommand=" << buildSettings.obfuscationToolCommand << "\n";
         file << "antiTamper=" << (buildSettings.antiTamper ? "1" : "0") << "\n";
@@ -13738,6 +13992,8 @@ void Engine::startExportBuild(const fs::path& outputDir, bool runAfter) {
     bool leanRuntimeExport = buildSettings.leanRuntimeExport;
     std::string packagingMode = buildSettings.packagingMode;   // "loose" / "extract" / "mount"
     bool bundleVerifyIntegrity = buildSettings.bundleVerifyIntegrity;
+    bool gles2Shaders = buildSettings.gles2Shaders;
+    bool preloadShaders = buildSettings.preloadShaders || buildSettings.gles2Shaders;
     bool obfuscateScripts = buildSettings.obfuscateScripts;
     std::string obfuscationToolCommand = buildSettings.obfuscationToolCommand;
     bool antiTamper = buildSettings.antiTamper;
@@ -13828,7 +14084,7 @@ void Engine::startExportBuild(const fs::path& outputDir, bool runAfter) {
              packageStem, androidAbi, androidApkPath, androidPackageName,
              buildNameDisplay, buildVersionDisplay, androidDebuggable,
              androidAssimpImporters, buildConfiguration, leanRuntimeExport,
-             compressAudio, audioVorbisQuality,
+             compressAudio, audioVorbisQuality, gles2Shaders, preloadShaders,
              appendCMakeModuleFlags, moduleAssimp, androidXrOptions]() {
             ExportJobResult result;
             result.outputDir = normalizedOut;
@@ -14036,6 +14292,7 @@ void Engine::startExportBuild(const fs::path& outputDir, bool runAfter) {
                 return result;
             }
 
+            RuntimeShaderPairs runtimeShaderPairs;
             if (!runtimeSceneNames.empty()) {
                 const float sceneCount = static_cast<float>(runtimeSceneNames.size());
                 for (size_t i = 0; i < runtimeSceneNames.size(); ++i) {
@@ -14047,11 +14304,17 @@ void Engine::startExportBuild(const fs::path& outputDir, bool runAfter) {
                     const fs::path sourceScenePath = scenesPath / (sceneName + ".scene");
                     const float progress = 0.66f + 0.06f * static_cast<float>(i) / std::max(1.0f, sceneCount);
                     setStatus(progress, "Serializing runtime scene: " + sceneName + "...");
-                    if (!StageRuntimeScene(sourceScenePath, sceneName, runtimeStager, runtimeStageRoot, copyError)) {
+                    if (!StageRuntimeScene(sourceScenePath, sceneName, runtimeStager, runtimeStageRoot, copyError,
+                                           &runtimeShaderPairs)) {
                         result.message = copyError;
                         return result;
                     }
                 }
+            }
+            if (!StageRuntimeShaderPrograms(runtimeStageRoot, runtimeShaderPairs, gles2Shaders, preloadShaders,
+                                            appendLog, copyError)) {
+                result.message = copyError;
+                return result;
             }
 
             std::string stagedSplashPath = exportSplashImagePath;
@@ -14299,7 +14562,7 @@ void Engine::startExportBuild(const fs::path& outputDir, bool runAfter) {
          buildConfiguration, includeEditorInExport, shipScriptSdk, leanRuntimeExport,
          packagingMode, bundleVerifyIntegrity, obfuscateScripts, obfuscationToolCommand,
          antiTamper, antiTamperToolCommand,
-         compressAudio, audioVorbisQuality,
+         compressAudio, audioVorbisQuality, gles2Shaders, preloadShaders,
          appendCMakeModuleFlags]() {
         ExportJobResult result;
         result.outputDir = exportRoot;
@@ -14466,6 +14729,22 @@ void Engine::startExportBuild(const fs::path& outputDir, bool runAfter) {
                         result.message = "Failed to copy runtime DLL: " + sourceDll.filename().string();
                         return result;
                     }
+                }
+            }
+        }
+#else
+        {
+#if defined(__APPLE__)
+            const fs::path discordRuntime = exePath.parent_path() / "libdiscord_partner_sdk.dylib";
+#else
+            const fs::path discordRuntime = exePath.parent_path() / "libdiscord_partner_sdk.so";
+#endif
+            if (fs::exists(discordRuntime, ec)) {
+                fs::copy_file(discordRuntime, exportRoot / discordRuntime.filename(),
+                              fs::copy_options::overwrite_existing, ec);
+                if (ec) {
+                    result.message = "Failed to copy Discord Social SDK runtime.";
+                    return result;
                 }
             }
         }
@@ -14707,6 +14986,7 @@ void Engine::startExportBuild(const fs::path& outputDir, bool runAfter) {
             return result;
         }
 
+        RuntimeShaderPairs runtimeShaderPairs;
         if (!runtimeSceneNames.empty()) {
             const float sceneCount = static_cast<float>(runtimeSceneNames.size());
             for (size_t i = 0; i < runtimeSceneNames.size(); ++i) {
@@ -14723,11 +15003,17 @@ void Engine::startExportBuild(const fs::path& outputDir, bool runAfter) {
                 const float progress = progressBase +
                     (progressRange * static_cast<float>(i) / std::max(1.0f, sceneCount));
                 setStatus(progress, "Serializing runtime scene: " + sceneName + "...");
-                if (!StageRuntimeScene(sourceScenePath, sceneName, runtimeStager, runtimeStageRoot, copyError)) {
+                if (!StageRuntimeScene(sourceScenePath, sceneName, runtimeStager, runtimeStageRoot, copyError,
+                                       &runtimeShaderPairs)) {
                     result.message = copyError;
                     return result;
                 }
             }
+        }
+        if (!StageRuntimeShaderPrograms(runtimeStageRoot, runtimeShaderPairs, gles2Shaders, preloadShaders,
+                                        appendLog, copyError)) {
+            result.message = copyError;
+            return result;
         }
 
         std::string stagedSplashPath = exportSplashImagePath;
@@ -16475,6 +16761,8 @@ void Engine::pasteClipboard() {
         SceneObject* newObj = findObjectById(newIds[i]);
         if (!newObj) continue;
 
+        auto linkedUi = idMap.find(newObj->ui.linkedObjectId);
+        if (linkedUi != idMap.end()) newObj->ui.linkedObjectId = linkedUi->second;
         const int oldParentId = oldParents[i];
         int resolvedParent = -1;
         auto mapped = idMap.find(oldParentId);
@@ -17680,60 +17968,90 @@ void Engine::markProjectDirty() {
     projectManager.currentProject.hasUnsavedChanges = true;
 }
 
-std::string Engine::httpPostFromScript(const std::string& url,
-                                       const std::string& contentType,
-                                       const std::string& body,
-                                       const std::string& headers) {
+namespace {
+std::string httpPostScriptRequest(const std::string& url,
+                                const std::string& contentType,
+                                const std::string& body,
+                                const std::string& headers,
+                                const fs::path& fallbackTempRoot,
+                                bool* outSuccess = nullptr,
+                                const std::function<bool(const std::string&)>& onChunk = {}) {
+    if (outSuccess) *outSuccess = false;
 #if defined(_WIN32)
-    return httpPostWindows(url, contentType, body, headers);
+    (void)fallbackTempRoot;
+    return httpPostWindows(url, contentType, body, headers, onChunk, outSuccess);
 #else
     std::error_code ec;
     fs::path tempRoot = fs::temp_directory_path(ec);
-    if (ec || tempRoot.empty()) {
-        tempRoot = resolveProjectPathFromScript("Library/Temp");
-    } else {
-        tempRoot /= "ModularityScriptHttp";
-    }
-
+    if (ec || tempRoot.empty()) tempRoot = fallbackTempRoot;
+    else tempRoot /= "ModularityScriptHttp";
     fs::create_directories(tempRoot, ec);
-    if (ec) {
-        return "Failed to create HTTP temp directory: " + tempRoot.string();
-    }
+    if (ec) return "Failed to create HTTP temp directory: " + tempRoot.string();
 
+    static std::atomic<uint64_t> serial{0};
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
-    const fs::path bodyPath = tempRoot / ("request_" + std::to_string(stamp) + ".json");
-
+    const std::string stem = "request_" + std::to_string(stamp) + "_" + std::to_string(serial++);
+    const fs::path bodyPath = tempRoot / (stem + ".body");
+    const fs::path headerPath = tempRoot / (stem + ".headers");
     {
         std::ofstream out(bodyPath, std::ios::binary | std::ios::trunc);
-        if (!out.is_open()) {
-            return "Failed to write HTTP request body: " + bodyPath.string();
-        }
+        if (!out) return "Failed to write HTTP request body: " + bodyPath.string();
         out << body;
         if (!out.good()) {
+            out.close();
+            fs::remove(bodyPath, ec);
             return "Failed to flush HTTP request body: " + bodyPath.string();
         }
     }
 
     std::ostringstream command;
     command << "curl -sS -L -X POST";
-    if (!contentType.empty()) {
-        command << " -H \"Content-Type: " << escapeShellArg(contentType) << "\"";
-    }
+    if (onChunk) command << " -N";
+    if (!contentType.empty()) command << " -H \"Content-Type: " << escapeShellArg(contentType) << "\"";
     for (const std::string& header : splitLines(headers)) {
         command << " -H \"" << escapeShellArg(header) << "\"";
     }
-    command << " --data-binary @\"" << escapeShellArg(bodyPath.string()) << "\""
+    command << " --dump-header \"" << escapeShellArg(headerPath.string()) << "\""
+            << " --data-binary @\"" << escapeShellArg(bodyPath.string()) << "\""
             << " \"" << escapeShellArg(url) << "\" 2>&1";
 
     std::string output;
-    const bool ok = runCommandCapture(command.str(), output);
-    fs::remove(bodyPath, ec);
-
-    if (!ok && output.empty()) {
-        return "curl POST failed: " + url;
+    bool cancelled = false;
+    const bool transportOk = onChunk
+        ? runCommandStreaming(command.str(), [&](const std::string& chunk) {
+            output += chunk;
+            if (!cancelled && !onChunk(chunk)) cancelled = true;
+        }, nullptr)
+        : runCommandCapture(command.str(), output);
+    // Curl writes each redirect/proxy response header in order. Use the final
+    // HTTP status independently of body text, including for streaming requests.
+    int status = 0;
+    std::ifstream responseHeaders(headerPath);
+    std::string line;
+    while (std::getline(responseHeaders, line)) {
+        if (line.rfind("HTTP/", 0) == 0) {
+            std::istringstream statusLine(line);
+            std::string version;
+            statusLine >> version >> status;
+        }
     }
+    responseHeaders.close();
+    fs::remove(bodyPath, ec);
+    fs::remove(headerPath, ec);
+    if (outSuccess) *outSuccess = transportOk && !cancelled && status >= 200 && status < 400;
+    if (!transportOk && output.empty()) return "curl POST failed: " + url;
     return output;
 #endif
+}
+
+} // namespace
+
+std::string Engine::httpPostFromScript(const std::string& url,
+                                       const std::string& contentType,
+                                       const std::string& body,
+                                       const std::string& headers) {
+    return httpPostScriptRequest(url, contentType, body, headers,
+                                 resolveProjectPathFromScript("Library/Temp"));
 }
 
 int Engine::startHttpPostFromScript(const std::string& url,
@@ -17751,7 +18069,10 @@ int Engine::startHttpPostFromScript(const std::string& url,
         scriptHttpRequests[requestId] = state;
     }
 
-    std::thread([this, state, url, contentType, body, headers]() {
+    // Resolve project-owned state on the caller thread. A detached request may
+    // outlive the engine or a project switch; the worker must not access this.
+    const fs::path fallbackTempRoot = resolveProjectPathFromScript("Library/Temp");
+    std::thread([state, url, contentType, body, headers, fallbackTempRoot]() {
         auto pushChunk = [&](const std::string& chunk) -> bool {
             std::scoped_lock lock(state->mutex);
             if (state->cancelled) {
@@ -17763,72 +18084,11 @@ int Engine::startHttpPostFromScript(const std::string& url,
             return true;
         };
 
-        std::string response;
-#if defined(_WIN32)
-        if (state->stream) {
-            response = httpPostWindows(url, contentType, body, headers, pushChunk);
-        } else {
-            response = httpPostWindows(url, contentType, body, headers);
-        }
-#else
-        if (state->stream) {
-            std::error_code ec;
-            fs::path tempRoot = fs::temp_directory_path(ec);
-            if (ec || tempRoot.empty()) {
-                tempRoot = resolveProjectPathFromScript("Library/Temp");
-            } else {
-                tempRoot /= "ModularityScriptHttp";
-            }
-
-            fs::create_directories(tempRoot, ec);
-            if (ec) {
-                response = "Failed to create HTTP temp directory: " + tempRoot.string();
-            } else {
-                const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
-                const fs::path bodyPath = tempRoot / ("request_" + std::to_string(stamp) + ".json");
-
-                {
-                    std::ofstream out(bodyPath, std::ios::binary | std::ios::trunc);
-                    if (!out.is_open()) {
-                        response = "Failed to write HTTP request body: " + bodyPath.string();
-                    } else {
-                        out << body;
-                        if (!out.good()) {
-                            response = "Failed to flush HTTP request body: " + bodyPath.string();
-                        }
-                    }
-                }
-
-                if (response.empty()) {
-                    std::ostringstream command;
-                    command << "curl -N -sS -L -X POST";
-                    if (!contentType.empty()) {
-                        command << " -H \"Content-Type: " << escapeShellArg(contentType) << "\"";
-                    }
-                    for (const std::string& header : splitLines(headers)) {
-                        command << " -H \"" << escapeShellArg(header) << "\"";
-                    }
-                    command << " --data-binary @\"" << escapeShellArg(bodyPath.string()) << "\""
-                            << " \"" << escapeShellArg(url) << "\" 2>&1";
-
-                    int curlExit = -1;
-                    const bool ok = runCommandStreaming(command.str(), [&](const std::string& chunk) {
-                        response += chunk;
-                        pushChunk(chunk);
-                    }, &curlExit);
-
-                    fs::remove(bodyPath, ec);
-                    if (!ok && response.empty()) {
-                        response = "curl POST failed: " + url;
-                    }
-                } else {
-                    fs::remove(bodyPath, ec);
-                }
-            }
-        } else {
-            response = httpPostFromScript(url, contentType, body, headers);
-        }
-#endif
+        bool success = false;
+        const std::string response = httpPostScriptRequest(
+            url, contentType, body, headers, fallbackTempRoot, &success,
+            state->stream ? std::function<bool(const std::string&)>(pushChunk)
+                          : std::function<bool(const std::string&)>{});
 
         {
             std::scoped_lock lock(state->mutex);
@@ -17836,9 +18096,7 @@ int Engine::startHttpPostFromScript(const std::string& url,
             if (!state->stream && !response.empty()) {
                 state->pendingChunks.push_back(response);
             }
-            state->success = response.rfind("HTTP ", 0) != 0 &&
-                             response.find("failed") == std::string::npos &&
-                             response.find("cancelled") == std::string::npos;
+            state->success = success && !state->cancelled;
             state->done = true;
         }
     }).detach();
@@ -17917,20 +18175,101 @@ int Engine::startProcessFromScript(const std::string& command,
     }
 
 #if defined(_WIN32)
-    (void)interactive;
-    std::thread([this, state, command, resolvedDir]() {
-        std::string cmd = command + " 2>&1";
-        if (!resolvedDir.empty()) {
-            cmd = "cd /d \"" + escapeShellArg(resolvedDir) + "\" && " + cmd;
-        }
-        int exitCode = -1;
-        runCommandStreaming(cmd, [&](const std::string& chunk) {
+    (void)interactive; // Windows stdin remains unsupported by this API.
+    std::thread([state, command, resolvedDir]() {
+        HANDLE readPipe = nullptr, writePipe = nullptr, nullInput = INVALID_HANDLE_VALUE;
+        HANDLE job = nullptr;
+        PROCESS_INFORMATION process{};
+        auto closeHandle = [](HANDLE& handle) {
+            if (handle && handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
+            handle = nullptr;
+        };
+        auto fail = [&](const char* message) {
+            const DWORD error = GetLastError();
+            if (process.hProcess) TerminateProcess(process.hProcess, 1);
+            closeHandle(process.hThread);
+            closeHandle(process.hProcess);
+            closeHandle(readPipe);
+            closeHandle(writePipe);
+            closeHandle(nullInput);
+            closeHandle(job);
             std::scoped_lock lock(state->mutex);
-            if (!state->cancelled && !chunk.empty()) state->pendingChunks.push_back(chunk);
-        }, &exitCode);
+            state->pendingChunks.push_back(std::string(message) + " (Windows error " + std::to_string(error) + ")\n");
+            state->done = true;
+        };
+        SECURITY_ATTRIBUTES security{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
+        if (!CreatePipe(&readPipe, &writePipe, &security, 0) ||
+            !SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0)) {
+            fail("Failed to create process output pipe"); return;
+        }
+        nullInput = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                &security, OPEN_EXISTING, 0, nullptr);
+        job = CreateJobObjectW(nullptr, nullptr);
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (nullInput == INVALID_HANDLE_VALUE || !job ||
+            !SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
+            fail("Failed to configure process job"); return;
+        }
+        // Restrict inheritance to this worker's standard handles. Concurrent
+        // processes must not keep each other's pipe writers open.
+        SIZE_T attributeBytes = 0;
+        InitializeProcThreadAttributeList(nullptr, 1, 0, &attributeBytes);
+        std::vector<unsigned char> attributeStorage(attributeBytes);
+        auto* attributes = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributeStorage.data());
+        if (!InitializeProcThreadAttributeList(attributes, 1, 0, &attributeBytes)) {
+            fail("Failed to initialize process attributes"); return;
+        }
+        HANDLE inherited[] = {writePipe, nullInput};
+        if (!UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                       inherited, sizeof(inherited), nullptr, nullptr)) {
+            DeleteProcThreadAttributeList(attributes);
+            fail("Failed to configure inherited process handles"); return;
+        }
+        STARTUPINFOEXW startup{};
+        startup.StartupInfo.cb = sizeof(startup);
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdOutput = writePipe;
+        startup.StartupInfo.hStdError = writePipe;
+        startup.StartupInfo.hStdInput = nullInput;
+        startup.lpAttributeList = attributes;
+        std::wstring commandLine = L"cmd.exe /D /S /C \"" + utf8ToWide(command) + L"\"";
+        const std::wstring directory = utf8ToWide(resolvedDir);
+        const bool created = CreateProcessW(nullptr, commandLine.data(), nullptr, nullptr, TRUE,
+            CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
+            nullptr, directory.empty() ? nullptr : directory.c_str(), &startup.StartupInfo, &process) != FALSE;
+        const DWORD createError = GetLastError();
+        DeleteProcThreadAttributeList(attributes);
+        if (!created) { SetLastError(createError); fail("Failed to start process"); return; }
+        if (!AssignProcessToJobObject(job, process.hProcess)) {
+            fail("Failed to assign process job"); return;
+        }
+        closeHandle(writePipe);
+        closeHandle(nullInput);
+        {
+            std::scoped_lock lock(state->mutex);
+            state->jobHandle = job;
+            state->pid = process.dwProcessId;
+            if (state->cancelled) TerminateJobObject(job, 1);
+        }
+        if (ResumeThread(process.hThread) == static_cast<DWORD>(-1)) TerminateJobObject(job, 1);
+        closeHandle(process.hThread);
+        char buffer[4096];
+        DWORD bytes = 0;
+        while (ReadFile(readPipe, buffer, sizeof(buffer), &bytes, nullptr) && bytes > 0) {
+            std::scoped_lock lock(state->mutex);
+            if (!state->cancelled) state->pendingChunks.emplace_back(buffer, bytes);
+        }
+        closeHandle(readPipe);
+        WaitForSingleObject(process.hProcess, INFINITE);
+        DWORD exitCode = static_cast<DWORD>(-1);
+        GetExitCodeProcess(process.hProcess, &exitCode);
+        closeHandle(process.hProcess);
         std::scoped_lock lock(state->mutex);
-        state->exitCode = exitCode;
-        state->success = (exitCode == 0);
+        state->jobHandle = nullptr;
+        closeHandle(job);
+        state->exitCode = static_cast<int>(exitCode);
+        state->success = !state->cancelled && exitCode == 0;
         state->done = true;
     }).detach();
     return processId;
@@ -18099,6 +18438,7 @@ void Engine::cancelProcessFromScript(int processId) {
 #else
     std::scoped_lock lock(state->mutex);
     state->cancelled = true;
+    if (state->jobHandle) TerminateJobObject(static_cast<HANDLE>(state->jobHandle), 1);
 #endif
 }
 
@@ -18124,16 +18464,17 @@ std::string Engine::runProcessBlockingFromScript(const std::string& command,
                 std::chrono::steady_clock::now() - start).count();
             if (elapsed >= timeoutMs) {
                 cancelProcessFromScript(id);
+                bool terminated = false;
                 for (int i = 0; i < 400; ++i) {
                     std::string c2; bool d2 = false, s2 = false; int e2 = -1;
                     if (!pollProcessFromScript(id, c2, d2, s2, e2)) break;
                     if (!c2.empty()) output += c2;
-                    if (d2) { code = e2; break; }
+                    if (d2) { code = e2; terminated = true; break; }
                     std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 }
                 if (exitCode) *exitCode = code;
                 return output + "\n[process timed out after " + std::to_string(timeoutMs) +
-                       "ms and was killed]";
+                       (terminated ? "ms; process terminated]" : "ms; cancellation requested, termination pending]");
             }
         }
         if (chunk.empty()) std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -18712,6 +19053,7 @@ namespace {
 } // namespace
 
 int Engine::createSceneObjectFromScript(const std::string& type, const std::string& name, int parentId) {
+    ScriptSceneMutationScope mutation(this);
     ObjectType objType = ObjectType::Empty;
     if (!parseObjectTypeName(type, objType)) {
         return -1;
@@ -18750,6 +19092,7 @@ int Engine::createSceneObjectFromScript(const std::string& type, const std::stri
 }
 
 bool Engine::deleteSceneObjectFromScript(int objectId) {
+    ScriptSceneMutationScope mutation(this);
     if (!findObjectById(objectId)) {
         return false;
     }
@@ -18813,6 +19156,7 @@ bool Engine::renameSceneObjectFromScript(int objectId, const std::string& name) 
 }
 
 bool Engine::setSceneObjectParentFromScript(int objectId, int parentId) {
+    ScriptSceneMutationScope mutation(this);
     if (!findObjectById(objectId)) {
         return false;
     }
@@ -18896,6 +19240,7 @@ bool Engine::addObjectComponentFromScript(int objectId, const std::string& compo
 }
 
 bool Engine::attachObjectScriptFromScript(int objectId, const std::string& scriptPath) {
+    ScriptSceneMutationScope mutation(this);
     SceneObject* obj = findObjectById(objectId);
     if (!obj) {
         return false;
@@ -20342,10 +20687,8 @@ void Engine::setupImGui() {
     }
 #endif
 
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-#if !MODULARITY_RUNTIME_ONLY
-    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
-#endif
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
+    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable; // Runtime dock containers use the same ImGui docking support.
 #if defined(__ANDROID__)
     io.ConfigFlags |= ImGuiConfigFlags_IsTouchScreen;
     io.ConfigWindowsMoveFromTitleBarOnly = true;
@@ -21111,6 +21454,10 @@ void Engine::loadEditorUserSettings() {
             showProjectBrowser = (value == "1" || value == "true" || value == "yes");
         } else if (key == "projectSettingsCompactSidebar") {
             projectSettingsCompactSidebar = (value == "1" || value == "true" || value == "yes");
+        } else if (key == "projectSettingsTwoColumns") {
+            projectSettingsTwoColumns = (value == "1" || value == "true" || value == "yes");
+        } else if (key == "projectSettingsVisibilityMode") {
+            try { projectSettingsVisibilityMode = std::clamp(std::stoi(value), 0, 2); } catch (...) {}
         } else if (key == "showRegistryPackagesWindow") {
             showRegistryPackagesWindow = (value == "1" || value == "true" || value == "yes");
         } else if (key == "showGameProfilerWindow") {
@@ -21689,6 +22036,8 @@ void Engine::saveEditorUserSettings() const {
     file << "showPixelSpriteEditorWindow=" << (showPixelSpriteEditorWindow ? "1" : "0") << "\n";
     file << "showProjectBrowser=" << (showProjectBrowser ? "1" : "0") << "\n";
     file << "projectSettingsCompactSidebar=" << (projectSettingsCompactSidebar ? "1" : "0") << "\n";
+    file << "projectSettingsTwoColumns=" << (projectSettingsTwoColumns ? "1" : "0") << "\n";
+    file << "projectSettingsVisibilityMode=" << std::clamp(projectSettingsVisibilityMode, 0, 2) << "\n";
     file << "showRegistryPackagesWindow=" << (showRegistryPackagesWindow ? "1" : "0") << "\n";
     file << "showGameProfilerWindow=" << (showGameProfilerWindow ? "1" : "0") << "\n";
     file << "hierarchyShowTexturePreview=" << (hierarchyShowTexturePreview ? "1" : "0") << "\n";

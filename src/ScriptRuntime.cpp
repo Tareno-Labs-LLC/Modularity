@@ -1,4 +1,5 @@
 #include "ScriptRuntime.h"
+#include "ScriptContextBinding.h"
 #include "Engine.h"
 #include "SceneObject.h"
 #include "SpritesheetFormat.h"
@@ -1142,6 +1143,7 @@ unsigned int ScriptContext::NetworkSpawn(const std::string& assetId,
                                          const glm::vec3& position,
                                          const glm::vec3& rotationDegrees,
                                          const glm::vec3& scale) {
+    ScriptSceneMutationScope mutation(engine);
     Net::NetworkSession* s = NetSession(this);
     if (!s || assetId.empty()) return Net::kInvalidNetworkId;
     const float pos[3] = {position.x, position.y, position.z};
@@ -1151,6 +1153,7 @@ unsigned int ScriptContext::NetworkSpawn(const std::string& assetId,
 }
 
 bool ScriptContext::NetworkDespawn(unsigned int networkId) {
+    ScriptSceneMutationScope mutation(engine);
     Net::NetworkSession* s = NetSession(this);
     return s && s->despawn(static_cast<Net::NetworkId>(networkId));
 }
@@ -3103,6 +3106,7 @@ ScriptRuntime::Module* ScriptRuntime::getModule(const fs::path& binaryPath) {
 
 void ScriptRuntime::tickModule(const fs::path& binaryPath, ScriptContext& ctx, float deltaTime,
                                bool runSpec, bool runTest) {
+    ScriptContextBinding binding(ctx);
     Module* mod = getModule(binaryPath);
     if (!mod) return;
 
@@ -3110,6 +3114,7 @@ void ScriptRuntime::tickModule(const fs::path& binaryPath, ScriptContext& ctx, f
     if (objId >= 0 && mod->begin && mod->beginCalledObjects.find(objId) == mod->beginCalledObjects.end()) {
         mod->begin(ctx, deltaTime);
         mod->beginCalledObjects.insert(objId);
+        if (!ctx.object || !ctx.script) return;
     }
 
     if (mod->tickUpdate) {
@@ -3118,19 +3123,24 @@ void ScriptRuntime::tickModule(const fs::path& binaryPath, ScriptContext& ctx, f
         mod->update(ctx, deltaTime);
     }
 
+    if (!ctx.object || !ctx.script) return;
     if (runSpec && mod->spec) {
         mod->spec(ctx, deltaTime);
     }
+    if (!ctx.object || !ctx.script) return;
     if (runTest && mod->testEditor) {
         mod->testEditor(ctx, deltaTime);
     }
 
+    if (!ctx.object || !ctx.script) return;
     // Tick any IEnum tasks registered by the script (per ScriptComponent instance).
     if (ctx.script && !ctx.script->activeIEnums.empty()) {
         auto tasks = ctx.script->activeIEnums; // copy so tasks can modify the list
         for (void* p : tasks) {
             auto fn = reinterpret_cast<IEnumFn>(p);
-            if (fn) fn(ctx, deltaTime);
+            if (!ctx.object || !ctx.script) break;
+            if (fn && std::find(ctx.script->activeIEnums.begin(), ctx.script->activeIEnums.end(), p) !=
+                      ctx.script->activeIEnums.end()) fn(ctx, deltaTime);
         }
     }
 }
@@ -3138,6 +3148,7 @@ void ScriptRuntime::tickModule(const fs::path& binaryPath, ScriptContext& ctx, f
 void ScriptRuntime::dispatchCollision(const fs::path& binaryPath, ScriptContext& ctx,
                                       SceneObject* other, PhysicsCollisionPhase phase,
                                       float deltaTime) {
+    ScriptContextBinding binding(ctx);
     if (!ctx.object || !ctx.script || !other) return;
     Module* mod = getModule(binaryPath);
     if (!mod) return;
@@ -3197,6 +3208,7 @@ bool ScriptRuntime::hasEditorWindow(const fs::path& binaryPath) {
 }
 
 void ScriptRuntime::callEditorWindow(const fs::path& binaryPath, ScriptContext& ctx) {
+    ScriptContextBinding binding(ctx);
     Module* mod = getModule(binaryPath);
     if (mod && mod->editorRender) {
         mod->editorRender(ctx);
@@ -3204,6 +3216,7 @@ void ScriptRuntime::callEditorWindow(const fs::path& binaryPath, ScriptContext& 
 }
 
 void ScriptRuntime::callExitEditorWindow(const fs::path& binaryPath, ScriptContext& ctx) {
+    ScriptContextBinding binding(ctx);
     Module* mod = getModule(binaryPath);
     if (mod && mod->editorExit) {
         mod->editorExit(ctx);

@@ -70,15 +70,7 @@ struct UnpackPreviewState {
 UnpackPreviewState gUnpackPreview;
 bool gOpenUnpackPreview = false;
 
-float gTabIndicatorX = -1.0f;
-float gTabIndicatorW = 0.0f;
-
 std::unordered_set<std::string> gExpandedPackageIds;
-
-float smoothApproach(float current, float target, float speed, float dt) {
-    const float blend = 1.0f - std::exp(-speed * dt);
-    return current + (target - current) * blend;
-}
 
 std::string toLowerCopy(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
@@ -373,6 +365,20 @@ void Engine::renderRegistryPackagesWindow() {
         return;
     }
 
+    // Keep this frequently-used window in the main editor viewport. A detached
+    // OpenGL viewport owns another native context and swap chain; on some Windows
+    // drivers merely presenting it serializes the editor and game view down to
+    // tens of frames per second. It remains freely movable and dockable inside
+    // the editor window without paying that multi-context cost.
+    if (ImGuiViewport* mainViewport = ImGui::GetMainViewport()) {
+        ImGui::SetNextWindowViewport(mainViewport->ID);
+    }
+
+    // Floating translucent windows trigger UiGlassBlur's full-frame capture and
+    // four blur passes. This manager is commonly kept open while the game runs,
+    // so keep its background opaque and avoid that GPU/CPU synchronization cost.
+    ImGui::SetNextWindowBgAlpha(1.0f);
+
     const bool wasOpen = showRegistryPackagesWindow;
     if (!ImGui::Begin(Loc::Window("WINDOW_MODUPAK_MANAGER", "Modupak Manager"), &showRegistryPackagesWindow, ImGuiWindowFlags_NoCollapse)) {
         ImGui::End();
@@ -509,17 +515,12 @@ void Engine::renderRegistryPackagesWindow() {
 
     {
         const int activeIdx = std::clamp(registryPackageView, 0, static_cast<int>(kViewTabs.size()) - 1);
-        const float targetX = tabXs[activeIdx] + 14.0f;
-        const float targetW = tabWidth - 28.0f;
-        if (gTabIndicatorX < 0.0f) { gTabIndicatorX = targetX; gTabIndicatorW = targetW; }
-        const float dt = ImGui::GetIO().DeltaTime;
-        gTabIndicatorX = smoothApproach(gTabIndicatorX, targetX, 16.0f, dt);
-        gTabIndicatorW = smoothApproach(gTabIndicatorW, targetW, 16.0f, dt);
-
         const float indH = 3.0f;
         const float indY = tabBarOrigin.y + tabHeight - indH - 0.5f;
-        tabDrawList->AddRectFilled(ImVec2(gTabIndicatorX, indY),
-                                   ImVec2(gTabIndicatorX + gTabIndicatorW, indY + indH),
+        const float indicatorX = tabXs[activeIdx] + 14.0f;
+        const float indicatorW = tabWidth - 28.0f;
+        tabDrawList->AddRectFilled(ImVec2(indicatorX, indY),
+                                   ImVec2(indicatorX + indicatorW, indY + indH),
                                    ImGui::GetColorU32(ImVec4(0.48f, 0.66f, 0.92f, 0.95f)),
                                    indH * 0.5f);
     }

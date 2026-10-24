@@ -140,6 +140,7 @@ GLFWwindow* Window::makeWindow(Modularity::GraphicsBackend backend)
         return nullptr;
     }
 
+    initialized = true;
     GLFWwindow* window = nullptr;
 
     if (backend == Modularity::GraphicsBackend::Vulkan)
@@ -200,7 +201,6 @@ GLFWwindow* Window::makeWindow(Modularity::GraphicsBackend backend)
     if (!window)
     {
         std::cerr << "Failed to create GLFW window\n";
-        glfwTerminate();
         return nullptr;
     }
 

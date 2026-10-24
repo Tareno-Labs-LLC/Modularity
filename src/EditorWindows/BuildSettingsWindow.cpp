@@ -283,6 +283,22 @@ void Engine::renderBuildSettingsWindow() {
             if (HintedCheckbox("Ship ScriptSDK", &buildSettings.shipScriptSdk, BuildSettingsHints::kShipScriptSdk)) changed = true;
             if (HintedCheckbox("Server Build", &buildSettings.serverBuild, BuildSettingsHints::kServerBuild)) changed = true;
             if (HintedCheckbox("Scripts Only", &buildSettings.scriptsOnlyBuild, BuildSettingsHints::kScriptsOnly)) changed = true;
+
+            ImGui::Spacing();
+            ImGui::SeparatorText("Graphics");
+            if (HintedCheckbox("GLES 2.0 Shaders (legacy handhelds)", &buildSettings.gles2Shaders,
+                               BuildSettingsHints::kGles2Shaders)) {
+                changed = true;
+            }
+            // GLES 2 implies preloading; show it ticked and locked rather than letting the two
+            // disagree.
+            bool preloadShown = buildSettings.preloadShaders || buildSettings.gles2Shaders;
+            ImGui::BeginDisabled(buildSettings.gles2Shaders);
+            if (HintedCheckbox("Precompile Shaders at Boot", &preloadShown, BuildSettingsHints::kPreloadShaders)) {
+                buildSettings.preloadShaders = preloadShown;
+                changed = true;
+            }
+            ImGui::EndDisabled();
             ImGui::EndTabItem();
         }
 

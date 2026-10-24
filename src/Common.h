@@ -43,7 +43,7 @@
 #if MODULARITY_HAS_VULKAN
 #include "ThirdParty/ModuGUI/backends/imgui_impl_vulkan.h"
 #endif
-#include "ThirdParty/ImGuizmo/ImGuizmo.h"
+#include "ThirdParty/ModuGuizmo/ImGuizmo.h"
 #include "ThirdParty/glm/glm.hpp"
 #include "ThirdParty/glm/gtc/matrix_transform.hpp"
 #include "ThirdParty/glm/gtc/type_ptr.hpp"

@@ -33,6 +33,7 @@
 #include "ThirdParty/ImGuiColorTextEdit/TextEditor.h"
 #include "Nebula/NebulaLightmap.h"
 #include "VersionControl.h"
+#include "EditorWindows/VREditorWorkspace.h"
 #endif
 #include "Vulkan/VulkanRenderer.h"
 #include "XR/XRSystem.h"
@@ -282,7 +283,9 @@ private:
     bool showConsole = true;
     bool consolePanelExpanded = false;
     bool showProjectBrowser = true;  // Now merged into file browser
-    bool projectSettingsCompactSidebar = true;
+    bool projectSettingsCompactSidebar = false; // false: named sidebar; true: top icon tabs
+    bool projectSettingsTwoColumns = false;
+    int projectSettingsVisibilityMode = 0; // Simple / Advanced / Developer
     bool showRegistryPackagesWindow = false;
     bool showModularityDoctorWindow = false;
     bool showVersionControlWindow = false;
@@ -989,6 +992,7 @@ private:
     };
     std::unordered_map<int, UiCanvas3DContext> uiCanvas3DContexts;
     std::unordered_map<int, UiCanvas3DInput> uiCanvas3DInputs;
+    int uiKeyboardCanvasId = -1;
     bool consoleWrapText = true;
     enum class MeshEditSelectionMode { Object = 0, Vertex = 1, Edge = 2, Face = 3, UV = 4, Carve = 5 };
     MeshEditSelectionMode meshEditSelectionMode = MeshEditSelectionMode::Object;
@@ -1184,6 +1188,13 @@ private:
         //              project/scene/script files stay loose so the direct loaders still find them)
         std::string packagingMode = "extract";
         bool bundleVerifyIntegrity = true;   // write + check the whole-bundle SHA-256
+        // GLES 2.0 shaders (original RG35XX-class GPUs). The export converts every shader the
+        // build scenes use, plus the skybox, to GLSL ES 1.00 next to the original as
+        // <name>.es2.glsl (Gles2ShaderTranspiler). Turns preloadShaders on.
+        bool gles2Shaders = false;
+        // Compile the shaders the build scenes use while the player boots, from the
+        // Resources/Shaders/preload.list the export writes, instead of on first draw.
+        bool preloadShaders = false;
         // Protection post-build hooks. The commands run after the exe + content are staged.
         // {exe},{bundle},{dir} are substituted. Empty command with the toggle on just warns.
         bool obfuscateScripts = false;
@@ -1366,6 +1377,9 @@ private:
         std::mutex stdinMutex;
         int stdinFd = -1;
         long long pid = -1;
+#if defined(_WIN32)
+        void* jobHandle = nullptr; // Guarded by mutex; worker owns/ closes it.
+#endif
         std::string lineBuffer;
     };
     std::mutex scriptProcessesMutex;
@@ -1613,7 +1627,7 @@ private:
     void renderPlayModeSaveModal();
     void renderNewProjectDialog();
     void renderOpenProjectDialog();
-    void renderMainMenuBar();
+    void renderMainMenuBar(bool embedded = false);
     void refreshEditorWindowIcons();
     // The shared "create a SceneOBJ" menu. Pass a parentId and everything the menu creates at
     // the root this frame is parented to it, which is what the Hierarchy's right-click
@@ -1658,8 +1672,8 @@ private:
                                            const glm::mat4& wallModelMatrix);
     void applyMapSectorVisibility();
     void renderHierarchyPanel();
-    void renderObjectNode(SceneObject& obj, const std::string& filter,
-                          std::vector<bool>& ancestorHasNext, std::unordered_set<int>& renderPath,
+    void renderObjectNode(int objectId, const std::string& filter,
+                          std::vector<bool>& ancestorHasNext, std::vector<int>& renderPath,
                           bool isLast, int depth, float animStep);
     void renderFileBrowserPanel();
     void renderMeshBuilderPanel();
@@ -1729,6 +1743,7 @@ private:
     void drawGameProfilerContent();
     void renderGameProfilerWindow();
     void renderUiCanvas3DTargets();
+    void renderDockedUiCanvas(SceneObject& canvas, ImVec2 min, ImVec2 max);
     void renderBuildSettingsWindow();
     void renderModularityDoctorWindow();
     void renderScriptingWindow();
@@ -1887,6 +1902,16 @@ private:
     std::vector<int> xrInteractableScratch;
 
     bool isXRRequestedByProject() const;
+#if !MODULARITY_RUNTIME_ONLY
+    VREditorWorkspace vrEditor;
+    bool openProjectInVR = false;
+    bool isVREditorActive() const;
+    void renderVREditorEntry();
+    void renderVREditorMonitor();
+    void renderVREditorUI(const Modularity::XR::XRInputState& input);
+    void applyVREditorActions();
+    void updateVREditorShortcut();
+#endif
     void updateXRSystem();
     bool renderXRFrame();
     void shutdownXRSystem();
@@ -1942,6 +1967,9 @@ private:
     std::array<ImVec2, 4> buildSpriteSheetUvs(const SceneObject& obj) const;
     void resetBuildSettings();
     void loadBuildSettings();
+    // Compiles every program in the exported Resources/Shaders/preload.list before the first
+    // scene loads. No list (editor, or an export with preloading off) does nothing.
+    void preloadRuntimeShaders();
     void saveBuildSettings();
     void selectBuildSettingsProfile(const fs::path& relativeProfilePath);
     void saveBuildSettingsProfileAs(const std::string& profileName);
@@ -2156,9 +2184,14 @@ private:
     Modularity::GraphicsBackend resolveRequestedBackend() const;
     bool usingVulkan() const { return graphicsBackend == Modularity::GraphicsBackend::Vulkan; }
     void onWindowResized(int width, int height);
+    void waitForBackgroundJobs();
 
 public:
     Engine() = default;
+    ~Engine();
+#if !MODULARITY_RUNTIME_ONLY
+    void setVREditorMode(bool enabled) { vrEditor.requested = enabled; }
+#endif
 
     void setStartupProjectPath(const std::string& path);
     bool init();

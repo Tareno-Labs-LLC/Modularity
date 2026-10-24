@@ -20,6 +20,12 @@ constexpr float kDefaultXRFarPlane = 1000.0f;
 } // namespace
 
 bool Engine::isXRRequestedByProject() const {
+#if !MODULARITY_RUNTIME_ONLY
+    if (!playerMode && vrEditor.preview) return false;
+#endif
+#if !MODULARITY_RUNTIME_ONLY && MODULARITY_HAS_OPENXR
+    if (!playerMode && vrEditor.requested && !usingVulkan()) return true;
+#endif
     if (!projectManager.currentProject.isLoaded) return false;
     const Modularity::XR::ProjectOpenXRSettings& xr =
         projectManager.currentProject.openXRSettings;
@@ -55,8 +61,26 @@ void Engine::updateXRSystem() {
         if (xrStartupAttempted) return;
         xrStartupAttempted = true;
 
-        const Modularity::XR::ProjectOpenXRSettings& xr =
-            projectManager.currentProject.openXRSettings;
+#if !MODULARITY_RUNTIME_ONLY
+        // The launcher has not opened a scene and normally has no renderer yet.
+        // A VR session still needs rendered frames to leave the compositor's
+        // application-waiting screen and show the spatial project selector.
+        if (vrEditor.requested && !playerMode && !initRenderer()) {
+            xrStartupError = "VR editor could not initialize the OpenGL renderer. See Console for the missing resource or shader error.";
+            return;
+        }
+#endif
+        Modularity::XR::ProjectOpenXRSettings xr = projectManager.currentProject.openXRSettings;
+#if !MODULARITY_RUNTIME_ONLY
+        if (vrEditor.requested && !playerMode) {
+            xr.enabled = true;
+            xr.interaction.editorWorkspace = true;
+            xr.activeTarget().enabled = true;
+            xr.activeTarget().renderMode = Modularity::XR::XRRenderMode::MultiPass;
+            xr.activeTarget().interactionProfiles = Modularity::XR::DefaultInteractionProfiles(
+                Modularity::XR::ActivePlatformTarget());
+        }
+#endif
 
         if (Modularity::XR::ActivePlatformTarget() == Modularity::XR::XRPlatformTarget::PC) {
             std::string overrideError;
@@ -104,11 +128,39 @@ bool Engine::renderXRFrame() {
 #else
     if (!xrSystem.isRunning() || !rendererInitialized) return false;
 
+#if MODULARITY_XR_HAS_ANY_GL_TYPES
+    // The desktop monitor renders after XR. Never leave a released eye image
+    // bound as its target, including when an XR frame cannot submit any views.
+    struct FrameTargetRestore {
+        GLint draw = 0, read = 0, viewport[4]{};
+        FrameTargetRestore() {
+            glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+            glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
+            glGetIntegerv(GL_VIEWPORT, viewport);
+        }
+        ~FrameTargetRestore() {
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, draw);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, read);
+            glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+        }
+    } restoreTarget;
+#endif
+
     Camera xrCamera = camera;
     float nearPlane = kDefaultXRNearPlane;
     float farPlane = kDefaultXRFarPlane;
-    const SceneObject* runtimeCam = findXRCameraObject();
-    if (!runtimeCam) runtimeCam = findPlayerCameraObject();
+    const SceneObject* runtimeCam = nullptr;
+#if !MODULARITY_RUNTIME_ONLY
+    const bool editingWorkspace = vrEditor.requested && !playerMode && !isPlaying;
+    if (editingWorkspace) {
+        nearPlane = std::max(0.01f, buildSettings.editorCameraNear);
+        farPlane = std::max(nearPlane + 0.01f, buildSettings.editorCameraFar);
+    } else
+#endif
+    {
+        runtimeCam = findXRCameraObject();
+        if (!runtimeCam) runtimeCam = findPlayerCameraObject();
+    }
     if (runtimeCam) {
         xrCamera = makeCameraFromObject(*runtimeCam);
         nearPlane = std::max(0.01f, runtimeCam->camera.nearClip);
@@ -117,6 +169,10 @@ bool Engine::renderXRFrame() {
     xrSystem.setClipPlanes(nearPlane, farPlane);
 
     const bool render = xrSystem.beginFrame();
+#if !MODULARITY_RUNTIME_ONLY
+    if (vrEditor.requested && !playerMode) renderVREditorUI(Modularity::XR::InputState());
+    if (editingWorkspace) xrCamera = camera;
+#endif
     if (render) {
         const uint32_t viewCount = xrSystem.viewCount();
         for (uint32_t viewIndex = 0; viewIndex < viewCount; ++viewIndex) {
@@ -135,14 +191,37 @@ bool Engine::renderXRFrame() {
             renderer.renderSceneToTarget(xrCamera, sceneObjects, view.framebuffer,
                                          static_cast<int>(view.width),
                                          static_cast<int>(view.height), projection, nearPlane,
-                                         farPlane);
+                                         farPlane, true, true);
             renderer.endRender();
+
+#if !MODULARITY_RUNTIME_ONLY
+            if (editingWorkspace) vrEditor.drawSceneOverlays(renderer,xrCamera,sceneObjects,projection,
+                view.framebuffer,static_cast<int>(view.width),static_cast<int>(view.height),nearPlane);
+#endif
+#if !MODULARITY_RUNTIME_ONLY
+            if (vrEditor.requested && !playerMode) {
+                glBindFramebuffer(GL_FRAMEBUFFER, view.framebuffer);
+                glViewport(0, 0, static_cast<int>(view.width), static_cast<int>(view.height));
+                const glm::mat4 trackingToWorld = xrSystem.originToWorld();
+                const glm::vec3 trackingEye = glm::vec3(glm::inverse(trackingToWorld) * glm::vec4(xrCamera.position, 1));
+                vrEditor.renderEye(renderer, projection * viewMatrix * trackingToWorld, trackingEye);
+                if (viewIndex == 0) {
+                    const bool firstMirror = !vrEditor.mirrorTexture();
+                    vrEditor.captureMirror(view.framebuffer, view.width, view.height);
+                    if (firstMirror && vrEditor.mirrorTexture())
+                        addConsoleMessage("VR editor submitted its first view; desktop mirror ready.", ConsoleMessageType::Info);
+                }
+            }
+#endif
 
             xrSystem.endView(viewIndex);
         }
     }
 
     xrSystem.endFrame();
+#if !MODULARITY_RUNTIME_ONLY
+    if (vrEditor.requested && !playerMode) applyVREditorActions();
+#endif
     return render;
 #endif
 }

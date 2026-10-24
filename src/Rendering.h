@@ -285,6 +285,7 @@ private:
         float resolvedBlend = 0.0f;
     };
     RenderTarget previewTarget;
+    RenderTarget externalSceneTarget;
     std::unordered_map<int, RenderTarget> extraPreviewTargets;
     std::unordered_map<int, uint64_t> extraPreviewTargetLastUsed;
     RenderTarget postTarget;
@@ -736,6 +737,17 @@ public:
     void renderObject(const SceneObject& obj);
     void renderScene(const Camera& camera, const std::vector<SceneObject>& sceneObjects, int selectedId = -1, float fovDeg = FOV, float nearPlane = NEAR_PLANE, float farPlane = FAR_PLANE, bool drawColliders = false, const std::vector<int>* selectedIds = nullptr, SceneRenderMode renderMode = SceneRenderMode::Normal, bool applyPostFX = true);
     void renderSelectionOutline(const Camera& camera, const std::vector<SceneObject>& sceneObjects, const std::vector<int>& selectedIds, float fovDeg, float nearPlane, float farPlane);
+    static bool getObjectLocalBounds(const SceneObject& object, glm::vec3& center, glm::vec3& extents);
+    void renderSelectionOutlinePass(const Camera& camera, const std::vector<SceneObject>& objects,
+        const std::vector<int>& ids, const glm::mat4& projection, unsigned int targetFramebuffer,
+        int width, int height, float nearPlane, float radiusPx, float opacity, bool animateSelection,
+        unsigned int depthFramebuffer);
+#if !MODULARITY_RUNTIME_ONLY
+    void renderSelectionOutlineToTarget(const Camera& camera, const std::vector<SceneObject>& objects,
+        const std::vector<int>& ids, const glm::mat4& projection, unsigned int targetFramebuffer,
+        int width, int height, float nearPlane, float radiusPx = 2.7f,
+        float opacity = .95f, bool animateSelection = true);
+#endif
     unsigned int renderScenePreview(const Camera& camera, const std::vector<SceneObject>& sceneObjects, int width, int height, float fovDeg, float nearPlane, float farPlane, bool applyPostFX = false, int previewSlot = 0, bool transparentBackground = false);
     void renderSceneToTarget(const Camera& camera,
                              const std::vector<SceneObject>& sceneObjects,
@@ -744,6 +756,13 @@ public:
                              const glm::mat4& projection,
                              float nearPlane, float farPlane,
                              bool clearTarget = true);
+    void renderSceneToTarget(const Camera& camera,
+                             const std::vector<SceneObject>& sceneObjects,
+                             unsigned int targetFramebuffer,
+                             int width, int height,
+                             const glm::mat4& projection,
+                             float nearPlane, float farPlane,
+                             bool clearTarget, bool applyPostFX);
     void renderCollisionOverlay(const Camera& camera, const std::vector<SceneObject>& sceneObjects, int width, int height, float fovDeg, float nearPlane, float farPlane, const std::vector<int>* previewIds = nullptr);
     void endRender();
     PostFXSettings resolvePostFXSettings(const Camera& camera, const std::vector<SceneObject>& sceneObjects) const;

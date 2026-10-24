@@ -1,4 +1,5 @@
 #include "ProjectManager.h"
+#include "UIControlsData.h"
 #include "../include/Platform/AssetSource.h"
 #include "SceneSerializationInternal.h"
 #include "DurableFile.h"
@@ -614,6 +615,24 @@ bool Project::load(const fs::path& projectFilePath) {
                 playerSettings.applicationIconPath = value;
             } else if (key == "playerSaveDataPathBehavior") {
                 playerSettings.saveDataPathBehavior = value;
+            } else if (key == "discordRichPresenceEnabled") {
+                discordPresenceSettings.enabled = ParseProjectBool(value);
+            } else if (key == "discordApplicationId") {
+                discordPresenceSettings.applicationId = value;
+            } else if (key == "discordState") {
+                discordPresenceSettings.state = value;
+            } else if (key == "discordDetails") {
+                discordPresenceSettings.details = value;
+            } else if (key == "discordLargeImageKey") {
+                discordPresenceSettings.largeImageKey = value;
+            } else if (key == "discordLargeImageText") {
+                discordPresenceSettings.largeImageText = value;
+            } else if (key == "discordSmallImageKey") {
+                discordPresenceSettings.smallImageKey = value;
+            } else if (key == "discordSmallImageText") {
+                discordPresenceSettings.smallImageText = value;
+            } else if (key == "discordPartyId") {
+                discordPresenceSettings.partyId = value;
             } else if (key == "openXREnabled") {
                 openXRSettings.enabled = ParseProjectBool(value);
             } else if (key == "openXRTrackingOrigin") {
@@ -841,6 +860,15 @@ void Project::saveProjectFile() const {
     file << "playerBuildTarget=" << playerSettings.buildTarget << "\n";
     file << "playerApplicationIcon=" << playerSettings.applicationIconPath << "\n";
     file << "playerSaveDataPathBehavior=" << playerSettings.saveDataPathBehavior << "\n";
+    file << "discordRichPresenceEnabled=" << (discordPresenceSettings.enabled ? 1 : 0) << "\n";
+    file << "discordApplicationId=" << discordPresenceSettings.applicationId << "\n";
+    file << "discordState=" << discordPresenceSettings.state << "\n";
+    file << "discordDetails=" << discordPresenceSettings.details << "\n";
+    file << "discordLargeImageKey=" << discordPresenceSettings.largeImageKey << "\n";
+    file << "discordLargeImageText=" << discordPresenceSettings.largeImageText << "\n";
+    file << "discordSmallImageKey=" << discordPresenceSettings.smallImageKey << "\n";
+    file << "discordSmallImageText=" << discordPresenceSettings.smallImageText << "\n";
+    file << "discordPartyId=" << discordPresenceSettings.partyId << "\n";
 
     {
         const Modularity::XR::ProjectOpenXRSettings& xr = openXRSettings;
@@ -2081,6 +2109,50 @@ bool SceneSerializationInternal::WriteLegacySceneStream(std::ostream& file,
             file << "uiPosition=" << obj.ui.position.x << "," << obj.ui.position.y << "\n";
             file << "uiRotation=" << obj.ui.rotation << "\n";
             file << "uiSize=" << obj.ui.size.x << "," << obj.ui.size.y << "\n";
+            if (obj.hasUI) {
+                file << "uiClipChildren=" << obj.ui.clipChildren << "\n";
+                file << "uiFitWidth=" << obj.ui.fitWidth << "\n";
+                file << "uiFitHeight=" << obj.ui.fitHeight << "\n";
+                file << "uiResponsive=" << obj.ui.responsive << "\n";
+                file << "uiChecked=" << obj.ui.checked << "\n";
+                file << "uiMultiline=" << obj.ui.multiline << "\n";
+                file << "uiPassword=" << obj.ui.password << "\n";
+                file << "uiIndeterminate=" << obj.ui.indeterminate << "\n";
+                file << "uiVertical=" << obj.ui.vertical << "\n";
+                file << "uiVirtualize=" << obj.ui.virtualize << "\n";
+                file << "uiSortable=" << obj.ui.sortable << "\n";
+                file << "uiOpen=" << obj.ui.open << "\n";
+                file << "uiDimBackground=" << obj.ui.dimBackground << "\n";
+                file << "uiGridColumns=" << obj.ui.gridColumns << "\n";
+                file << "uiSelectedIndex=" << obj.ui.selectedIndex << "\n";
+                file << "uiLinkedObjectId=" << obj.ui.linkedObjectId << "\n";
+                file << "uiFlexibleSize=" << obj.ui.flexibleSize << "\n";
+                file << "uiAspectRatio=" << obj.ui.aspectRatio << "\n";
+                file << "uiRounding=" << obj.ui.rounding << "\n";
+                file << "uiBorderWidth=" << obj.ui.borderWidth << "\n";
+                file << "uiRangeUpper=" << obj.ui.rangeUpper << "\n";
+                file << "uiRowHeight=" << obj.ui.rowHeight << "\n";
+                file << "uiNumericStep=" << obj.ui.numericStep << "\n";
+                file << "uiSpacing=" << obj.ui.spacing.x << "," << obj.ui.spacing.y << "\n";
+                file << "uiMinimumSize=" << obj.ui.minimumSize.x << "," << obj.ui.minimumSize.y << "\n";
+                file << "uiPreferredSize=" << obj.ui.preferredSize.x << "," << obj.ui.preferredSize.y << "\n";
+                file << "uiMaximumSize=" << obj.ui.maximumSize.x << "," << obj.ui.maximumSize.y << "\n";
+                file << "uiAnchorMin=" << obj.ui.anchorMin.x << "," << obj.ui.anchorMin.y << "\n";
+                file << "uiAnchorMax=" << obj.ui.anchorMax.x << "," << obj.ui.anchorMax.y << "\n";
+                file << "uiPivot=" << obj.ui.pivot.x << "," << obj.ui.pivot.y << "\n";
+                file << "uiScrollOffset=" << obj.ui.scrollOffset.x << "," << obj.ui.scrollOffset.y << "\n";
+                file << "uiContentSize=" << obj.ui.contentSize.x << "," << obj.ui.contentSize.y << "\n";
+                file << "uiPadding=" << obj.ui.padding.x << "," << obj.ui.padding.y << "," << obj.ui.padding.z << "," << obj.ui.padding.w << "\n";
+                file << "uiMargin=" << obj.ui.margin.x << "," << obj.ui.margin.y << "," << obj.ui.margin.z << "," << obj.ui.margin.w << "\n";
+                file << "uiNumericValue=" << obj.ui.numericValue.x << "," << obj.ui.numericValue.y << "," << obj.ui.numericValue.z << "," << obj.ui.numericValue.w << "\n";
+                file << "uiInputText=" << EncodeSceneTextValue(obj.ui.inputText) << "\n";
+                file << "uiPlaceholder=" << EncodeSceneTextValue(obj.ui.placeholder) << "\n";
+                file << "uiTooltip=" << EncodeSceneTextValue(obj.ui.tooltip) << "\n";
+                file << "uiItems=" << EncodeSceneTextValue(UIControlsData::Join(obj.ui.items)) << "\n";
+                file << "uiItemParents=" << EncodeSceneTextValue(UIControlsData::Join(obj.ui.itemParents)) << "\n";
+                file << "uiExpandedItems=" << EncodeSceneTextValue(UIControlsData::Join(obj.ui.expandedItems)) << "\n";
+                file << "uiLayout=" << static_cast<int>(obj.ui.layout) << "\n";
+            }
             file << "uiMaskChildren=" << (obj.ui.maskChildren ? 1 : 0) << "\n";
             file << "uiSliderValue=" << obj.ui.sliderValue << "\n";
             file << "uiSliderMin=" << obj.ui.sliderMin << "\n";
@@ -3222,6 +3294,48 @@ const std::unordered_map<std::string, KeyHandler>& GetSceneObjectKeyHandlers() {
         {"uiPosition", +[](SceneObject& obj, const std::string& value) { ParseVec2(value, obj.ui.position); }},
         {"uiRotation", +[](SceneObject& obj, const std::string& value) { obj.ui.rotation = std::stof(value); }},
         {"uiSize", +[](SceneObject& obj, const std::string& value) { ParseVec2(value, obj.ui.size); }},
+        {"uiClipChildren", +[](SceneObject& obj, const std::string& value) { obj.ui.clipChildren = (std::stoi(value) != 0); }},
+        {"uiFitWidth", +[](SceneObject& obj, const std::string& value) { obj.ui.fitWidth = (std::stoi(value) != 0); }},
+        {"uiFitHeight", +[](SceneObject& obj, const std::string& value) { obj.ui.fitHeight = (std::stoi(value) != 0); }},
+        {"uiResponsive", +[](SceneObject& obj, const std::string& value) { obj.ui.responsive = (std::stoi(value) != 0); }},
+        {"uiChecked", +[](SceneObject& obj, const std::string& value) { obj.ui.checked = (std::stoi(value) != 0); }},
+        {"uiMultiline", +[](SceneObject& obj, const std::string& value) { obj.ui.multiline = (std::stoi(value) != 0); }},
+        {"uiPassword", +[](SceneObject& obj, const std::string& value) { obj.ui.password = (std::stoi(value) != 0); }},
+        {"uiIndeterminate", +[](SceneObject& obj, const std::string& value) { obj.ui.indeterminate = (std::stoi(value) != 0); }},
+        {"uiVertical", +[](SceneObject& obj, const std::string& value) { obj.ui.vertical = (std::stoi(value) != 0); }},
+        {"uiVirtualize", +[](SceneObject& obj, const std::string& value) { obj.ui.virtualize = (std::stoi(value) != 0); }},
+        {"uiSortable", +[](SceneObject& obj, const std::string& value) { obj.ui.sortable = (std::stoi(value) != 0); }},
+        {"uiOpen", +[](SceneObject& obj, const std::string& value) { obj.ui.open = (std::stoi(value) != 0); }},
+        {"uiDimBackground", +[](SceneObject& obj, const std::string& value) { obj.ui.dimBackground = (std::stoi(value) != 0); }},
+        {"uiGridColumns", +[](SceneObject& obj, const std::string& value) { obj.ui.gridColumns = std::stoi(value); }},
+        {"uiSelectedIndex", +[](SceneObject& obj, const std::string& value) { obj.ui.selectedIndex = std::stoi(value); }},
+        {"uiLinkedObjectId", +[](SceneObject& obj, const std::string& value) { obj.ui.linkedObjectId = std::stoi(value); }},
+        {"uiFlexibleSize", +[](SceneObject& obj, const std::string& value) { obj.ui.flexibleSize = std::stof(value); }},
+        {"uiAspectRatio", +[](SceneObject& obj, const std::string& value) { obj.ui.aspectRatio = std::stof(value); }},
+        {"uiRounding", +[](SceneObject& obj, const std::string& value) { obj.ui.rounding = std::stof(value); }},
+        {"uiBorderWidth", +[](SceneObject& obj, const std::string& value) { obj.ui.borderWidth = std::stof(value); }},
+        {"uiRangeUpper", +[](SceneObject& obj, const std::string& value) { obj.ui.rangeUpper = std::stof(value); }},
+        {"uiRowHeight", +[](SceneObject& obj, const std::string& value) { obj.ui.rowHeight = std::stof(value); }},
+        {"uiNumericStep", +[](SceneObject& obj, const std::string& value) { obj.ui.numericStep = std::stof(value); }},
+        {"uiSpacing", +[](SceneObject& obj, const std::string& value) { ParseVec2(value, obj.ui.spacing); }},
+        {"uiMinimumSize", +[](SceneObject& obj, const std::string& value) { ParseVec2(value, obj.ui.minimumSize); }},
+        {"uiPreferredSize", +[](SceneObject& obj, const std::string& value) { ParseVec2(value, obj.ui.preferredSize); }},
+        {"uiMaximumSize", +[](SceneObject& obj, const std::string& value) { ParseVec2(value, obj.ui.maximumSize); }},
+        {"uiAnchorMin", +[](SceneObject& obj, const std::string& value) { ParseVec2(value, obj.ui.anchorMin); }},
+        {"uiAnchorMax", +[](SceneObject& obj, const std::string& value) { ParseVec2(value, obj.ui.anchorMax); }},
+        {"uiPivot", +[](SceneObject& obj, const std::string& value) { ParseVec2(value, obj.ui.pivot); }},
+        {"uiScrollOffset", +[](SceneObject& obj, const std::string& value) { ParseVec2(value, obj.ui.scrollOffset); }},
+        {"uiContentSize", +[](SceneObject& obj, const std::string& value) { ParseVec2(value, obj.ui.contentSize); }},
+        {"uiPadding", +[](SceneObject& obj, const std::string& value) { ParseVec4(value, obj.ui.padding); }},
+        {"uiMargin", +[](SceneObject& obj, const std::string& value) { ParseVec4(value, obj.ui.margin); }},
+        {"uiNumericValue", +[](SceneObject& obj, const std::string& value) { ParseVec4(value, obj.ui.numericValue); }},
+        {"uiInputText", +[](SceneObject& obj, const std::string& value) { obj.ui.inputText = SceneSerializationInternal::DecodeSceneTextValue(value); }},
+        {"uiPlaceholder", +[](SceneObject& obj, const std::string& value) { obj.ui.placeholder = SceneSerializationInternal::DecodeSceneTextValue(value); }},
+        {"uiTooltip", +[](SceneObject& obj, const std::string& value) { obj.ui.tooltip = SceneSerializationInternal::DecodeSceneTextValue(value); }},
+        {"uiItems", +[](SceneObject& obj, const std::string& value) { UIControlsData::Split(value.empty() ? std::string{} : SceneSerializationInternal::DecodeSceneTextValue(value), obj.ui.items); }},
+        {"uiItemParents", +[](SceneObject& obj, const std::string& value) { UIControlsData::Split(value.empty() ? std::string{} : SceneSerializationInternal::DecodeSceneTextValue(value), obj.ui.itemParents); }},
+        {"uiExpandedItems", +[](SceneObject& obj, const std::string& value) { UIControlsData::Split(value.empty() ? std::string{} : SceneSerializationInternal::DecodeSceneTextValue(value), obj.ui.expandedItems); }},
+        {"uiLayout", +[](SceneObject& obj, const std::string& value) { obj.ui.layout = static_cast<UILayoutMode>(std::clamp(std::stoi(value), 0, 3)); }},
         {"uiMaskChildren", +[](SceneObject& obj, const std::string& value) { obj.ui.maskChildren = (std::stoi(value) != 0); }},
         {"uiSliderValue", +[](SceneObject& obj, const std::string& value) { obj.ui.sliderValue = std::stof(value); }},
         {"uiSliderMin", +[](SceneObject& obj, const std::string& value) { obj.ui.sliderMin = std::stof(value); }},
@@ -3587,6 +3701,7 @@ ObjectType GetLegacyTypeFromComponents(const SceneObject& obj) {
                     ? ObjectType::Sprite25D
                     : ObjectType::Sprite2D;
             case UIElementType::None: break;
+            default: if (IsExtendedUIType(obj.ui.type)) return ObjectType::UIImage; break;
         }
     }
     if (obj.hasLight) {

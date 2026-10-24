@@ -390,6 +390,46 @@ static void TestRpc() {
     const int afterUnregister = calls;
     fx.session.callRpc("Greet", args, Net::RpcTarget::Local);
     CHECK(calls == afterUnregister, "unregistered RPC no longer fires");
+
+    for (auto target : {Net::RpcTarget::Local, Net::RpcTarget::All}) {
+        auto captured = std::make_shared<int>(42);
+        std::weak_ptr<int> lifetime = captured;
+        bool invoked = false;
+        fx.session.registerRpc("Once", [&, captured](Net::PlayerId, Net::Reader&) {
+            // Keep the observation outside the callback's own captures, which
+            // the original dispatch destroys as soon as unregisterRpc runs.
+            auto observation = lifetime;
+            bool* result = &invoked;
+            fx.session.unregisterRpc("Once");
+            CHECK(!observation.expired(), "self-unregistering RPC retains its captures during the call");
+            *result = true;
+        });
+        captured.reset();
+        CHECK(fx.session.callRpc("Once", args, target), "one-shot RPC dispatches");
+        fx.pump();
+        CHECK(invoked, "self-unregistering RPC completes");
+        CHECK(lifetime.expired(), "one-shot RPC captures are released after dispatch");
+    }
+    int afterShutdown = 0;
+    fx.session.registerRpc("Stop", [&](Net::PlayerId, Net::Reader&) {
+        fx.session.shutdown();
+        // Re-registering proves old queued events are rejected by generation,
+        // rather than merely finding an empty handler table.
+        fx.session.registerRpc("Late", [&](Net::PlayerId, Net::Reader&) { ++afterShutdown; });
+    });
+    fx.session.registerRpc("Late", [&](Net::PlayerId, Net::Reader&) { ++afterShutdown; });
+    CHECK(fx.session.callRpc("Stop", args, Net::RpcTarget::All), "queue shutdown RPC");
+    CHECK(fx.session.callRpc("Late", args, Net::RpcTarget::All), "queue event after shutdown RPC");
+    fx.pump();
+    CHECK(afterShutdown == 0, "shutdown discards later events in the active backend batch");
+    CHECK(!fx.session.inRoom(), "callback shutdown leaves session stopped");
+
+    fx.session.onStateChanged = [&](Net::ConnectionState) { fx.session.shutdown(); };
+    CHECK(fx.session.start(cfg, fx.bridge()), "restart after callback shutdown");
+    fx.session.connect(); // Synchronous callback must not destroy connect's backend.
+    fx.pump();
+    CHECK(!fx.session.inRoom(), "synchronous state callback can shut down safely");
+
 }
 
 static void TestBackendFallback() {

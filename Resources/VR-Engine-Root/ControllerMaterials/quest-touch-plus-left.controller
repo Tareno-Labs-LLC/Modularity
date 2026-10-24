@@ -1,0 +1,10 @@
+mesh=Resources/VR-Engine-Root/Meta-Quest-Touch-Plus/models/MetaQuestTouchPlus_Left.fbx
+albedo=Resources/VR-Engine-Root/Meta-Quest-Touch-Plus/textures/MetaQuestTouchPlus_Left_BaseColor.png
+normal=Resources/VR-Engine-Root/Meta-Quest-Touch-Plus/textures/MetaQuestTouchPlus_Normals.png
+orm=Resources/VR-Engine-Root/Meta-Quest-Touch-Plus/textures/MetaQuestTouchPlus_ORM.png
+metallic=0
+roughness=0.45
+ambient=0.28
+scale=1
+offset=0,0,0
+rotation=0,0,0

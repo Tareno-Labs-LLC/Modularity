@@ -212,8 +212,16 @@ vec4 marchClouds(vec3 dir, vec3 sunDir, float dayAmount) {
     // whole budget on one pixel and aliasing badly.
     span = min(span, (top - bottom) * 12.0);
 
-    int steps = clamp(uCloudSteps, 4, 64);
-    int lightSteps = clamp(uCloudLightSteps, 1, 8);
+    // Float clamps: GLSL ES 1.00 has no integer clamp().
+#ifdef MODU_ES2
+    // The full march is 64 x 8 noise evaluations per pixel; a GLES 2 GPU gets a
+    // fraction of that budget, and the cached sky bake hides most of the loss.
+    int steps = int(clamp(float(uCloudSteps), 4.0, 12.0));
+    int lightSteps = int(clamp(float(uCloudLightSteps), 1.0, 2.0));
+#else
+    int steps = int(clamp(float(uCloudSteps), 4.0, 64.0));
+    int lightSteps = int(clamp(float(uCloudLightSteps), 1.0, 8.0));
+#endif
     float stepLen = span / float(steps);
 
     float cosTheta = dot(dir, sunDir);

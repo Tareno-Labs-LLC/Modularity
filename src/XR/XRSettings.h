@@ -98,6 +98,8 @@ struct XRPCRuntimeSettings {
 struct XRInteractionSettings {
     bool enabled = true;
     std::string defaultActionSet;
+    // Session-only policy for the native VR editor; never saved to a project.
+    bool editorWorkspace = false;
 };
 
 std::array<XRTargetSettings, static_cast<size_t>(XRPlatformTarget::Count)> DefaultTargetSettings();

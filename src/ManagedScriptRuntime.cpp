@@ -1,4 +1,5 @@
 #include "ManagedScriptRuntime.h"
+#include "ScriptContextBinding.h"
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
@@ -445,6 +446,7 @@ bool ManagedScriptRuntime::hasInspector(const fs::path& assemblyPath, const std:
 void ManagedScriptRuntime::tickModule(const fs::path& assemblyPath, const std::string& typeName,
                                       ScriptContext& ctx, float deltaTime,
                                       bool runSpec, bool runTest) {
+    ScriptContextBinding binding(ctx);
     Module* mod = getModule(assemblyPath, typeName);
     if (!mod) return;
 
@@ -459,6 +461,7 @@ void ManagedScriptRuntime::tickModule(const fs::path& assemblyPath, const std::s
             return;
         }
         mod->beginCalledObjects.insert(objId);
+        if (!ctx.object || !ctx.script) return;
     }
 
     MonoMethod* tickUpdate = reinterpret_cast<MonoMethod*>(mod->tickUpdate.method);
@@ -477,6 +480,7 @@ void ManagedScriptRuntime::tickModule(const fs::path& assemblyPath, const std::s
         }
     }
 
+    if (!ctx.object || !ctx.script) return;
     if (runSpec) {
         MonoMethod* spec = reinterpret_cast<MonoMethod*>(mod->spec.method);
         if (spec) {
@@ -489,6 +493,7 @@ void ManagedScriptRuntime::tickModule(const fs::path& assemblyPath, const std::s
             }
         }
     }
+    if (!ctx.object || !ctx.script) return;
     if (runTest) {
         MonoMethod* test = reinterpret_cast<MonoMethod*>(mod->testEditor.method);
         if (test) {

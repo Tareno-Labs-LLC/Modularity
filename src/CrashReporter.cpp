@@ -16,6 +16,7 @@ namespace Modularity::CrashReporter {
 #include "ThirdParty/ModuGUI/imgui.h"
 #include "../include/ThirdParty/stb_image.h"
 #include "../include/Textures/StbFlipScope.h"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -787,6 +788,14 @@ namespace Modularity::CrashReporter {
             public:
                 TeeStreamBuf(std::streambuf* primary, std::streambuf* secondary) : primary_(primary), secondary_(secondary) {}
             protected:
+                // Forward blocks directly. The default xsputn calls overflow for each
+                // byte; stderr is unbuffered, turning an asset warning into hundreds
+                // of synchronous writes on Windows (and stalling the render thread).
+                std::streamsize xsputn(const char* data, std::streamsize count) override {
+                    const auto first = primary_ ? primary_->sputn(data, count) : count;
+                    const auto second = secondary_ ? secondary_->sputn(data, count) : count;
+                    return std::min(first, second);
+                }
                 int overflow(int ch) override {
                     if (ch == EOF) return !EOF;
                     const int first = primary_ ? primary_->sputc(static_cast<char>(ch)) : ch;

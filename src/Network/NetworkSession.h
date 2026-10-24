@@ -178,7 +178,9 @@ private:
     double budgetWindowStart = 0.0;
     uint64_t budgetWindowBytes = 0;
 
-    std::unique_ptr<NetworkBackend> backend;
+    // Active calls retain their backend if a callback shuts down/restarts the session.
+    std::shared_ptr<NetworkBackend> backend;
+    uint64_t backendGeneration = 0;
     SessionConfig config;
     SceneBridge scene;
     NetworkError error;
