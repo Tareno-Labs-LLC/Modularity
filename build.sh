@@ -421,6 +421,8 @@ Options:
                           x86-64-v2, x86-64-v3, x86-64-v4, or native
   --native                Shorthand for --cpu-target=native (DEV ONLY; do not ship)
   --generator=<name>      Force CMake generator (e.g. Ninja, "Unix Makefiles")
+  --discord               Enable optional Discord Rich Presence (default: off)
+  --no-discord            Build without the Discord Social SDK
   --jobs=<N>              Parallel compile jobs (default: nproc - 2, min 1)
   --skip-deps             Skip automatic dependency checks/install
   --zip                   Package as .zip (default; fast to compress)
@@ -442,6 +444,7 @@ EOF
 clean_build=0
 build_type="Release"
 build_cpp_standard="c++23"
+discord_sdk="OFF"
 # Default to baseline x86-64 so public Linux releases run on any 64-bit x86 CPU.
 # Higher levels (or --native) are developer-only and must not be shipped.
 cpu_target="baseline"
@@ -496,6 +499,12 @@ for arg in "$@"; do
             ;;
         --build-type=*)
             build_type="${arg#*=}"
+            ;;
+        --discord)
+            discord_sdk="ON"
+            ;;
+        --no-discord)
+            discord_sdk="OFF"
             ;;
         --cpu-target=*)
             cpu_target="${arg#*=}"
@@ -1065,6 +1074,7 @@ configure_editor_build() {
         "${cmake_platform_args[@]}" \
         -DMONO_ROOT=/usr \
         -DMODULARITY_BUILD_CPP_STANDARD="${build_cpp_standard}" \
+        -DMODULARITY_ENABLE_DISCORD_SOCIAL_SDK="${discord_sdk}" \
         -DMODULARITY_CPU_TARGET="${cpu_target}" \
         -DCMAKE_BUILD_TYPE="${build_type}"
 }
@@ -1107,6 +1117,7 @@ configure_player_build() {
         "${cmake_platform_args[@]}" \
         -DMONO_ROOT=/usr \
         -DMODULARITY_BUILD_CPP_STANDARD="${build_cpp_standard}" \
+        -DMODULARITY_ENABLE_DISCORD_SOCIAL_SDK="${discord_sdk}" \
         -DMODULARITY_CPU_TARGET="${cpu_target}" \
         -DCMAKE_BUILD_TYPE="${build_type}" \
         -DMODULARITY_BUILD_EDITOR=OFF

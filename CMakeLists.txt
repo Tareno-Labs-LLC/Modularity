@@ -739,9 +739,12 @@ if(MODULARITY_ENABLE_OPENXR)
 endif()
 
 # ==================== Discord Social SDK ====================
-# Rich Presence is optional at build time so unsupported targets (Android and
-# MinGW in the currently supplied SDK) continue to build with a no-op backend.
-option(MODULARITY_ENABLE_DISCORD_SOCIAL_SDK "Enable Discord Social SDK Rich Presence" ON)
+# Rich Presence is optional and opt-in. A fresh checkout can build and install
+# Modularity without downloading the Discord Social SDK. Set
+# -DMODULARITY_ENABLE_DISCORD_SOCIAL_SDK=ON to opt in on supported platforms.
+# When disabled or unavailable, MODULARITY_HAS_DISCORD_SOCIAL_SDK=0 lets the
+# engine compile its no-op implementation without linking or copying Discord.
+option(MODULARITY_ENABLE_DISCORD_SOCIAL_SDK "Enable Discord Social SDK Rich Presence" OFF)
 set(MODULARITY_DISCORD_SOCIAL_SDK_ROOT
     "${PROJECT_SOURCE_DIR}/src/ThirdParty/DiscordSocialSdk"
     CACHE PATH "Discord Social SDK root containing include/, lib/ and bin/")
@@ -804,6 +807,8 @@ endif()
 
 if(MODULARITY_HAS_DISCORD_SOCIAL_SDK)
     message(STATUS "Discord Social SDK Rich Presence enabled: ${MODULARITY_DISCORD_SOCIAL_RUNTIME}")
+elseif(NOT MODULARITY_ENABLE_DISCORD_SOCIAL_SDK)
+    message(STATUS "Discord Social SDK disabled (optional; enable with -DMODULARITY_ENABLE_DISCORD_SOCIAL_SDK=ON).")
 endif()
 set(MODULARITY_SCRIPT_SDK_COPY_SCRIPT ${CMAKE_SOURCE_DIR}/cmake/CopyScriptSDK.cmake)
 set(MODULARITY_RUNTIME_DLL_COPY_SCRIPT ${CMAKE_SOURCE_DIR}/cmake/CopyRuntimeDlls.cmake)
@@ -2161,8 +2166,14 @@ if(MODULARITY_HAS_DISCORD_SOCIAL_SDK)
         install(FILES "${MODULARITY_DISCORD_SOCIAL_RUNTIME}"
             DESTINATION ${CMAKE_INSTALL_LIBDIR})
     endif()
-    install(FILES "${MODULARITY_DISCORD_SOCIAL_SDK_ROOT}/License-Notices.txt"
-        DESTINATION "licenses/DiscordSocialSdk")
+    # Some manually vendored SDK layouts omit the separate license-notice file.
+    # It must not make an otherwise valid optional build fail at install time.
+    if(EXISTS "${MODULARITY_DISCORD_SOCIAL_SDK_ROOT}/License-Notices.txt")
+        install(FILES "${MODULARITY_DISCORD_SOCIAL_SDK_ROOT}/License-Notices.txt"
+            DESTINATION "licenses/DiscordSocialSdk")
+    else()
+        message(WARNING "Discord Social SDK license notices file not found. Review the SDK's redistribution requirements before packaging.")
+    endif()
 endif()
 
 if(NOT WIN32 AND MODULARITY_ENABLE_PHYSX)

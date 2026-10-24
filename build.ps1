@@ -514,6 +514,8 @@ function Show-Usage {
     Write-Host '  --build-type=<type>     CMake build type (default: Release)'
     Write-Host '  --jobs=<N>              Parallel compile jobs (default: cores - 2, min 1)'
     Write-Host '  --no-player             Skip the ModularityPlayer runtime build'
+    Write-Host '  --discord               Enable optional Discord Rich Presence (default: off)'
+    Write-Host '  --no-discord            Build without the Discord Social SDK'
     Write-Host '  --zip                   Package as .zip (default; fast to compress)'
     Write-Host '  --7z                    Package as .7z (smaller, but much slower)'
     Write-Host '  --help                  Show this help message'
@@ -521,6 +523,7 @@ function Show-Usage {
 
 $cleanBuild = $false
 $skipPlayer = $false
+$discordSdk = 'OFF'
 $buildType = 'Release'
 $buildCppStandard = 'c++23'
 # ZIP is the default package format. It is stored/deflate and finishes in
@@ -534,6 +537,8 @@ foreach ($arg in $Arguments) {
     switch -Regex ($arg) {
         '^--clean$'      { $cleanBuild = $true; continue }
         '^--no-player$'  { $skipPlayer = $true; continue }
+        '^--discord$'   { $discordSdk = 'ON'; continue }
+        '^--no-discord$' { $discordSdk = 'OFF'; continue }
         '^--zip$'        { $packageFormat = 'ZIP'; $packageExt = 'zip'; continue }
         '^--7z$'         { $packageFormat = '7Z'; $packageExt = '7z'; continue }
         '^--help$|^-h$'  { Show-Usage; exit 0 }
@@ -634,6 +639,7 @@ if ($jobsDefaulted -and $jobs -lt $coreCount) {
 }
 Write-Info "CMake generator: $generatorDisplay"
 Write-Info "Package format: $packageFormat"
+Write-Info "Discord Social SDK: $discordSdk (optional; --discord to enable)"
 Write-Info "Modularity root: $root"
 if (-not $generator) {
     Write-Warn 'No Visual Studio generator detected; using CMake default.'
@@ -812,7 +818,8 @@ function Invoke-BuildPipeline {
     if (-not (Invoke-ExternalStep 'Syncing Submodules' 'git' @('submodule', 'update', '--init', '--recursive'))) { return $false }
 
     $configureArgs = @() + $generatorArgs + @('-S', $root, '-B', $buildDir,
-        "-DCMAKE_BUILD_TYPE=$buildType", "-DMODULARITY_BUILD_CPP_STANDARD=$buildCppStandard") + $vsGlobalsArgs + $monoArgs
+        "-DCMAKE_BUILD_TYPE=$buildType", "-DMODULARITY_BUILD_CPP_STANDARD=$buildCppStandard",
+        "-DMODULARITY_ENABLE_DISCORD_SOCIAL_SDK=$discordSdk") + $vsGlobalsArgs + $monoArgs
     if (-not (Invoke-ExternalStep 'Configuring Editor' 'cmake' $configureArgs)) { return $false }
 
     $buildArgs = @('--build', $buildDir, '--config', $buildType, '--parallel', "$jobs") + $buildExtraArgs
@@ -835,7 +842,8 @@ function Invoke-BuildPipeline {
     } else {
         $playerConfigureArgs = @() + $generatorArgs + @('-S', $root, '-B', $playerCacheDir,
             '-DMODULARITY_BUILD_EDITOR=OFF', "-DCMAKE_BUILD_TYPE=$buildType",
-            "-DMODULARITY_BUILD_CPP_STANDARD=$buildCppStandard") + $vsGlobalsArgs + $monoArgs
+            "-DMODULARITY_BUILD_CPP_STANDARD=$buildCppStandard",
+            "-DMODULARITY_ENABLE_DISCORD_SOCIAL_SDK=$discordSdk") + $vsGlobalsArgs + $monoArgs
         if (-not (Invoke-ExternalStep 'Configuring Player' 'cmake' $playerConfigureArgs)) { return $false }
 
         $playerBuildArgs = @('--build', $playerCacheDir, '--config', $buildType,

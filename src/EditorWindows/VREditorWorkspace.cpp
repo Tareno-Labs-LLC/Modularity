@@ -2,6 +2,7 @@
 #if !MODULARITY_RUNTIME_ONLY
 #include "ModelLoader.h"
 #include "ScenePicking.h"
+#include "VREditorMouseInput.h"
 #include "Camera.h"
 #include "ThirdParty/ModuGUI/imgui_internal.h"
 #include "ThirdParty/ModuGUI/backends/imgui_impl_opengl3.h"
@@ -309,7 +310,7 @@ void VREditorWorkspace::beginUI(const XRInputState& state, float dt, bool launch
     updateWristTools();
     updateWristSurfaces();
     feedPointer(dt);
-    ImGui::NewFrame();
+    VREditorMouseInput::NewFrame(hit ? hoveredPanel : 0);
     saveClock+=dt;
 }
 
@@ -381,7 +382,6 @@ void VREditorWorkspace::feedPointer(float dt) {
     keyboardPress=false;
     scenePickPending=false;
     hit=false;hoveredPanel=0;
-    ImGui::SetMouseHitTestRoot(0);
     if(!input.hasFocus || !input.sessionActive) {
         io.AddMouseButtonEvent(0,false);io.AddMouseButtonEvent(1,false); io.AddMousePosEvent(-FLT_MAX,-FLT_MAX);
         mouseDown=gripDown=rightDown=padTouched=false; draggedPanel=0; capturedHand=-1; return;
@@ -470,7 +470,6 @@ void VREditorWorkspace::feedPointer(float dt) {
         }
     } else io.AddMousePosEvent(-FLT_MAX,-FLT_MAX);
     const auto* pointed=findPanel(hoveredPanel);
-    if(hit && pointed)ImGui::SetMouseHitTestRoot(pointed->id);
     const bool overKeyboard=pointed && pointed->name.find("VR Keyboard")!=std::string::npos &&
         uv.y*pointed->uiSize.y > ImGui::GetFrameHeight()+2;
     keyboardPress=overKeyboard && trigger && !mouseDown;

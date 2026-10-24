@@ -1,5 +1,6 @@
 #include "EditorWindows/VREditorWorkspace.h"
 #include "EditorWindows/VREditorWidgets.h"
+#include "EditorWindows/VREditorMouseInput.h"
 #include "ModelLoader.h"
 #include "Camera.h"
 #include "EditorWindows/ScenePicking.h"
@@ -533,11 +534,11 @@ int main() {
         ImGui::SetCurrentContext(workspace.context());check(!ImGui::GetIO().MouseDown[0],"focus loss releases the virtual pointer");ImGui::SetCurrentContext(desktop);
         state.hasFocus=true;hand.buttons[(size_t)XRButton::Trigger]=false;
         // Root hit-test routing must work even for identical 2D window rectangles.
-        auto& io=ImGui::GetIO();ImGui::SetMouseHitTestRoot(0);
+        auto& io=ImGui::GetIO();
         for(int i=0;i<2;++i){ImGui_ImplOpenGL3_NewFrame();io.DeltaTime=1.f/90;ImGui::NewFrame();
             for(const char* name:{"Overlap A","Overlap B"}){ImGui::SetNextWindowPos({100,100});ImGui::SetNextWindowSize({260,220});ImGui::Begin(name);ImGui::TextUnformatted(name);ImGui::End();}ImGui::Render();}
-        auto* a=ImGui::FindWindowByName("Overlap A");io.AddMousePosEvent(180,180);ImGui::SetMouseHitTestRoot(a->ID);
-        ImGui_ImplOpenGL3_NewFrame();ImGui::NewFrame();check(ImGui::GetCurrentContext()->HoveredWindow==a,"compositor hit root overrides overlapping 2D stacking");ImGui::EndFrame();ImGui::SetMouseHitTestRoot(0);
+        auto* a=ImGui::FindWindowByName("Overlap A");io.AddMousePosEvent(180,180);
+        ImGui_ImplOpenGL3_NewFrame();VREditorMouseInput::NewFrame(a->ID);check(ImGui::GetCurrentContext()->HoveredWindow==a,"compositor hit root overrides overlapping 2D stacking");ImGui::EndFrame();
         VREditorWorkspace::Surface s;s.position={0,0,-1};s.size={2,2};float distance;glm::vec2 result;
         check(VREditorWorkspace::intersect(s,{0,0,0},{0,0,-1},distance,result)&&std::abs(distance-1)<.001f&&glm::length(result-glm::vec2(.5f))<.001f,"ray/quad intersection maps UVs correctly");
         check(!VREditorWorkspace::intersect(s,{0,0,-2},{0,0,1},distance,result),"back faces reject pointer input");

@@ -5,6 +5,21 @@ starts, a project that has Discord Rich Presence enabled switches to that projec
 application and configured activity. Leaving Play Mode restores the editor activity. Standalone
 players publish only the project's activity and remain silent when the feature is disabled.
 
+## Build setup
+
+Discord integration is optional and disabled by default. Normal editor/player
+builds do not need the Social SDK or its runtime library. The build scripts also
+disable a previously cached SDK setting unless explicitly enabled for that build.
+
+To include Rich Presence, run `build.bat --discord` on Windows or
+`./build.sh --discord` on Linux. For direct CMake builds, set
+`-DMODULARITY_ENABLE_DISCORD_SOCIAL_SDK=ON`. Use `--no-discord` (or omit
+`--discord`) to build without it; a clean build is not required.
+
+When enabled, provide a compatible SDK under `src/ThirdParty/DiscordSocialSdk`
+or set `MODULARITY_DISCORD_SOCIAL_SDK_ROOT` to its location. Without a usable SDK,
+the engine builds with its no-op Discord implementation.
+
 ## Project setup
 
 Open **Project Settings > Player Config > Discord Rich Presence**, enable the feature, and enter the
