@@ -3,6 +3,12 @@
 #include <cctype>
 #include <cstdint>
 #include <string>
+// Use the logical public output path, not compile()'s temporary .staging file.
+// The bundle placeholder and the runtime loader must derive the same soname.
+inline fs::path moduAndroidScriptRelativeBinary(const fs::path& publicBinary,
+                                                const fs::path& outDir) {
+    return publicBinary.lexically_normal().lexically_relative(outDir.lexically_normal());
+}
 inline std::string moduAndroidScriptSoname(const fs::path& binaryRelativeToOutDir) {
     std::string raw = binaryRelativeToOutDir.generic_string();
     for (const char* ext : {".so", ".dll", ".dylib"}) {

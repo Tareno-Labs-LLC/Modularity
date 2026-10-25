@@ -1092,10 +1092,10 @@ copy_third_party_libraries() {
 
     mkdir -p "${target_dir}/Packages/ThirdParty"
     if [[ "${build_platform}" == "windows" ]]; then
-        find "${target_dir}" -type f \( -name "*.a" -o -name "*.so" -o -name "*.dylib" -o -name "*.lib" -o -name "*.dll" -o -name "*.dll.a" \) \
+        find "${target_dir}" \( -path "${target_dir}/android-sdk" -o -path "${target_dir}/android-sdk-smoke" -o -path "${target_dir}/android-clang" -o -path "${target_dir}/android" \) -prune -o -type f \( -name "*.a" -o -name "*.so" -o -name "*.dylib" -o -name "*.lib" -o -name "*.dll" -o -name "*.dll.a" \) \
             -not -path "${target_dir}/Packages/*" -exec cp -f {} "${target_dir}/Packages/ThirdParty/" \;
     else
-        find "${target_dir}" -type f \( -name "*.a" -o -name "*.so" -o -name "*.dylib" -o -name "*.lib" \) \
+        find "${target_dir}" \( -path "${target_dir}/android-sdk" -o -path "${target_dir}/android-sdk-smoke" -o -path "${target_dir}/android-clang" -o -path "${target_dir}/android" \) -prune -o -type f \( -name "*.a" -o -name "*.so" -o -name "*.dylib" -o -name "*.lib" \) \
             -not -path "${target_dir}/Packages/*" -exec cp -f {} "${target_dir}/Packages/ThirdParty/" \;
     fi
 }
@@ -1104,7 +1104,7 @@ copy_engine_libraries() {
     local target_dir="$1"
 
     mkdir -p "${target_dir}/Packages/Engine"
-    find "${target_dir}" -type f \( -name "libcore*" -o -name "core*.lib" -o -name "core*.dll" \) \
+    find "${target_dir}" \( -path "${target_dir}/android-sdk" -o -path "${target_dir}/android-sdk-smoke" -o -path "${target_dir}/android-clang" -o -path "${target_dir}/android" \) -prune -o -type f \( -name "libcore*" -o -name "core*.lib" -o -name "core*.dll" \) \
         -not -path "${target_dir}/Packages/*" -exec cp -f {} "${target_dir}/Packages/Engine/" \;
 }
 

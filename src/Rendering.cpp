@@ -1787,6 +1787,14 @@ void Renderer::setShadowQuality(int filterQuality, float lodDistance, bool conta
 
 float Renderer::updateEyeAdaptation(unsigned int sourceTexture, int width, int height,
                                     const PostFXSettings& settings) {
+#if MODULARITY_OPENGL_ES
+    // This readback uses desktop glGetTexImage, which GLES does not provide.
+    // Keep the configured manual exposure rather than reading an empty PBO.
+    (void)sourceTexture; (void)width; (void)height; (void)settings;
+    adaptedLuminance = -1.0f;
+    luminancePboPrimed = false;
+    return 1.0f;
+#else
     if (!settings.eyeAdaptationEnabled || sourceTexture == 0 || width <= 0 || height <= 0) {
         adaptedLuminance = -1.0f;
         luminancePboPrimed = false;
@@ -1861,6 +1869,7 @@ float Renderer::updateEyeAdaptation(unsigned int sourceTexture, int width, int h
         lastAdaptationTime = now;
     }
     return ComputeAdaptedExposure(measured, adaptedLuminance, dt, settings);
+#endif
 }
 
 void Renderer::setDefaultTextureFormatPolicy(TextureFormatPolicy policy) {
@@ -2598,6 +2607,10 @@ std::string Renderer::giUnsupportedReason() const {
 }
 
 bool Renderer::ensureVoxelVolume(int resolution, int volumeCount) {
+#if MODULARITY_OPENGL_ES
+    (void)resolution; (void)volumeCount;
+    return false;
+#else
     resolution = std::clamp(resolution, 32, 256);
     volumeCount = std::clamp(volumeCount, 1, 2);
     if (voxelVolume.texture[0] != 0 && voxelVolume.resolution == resolution &&
@@ -2643,6 +2656,7 @@ bool Renderer::ensureVoxelVolume(int resolution, int volumeCount) {
     voxelVolume.hasData = false;
     voxelSceneSignature = 0;
     return true;
+#endif
 }
 
 void Renderer::releaseVoxelVolume() {
@@ -6204,6 +6218,7 @@ void Renderer::renderSceneInternal(const Camera& camera, const std::vector<Scene
     };
 
     bool giActiveThisPass = false;
+#if !MODULARITY_OPENGL_ES
     if (skybox && !reflectionCapturePass && giSupported()) {
         const SkyboxSettings& giSky = skybox->getSettings();
         if (giSky.giEnabled && giSky.giIntensity > 0.0f) {
@@ -6446,6 +6461,7 @@ void Renderer::renderSceneInternal(const Camera& camera, const std::vector<Scene
         }
     }
 
+#endif
     struct MaterialUniformCache {
         bool valid = false;
         bool unlit = false;

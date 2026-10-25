@@ -104,7 +104,9 @@ std::string StateName(unsigned pname) {
         case GL_ARRAY_BUFFER_BINDING: return "ARRAY_BUFFER_BINDING";
         case GL_ELEMENT_ARRAY_BUFFER_BINDING: return "ELEMENT_ARRAY_BUFFER_BINDING";
         case GL_VERTEX_ARRAY_BINDING: return "VERTEX_ARRAY_BINDING";
+#if !MODULARITY_OPENGL_ES
         case GL_POLYGON_MODE: return "POLYGON_MODE";
+#endif
         case GL_BLEND_SRC_RGB: return "BLEND_SRC_RGB";
         case GL_BLEND_DST_RGB: return "BLEND_DST_RGB";
         case GL_BLEND_SRC_ALPHA: return "BLEND_SRC_ALPHA";
@@ -127,10 +129,12 @@ std::string StateName(unsigned pname) {
         case GL_STENCIL_TEST: return "STENCIL_TEST";
         case GL_SCISSOR_TEST: return "SCISSOR_TEST";
         case GL_POLYGON_OFFSET_FILL: return "POLYGON_OFFSET_FILL";
+#if !MODULARITY_OPENGL_ES
         case GL_POLYGON_OFFSET_LINE: return "POLYGON_OFFSET_LINE";
         case GL_PRIMITIVE_RESTART: return "PRIMITIVE_RESTART";
         case GL_FRAMEBUFFER_SRGB: return "FRAMEBUFFER_SRGB";
         case GL_MULTISAMPLE: return "MULTISAMPLE";
+#endif
         default: {
             char buffer[16];
             std::snprintf(buffer, sizeof(buffer), "0x%04X", pname);

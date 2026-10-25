@@ -13,7 +13,24 @@ how to actually build an installable `.apk` from the command line.
 ./build.sh --Android --editor -o ~/Modularity.apk
 ```
 
-You need the Android NDK and SDK installed, with the env vars set:
+On Windows, install the command-line SDK/NDK once, then use the same exporter:
+
+```powershell
+# Requires a JDK (21 or newer). Review Google's SDK license before accepting it.
+powershell -ExecutionPolicy Bypass -File tools\Setup-Android.ps1 -AcceptLicenses
+.\build.bat --Android --jobs=4
+.\build.bat --Android --project=C:\Games\Game\project.modu --output=C:\Games\Game.apk
+.\build.bat --Android --editor --output=C:\Games\Modularity.apk
+```
+
+The setup script installs tools under `build/android-sdk`, verifies Google's
+command-line tools archive checksum, and installs NDK 30.0.16248370, platform 36,
+build-tools 36.0.0, platform-tools, and SDK CMake/Ninja. Android Studio and Gradle
+are not required. It does not change machine-wide environment variables.
+`-CheckOnly` checks an existing installation without downloading packages.
+
+The exporter detects `build/android-sdk`, the standard Android Studio SDK
+directory, and side-by-side NDKs automatically. You can override discovery with:
 
 - `ANDROID_NDK_ROOT` (or `ANDROID_NDK_HOME` / `ANDROID_NDK`) pointing at the NDK
 - `ANDROID_SDK_ROOT` (or `ANDROID_HOME`) pointing at the SDK
@@ -40,10 +57,18 @@ Under the hood it:
 1. Configures + builds `core_player` with the NDK toolchain into
    `libModularityPlayer.so` (CMake is already Android-aware, see `CMakeLists.txt`).
 2. Cross-compiles your ModuCPP scripts for the target ABI (see below).
+   The engine and scripts use the same NDK shared C++ runtime. Its library and
+   notice are packaged with the app, following [Android's runtime guidance](https://developer.android.com/ndk/guides/cpp-support#shared_runtimes).
 3. Stages runtime content (scenes, assets) into `assets/content.modbundle`.
 4. Writes an `AndroidManifest.xml` that launches `android.app.NativeActivity`
    with `android.app.lib_name=ModularityPlayer`.
-5. Packages + signs the APK with `aapt2` / `zipalign` / `apksigner`.
+5. Packages native libraries with the JDK `jar` tool, aligns the APK with
+   `zipalign -P 16`, and signs it with `apksigner`.
+
+Fresh Android builds use Ninja when available, including SDK-bundled Ninja,
+so Windows does not select a desktop Visual Studio generator for the NDK.
+Android builds default to four compiler workers; set
+`CMAKE_BUILD_PARALLEL_LEVEL` to override this, or use `--jobs=N` on Windows.
 
 Player APKs have no Java/Kotlin (`android:hasCode="false"`). The experimental
 editor APK generates one tiny Java `NativeActivity` subclass while packaging so
@@ -160,6 +185,12 @@ import an entire external folder in one action.
 
 - Needs a working desktop build environment, since the APK build builds the
   native editor first. (This is why it isn't a pure cross-compile.)
+- APK packaging and the debug signing key need a JDK. `JAVA_HOME` and the
+  Windows Java `latest` installation are checked in addition to PATH.
+- The supported Photon SDK packages contain desktop binaries and are excluded
+  from Android builds; networking falls back to the offline backend.
+- GLES builds use manual exposure. The desktop auto-exposure readback and
+  geometry/image-store voxel GI paths are not available on the GLES 3.0 backend.
 - Editor APK packaging needs `javac` on PATH and SDK build-tools with `d8` so
   the generated file-picker Activity can be compiled without Gradle.
 - arm64-v8a only by default. Other ABIs work via `--abi=` but aren't routinely

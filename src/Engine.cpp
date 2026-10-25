@@ -10,6 +10,7 @@ namespace Loc = Modularity::Loc;
 #include <windows.h>
 #endif
 #include "Engine.h"
+#include "AndroidToolchain.h"
 #include "ScriptContextBinding.h"
 #include "Modu2DStats.h"
 #ifdef __ANDROID__
@@ -1806,7 +1807,10 @@ namespace {
 bool runCommandCapture(const std::string& command, std::string& output) {
     std::array<char, 256> buffer{};
 #ifdef _WIN32
-    FILE* pipe = _popen(command.c_str(), "r");
+    // cmd /c consumes an outer pair of quotes. Keep quotes around executable
+    // paths (notably a JDK under Program Files) intact inside that pair.
+    const std::string shellCommand = "\"" + command + "\"";
+    FILE* pipe = _popen(shellCommand.c_str(), "r");
 #else
     FILE* pipe = popen(command.c_str(), "r");
 #endif
@@ -1835,7 +1839,8 @@ bool runCommandStreaming(const std::string& command,
                          int* exitCodeOut) {
     std::array<char, 256> buffer{};
 #ifdef _WIN32
-    FILE* pipe = _popen(command.c_str(), "r");
+    const std::string shellCommand = "\"" + command + "\"";
+    FILE* pipe = _popen(shellCommand.c_str(), "r");
 #else
     FILE* pipe = popen(command.c_str(), "r");
 #endif
@@ -2633,23 +2638,96 @@ std::string androidToolName(const char* name) {
 }
 
 fs::path findAndroidSdkRoot() {
-    const char* envVars[] = {
-        "ANDROID_SDK_ROOT",
-        "ANDROID_HOME",
-        "ANDROID_SDK_HOME",
-        "ANDROID_SDK",
-    };
-    for (const char* var : envVars) {
-        const char* value = std::getenv(var);
-        if (!value || !*value) continue;
-        std::error_code ec;
-        fs::path candidate(value);
-        if (fs::is_directory(candidate / "platforms", ec) &&
-            fs::is_directory(candidate / "build-tools", ec)) {
-            return candidate;
+    return AndroidToolchain::FindSdkRoot();
+}
+
+fs::path findJavaTool(const char* name) {
+    auto jdk = AndroidToolchain::EnvironmentPath("JAVA_HOME");
+    auto candidate = jdk / "bin" / androidToolName(name);
+    if (!jdk.empty() && AndroidToolchain::Exists(candidate)) return candidate;
+    if (auto tool = findExecutableInPath(name); !tool.empty()) return tool;
+#ifdef _WIN32
+    auto programs = AndroidToolchain::EnvironmentPath("ProgramFiles");
+    if (!programs.empty()) {
+        for (const auto& vendor : {programs / "Java" / "latest", programs / "Java",
+                                   programs / "Eclipse Adoptium", programs / "Microsoft"}) {
+            std::vector<fs::path> roots{vendor};
+            std::error_code ec;
+            for (fs::directory_iterator it(vendor, ec); !ec && it != fs::directory_iterator(); it.increment(ec)) {
+                if (it->is_directory(ec) && AndroidToolchain::Exists(it->path() / "bin" / "javac.exe")) roots.push_back(it->path());
+            }
+            auto version = [](const fs::path& root) {
+                const std::string text = root.filename().string();
+                const auto start = text.find_first_of("0123456789");
+                if (start == std::string::npos) return std::vector<int>{};
+                auto end = text.find_first_not_of("0123456789.", start);
+                std::string number = text.substr(start, end - start);
+                while (!number.empty() && number.back() == '.') number.pop_back();
+                return AndroidToolchain::Version(number);
+            };
+            std::sort(roots.begin(), roots.end(), [&](const fs::path& a, const fs::path& b) { return version(a) > version(b); });
+            for (const auto& root : roots) {
+                candidate = root / "bin" / androidToolName(name);
+                if (AndroidToolchain::Exists(candidate)) return candidate;
+            }
         }
     }
+#endif
     return {};
+}
+
+bool androidCMakeGeneratorArgs(const fs::path& sdk, const fs::path& buildRoot,
+                               std::string& arguments, std::string& error) {
+    std::error_code ec;
+    if (fs::exists(buildRoot / "CMakeCache.txt", ec)) return true;
+    auto ninja = AndroidToolchain::FindNinja(sdk);
+    if (ninja.empty()) ninja = findExecutableInPath("ninja");
+    if (!ninja.empty()) {
+        arguments = " -G Ninja -DCMAKE_MAKE_PROGRAM=" + quotePath(ninja);
+        return true;
+    }
+#ifdef _WIN32
+    error = "Android cross-compilation on Windows needs Ninja. Run tools/Setup-Android.ps1 or install CMake in the Android SDK Manager.";
+    return false;
+#else
+    (void)error;
+    return true;
+#endif
+}
+
+bool stageAndroidCxxRuntime(const fs::path& ndk, const std::string& abi,
+                            const fs::path& libDir, std::string& error) {
+    const auto runtime = AndroidToolchain::FindSharedCxxRuntime(ndk, abi);
+    if (runtime.empty()) {
+        error = "NDK libc++_shared.so not found for " + abi + ". Reinstall the selected NDK.";
+        return false;
+    }
+    std::error_code ec;
+    fs::create_directories(libDir, ec);
+    if (!ec) fs::copy_file(runtime, libDir / "libc++_shared.so", fs::copy_options::overwrite_existing, ec);
+    if (ec) { error = "Failed to package the Android C++ runtime: " + ec.message(); return false; }
+    auto hostRoot = runtime;
+    for (int i = 0; i < 5; ++i) hostRoot = hostRoot.parent_path();
+    const auto notice = hostRoot / "NOTICE";
+    if (AndroidToolchain::Exists(notice)) {
+        const auto licenseDir = libDir.parent_path().parent_path() / "assets" / "licenses";
+        fs::create_directories(licenseDir, ec);
+        if (!ec) fs::copy_file(notice, licenseDir / "libcxx-NOTICE.txt", fs::copy_options::overwrite_existing, ec);
+        if (ec) { error = "Failed to package the Android C++ runtime notice: " + ec.message(); return false; }
+    }
+    return true;
+}
+
+std::string androidBuildParallelArgs() {
+    unsigned jobs = 4;
+    if (const char* raw = std::getenv("CMAKE_BUILD_PARALLEL_LEVEL"); raw && *raw) {
+        const std::string value(raw);
+        if (value.size() < 5 && value.find_first_not_of("0123456789") == std::string::npos) {
+            const unsigned requested = static_cast<unsigned>(std::strtoul(raw, nullptr, 10));
+            if (requested) jobs = std::min(requested, 64u);
+        }
+    }
+    return " --parallel " + std::to_string(jobs);
 }
 
 fs::path findLatestAndroidJar(const fs::path& sdkRoot, int& outApiLevel) {
@@ -2722,7 +2800,7 @@ AndroidBuildTools findLatestAndroidBuildTools(const fs::path& sdkRoot) {
             continue;
         }
         const std::string version = entry.path().filename().string();
-        if (version > bestVersion) {
+        if (AndroidToolchain::Version(version) > AndroidToolchain::Version(bestVersion)) {
             bestVersion = version;
             best = {aapt2, zipalign, apksigner, fs::exists(d8, ec) && !ec ? d8 : fs::path{}};
         }
@@ -3317,7 +3395,7 @@ bool ensureAndroidDebugKeystore(const fs::path& keystorePath,
         return false;
     }
 
-    fs::path keytool = findExecutableInPath("keytool");
+    fs::path keytool = findJavaTool("keytool");
     if (keytool.empty()) {
         error = "Android debug keystore is missing and keytool was not found in PATH.";
         return false;
@@ -3406,7 +3484,7 @@ bool packageAndroidApk(const fs::path& apkStageRoot,
     const fs::path javaSourceRoot = apkStageRoot / "java";
     const std::vector<fs::path> javaFiles = collectFilesWithExtension(javaSourceRoot, ".java");
     if (!javaFiles.empty()) {
-        fs::path javac = findExecutableInPath(androidToolName("javac"));
+        fs::path javac = findJavaTool("javac");
         if (javac.empty()) {
             error = "javac was not found in PATH; needed to compile the Android activity bridge.";
             return false;
@@ -3443,7 +3521,7 @@ bool packageAndroidApk(const fs::path& apkStageRoot,
             error = "Android activity bridge produced no .class files.";
             return false;
         }
-        fs::path jarTool = findExecutableInPath(androidToolName("jar"));
+        fs::path jarTool = findJavaTool("jar");
         if (jarTool.empty()) {
             error = "jar was not found in PATH; needed to package Android activity bridge classes for d8.";
             return false;
@@ -3473,22 +3551,22 @@ bool packageAndroidApk(const fs::path& apkStageRoot,
         }
     }
 
-    fs::path zipTool = findExecutableInPath("zip");
-    if (zipTool.empty()) {
-        error = "zip was not found in PATH; needed to add native libraries to the APK.";
+    fs::path jarTool = findJavaTool("jar");
+    if (jarTool.empty()) {
+        error = "The JDK jar tool was not found. Set JAVA_HOME or add the JDK bin directory to PATH.";
         return false;
     }
-    std::string zipEntries = "lib";
+    std::string jarCommand = quotePath(jarTool) + " ufM " + quotePath(unsignedApk) +
+        " -C " + quotePath(apkStageRoot) + " lib";
     if (fs::exists(apkStageRoot / "classes.dex", ec) && !ec) {
-        zipEntries += " classes.dex";
+        jarCommand += " -C " + quotePath(apkStageRoot) + " classes.dex";
     }
-    if (!runStep("cd " + quotePath(apkStageRoot) + " && " +
-                 quotePath(zipTool) + " -q -r " + quotePath(unsignedApk) + " " + zipEntries,
+    if (!runStep(jarCommand,
                  "Failed to add native libraries to APK")) {
         return false;
     }
 
-    if (!runStep(quotePath(tools.zipalign) + " -f 4 " +
+    if (!runStep(quotePath(tools.zipalign) + " -P 16 -f 4 " +
                  quotePath(unsignedApk) + " " + quotePath(alignedApk),
                  "zipalign failed")) {
         return false;
@@ -14176,15 +14254,17 @@ void Engine::startExportBuild(const fs::path& outputDir, bool runAfter) {
             } else {
                 appendLog("No model assets detected for Android export; Assimp disabled.");
             }
+            std::string generatorArgs;
+            if (!androidCMakeGeneratorArgs(sdkRoot, buildRoot, generatorArgs, result.message)) return result;
             std::string configureCmd =
-                "cmake -S " + quotePath(sourceRoot) +
+                "cmake" + generatorArgs + " -S " + quotePath(sourceRoot) +
                 " -B " + quotePath(buildRoot) +
                 " -DCMAKE_BUILD_TYPE=" + buildConfiguration +
                 " -DMODULARITY_BUILD_EDITOR=OFF"
                 " -DCMAKE_TOOLCHAIN_FILE=" + quotePath(toolchainFile) +
                 " -DANDROID_ABI=" + androidAbi +
                 " -DANDROID_PLATFORM=android-26"
-                " -DANDROID_STL=c++_static"
+                " -DANDROID_STL=c++_shared"
                 " -DMODULARITY_ENABLE_ASSIMP=" + std::string(androidEnableAssimp ? "ON" : "OFF");
             appendCMakeModuleFlags(configureCmd, true);
             if (androidEnableAssimp) {
@@ -14206,7 +14286,7 @@ void Engine::startExportBuild(const fs::path& outputDir, bool runAfter) {
 
             setStatus(0.32f, "Building Android player library...");
             std::string buildCmd = "cmake --build " + quotePath(buildRoot) +
-                                   " --config " + buildConfiguration + " --target core_player";
+                                   " --config " + buildConfiguration + " --target core_player" + androidBuildParallelArgs();
             int buildExit = 0;
             appendLog("Running: " + buildCmd);
             auto onBuildChunk = [this, &appendLog](const std::string& chunk) {
@@ -14245,6 +14325,7 @@ void Engine::startExportBuild(const fs::path& outputDir, bool runAfter) {
             const fs::path apkStageRoot = exportRoot / "apk";
             const fs::path assetsRoot = apkStageRoot / "assets";
             const fs::path libDir = apkStageRoot / "lib" / androidAbi;
+            if (!stageAndroidCxxRuntime(ndkRoot, androidAbi, libDir, result.message)) return result;
             fs::create_directories(assetsRoot, ec);
             fs::create_directories(libDir, ec);
             if (ec) {
@@ -15503,6 +15584,10 @@ void Engine::pollExportBuild() {
 }
 
 int Engine::buildAndroidApkHeadless(const AndroidBuildRequest& request, std::string& error) {
+    if (!request.abi.empty() && !AndroidToolchain::ValidAbi(request.abi)) {
+        error = "Unsupported Android ABI: " + request.abi;
+        return 2;
+    }
     if (request.projectPath.empty() || request.editor) {
         return buildBareAndroidApk(request, error);
     }
@@ -15713,6 +15798,7 @@ int Engine::buildBareAndroidApk(const AndroidBuildRequest& request, std::string&
     ec.clear();
     const fs::path assetsRoot = apkStageRoot / "assets";
     const fs::path libDir = apkStageRoot / "lib" / abi;
+    if (!stageAndroidCxxRuntime(ndkRoot, abi, libDir, error)) return 1;
     fs::create_directories(assetsRoot, ec);
     fs::create_directories(libDir, ec);
     fs::create_directories(buildRoot, ec);
@@ -15720,14 +15806,16 @@ int Engine::buildBareAndroidApk(const AndroidBuildRequest& request, std::string&
     auto logcb = [](const std::string& s) { std::fprintf(stderr, "%s", s.c_str()); std::fflush(stderr); };
     const std::string config = request.debug ? "Debug" : "Release";
 
+    std::string generatorArgs;
+    if (!androidCMakeGeneratorArgs(sdkRoot, buildRoot, generatorArgs, error)) return 2;
     const std::string configureCmd =
-        "cmake -S " + quotePath(sourceRoot) + " -B " + quotePath(buildRoot) +
+        "cmake" + generatorArgs + " -S " + quotePath(sourceRoot) + " -B " + quotePath(buildRoot) +
         " -DCMAKE_BUILD_TYPE=" + config +
         " -DMODULARITY_BUILD_EDITOR=OFF"
         " -DCMAKE_TOOLCHAIN_FILE=" + quotePath(toolchainFile) +
         " -DANDROID_ABI=" + abi +
         " -DANDROID_PLATFORM=android-26"
-        " -DANDROID_STL=c++_static"
+        " -DANDROID_STL=c++_shared"
         " -DMODULARITY_ENABLE_ASSIMP=OFF";
     const bool editor = request.editor;
     const std::string cmakeTarget = editor ? "ModularityEditorAndroid" : "core_player";
@@ -15745,7 +15833,7 @@ int Engine::buildBareAndroidApk(const AndroidBuildRequest& request, std::string&
         return 1;
     }
     const std::string buildCmd =
-        "cmake --build " + quotePath(buildRoot) + " --config " + config + " --target " + cmakeTarget;
+        "cmake --build " + quotePath(buildRoot) + " --config " + config + " --target " + cmakeTarget + androidBuildParallelArgs();
     std::fprintf(stderr, "[Android] Building %s...\n", soName.c_str());
     if (!runCommandStreaming(buildCmd + " 2>&1", logcb, &rc)) {
         error = "Android " + std::string(editor ? "editor" : "player") +
@@ -20506,7 +20594,9 @@ void Engine::saveScriptEditorWindowProbeCache() {
     std::ofstream file(cachePath, std::ios::trunc);
     if (!file.is_open()) return;
     for (const auto& entry : scriptEditorWindowProbeCache) {
-        file << entry.second.writeTime.time_since_epoch().count() << '|'
+        // The cache reader uses stoll; libc++ file clocks may use __int128,
+        // which has no ostream insertion operator.
+        file << static_cast<long long>(entry.second.writeTime.time_since_epoch().count()) << '|'
              << (entry.second.hasEditorWindow ? '1' : '0') << '|'
              << entry.first << '\n';
     }

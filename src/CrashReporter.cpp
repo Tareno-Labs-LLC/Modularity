@@ -3,7 +3,9 @@
 #include <android/log.h>
 namespace Modularity::CrashReporter {
     bool HandleCrashReporterMode(int /*argc*/, char** /*argv*/) {return false;}
-    void Initialize(const std::string& /*productName*/, const std::string& /*executablePath*/) {// TODO: register a signal handler that writes a tombstone to logcat before re-raising.}
+    void Initialize(const std::string& /*productName*/, const std::string& /*executablePath*/) {
+        // TODO: register a signal handler that writes a tombstone to logcat before re-raising.
+    }
     int RunProtected(const std::function<int()>& entryPoint) {return entryPoint ? entryPoint() : 0;}
     void AppendLogLine(const std::string& line) {__android_log_print(ANDROID_LOG_INFO, "Modularity", "%s", line.c_str());}
 }

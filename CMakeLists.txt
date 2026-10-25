@@ -390,6 +390,14 @@ function(modularity_photon_resolve_libs root prefix)
     set(${prefix}_COMMON "" PARENT_SCOPE)
     set(${prefix}_REASON "" PARENT_SCOPE)
 
+    # The currently supported Photon package layouts contain desktop binaries.
+    # Android is UNIX too, but Linux .a files cannot be linked into an ARM APK,
+    # and a host-side try_run cannot validate an Android binary.
+    if(ANDROID)
+        set(${prefix}_REASON "desktop Photon SDK packages cannot target Android" PARENT_SCOPE)
+        return()
+    endif()
+
     if(NOT EXISTS "${root}/LoadBalancing-cpp/inc/Client.h")
         set(${prefix}_REASON "LoadBalancing-cpp/inc/Client.h is missing" PARENT_SCOPE)
         return()

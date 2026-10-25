@@ -514,6 +514,12 @@ function Show-Usage {
     Write-Host '  --build-type=<type>     CMake build type (default: Release)'
     Write-Host '  --jobs=<N>              Parallel compile jobs (default: cores - 2, min 1)'
     Write-Host '  --no-player             Skip the ModularityPlayer runtime build'
+    Write-Host '  --Android               Build an Android ARM64 APK using the native editor'
+    Write-Host '  --abi=<abi>             Android ABI (default: arm64-v8a)'
+    Write-Host '  --project=<path.modu>   Bundle a project into the APK (default: bare player)'
+    Write-Host '  --output=<path.apk>     APK output path'
+    Write-Host '  --debug                 Android: build a debuggable APK'
+    Write-Host '  --editor                Android: build the experimental editor APK'
     Write-Host '  --discord               Enable optional Discord Rich Presence (default: off)'
     Write-Host '  --no-discord            Build without the Discord Social SDK'
     Write-Host '  --zip                   Package as .zip (default; fast to compress)'
@@ -524,6 +530,12 @@ function Show-Usage {
 $cleanBuild = $false
 $skipPlayer = $false
 $discordSdk = 'OFF'
+$androidBuild = $false
+$androidAbi = 'arm64-v8a'
+$androidProject = ''
+$androidOutput = ''
+$androidDebug = $false
+$androidEditor = $false
 $buildType = 'Release'
 $buildCppStandard = 'c++23'
 # ZIP is the default package format. It is stored/deflate and finishes in
@@ -537,6 +549,14 @@ foreach ($arg in $Arguments) {
     switch -Regex ($arg) {
         '^--clean$'      { $cleanBuild = $true; continue }
         '^--no-player$'  { $skipPlayer = $true; continue }
+        '^--Android$|^--platform=android$' { $androidBuild = $true; continue }
+        '^--abi=(.+)$' { $androidAbi = $Matches[1]; continue }
+        '^--project=(.+)$' { $androidProject = [IO.Path]::GetFullPath($Matches[1]); continue }
+        '^(?:--output|-o)=(.+)$' {
+            $androidOutput = [IO.Path]::GetFullPath($Matches[1]); continue
+        }
+        '^--debug$' { $androidDebug = $true; continue }
+        '^--editor$' { $androidEditor = $true; continue }
         '^--discord$'   { $discordSdk = 'ON'; continue }
         '^--no-discord$' { $discordSdk = 'OFF'; continue }
         '^--zip$'        { $packageFormat = 'ZIP'; $packageExt = 'zip'; continue }
@@ -562,6 +582,11 @@ if ($jobs -le 0) {
     $jobsDefaulted = $false
 }
 if ($jobs -lt 1) { $jobs = 1 }
+if ($androidBuild) {
+    $skipPlayer = $true
+    if ($jobsDefaulted) { $jobs = [Math]::Min($jobs, 4) }
+    if ($androidAbi -notin @('arm64-v8a', 'armeabi-v7a', 'x86_64', 'x86')) { throw "Unsupported Android ABI: $androidAbi" }
+}
 
 # ---------------------------------------------------------------------------
 # Bootstrap
@@ -622,6 +647,7 @@ if ($env:MONO_ROOT) { $monoArgs = @("-DMONO_ROOT=$env:MONO_ROOT") }
 
 # --- Step accounting. Keep in sync with the hierarchy printed below. --------
 $script:TotalSteps = 6
+if ($androidBuild) { $script:TotalSteps -= 1 }
 if ($cleanBuild) { $script:TotalSteps += 2 }
 if (-not $skipPlayer) { $script:TotalSteps += 4 }
 
@@ -632,7 +658,7 @@ Write-Host '================================' -ForegroundColor $script:ColBold
 Write-Host '   Modularity - Native Windows Build' -ForegroundColor $script:ColBold
 Write-Host '================================' -ForegroundColor $script:ColBold
 
-if ($jobsDefaulted -and $jobs -lt $coreCount) {
+if ($jobsDefaulted -and $jobs -lt $coreCount -and -not $androidBuild) {
     Write-Info "Build type: $buildType  -  C++: $buildCppStandard  -  Jobs: $jobs (of $coreCount cores; reserved 2 to keep desktop responsive - override with --jobs=N)"
 } else {
     Write-Info "Build type: $buildType  -  C++: $buildCppStandard  -  Jobs: $jobs"
@@ -710,6 +736,7 @@ if (Test-Path (Join-Path $buildDir 'CMakeCache.txt')) {
 
 # --- Stage hierarchy -------------------------------------------------------
 $stages = New-Object System.Collections.Generic.List[string]
+if ($androidBuild) { $stages.Add('Check Android SDK, NDK and JDK') }
 if ($cleanBuild) {
     $stages.Add('Clean editor build directory')
     $stages.Add('Clean player cache directory')
@@ -717,15 +744,17 @@ if ($cleanBuild) {
 $stages.Add('Sync git submodules')
 $stages.Add('Configure editor build')
 $stages.Add('Build editor + engine targets')
-$stages.Add('Collect editor libraries')
-$stages.Add('Copy resources')
+if (-not $androidBuild) {
+    $stages.Add('Collect editor libraries')
+    $stages.Add('Copy resources')
+}
 if (-not $skipPlayer) {
     $stages.Add('Configure player-only cache build')
     $stages.Add('Build ModularityPlayer target')
     $stages.Add('Collect player third-party libraries')
     $stages.Add('Collect player engine libraries')
 }
-$stages.Add('Package artifacts and resources')
+if ($androidBuild) { $stages.Add('Build and sign Android APK') } else { $stages.Add('Package artifacts and resources') }
 
 Write-Info 'Build stage hierarchy:'
 for ($i = 0; $i -lt $stages.Count; $i++) {
@@ -765,9 +794,9 @@ function Get-PackageBinaryCandidates {
     }
 
     $libs = @(Get-ChildItem -LiteralPath $TargetDir -Recurse -File -Filter '*.lib' -ErrorAction SilentlyContinue |
-        Where-Object { $_.FullName -notmatch '\\Packages\\' })
+        Where-Object { $_.FullName -notmatch '\\(Packages|android-sdk(?:-smoke)?|android-clang|android)\\' })
     $dlls = @(Get-ChildItem -LiteralPath $TargetDir -Recurse -File -Filter '*.dll' -ErrorAction SilentlyContinue |
-        Where-Object { $_.FullName -notmatch '\\Packages\\' })
+        Where-Object { $_.FullName -notmatch '\\(Packages|android-sdk(?:-smoke)?|android-clang|android)\\' })
 
     $result = @{
         Libs = @($libs | Where-Object { $script:ExcludedLibs -notcontains $_.Name })
@@ -805,9 +834,26 @@ function Copy-PackageBinaries {
 # ---------------------------------------------------------------------------
 
 function Invoke-BuildPipeline {
+    if ($androidBuild) {
+        if (-not (Invoke-InlineStep 'Checking Android Tools' {
+            & (Join-Path $root 'tools\Setup-Android.ps1') -CheckOnly
+            $env:CMAKE_BUILD_PARALLEL_LEVEL = "$jobs"
+        })) { return $false }
+    }
     if ($cleanBuild) {
         if (-not (Invoke-InlineStep 'Cleaning Editor' {
-            if (Test-Path $buildDir) { Remove-Item -LiteralPath $buildDir -Recurse -Force }
+            # Keep downloaded Android tools when cleaning engine outputs.
+            $cleanRoot = [IO.Path]::GetFullPath($buildDir).TrimEnd('\')
+            $sourcePrefix = [IO.Path]::GetFullPath($root).TrimEnd('\') + '\'
+            if (-not $cleanRoot.StartsWith($sourcePrefix, [StringComparison]::OrdinalIgnoreCase)) { throw 'Build directory must stay inside the source root.' }
+            if (Test-Path -LiteralPath $cleanRoot) {
+                foreach ($item in Get-ChildItem -LiteralPath $cleanRoot -Force) {
+                    if ($item.Name -in @('android-sdk', 'android-sdk-smoke', 'android-clang')) { continue }
+                    $target = [IO.Path]::GetFullPath($item.FullName)
+                    if (-not $target.StartsWith($cleanRoot + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Clean target escaped the build directory.' }
+                    Remove-Item -LiteralPath $target -Recurse -Force
+                }
+            }
         })) { return $false }
 
         if (-not (Invoke-InlineStep 'Cleaning Player' {
@@ -823,7 +869,24 @@ function Invoke-BuildPipeline {
     if (-not (Invoke-ExternalStep 'Configuring Editor' 'cmake' $configureArgs)) { return $false }
 
     $buildArgs = @('--build', $buildDir, '--config', $buildType, '--parallel', "$jobs") + $buildExtraArgs
+    if ($androidBuild) {
+        $buildArgs = @('--build', $buildDir, '--config', $buildType, '--target', 'Modularity', '--parallel', "$jobs") + $buildExtraArgs
+    }
     if (-not (Invoke-ExternalStep 'Building Editor' 'cmake' $buildArgs)) { return $false }
+
+    if ($androidBuild) {
+        $editorExe = Join-Path $buildDir "$buildType\Modularity.exe"
+        if (-not (Test-Path -LiteralPath $editorExe)) { $editorExe = Join-Path $buildDir 'Modularity.exe' }
+        if (-not $androidOutput) {
+            $stem = 'ModularityPlayer'; if ($androidEditor) { $stem = 'Modularity' }
+            $script:androidOutput = Join-Path $buildDir "android\$stem.apk"
+        }
+        $apkArgs = @('--build-android', "--abi=$androidAbi", "--output=$androidOutput")
+        if ($androidProject) { $apkArgs += "--project=$androidProject" }
+        if ($androidDebug) { $apkArgs += '--debug' }
+        if ($androidEditor) { $apkArgs += '--editor' }
+        return (Invoke-ExternalStep 'Building Android APK' $editorExe $apkArgs)
+    }
 
     if (-not (Invoke-InlineStep 'Collecting Editor Libs' {
         Copy-PackageBinaries -TargetDir $buildDir -IncludeThirdParty -IncludeEngine
@@ -961,12 +1024,14 @@ if ($succeeded) {
     Write-Host '================================' -ForegroundColor $script:ColBold
     Write-Ok "Build completed in $($duration)s."
     Write-Info "Editor:        build\$buildType\Modularity.exe"
-    if ($skipPlayer) {
+    if ($androidBuild) {
+        Write-Info "Android ABI:   $androidAbi"
+    } elseif ($skipPlayer) {
         Write-Info 'Player:        skipped (--no-player)'
     } else {
         Write-Info "Player:        build\$buildType\ModularityPlayer.exe"
     }
-    Write-Info "Distribution:  build\Modularity-1.0.0-Windows.$packageExt"
+    if ($androidBuild) { Write-Info "Android APK:   $androidOutput" } else { Write-Info "Distribution:  build\Modularity-1.0.0-Windows.$packageExt" }
     Write-TimingSummary
     Write-IssueSummary
     exit 0

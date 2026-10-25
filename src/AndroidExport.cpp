@@ -1,5 +1,6 @@
 #include "Engine.h"
 #include "AndroidScript.h"
+#include "AndroidToolchain.h"
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
@@ -8,15 +9,7 @@
 #include <vector>
 namespace fs = std::filesystem;
 std::string Engine::resolveAndroidNdkPath() {
-    const char* envVars[] = {"ANDROID_NDK_ROOT", "ANDROID_NDK_HOME", "ANDROID_NDK",};
-    for (const char* var : envVars) {
-        const char* value = std::getenv(var);
-        if (!value || !*value) continue;
-        std::error_code ec;
-        fs::path candidate(value);
-        if (!fs::is_directory(candidate, ec)) continue;
-        if (fs::exists(candidate / "source.properties", ec)) {return candidate.string();}
-    }   return {};
+    return AndroidToolchain::FindNdkRoot().string();
 }
 namespace {
     fs::path resolveAndroidScriptCompiler(const fs::path& ndkRoot, const std::string& abi) {
@@ -32,7 +25,7 @@ namespace {
         else if (abi == "armeabi-v7a") triple = "armv7a-linux-androideabi";
         else if (abi == "x86_64")      triple = "x86_64-linux-android";
         else if (abi == "x86")         triple = "i686-linux-android";
-        else                           triple = "aarch64-linux-android";
+        else                           return {};
         const std::string base = triple + "26-clang++";
         std::error_code ec;
         fs::path driver = llvmBin / base;
@@ -71,6 +64,8 @@ bool Engine::crossCompileAndroidScripts(const ScriptBuildConfig& scriptConfig, c
     androidConfig.extraLinkFlags.push_back("-s");
     androidConfig.defines.push_back("MODULARITY_RUNTIME_ONLY=1");
     androidConfig.defines.push_back("MODULARITY_PLAYER=1");
+    androidConfig.defines.push_back("MODULARITY_OPENGL_ES=1");
+    androidConfig.defines.push_back("MODULARITY_USE_MONO=0");
     const std::string outDirKey = scriptOutDir.lexically_normal().string();
     const std::string scriptsDirKey = scriptsDir.lexically_normal().string();
     auto underDir = [](const std::string& key, const std::string& dirKey) {
@@ -113,9 +108,8 @@ bool Engine::crossCompileAndroidScripts(const ScriptBuildConfig& scriptConfig, c
         if (produced.empty() || !fs::exists(produced, ec)) {
             error = "Android script produced no binary for " + source.string(); return false;
         }
-        std::error_code relEc;
-        fs::path relBinary = fs::relative(produced, scriptOutDir, relEc);
-        if (relEc || relBinary.empty()) relBinary = produced.filename();
+        fs::path relBinary = moduAndroidScriptRelativeBinary(commands.binaryPath, scriptOutDir);
+        if (relBinary.empty()) relBinary = commands.binaryPath.filename();
         const std::string soname = moduAndroidScriptSoname(relBinary);
         const fs::path dest = libDir / soname;
         fs::copy_file(produced, dest, fs::copy_options::overwrite_existing, ec);

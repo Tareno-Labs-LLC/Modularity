@@ -603,8 +603,8 @@ namespace {
         return info;
     }
 
-#if !defined(_WIN32)
     std::string posixCompileDriver(bool cxx) {
+#if !defined(_WIN32)
         static std::mutex ccacheMutex;
         static int ccacheAvailable = -1;
         std::lock_guard<std::mutex> lock(ccacheMutex);
@@ -615,6 +615,9 @@ namespace {
             return cxx ? "ccache g++" : "ccache gcc";
         }
         return cxx ? "g++" : "gcc";
+#else
+        return cxx ? "clang++" : "clang";
+#endif
     }
 
     std::string posixScriptCompileDriver(const ScriptBuildConfig& config) {
@@ -630,6 +633,9 @@ namespace {
         return "g++";
     }
     bool posixScriptCompilerSupportsNoGnuUnique() {
+#ifdef _WIN32
+        return false;
+#else
         static std::mutex probeMutex;
         static int supported = -1;
         std::lock_guard<std::mutex> lock(probeMutex);
@@ -640,6 +646,7 @@ namespace {
                             : 0;
         }
         return supported == 1;
+#endif
     }
 
     void appendPerModuleStoreFlags(std::ostringstream& cmd, const ScriptBuildConfig& config) {
@@ -660,7 +667,6 @@ namespace {
     void appendExtraLinkFlags(std::ostringstream& cmd, const ScriptBuildConfig& config) {
         for (const std::string& flag : config.extraLinkFlags) cmd << " " << flag;
     }
-#endif
     // why does windows need all of this :sob:
 #if defined(_WIN32)
     std::string getEnvValue(const char* name) {
@@ -1327,22 +1333,29 @@ bool ScriptCompiler::makeCommands(const ScriptBuildConfig& config, const fs::pat
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     const bool isMakoSource = extLower == ".mko" || extLower == ".modumako";
     std::string baseName = NativeScriptArtifactStem(scriptAbs);
+#ifdef _WIN32
+    const bool msvcTarget = config.crossCompilerDriver.empty();
+    const std::string cppStandardFlag = msvcTarget
+        ? compilerCppStandardFlag(config.cppStandard) : canonicalizeCppStandard(config.cppStandard);
+#else
+    const bool msvcTarget = false;
     const std::string cppStandardFlag = compilerCppStandardFlag(config.cppStandard);
+#endif
     fs::path objectPath = config.outDir / relativeParent / (baseName + ".o");
     fs::path secondaryObjectPath;
     fs::path dependencyPath;
     fs::path secondaryDependencyPath;
 
     fs::path binaryPath = config.outDir / relativeParent;
-#ifdef _WIN32
-    objectPath = config.outDir / relativeParent / (baseName + ".obj");
-    binaryPath /= baseName + ".dll";
-    outCommands.linkBinaryPath = config.outDir / ".staging" / relativeParent / (baseName + ".dll");
-#else
-    binaryPath /= baseName + ".so";
-    outCommands.linkBinaryPath = config.outDir / ".staging" / relativeParent / (baseName + ".so");
-    dependencyPath = config.outDir / relativeParent / (baseName + ".d");
-#endif
+    if (msvcTarget) {
+        objectPath = config.outDir / relativeParent / (baseName + ".obj");
+        binaryPath /= baseName + ".dll";
+        outCommands.linkBinaryPath = config.outDir / ".staging" / relativeParent / (baseName + ".dll");
+    } else {
+        binaryPath /= baseName + ".so";
+        outCommands.linkBinaryPath = config.outDir / ".staging" / relativeParent / (baseName + ".so");
+        dependencyPath = config.outDir / relativeParent / (baseName + ".d");
+    }
 
     bool isCSource = extLower == ".c";
 
@@ -1641,8 +1654,8 @@ bool ScriptCompiler::makeCommands(const ScriptBuildConfig& config, const fs::pat
     };
 
 #ifdef _WIN32
-    const std::optional<fs::path> hostImportLib = findHostImportLibrary();
-    if (!hostImportLib) {
+    const std::optional<fs::path> hostImportLib = msvcTarget ? findHostImportLibrary() : std::nullopt;
+    if (msvcTarget && !hostImportLib) {
         const fs::path exePath = getCurrentExecutablePath();
         error = "Unable to locate the host import library for " +
                 (exePath.empty() ? std::string("the running executable")
@@ -1678,12 +1691,12 @@ bool ScriptCompiler::makeCommands(const ScriptBuildConfig& config, const fs::pat
         }
 
         wrapperPath = config.outDir / relativeParent / (baseName + ".capi.wrap.cpp");
-#ifdef _WIN32
-        secondaryObjectPath = config.outDir / relativeParent / (baseName + ".wrap.obj");
-#else
-        secondaryObjectPath = config.outDir / relativeParent / (baseName + ".wrap.o");
-        secondaryDependencyPath = config.outDir / relativeParent / (baseName + ".wrap.d");
-#endif
+        if (msvcTarget) {
+            secondaryObjectPath = config.outDir / relativeParent / (baseName + ".wrap.obj");
+        } else {
+            secondaryObjectPath = config.outDir / relativeParent / (baseName + ".wrap.o");
+            secondaryDependencyPath = config.outDir / relativeParent / (baseName + ".wrap.d");
+        }
         std::ostringstream wrapper;
 
         auto emitCImplDecl = [&](const char* name, const FunctionSpec& spec) {
@@ -2166,6 +2179,7 @@ bool ScriptCompiler::makeCommands(const ScriptBuildConfig& config, const fs::pat
         }
 
 #ifdef _WIN32
+        if (msvcTarget) {
         fs::path scriptRspPath = config.outDir / relativeParent / (baseName + ".compile.rsp");
         fs::path wrapperRspPath = config.outDir / relativeParent / (baseName + ".wrap.compile.rsp");
         fs::path linkRspPath = config.outDir / relativeParent / (baseName + ".link.rsp");
@@ -2207,7 +2221,9 @@ bool ScriptCompiler::makeCommands(const ScriptBuildConfig& config, const fs::pat
         compileCmd << "cl @\"" << wrapperRspPath.string() << "\"";
         linkCmd << "link @\"" << linkRspPath.string() << "\"";
         buildSignaturePayload = scriptRsp.str() + "\n---rsp---\n" + wrapperRsp.str() + "\n---rsp---\n" + linkRsp.str();
-#else
+        } else
+#endif
+        {
         compileCmd << posixScriptCompileDriver(config) << " -std=" << cppStandardFlag << " -fPIC -g" << posixOptFlags(config);
         appendPerModuleStoreFlags(compileCmd, config);
         appendExtraCompileFlags(compileCmd, config);
@@ -2228,7 +2244,7 @@ bool ScriptCompiler::makeCommands(const ScriptBuildConfig& config, const fs::pat
             linkCmd << " " << formatLinkFlag(lib);
         }
         appendExtraLinkFlags(linkCmd, config);
-#endif
+        }
     } else {
         const std::string cppContextPattern = "ScriptContext\\s*[&*]";
         FunctionSpec beginSpec = detectFunction(scriptSource, "Begin", cppContextPattern);
@@ -2348,6 +2364,7 @@ bool ScriptCompiler::makeCommands(const ScriptBuildConfig& config, const fs::pat
         }
 
 #ifdef _WIN32
+        if (msvcTarget) {
         fs::path compileRspPath = config.outDir / relativeParent / (baseName + ".compile.rsp");
         fs::path linkRspPath = config.outDir / relativeParent / (baseName + ".link.rsp");
         const fs::path producedBinaryPath = outCommands.linkBinaryPath.empty() ? binaryPath : outCommands.linkBinaryPath;
@@ -2392,7 +2409,9 @@ bool ScriptCompiler::makeCommands(const ScriptBuildConfig& config, const fs::pat
         compileCmd << "cl @\"" << compileRspPath.string() << "\"";
         linkCmd << "link @\"" << linkRspPath.string() << "\"";
         buildSignaturePayload = compileRsp.str() + "\n---rsp---\n" + linkRsp.str();
-#else
+        } else
+#endif
+        {
         compileCmd << posixScriptCompileDriver(config) << " -std=" << cppStandardFlag << " -fPIC -g" << posixOptFlags(config);
         appendPerModuleStoreFlags(compileCmd, config);
         appendExtraCompileFlags(compileCmd, config);
@@ -2405,12 +2424,13 @@ bool ScriptCompiler::makeCommands(const ScriptBuildConfig& config, const fs::pat
             linkCmd << " " << formatLinkFlag(lib);
         }
         appendExtraLinkFlags(linkCmd, config);
-#endif
+        }
     }
 
     std::string compileStr = compileCmd.str();
     std::string linkStr = linkCmd.str();
 #ifdef _WIN32
+    if (msvcTarget) {
     const std::string clPath = findVsTool("cl.exe");
     const std::string linkPath = findVsTool("link.exe");
     compileStr = applyToolOverride(compileStr, "cl", clPath);
@@ -2426,6 +2446,7 @@ bool ScriptCompiler::makeCommands(const ScriptBuildConfig& config, const fs::pat
     linkStr = applyToolOverride(linkStr, "link", linkPath);
     compileStr = wrapWithVsDevCmdIfNeeded(compileStr);
     linkStr = wrapWithVsDevCmdIfNeeded(linkStr);
+    }
 #endif
 
     outCommands.compile = compileStr;
