@@ -5160,6 +5160,14 @@ namespace {
         return name == "vec3" || name == "Vector3";
     }
 
+    // Main-class fields the C++ backend draws with DrawObjectRefInput and stores as a reference
+    // string ("Object.ID-<id>"): SceneObj-typed fields and [ObjectRef] strings.
+    bool cFieldIsObjectRef(const FieldSpec& field) {
+        if (!field.arrayDimensions.empty()) return false;
+        return field.kind == FieldKind::ObjectRef ||
+               (field.kind == FieldKind::String && field.hasObjectRefAttribute);
+    }
+
     bool cMathNameSupported(const std::string& name) {
         static const std::unordered_set<std::string> kNames = {
             "Sin", "Cos", "Tan", "Sqrt", "Abs", "Floor", "Ceil", "Exp", "Pow",
@@ -5546,6 +5554,23 @@ namespace {
             if (!op.empty() || prevSig == '#') {
                 return fail("public field '" + word + "' is written to (read-only in the C backend)");
             }
+            const FieldSpec& field = *pub->second;
+            if (cFieldIsObjectRef(field)) {
+                return fail("ObjectRef field '" + word + "' is used in code (needs the object-by-id API)");
+            }
+            const size_t nxt = peekSig(after);
+            const char nextSig = (nxt == std::string::npos) ? '\0' : src[nxt];
+            if (field.kind == FieldKind::String) {
+                // A C char buffer: fine to hand to a call, wrong for +, == and the like.
+                // ' ' is what the call rewrites (AddLog -> Modu_AddConsoleMessage(ctx, ...) leave behind.
+                const bool callArgument = (prevSig == '(' || prevSig == ',' || prevSig == ' ') &&
+                                          (nextSig == ')' || nextSig == ',');
+                if (!callArgument) {
+                    return fail("string field '" + word + "' is used outside a call argument");
+                }
+            } else if (field.kind == FieldKind::Vec3 && nextSig != '.' && !checkVec3Context(after)) {
+                return false;
+            }
             usedPublics.insert(word);
             emitSig(word, 'p');
             return true;
@@ -5721,10 +5746,47 @@ namespace {
         return true;
     }
 
+    bool cIsStringLiteral(const std::string& value) {
+        static const std::regex kStringLiteral(R"(^"([^"\\]|\\.)*"$)");
+        return std::regex_match(trimCopy(value), kStringLiteral);
+    }
+
+    bool cIsIntegerLiteral(const std::string& value) {
+        static const std::regex kInteger(R"(^[+-]?\d+$)");
+        return std::regex_match(trimCopy(value), kInteger);
+    }
+
+    bool cVec3InitializerOk(const FieldSpec& field, std::string& reason) {
+        const std::string init = trimCopy(field.initializer);
+        if (init.empty()) return true;
+        static const std::regex kVecInit(R"(^(?:vec3|Vector3)\s*\((.*)\)$)");
+        std::smatch m;
+        if (!std::regex_match(init, m, kVecInit)) {
+            reason = "field '" + field.name + "' has a non-literal vec3 initializer";
+            return false;
+        }
+        std::istringstream args(m[1].str());
+        std::string part;
+        int count = 0;
+        while (std::getline(args, part, ',')) {
+            if (!cIsNumericLiteral(part)) {
+                reason = "field '" + field.name + "' has a non-literal vec3 initializer";
+                return false;
+            }
+            ++count;
+        }
+        if (count != 1 && count != 3) {
+            reason = "field '" + field.name + "' vec3 initializer needs 1 or 3 args";
+            return false;
+        }
+        return true;
+    }
+
     bool cFieldEligible(const FieldSpec& field, std::string& reason) {
         if (!field.arrayDimensions.empty()) { reason = "array field '" + field.name + "'"; return false; }
-        if (field.hasObjectRefAttribute || field.hasObjectListAttribute ||
-            field.hasDialogueLinesAttribute || field.hasClipGridPairAttribute) {
+        if (field.hasObjectListAttribute || field.hasDialogueLinesAttribute ||
+            field.hasClipGridPairAttribute || field.soundSetLabel ||
+            (field.hasObjectRefAttribute && field.kind != FieldKind::String)) {
             reason = "field '" + field.name + "' uses attributes without a C lowering";
             return false;
         }
@@ -5734,35 +5796,61 @@ namespace {
                 reason = "private field '" + field.name + "' with inspector metadata";
                 return false;
             }
-            if (field.kind == FieldKind::Float) {
+            // Attribute arguments are pasted into the generated C, so they must be literals.
+            for (const std::optional<std::string>* expr : {&field.sliderMinExpr, &field.sliderMaxExpr,
+                                                            &field.rangeMinExpr, &field.rangeMaxExpr,
+                                                            &field.stepExpr}) {
+                if (expr->has_value() && !cIsNumericLiteral(**expr)) {
+                    reason = "field '" + field.name + "' has a non-literal attribute bound";
+                    return false;
+                }
+            }
+            if (field.hasSliderAttribute && (!field.sliderMinExpr || !field.sliderMaxExpr)) {
+                reason = "field '" + field.name + "' slider bounds are not literals";
+                return false;
+            }
+            if (field.inspectorHeader && !cIsStringLiteral(*field.inspectorHeader)) {
+                reason = "field '" + field.name + "' header is not a plain string";
+                return false;
+            }
+            const bool numeric = field.kind == FieldKind::Float || field.kind == FieldKind::Int ||
+                                 field.kind == FieldKind::Vec3;
+            if (field.hasSliderAttribute && !numeric) {
+                reason = "[Slider] on non-numeric field '" + field.name + "'";
+                return false;
+            }
+            if (cFieldIsObjectRef(field) || field.kind == FieldKind::String) {
+                if (!init.empty() && !cIsStringLiteral(init)) {
+                    reason = "field '" + field.name + "' has a non-literal initializer";
+                    return false;
+                }
+                return true;
+            }
+            switch (field.kind) {
+            case FieldKind::Float:
                 if (!init.empty() && !cIsNumericLiteral(init)) {
                     reason = "field '" + field.name + "' has a non-literal initializer";
                     return false;
                 }
-            } else if (field.kind == FieldKind::Bool) {
+                return true;
+            case FieldKind::Int:
+                if (!init.empty() && !cIsIntegerLiteral(init)) {
+                    reason = "field '" + field.name + "' has a non-literal initializer";
+                    return false;
+                }
+                return true;
+            case FieldKind::Bool:
                 if (!init.empty() && init != "true" && init != "false") {
                     reason = "field '" + field.name + "' has a non-literal initializer";
                     return false;
                 }
-            } else {
-                reason = "public field '" + field.name + "' is not float/bool";
+                return true;
+            case FieldKind::Vec3:
+                return cVec3InitializerOk(field, reason);
+            default:
+                reason = "public field '" + field.name + "' (" + trimCopy(field.rawType) + ") has no C lowering";
                 return false;
             }
-            if (field.hasSliderAttribute) {
-                if (!field.sliderMinExpr || !field.sliderMaxExpr ||
-                    !cIsNumericLiteral(*field.sliderMinExpr) || !cIsNumericLiteral(*field.sliderMaxExpr)) {
-                    reason = "field '" + field.name + "' slider bounds are not literals";
-                    return false;
-                }
-            }
-            if (field.inspectorHeader) {
-                static const std::regex kStringLiteral(R"(^"([^"\\]|\\.)*"$)");
-                if (!std::regex_match(trimCopy(*field.inspectorHeader), kStringLiteral)) {
-                    reason = "field '" + field.name + "' header is not a plain string";
-                    return false;
-                }
-            }
-            return true;
         }
         switch (field.kind) {
         case FieldKind::Float:
@@ -5773,30 +5861,8 @@ namespace {
                 return false;
             }
             return true;
-        case FieldKind::Vec3: {
-            if (init.empty()) return true;
-            static const std::regex kVecInit(R"(^(?:vec3|Vector3)\s*\((.*)\)$)");
-            std::smatch m;
-            if (!std::regex_match(init, m, kVecInit)) {
-                reason = "field '" + field.name + "' has a non-literal vec3 initializer";
-                return false;
-            }
-            std::istringstream args(m[1].str());
-            std::string part;
-            int count = 0;
-            while (std::getline(args, part, ',')) {
-                if (!cIsNumericLiteral(part)) {
-                    reason = "field '" + field.name + "' has a non-literal vec3 initializer";
-                    return false;
-                }
-                ++count;
-            }
-            if (count != 1 && count != 3) {
-                reason = "field '" + field.name + "' vec3 initializer needs 1 or 3 args";
-                return false;
-            }
-            return true;
-        }
+        case FieldKind::Vec3:
+            return cVec3InitializerOk(field, reason);
         default:
             reason = "field '" + field.name + "' type has no C lowering";
             return false;
@@ -6037,8 +6103,9 @@ namespace {
                 out << "    " << type << " " << field->name << ";\n";
             }
             out << "} " << stateType << ";\n\n";
-            out << "static " << stateType << "* " << san << "_GetState(ModuScriptContext* ctx) {\n"
-                << "    static struct { int objectId; int used; " << stateType << " state; } s_slots[MODUC_MAX_STATE_SLOTS];\n"
+            // File scope rather than inside _GetState so Modu_ResetState below can clear it.
+            out << "static struct { int objectId; int used; " << stateType << " state; } s_slots[MODUC_MAX_STATE_SLOTS];\n\n"
+                << "static " << stateType << "* " << san << "_GetState(ModuScriptContext* ctx) {\n"
                 << "    const int id = Modu_GetObjectId(ctx);\n"
                 << "    int n;\n"
                 << "    for (n = 0; n < MODUC_MAX_STATE_SLOTS; ++n) {\n"
@@ -6057,6 +6124,13 @@ namespace {
             }
             out << "    return &s_slots[n].state;\n"
                 << "}\n\n";
+            // The runtime calls Script_ResetState on Stop and never unloads script modules, so
+            // without this a C-lowered script's private fields would carry into the next Play
+            // (the C++ backend resets through ModuCPP::ResetScriptState).
+            out << "MODU_HOOK_ABI\nvoid Modu_ResetState(void) {\n"
+                << "    int n;\n"
+                << "    for (n = 0; n < MODUC_MAX_STATE_SLOTS; ++n) s_slots[n].used = 0;\n"
+                << "}\n\n";
         }
 
         for (const LoweredMethod& helper : helpers) {
@@ -6070,10 +6144,25 @@ namespace {
                 << "(" << helpers[idx].params << ") {" << helperBodies[idx].text << "}\n\n";
         }
 
+        auto cStringInit = [&](const FieldSpec& field) {
+            const std::string init = trimCopy(field.initializer);
+            return init.empty() ? std::string("\"\"") : init;
+        };
+
         auto emitPublicLoad = [&](const FieldSpec& field, std::ostream& os) {
-            if (field.kind == FieldKind::Bool) {
+            if (field.kind == FieldKind::String || cFieldIsObjectRef(field)) {
+                os << "    char " << field.name << "[MODUC_STRING_FIELD_MAX];\n"
+                   << "    Modu_GetSettingString(ctx, \"" << field.name << "\", " << cStringInit(field)
+                   << ", " << field.name << ", (int)sizeof(" << field.name << "));\n";
+            } else if (field.kind == FieldKind::Bool) {
                 os << "    const bool " << field.name << " = Modu_GetSettingBool(ctx, \""
                    << field.name << "\", " << cScalarInitExpr(field) << ") != 0;\n";
+            } else if (field.kind == FieldKind::Int) {
+                os << "    const int " << field.name << " = Modu_GetSettingInt(ctx, \""
+                   << field.name << "\", " << cScalarInitExpr(field) << ");\n";
+            } else if (field.kind == FieldKind::Vec3) {
+                os << "    const ModuVec3 " << field.name << " = Modu_GetSettingVec3(ctx, \""
+                   << field.name << "\", " << cVec3InitExpr(field.initializer) << ");\n";
             } else {
                 os << "    const float " << field.name << " = Modu_GetSettingFloat(ctx, \""
                    << field.name << "\", " << cScalarInitExpr(field) << ");\n";
@@ -6098,42 +6187,91 @@ namespace {
         }
 
         if (!publicOrder.empty()) {
+            // Mirrors the C++ backend's emitAutoInspectorField widget for widget, so the
+            // inspector looks the same whichever backend compiled the script.
             out << "MODU_HOOK_ABI\nvoid Modu_OnInspector(ModuScriptContext* ctx) {\n";
             for (const FieldSpec* field : publicOrder) {
                 if (field->inspectorHeader) {
-                    out << "    Modu_InspectorText(ctx, " << trimCopy(*field->inspectorHeader) << ");\n";
+                    out << "    Modu_InspectorText(ctx, " << trimCopy(*field->inspectorHeader) << ");\n"
+                        << "    Modu_InspectorSeparator(ctx);\n";
                 }
                 if (field->hasSeparatorAttribute) {
                     out << "    Modu_InspectorSeparator(ctx);\n";
                 }
+                const std::string key = field->name;
                 const std::string label = escapeCStringLiteral(inspectorLabelFromFieldName(field->name));
-                if (field->kind == FieldKind::Bool) {
-                    out << "    {\n"
-                        << "        int _moduV = Modu_GetSettingBool(ctx, \"" << field->name << "\", "
+                auto lit = [](const std::optional<std::string>& expr, const char* fallback) {
+                    return expr ? trimCopy(*expr) : std::string(fallback);
+                };
+                out << "    {\n";
+                if (cFieldIsObjectRef(*field)) {
+                    out << "        char _moduV[MODUC_STRING_FIELD_MAX];\n"
+                        << "        Modu_GetSettingString(ctx, \"" << key << "\", " << cStringInit(*field)
+                        << ", _moduV, (int)sizeof(_moduV));\n"
+                        << "        if (Modu_InspectorObjectRef(ctx, \"" << label << "\", _moduV, (int)sizeof(_moduV))) {\n"
+                        << "            Modu_SetSettingString(ctx, \"" << key << "\", _moduV);\n"
+                        << "        }\n";
+                } else if (field->kind == FieldKind::String) {
+                    out << "        char _moduV[MODUC_STRING_FIELD_MAX];\n"
+                        << "        Modu_GetSettingString(ctx, \"" << key << "\", " << cStringInit(*field)
+                        << ", _moduV, (int)sizeof(_moduV));\n"
+                        << "        if (Modu_InspectorInputText(ctx, \"" << label << "\", _moduV, (int)sizeof(_moduV))) {\n"
+                        << "            Modu_SetSettingString(ctx, \"" << key << "\", _moduV);\n"
+                        << "        }\n";
+                } else if (field->kind == FieldKind::Bool) {
+                    out << "        int _moduV = Modu_GetSettingBool(ctx, \"" << key << "\", "
                         << cScalarInitExpr(*field) << ");\n"
                         << "        if (Modu_InspectorCheckbox(ctx, \"" << label << "\", &_moduV)) {\n"
-                        << "            Modu_SetSettingBool(ctx, \"" << field->name << "\", _moduV);\n"
-                        << "        }\n"
-                        << "    }\n";
-                } else {
-                    std::string minText = "0.0f";
-                    std::string maxText = "0.0f";
-                    std::string speedText = "0.01f";
+                        << "            Modu_SetSettingBool(ctx, \"" << key << "\", _moduV);\n"
+                        << "        }\n";
+                } else if (field->kind == FieldKind::Int) {
+                    out << "        int _moduV = Modu_GetSettingInt(ctx, \"" << key << "\", "
+                        << cScalarInitExpr(*field) << ");\n";
+                    std::string widget;
                     if (field->hasSliderAttribute) {
-                        minText = trimCopy(*field->sliderMinExpr);
-                        maxText = trimCopy(*field->sliderMaxExpr);
-                        const float span = cParseNumericLiteral(maxText) - cParseNumericLiteral(minText);
-                        if (span > 0.0f) speedText = cFormatFloatLiteral(span * 0.005f);
+                        widget = "Modu_InspectorSliderInt(ctx, \"" + label + "\", &_moduV, (int)(" +
+                                 trimCopy(*field->sliderMinExpr) + "), (int)(" + trimCopy(*field->sliderMaxExpr) + "))";
+                    } else if (field->rangeMinExpr && field->rangeMaxExpr) {
+                        widget = "Modu_InspectorSliderInt(ctx, \"" + label + "\", &_moduV, (int)(" +
+                                 trimCopy(*field->rangeMinExpr) + "), (int)(" + trimCopy(*field->rangeMaxExpr) + "))";
+                    } else {
+                        widget = "Modu_InspectorInputInt(ctx, \"" + label + "\", &_moduV)";
                     }
-                    out << "    {\n"
-                        << "        float _moduV = Modu_GetSettingFloat(ctx, \"" << field->name << "\", "
-                        << cScalarInitExpr(*field) << ");\n"
-                        << "        if (Modu_InspectorDragFloat(ctx, \"" << label << "\", &_moduV, "
-                        << speedText << ", " << minText << ", " << maxText << ", \"\")) {\n"
-                        << "            Modu_SetSettingFloat(ctx, \"" << field->name << "\", _moduV);\n"
-                        << "        }\n"
-                        << "    }\n";
+                    out << "        if (" << widget << ") {\n"
+                        << "            Modu_SetSettingInt(ctx, \"" << key << "\", _moduV);\n"
+                        << "        }\n";
+                } else if (field->kind == FieldKind::Vec3) {
+                    out << "        ModuVec3 _moduV = Modu_GetSettingVec3(ctx, \"" << key << "\", "
+                        << cVec3InitExpr(field->initializer) << ");\n";
+                    std::string widget;
+                    if (field->hasSliderAttribute) {
+                        widget = "Modu_InspectorSliderFloat3(ctx, \"" + label + "\", &_moduV.x, " +
+                                 trimCopy(*field->sliderMinExpr) + ", " + trimCopy(*field->sliderMaxExpr) + ", \"%.3f\")";
+                    } else {
+                        widget = "Modu_InspectorDragFloat3(ctx, \"" + label + "\", &_moduV.x, " +
+                                 lit(field->stepExpr, "0.01f") + ", " + lit(field->rangeMinExpr, "-1000.0f") + ", " +
+                                 lit(field->rangeMaxExpr, "1000.0f") + ", \"%.3f\")";
+                    }
+                    out << "        if (" << widget << ") {\n"
+                        << "            Modu_SetSettingVec3(ctx, \"" << key << "\", _moduV);\n"
+                        << "        }\n";
+                } else {
+                    out << "        float _moduV = Modu_GetSettingFloat(ctx, \"" << key << "\", "
+                        << cScalarInitExpr(*field) << ");\n";
+                    std::string widget;
+                    if (field->hasSliderAttribute) {
+                        widget = "Modu_InspectorSliderFloat(ctx, \"" + label + "\", &_moduV, " +
+                                 trimCopy(*field->sliderMinExpr) + ", " + trimCopy(*field->sliderMaxExpr) + ")";
+                    } else {
+                        widget = "Modu_InspectorDragFloat(ctx, \"" + label + "\", &_moduV, " +
+                                 lit(field->stepExpr, "0.01f") + ", " + lit(field->rangeMinExpr, "0.0f") + ", " +
+                                 lit(field->rangeMaxExpr, "0.0f") + ", \"\")";
+                    }
+                    out << "        if (" << widget << ") {\n"
+                        << "            Modu_SetSettingFloat(ctx, \"" << key << "\", _moduV);\n"
+                        << "        }\n";
                 }
+                out << "    }\n";
             }
             out << "}\n";
         }

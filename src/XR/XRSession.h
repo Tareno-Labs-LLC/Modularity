@@ -85,6 +85,13 @@ public:
     bool usingFallbackReferenceSpace() const { return referenceSpaceFellBack_; }
     XRTrackingOrigin effectiveTrackingOrigin() const { return effectiveTrackingOrigin_; }
 
+    // Swaps the tracking space of a live session, e.g. when the scene's XR Origin asks for
+    // a different one than the project. Only call between frames (not between beginFrame
+    // and endFrame). A no-op when the same origin was already requested, so a runtime with
+    // no STAGE space falls back once instead of recreating the space every frame.
+    // outSwapped is set when the app space was actually replaced.
+    bool setTrackingOrigin(XRTrackingOrigin origin, bool& outSwapped, std::string& outError);
+
 #if MODULARITY_HAS_OPENXR
     XrSession handle() const { return session_; }
     XrSpace appSpace() const { return appSpace_; }
@@ -102,6 +109,8 @@ private:
     bool checkGraphicsRequirements(std::string& outError);
     bool createSession(const XRGraphicsBinding& binding, std::string& outError);
     bool createReferenceSpaces(const ProjectOpenXRSettings& settings, std::string& outError);
+    bool createAppSpace(XRTrackingOrigin origin, XrSpace& outSpace, XRTrackingOrigin& outEffective,
+                        bool& outFellBack, std::string& outError);
     bool beginSession(std::string& outError);
     void endSession();
     void handleStateChange(const XrEventDataSessionStateChanged& event);
@@ -122,6 +131,7 @@ private:
     bool referenceSpaceFellBack_ = false;
     XRSessionStatus status_ = XRSessionStatus::None;
     XRTrackingOrigin effectiveTrackingOrigin_ = XRTrackingOrigin::Floor;
+    XRTrackingOrigin requestedTrackingOrigin_ = XRTrackingOrigin::Floor;
 };
 
 }

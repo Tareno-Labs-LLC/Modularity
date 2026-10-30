@@ -32,6 +32,12 @@
 #define MODUC_MAX_STATE_SLOTS 512
 #endif
 
+// buffer size for public string / ObjectRef fields, same as the C++ backend's InputText
+// buffer, so text that fits in one backend's inspector fits in the other's.
+#ifndef MODUC_STRING_FIELD_MAX
+#define MODUC_STRING_FIELD_MAX 512
+#endif
+
 static inline ModuVec3 ModuC_Vec3(float x, float y, float z) {
     ModuVec3 v;
     v.x = x;

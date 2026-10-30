@@ -5,7 +5,7 @@ import subprocess
 import xml.etree.ElementTree as ET
 
 repo = Path(__file__).resolve().parents[2]
-out = repo / "build/engine-audit-check"
+out = repo / "build/Dev-Resources/engine-audit-check"
 out.mkdir(parents=True, exist_ok=True)
 vswhere = Path(os.environ.get("ProgramFiles(x86)", "C:/Program Files (x86)")) / "Microsoft Visual Studio/Installer/vswhere.exe"
 vs = subprocess.check_output([str(vswhere), "-latest", "-products", "*", "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"], text=True).strip()
@@ -15,7 +15,7 @@ for target, sources in [
     ("core", ["src/Engine.cpp", "src/EditorWindows/Panels/SceneHierarchyWindow.cpp", "src/Network/NetworkSession.cpp", "src/Network/LoopbackBackend.cpp", "src/WinView/Window.cpp", "src/ScriptRuntime.cpp", "src/ManagedScriptRuntime.cpp", "tools/network-selftest/network_test.cpp"]),
     ("core_player", ["src/Engine.cpp", "src/ScriptRuntime.cpp", "src/ManagedScriptRuntime.cpp", "src/WinView/Window.cpp"]),
 ]:
-    root = ET.parse(repo / f"build/{target}.vcxproj").getroot()
+    root = ET.parse(repo / f"build/Dev-Resources/{target}.vcxproj").getroot()
     group = next(g for g in root.findall("m:ItemDefinitionGroup", ns) if "release|x64" in g.attrib.get("Condition", "").lower())
     compiler = group.find("m:ClCompile", ns)
     def values(name):

@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <memory>
+#include <atomic>
 struct AudioClipPreview {
     bool loaded = false;
     std::string path;
@@ -63,6 +64,17 @@ public:
 
     void setGlobalAudioFX(const AudioFXChain& chain);
     AudioFXChain getGlobalAudioFX() const { return globalFXChain; }
+
+    // Microphone input for scripts. Opened on request and kept open until released or play
+    // stops. On Android the first request raises the RECORD_AUDIO prompt and the device
+    // opens once it is granted, so a request can sit in WaitingForPermission for a while.
+    enum class MicrophoneState { Off, WaitingForPermission, Active, Failed };
+    void requestMicrophone();
+    void releaseMicrophone();
+    MicrophoneState getMicrophoneState() const { return micState; }
+    const std::string& getMicrophoneStatus() const { return micStatus; }
+    float getMicrophoneLevel() const;  // RMS, 0..1, smoothed over ~50 ms
+    float getMicrophonePeak() const;   // decaying peak, 0..1
 
     struct AudioFXNode {
         ma_node_base baseNode;
@@ -167,6 +179,28 @@ private:
     double weatherRetryAfterSec = 0.0;
     bool prefer2DSpatialAudio = false;
     glm::vec3 lastListenerPosition = glm::vec3(0.0f);
+
+    // Written on the capture thread, read from scripts on the main thread.
+    struct MicrophoneMeter {
+        std::atomic<float> meanSquare{0.0f};
+        std::atomic<float> peak{0.0f};
+        ma_uint32 sampleRate = 48000;
+    };
+    std::unique_ptr<ma_device> micDevice;
+    std::unique_ptr<MicrophoneMeter> micMeter;
+    bool micWanted = false;
+    bool micPermissionRequested = false;
+    double micPermissionAskedAtSec = 0.0;
+    unsigned micPermissionAskedResumeCount = 0;
+    MicrophoneState micState = MicrophoneState::Off;
+    std::string micStatus = "Off";
+    std::string micListeningStatus;
+    double micRetryAfterSec = 0.0;
+    void pumpMicrophone();
+    bool openMicrophoneDevice();
+    void closeMicrophoneDevice();
+    static void microphoneDataCallback(ma_device* device, void* output, const void* input, ma_uint32 frameCount);
+
     void destroyActiveSounds();
     void destroyOneShotSounds();
     void destroyVideoStreams();

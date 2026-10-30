@@ -48,6 +48,12 @@ public:
     bool isInstalled(const std::string& id) const;
     bool hasProjectInstallPayload(const std::string& id) const;
     bool isGloballyInstalled(const std::string& id) const;
+    // Folder holding a package's files: the project's Packages/ copy, else the global
+    // install, else a local registry checkout (Modu-Package-Manager beside the engine).
+    // Matched by "<id>-<version>" folder name, newest version first, so a payload already
+    // on disk is found even before the package is in the published registry listing.
+    // Empty when none exists.
+    fs::path installedPackageRoot(const std::string& id) const;
     bool hasUpdateAvailable(const std::string& id) const;
     bool isCompatible(const std::string& id) const;
     bool isCompatible(const PackageInfo& pkg) const;

@@ -1,4 +1,4 @@
-param([string]$BuildDirectory = 'build', [string]$Output = 'build/ui-gallery.png', [string]$Defines = '', [switch]$Edit)
+param([string]$BuildDirectory = 'build/Dev-Resources', [string]$Output = 'build/Dev-Resources/ui-gallery.png', [string]$Defines = '', [switch]$Edit)
 # Renders every extended UI control with the editor theme to a PNG (see tools/ui_gallery.cpp).
 # -Edit draws them non-interactive, the way the Scene view and a stopped Game view show them.
 $ErrorActionPreference = 'Stop'

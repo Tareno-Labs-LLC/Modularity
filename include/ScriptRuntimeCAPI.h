@@ -69,6 +69,13 @@ float Modu_GetSettingFloat(ModuScriptContext* ctx, const char* key, float fallba
 void Modu_SetSettingFloat(ModuScriptContext* ctx, const char* key, float value);
 int Modu_GetSettingBool(ModuScriptContext* ctx, const char* key, int fallback);
 void Modu_SetSettingBool(ModuScriptContext* ctx, const char* key, int value);
+/// Same storage as the C++ backend's int fields (std::to_string / stoi), so a script keeps
+/// its saved values whichever backend compiles it.
+int Modu_GetSettingInt(ModuScriptContext* ctx, const char* key, int fallback);
+void Modu_SetSettingInt(ModuScriptContext* ctx, const char* key, int value);
+/// "x,y,z", the format ScriptContext::GetSettingVec3 / SetSettingVec3 use.
+ModuVec3 Modu_GetSettingVec3(ModuScriptContext* ctx, const char* key, ModuVec3 fallback);
+void Modu_SetSettingVec3(ModuScriptContext* ctx, const char* key, ModuVec3 value);
 void Modu_SetSettingString(ModuScriptContext* ctx, const char* key, const char* value);
 int Modu_GetSettingString(ModuScriptContext* ctx, const char* key, const char* fallback,
                           char* outBuffer, int outBufferSize);
@@ -89,6 +96,22 @@ int Modu_InspectorDragFloat3(ModuScriptContext* ctx, const char* label, float* v
                              float speed, float minValue, float maxValue, const char* format);
 int Modu_InspectorCheckbox(ModuScriptContext* ctx, const char* label, int* value);
 int Modu_InspectorObject(ModuScriptContext* ctx, const char* label, int* objectId);
+/// The widgets the C++ backend emits for the same field declarations, so a script's
+/// inspector looks identical whichever backend compiled it.
+int Modu_InspectorSliderFloat(ModuScriptContext* ctx, const char* label, float* value,
+                              float minValue, float maxValue);
+int Modu_InspectorSliderFloat3(ModuScriptContext* ctx, const char* label, float* value,
+                               float minValue, float maxValue, const char* format);
+int Modu_InspectorInputInt(ModuScriptContext* ctx, const char* label, int* value);
+int Modu_InspectorSliderInt(ModuScriptContext* ctx, const char* label, int* value,
+                            int minValue, int maxValue);
+int Modu_InspectorInputText(ModuScriptContext* ctx, const char* label, char* buffer, int bufferSize);
+/// ObjectRef slot (drag a scene object in, or pick one), storing the reference string
+/// ("Object.ID-<id>") exactly like the C++ backend's DrawObjectRefInput.
+int Modu_InspectorObjectRef(ModuScriptContext* ctx, const char* label, char* refBuffer, int refBufferSize);
+
+/// Resolve an ObjectRef string (as stored by Modu_InspectorObjectRef) to an object id, or -1.
+int Modu_ResolveObjectRef(ModuScriptContext* ctx, const char* objectRef);
 
 #ifdef __cplusplus
 }

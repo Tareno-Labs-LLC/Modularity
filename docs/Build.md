@@ -17,6 +17,66 @@ See `CLAUDE.md` for the full flag list. (it's human readable too, no worries!)
 ./buildandrun.sh                 # Build.sh then run the resulting binary
 ```
 
+## Windows (`build.ps1`) output layout
+`build.ps1` (or the `build.bat` shim) leaves exactly three things in `build\`:
+
+| Path | What it is |
+| --- | --- |
+| `Dev-ExportedBuild\` | The runnable editor and player. The linker writes `Modularity.exe` and `ModularityPlayer.exe` straight here; POST_BUILD steps add the DLLs, `Resources\` and the Script SDK. Run the editor from here. |
+| `Dev-Resources\` | Everything you only open to debug: the CMake tree, `.pdb` files and the import `.lib` scripts link against (`Dev-Resources\Release\`), the `player-cache\` tree game exports reuse, and `github-publish` (kept by `--clean`). |
+| `Modularity V7.0 - Windows.zip` | The release archive, built by CPack from the install rules (not a copy of `Dev-ExportedBuild`): no PDBs, import libs, PhysX SDK headers or unused FFmpeg DLLs. `Modularity.exe` sits at the top of the archive's folder. |
+
+```powershell
+.\build.ps1                  # Release build + "Modularity V7.0 - Windows.zip"
+.\build.ps1 --version=V7.1   # change the release label
+.\build.ps1 --7z             # .7z instead of .zip (smaller, slower)
+.\build.ps1 --clean          # wipe Dev-Resources (keeping github-publish) and Dev-ExportedBuild; Build-Android is untouched
+```
+
+Android lives outside `build\` entirely, in `<repo>\Build-Android\`:
+
+| Path | What it is |
+| --- | --- |
+| `android-sdk\` | SDK + NDK from `tools\Setup-Android.ps1` (~2.6 GB). |
+| `embedded-compilers\` | Cling/LLVM/TinyCC sources and build trees for the Android editor (`tools\setup-embedded-compilers.py`); the finished bundle is `arm64-v8a\`. |
+| `android-clang\` | Optional Termux clang bundle (`build.sh`). |
+| `APK-Output\` | APKs, their build trees, and `signing\debug.keystore` that installed APKs are signed with. |
+
+The Cling/LLVM build trees record absolute paths, so moving `embedded-compilers`
+makes the setup script rebuild them from scratch; the downloaded sources are kept.
+
+The first run on a checkout that still has the old flat `build\` tree moves the
+Android folders into `Build-Android\`, deletes what CMake/CPack generated there, and
+lists anything else it found instead of deleting it. Because the CMake tree
+moves, that first build compiles everything from scratch. `build.sh` (Linux)
+keeps the flat `build/` layout; the engine looks in `build/Dev-Resources/` first
+and falls back to `build/` (`src/DevBuildDir.h`).
+
+### Debug info (why `Dev-Resources` is the size it is)
+MSVC builds compile with `/Zi /FS`: every `.obj` keeps its symbols and line tables, so
+crash stacks from optimised builds still show function names and source lines, but type
+records are written once per target into a shared compiler PDB. `/Z7` (the old setting)
+repeated them in every object and again in each static `.lib`; they were ~64% of the debug
+info, and the reason the Windows tree dwarfed Linux's (which builds without `-g`). A Ninja or
+Makefile build using ccache/sccache keeps `/Z7`, the only format those can cache.
+
+## AddressSanitizer builds (`--asan`)
+```powershell
+.\build.ps1 --asan                     # also --ASANDEBUG or --fsanitize (build.sh's spelling)
+.\build.ps1 --asan --build-type=Debug  # unoptimised, if you need to step through it
+```
+This builds an instrumented editor and player into `<repo>\Build-ASAN\`, laid out like
+`build\` (`Dev-Resources\`, `Dev-ExportedBuild\`) but never packaged. Expect them to run
+2-3x slower and use far more memory. MSVC's ASan has no UBSan, and it is applied to every
+target, third-party included: the STL marks instrumented objects differently, so mixing them
+fails to link (LNK2038 `annotate_vector`), and it means overflows from inside
+PhysX/Jolt/assimp are caught too. `HeapAlloc` users are covered as well.
+
+The editor and player are GUI programs, so ASan reports are written beside the exe as
+`Build-ASAN\Dev-ExportedBuild\asan-report.<pid>` (`src/AsanReportPath.h`). Set
+`ASAN_OPTIONS=log_path=...` to send them elsewhere; MSVC's runtime ignores
+`__asan_default_options`. The ASan runtime DLL is copied next to the exes automatically.
+
 ## Android (.apk)
 
 ```bash

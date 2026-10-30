@@ -11,6 +11,7 @@ namespace Loc = Modularity::Loc;
 #endif
 #include "Engine.h"
 #include "AndroidToolchain.h"
+#include "DevBuildDir.h"
 #include "ScriptContextBinding.h"
 #include "Modu2DStats.h"
 #ifdef __ANDROID__
@@ -2846,7 +2847,8 @@ static bool bundleAndroidToolchain(const fs::path& bundleSrc,
                                    const fs::path& assetsRoot,
                                    const std::string& abi,
                                    const std::function<void(const std::string&)>& log,
-                                   std::string& error) {
+                                   std::string& error,
+                                   const fs::path& scriptSourceRoot = {}) {
     std::error_code ec;
     if (!fs::is_directory(bundleSrc, ec)) {
         error = "Toolchain bundle directory not found: " + bundleSrc.string();
@@ -2862,6 +2864,20 @@ static bool bundleAndroidToolchain(const fs::path& bundleSrc,
         error = "Failed to copy toolchain into APK assets: " + ec.message();
         return false;
     }
+
+    if (!scriptSourceRoot.empty()) {
+        int rc = 0;
+        const std::string refresh = "cmake -DSRC_ROOT=" + quotePath(scriptSourceRoot) +
+            " -DDST_ROOT=" + quotePath(dest / "headers") + " -P " +
+            quotePath(scriptSourceRoot / "cmake/CopyScriptSDK.cmake");
+        if (!runCommandStreaming(refresh + " 2>&1", log, &rc)) {
+            error = "Cannot refresh the bundled script SDK (exit " + std::to_string(rc) + ").";
+            return false;
+        }
+    }
+    // Each APK refreshes the extracted SDK, including changed engine headers.
+    std::ofstream(dest / "bundle.id", std::ios::binary | std::ios::trunc)
+        << std::chrono::system_clock::now().time_since_epoch().count();
 
     std::ostringstream list;
     uintmax_t totalBytes = 0;
@@ -2889,13 +2905,42 @@ static bool bundleAndroidToolchain(const fs::path& bundleSrc,
         error = "Failed to write toolchain files.list";
         return false;
     }
+    if (walkEc) { error = "Cannot enumerate compiler SDK: " + walkEc.message(); return false; }
     out << list.str();
     out.close();
+    if (!out) { error = "Cannot finish compiler SDK file list."; return false; }
 
     if (log) {
-        log("[Android] Bundled on-device clang toolchain: " + std::to_string(count) +
+        log("[Android] Bundled on-device compiler SDK: " + std::to_string(count) +
             " files, " + std::to_string(totalBytes / (1024 * 1024)) + " MiB.\n");
     }
+    return true;
+}
+
+static fs::path findEmbeddedAndroidCompilers(const fs::path& sourceRoot) {
+    if (const char* root = std::getenv("MODULARITY_EMBEDDED_COMPILERS_ROOT"); root && *root)
+        return fs::path(root);
+    const fs::path root = ModularityAndroidDir(sourceRoot, "embedded-compilers") / "arm64-v8a";
+    return fs::exists(root / "ready.json") ? root : fs::path{};
+}
+
+static bool stageEmbeddedAndroidCompilers(const fs::path& root, const fs::path& libDir, std::string& error) {
+    std::ifstream manifest(root / "runtime-libraries.txt");
+    if (!manifest) { error = "Embedded compiler setup is incomplete: " + root.string(); return false; }
+    std::string name;
+    size_t count = 0;
+    while (std::getline(manifest, name)) {
+        if (!name.empty() && name.back() == '\r') name.pop_back();
+        if (name.empty()) continue;
+        if (fs::path(name).filename() != name || name.rfind("lib", 0) != 0 || fs::path(name).extension() != ".so") {
+            error = "Invalid compiler runtime library name: " + name; return false;
+        }
+        std::error_code ec;
+        fs::copy_file(root / "lib" / name, libDir / name, fs::copy_options::overwrite_existing, ec);
+        if (ec) { error = "Cannot package compiler runtime " + name + ": " + ec.message(); return false; }
+        ++count;
+    }
+    if (!count) { error = "The embedded compiler runtime list is empty."; return false; }
     return true;
 }
 
@@ -2904,6 +2949,37 @@ struct AndroidXrManifestOptions {
     bool questSupport = false;
     bool handTracking = false;
 };
+
+// Declaring RECORD_AUDIO lists "microphone" on the app's permission page even if it is never
+// asked for, so an exported game only declares it when one of its scripts uses Microphone.
+// Walks the same tree crossCompileAndroidScripts does (the whole project, minus build output),
+// so a script outside Assets (old-layout Scripts/) is not compiled in without its permission.
+bool projectUsesMicrophone(const fs::path& projectRoot) {
+    std::error_code ec;
+    if (!fs::is_directory(projectRoot, ec)) return false;
+    for (auto it = fs::recursive_directory_iterator(projectRoot, fs::directory_options::skip_permission_denied, ec);
+         !ec && it != fs::recursive_directory_iterator();
+         it.increment(ec)) {
+        if (ec) continue;
+        if (it->is_directory(ec)) {
+            const std::string name = it->path().filename().string();
+            if (name == "Builds" || name == "build" || name == "Library" || name == "Cache" || name == ".git") {
+                it.disable_recursion_pending();
+            }
+            continue;
+        }
+        if (!it->is_regular_file(ec)) continue;
+        const std::string ext = lowerExtension(it->path());
+        if (ext != ".moducpp" && ext != ".cpp" && ext != ".h" && ext != ".hpp" && ext != ".cs") continue;
+        if (it->file_size(ec) > 4 * 1024 * 1024 || ec) continue;
+        std::ifstream in(it->path(), std::ios::binary);
+        if (!in.is_open()) continue;
+        std::ostringstream text;
+        text << in.rdbuf();
+        if (text.str().find("Microphone") != std::string::npos) return true;
+    }
+    return false;
+}
 
 bool writeAndroidManifest(const fs::path& manifestPath,
                           const std::string& packageName,
@@ -2916,7 +2992,8 @@ bool writeAndroidManifest(const fs::path& manifestPath,
                           int targetSdkVersion = 34,
                           const std::string& activityName = "android.app.NativeActivity",
                           bool hasJavaCode = false,
-                          const AndroidXrManifestOptions& xr = AndroidXrManifestOptions{}) {
+                          const AndroidXrManifestOptions& xr = AndroidXrManifestOptions{},
+                          bool recordAudio = false) {
     std::ostringstream manifest;
     manifest << "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n";
     manifest << "<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\"\n";
@@ -2932,6 +3009,12 @@ bool writeAndroidManifest(const fs::path& manifestPath,
     manifest << "    <uses-permission android:name=\"android.permission.READ_MEDIA_VIDEO\" />\n";
     manifest << "    <uses-permission android:name=\"android.permission.READ_MEDIA_AUDIO\" />\n";
     manifest << "    <uses-permission android:name=\"android.permission.MANAGE_EXTERNAL_STORAGE\" />\n";
+    if (recordAudio) {
+        manifest << "    <uses-permission android:name=\"android.permission.RECORD_AUDIO\" />\n";
+        // RECORD_AUDIO alone implies a required mic, which hides the app from mic-less devices
+        // in store filtering; the engine copes without one (Microphone.Level() just reads 0).
+        manifest << "    <uses-feature android:name=\"android.hardware.microphone\" android:required=\"false\" />\n";
+    }
 
     if (xr.enabled) {
         manifest << "\n    <!-- OpenXR (generated because this project enables XR) -->\n";
@@ -3020,6 +3103,7 @@ import java.util.ArrayList;
 public class ModularityNativeActivity extends NativeActivity {
     private static final int REQUEST_IMPORT_FILES = 6101;
     private static final int REQUEST_STORAGE_PERMISSION = 6102;
+    private static final int REQUEST_MICROPHONE_PERMISSION = 6103;
 
     private static native void nativeOnFilePickerResult(String[] paths, String error, boolean canceled);
 
@@ -3075,6 +3159,21 @@ public class ModularityNativeActivity extends NativeActivity {
                                 REQUEST_STORAGE_PERMISSION);
                     } catch (Throwable ignored) {
                     }
+                }
+            }
+        });
+    }
+
+    // RECORD_AUDIO prompt for script microphone input; native polls checkSelfPermission for the answer.
+    public void modularityRequestMicrophonePermission() {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    requestPermissions(
+                            new String[] { android.Manifest.permission.RECORD_AUDIO },
+                            REQUEST_MICROPHONE_PERMISSION);
+                } catch (Throwable ignored) {
                 }
             }
         });
@@ -14202,8 +14301,8 @@ void Engine::startExportBuild(const fs::path& outputDir, bool runAfter) {
             std::vector<fs::path> androidJarSdkRoots;
             androidJarSdkRoots.push_back(sdkRoot);
             for (const fs::path& localSdkRoot : {
-                     sourceRoot / "build" / "android-sdk",
-                     sourceRoot / "build" / "android-sdk-smoke"
+                     ModularityAndroidDir(sourceRoot, "android-sdk"),
+                     ModularityAndroidDir(sourceRoot, "android-sdk-smoke")
                  }) {
                 if (localSdkRoot != sdkRoot) {
                     androidJarSdkRoots.push_back(localSdkRoot);
@@ -14214,7 +14313,7 @@ void Engine::startExportBuild(const fs::path& outputDir, bool runAfter) {
             const fs::path androidJar =
                 findLatestAndroidJarInRoots(androidJarSdkRoots, androidJarSdkRoot, targetApi);
             if (androidJar.empty()) {
-                const fs::path localSdkRoot = sourceRoot / "build" / "android-sdk";
+                const fs::path localSdkRoot = ModularityAndroidDir(sourceRoot, "android-sdk");
                 result.message =
                     "Android SDK platform android.jar not found under: " + sdkRoot.string() +
                     "\nInstall one with: " +
@@ -14584,7 +14683,8 @@ void Engine::startExportBuild(const fs::path& outputDir, bool runAfter) {
                                       34,
                                       "android.app.NativeActivity",
                                       false,
-                                      androidXrOptions)) {
+                                      androidXrOptions,
+                                      projectUsesMicrophone(projectRoot))) {
                 result.message = copyError;
                 return result;
             }
@@ -14690,7 +14790,7 @@ void Engine::startExportBuild(const fs::path& outputDir, bool runAfter) {
             }
         }
 
-        fs::path sharedBuildRoot = sourceRoot / "build" / "player-cache";
+        fs::path sharedBuildRoot = ModularityDevBuildDir(sourceRoot) / "player-cache";
         bool useSharedBuild = fs::exists(sharedBuildRoot / "CMakeCache.txt");
         fs::path buildRoot = useSharedBuild ? sharedBuildRoot : (normalizedOut / "_build");
         if (!useSharedBuild) {
@@ -15768,8 +15868,9 @@ int Engine::buildBareAndroidApk(const AndroidBuildRequest& request, std::string&
     }
 
     std::vector<fs::path> jarRoots = { sdkRoot };
-    for (const fs::path& localSdk : { sourceRoot / "build" / "android-sdk",
-                                      sourceRoot / "build" / "android-sdk-smoke" }) {
+    const fs::path localSdkRoot = ModularityAndroidDir(sourceRoot, "android-sdk");
+    for (const fs::path& localSdk : { localSdkRoot,
+                                      ModularityAndroidDir(sourceRoot, "android-sdk-smoke") }) {
         if (localSdk != sdkRoot) jarRoots.push_back(localSdk);
     }
     fs::path jarSdkRoot;
@@ -15777,9 +15878,9 @@ int Engine::buildBareAndroidApk(const AndroidBuildRequest& request, std::string&
     const fs::path androidJar = findLatestAndroidJarInRoots(jarRoots, jarSdkRoot, targetApi);
     if (androidJar.empty()) {
         error = "No Android platform android.jar under " + sdkRoot.string() +
-                " or " + (sourceRoot / "build" / "android-sdk").string() +
+                " or " + localSdkRoot.string() +
                 " (install one with: sdkmanager --sdk_root=" +
-                (sourceRoot / "build" / "android-sdk").string() + " \"platforms;android-34\").";
+                localSdkRoot.string() + " \"platforms;android-34\").";
         return 2;
     }
     AndroidBuildTools buildTools = findLatestAndroidBuildTools(sdkRoot);
@@ -15789,7 +15890,7 @@ int Engine::buildBareAndroidApk(const AndroidBuildRequest& request, std::string&
     }
 
     const fs::path outputDir = request.outputDir.empty()
-        ? (sourceRoot / "build" / "android")
+        ? ModularityAndroidOutputDir(sourceRoot)
         : fs::path(request.outputDir);
     fs::create_directories(outputDir, ec);
     const fs::path buildRoot = outputDir / ("_android_build_" + abi);
@@ -15808,8 +15909,16 @@ int Engine::buildBareAndroidApk(const AndroidBuildRequest& request, std::string&
 
     std::string generatorArgs;
     if (!androidCMakeGeneratorArgs(sdkRoot, buildRoot, generatorArgs, error)) return 2;
+    const fs::path embeddedRoot = request.editor ? findEmbeddedAndroidCompilers(sourceRoot) : fs::path{};
+    if (!embeddedRoot.empty() && abi != "arm64-v8a") {
+        error = "The embedded compiler SDK currently supports Android arm64-v8a.";
+        return 2;
+    }
+    const std::string embeddedArgs = embeddedRoot.empty()
+        ? " -DMODULARITY_ENABLE_EMBEDDED_COMPILERS=OFF"
+        : " -DMODULARITY_ENABLE_EMBEDDED_COMPILERS=ON -DMODULARITY_EMBEDDED_COMPILERS_ROOT=" + quotePath(embeddedRoot);
     const std::string configureCmd =
-        "cmake" + generatorArgs + " -S " + quotePath(sourceRoot) + " -B " + quotePath(buildRoot) +
+        "cmake" + generatorArgs + " -S " + quotePath(sourceRoot) + " -B " + quotePath(buildRoot) + embeddedArgs +
         " -DCMAKE_BUILD_TYPE=" + config +
         " -DMODULARITY_BUILD_EDITOR=OFF"
         " -DCMAKE_TOOLCHAIN_FILE=" + quotePath(toolchainFile) +
@@ -15873,7 +15982,11 @@ int Engine::buildBareAndroidApk(const AndroidBuildRequest& request, std::string&
             }
         }
 
-        if (const char* clangDirEnv = std::getenv("MODULARITY_ANDROID_CLANG_DIR");
+        if (!embeddedRoot.empty()) {
+            if (!stageEmbeddedAndroidCompilers(embeddedRoot, libDir, error) ||
+                !bundleAndroidToolchain(embeddedRoot / "bundle", assetsRoot, abi, logcb, error, sourceRoot)) return 1;
+            std::fprintf(stderr, "[Android] Embedded Cling/TinyCC runtime and script SDK bundled.\n");
+        } else if (const char* clangDirEnv = std::getenv("MODULARITY_ANDROID_CLANG_DIR");
             clangDirEnv && *clangDirEnv) {
             std::string bundleErr;
             if (!bundleAndroidToolchain(fs::path(clangDirEnv), assetsRoot, abi, logcb, bundleErr)) {
@@ -15903,7 +16016,9 @@ int Engine::buildBareAndroidApk(const AndroidBuildRequest& request, std::string&
                               appLabel, "0.1.0", request.debug, iconRef, perr, libName,
                               editor ? 28 : 34,
                               editor ? kAndroidBridgeActivityName : "android.app.NativeActivity",
-                              editor)) {
+                              editor,
+                              AndroidXrManifestOptions{},
+                              true)) {  // runs any project, so any of them may want the mic
         error = perr;
         return 1;
     }

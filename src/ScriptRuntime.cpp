@@ -1,4 +1,5 @@
 #include "ScriptRuntime.h"
+#include "EmbeddedScript.h"
 #include "ScriptContextBinding.h"
 #include "Engine.h"
 #include "SceneObject.h"
@@ -852,6 +853,30 @@ bool ScriptContext::IsTouchActive() const {
 #else
     return ImGui::IsMouseDown(ImGuiMouseButton_Left);
 #endif
+}
+
+void ScriptContext::RequestMicrophone() {
+    if (engine) engine->getAudioSystem().requestMicrophone();
+}
+
+void ScriptContext::ReleaseMicrophone() {
+    if (engine) engine->getAudioSystem().releaseMicrophone();
+}
+
+bool ScriptContext::IsMicrophoneActive() const {
+    return engine && engine->getAudioSystem().getMicrophoneState() == AudioSystem::MicrophoneState::Active;
+}
+
+float ScriptContext::GetMicrophoneLevel() const {
+    return engine ? engine->getAudioSystem().getMicrophoneLevel() : 0.0f;
+}
+
+float ScriptContext::GetMicrophonePeak() const {
+    return engine ? engine->getAudioSystem().getMicrophonePeak() : 0.0f;
+}
+
+std::string ScriptContext::GetMicrophoneStatus() const {
+    return engine ? engine->getAudioSystem().getMicrophoneStatus() : std::string("Off");
 }
 
 namespace {
@@ -2944,6 +2969,32 @@ ScriptRuntime::Module* ScriptRuntime::getModule(const fs::path& binaryPath) {
 #endif
     };
     const auto __moduLoadStart = std::chrono::steady_clock::now();
+    AbiVersionFn abiVersionFn = nullptr;
+    LayoutSignatureFn layoutSignatureFn = nullptr;
+    void* embeddedModule = nullptr;
+    const auto embeddedResult = EmbeddedScript::Load(binaryPath, embeddedModule, lastError);
+    if (embeddedResult == EmbeddedScript::LoadResult::Failed) {
+        lastFailure = ScriptLoadFailure::Unreadable;
+        return nullptr;
+    }
+    if (embeddedResult == EmbeddedScript::LoadResult::Loaded) {
+        mod.loadedPath = binaryPath;
+        abiVersionFn = reinterpret_cast<AbiVersionFn>(EmbeddedScript::Symbol(embeddedModule, "Modularity_ScriptAbiVersion"));
+        layoutSignatureFn = reinterpret_cast<LayoutSignatureFn>(EmbeddedScript::Symbol(embeddedModule, "Modularity_ScriptLayoutSignature"));
+        mod.inspector = reinterpret_cast<InspectorFn>(EmbeddedScript::Symbol(embeddedModule, "Script_OnInspector"));
+        mod.begin = reinterpret_cast<BeginFn>(EmbeddedScript::Symbol(embeddedModule, "Script_Begin"));
+        mod.spec = reinterpret_cast<SpecFn>(EmbeddedScript::Symbol(embeddedModule, "Script_Spec"));
+        mod.testEditor = reinterpret_cast<TestEditorFn>(EmbeddedScript::Symbol(embeddedModule, "Script_TestEditor"));
+        mod.update = reinterpret_cast<UpdateFn>(EmbeddedScript::Symbol(embeddedModule, "Script_Update"));
+        mod.tickUpdate = reinterpret_cast<TickUpdateFn>(EmbeddedScript::Symbol(embeddedModule, "Script_TickUpdate"));
+        mod.editorRender = reinterpret_cast<EditorRenderFn>(EmbeddedScript::Symbol(embeddedModule, "RenderEditorWindow"));
+        mod.editorExit = reinterpret_cast<EditorExitFn>(EmbeddedScript::Symbol(embeddedModule, "ExitRenderEditorWindow"));
+        mod.resetState = reinterpret_cast<ResetStateFn>(EmbeddedScript::Symbol(embeddedModule, "Script_ResetState"));
+        mod.collideEnter = reinterpret_cast<CollisionFn>(EmbeddedScript::Symbol(embeddedModule, "Script_OnCollideEnter"));
+        mod.collideHold = reinterpret_cast<CollisionFn>(EmbeddedScript::Symbol(embeddedModule, "Script_OnCollideHold"));
+        mod.collideExit = reinterpret_cast<CollisionFn>(EmbeddedScript::Symbol(embeddedModule, "Script_OnCollideExit"));
+        mod.collideHoldDuration = reinterpret_cast<CollisionHoldDurationFn>(EmbeddedScript::Symbol(embeddedModule, "Script_OnCollideHoldDuration"));
+    } else {
 #if defined(_WIN32)
     fs::path loadPath = binaryPath;
     std::string shadowError;
@@ -2972,9 +3023,9 @@ ScriptRuntime::Module* ScriptRuntime::getModule(const fs::path& binaryPath) {
         }
         return nullptr;
     }
-    AbiVersionFn abiVersionFn = reinterpret_cast<AbiVersionFn>(
+    abiVersionFn = reinterpret_cast<AbiVersionFn>(
         GetProcAddress(static_cast<HMODULE>(mod.handle), "Modularity_ScriptAbiVersion"));
-    LayoutSignatureFn layoutSignatureFn = reinterpret_cast<LayoutSignatureFn>(
+    layoutSignatureFn = reinterpret_cast<LayoutSignatureFn>(
         GetProcAddress(static_cast<HMODULE>(mod.handle), "Modularity_ScriptLayoutSignature"));
     mod.inspector = reinterpret_cast<InspectorFn>(GetProcAddress(static_cast<HMODULE>(mod.handle), "Script_OnInspector"));
     mod.begin = reinterpret_cast<BeginFn>(GetProcAddress(static_cast<HMODULE>(mod.handle), "Script_Begin"));
@@ -3020,8 +3071,8 @@ ScriptRuntime::Module* ScriptRuntime::getModule(const fs::path& binaryPath) {
         return nullptr;
     }
     dlerror();
-    AbiVersionFn abiVersionFn = reinterpret_cast<AbiVersionFn>(dlsym(mod.handle, "Modularity_ScriptAbiVersion"));
-    LayoutSignatureFn layoutSignatureFn = reinterpret_cast<LayoutSignatureFn>(dlsym(mod.handle, "Modularity_ScriptLayoutSignature"));
+    abiVersionFn = reinterpret_cast<AbiVersionFn>(dlsym(mod.handle, "Modularity_ScriptAbiVersion"));
+    layoutSignatureFn = reinterpret_cast<LayoutSignatureFn>(dlsym(mod.handle, "Modularity_ScriptLayoutSignature"));
     mod.inspector = reinterpret_cast<InspectorFn>(dlsym(mod.handle, "Script_OnInspector"));
     mod.begin = reinterpret_cast<BeginFn>(dlsym(mod.handle, "Script_Begin"));
     mod.spec = reinterpret_cast<SpecFn>(dlsym(mod.handle, "Script_Spec"));
@@ -3046,6 +3097,8 @@ ScriptRuntime::Module* ScriptRuntime::getModule(const fs::path& binaryPath) {
     }
 #endif
 #endif
+
+    }
 
     if (!abiVersionFn) {
         unloadModuleHandle(mod.handle);

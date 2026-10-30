@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 
+#include "DevBuildDir.h"
+
 namespace AndroidToolchain {
 namespace fs = std::filesystem;
 
@@ -28,11 +30,11 @@ inline std::vector<fs::path> SdkRoots() {
         if (auto path = EnvironmentPath(name); !path.empty()) roots.push_back(path);
     }
 #ifdef MODULARITY_SOURCE_DIR
-    roots.emplace_back(fs::path(MODULARITY_SOURCE_DIR) / "build" / "android-sdk");
+    roots.emplace_back(ModularityAndroidDir(fs::path(MODULARITY_SOURCE_DIR), "android-sdk"));
 #endif
     std::error_code ec;
     const auto cwd = fs::current_path(ec);
-    if (!ec) roots.push_back(cwd / "build" / "android-sdk");
+    if (!ec) roots.push_back(ModularityAndroidDir(cwd, "android-sdk"));
 #ifdef _WIN32
     if (auto local = EnvironmentPath("LOCALAPPDATA"); !local.empty()) roots.push_back(local / "Android" / "Sdk");
 #else

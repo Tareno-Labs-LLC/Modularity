@@ -45,7 +45,7 @@ static void ApplyEditorTheme() {
 }
 
 int main(int argc, char** argv) {
-    const char* outPath = argc > 1 ? argv[1] : "build/ui-gallery.ppm";
+    const char* outPath = argc > 1 ? argv[1] : "build/Dev-Resources/ui-gallery.ppm";
     const int W = 1600, H = 1500; // offscreen, so not limited by the desktop size
     if (!glfwInit()) return 2;
     glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE); glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3); glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);

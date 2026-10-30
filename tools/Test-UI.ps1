@@ -1,4 +1,4 @@
-param([string]$BuildDirectory = 'build', [string]$Configuration = 'Release')
+param([string]$BuildDirectory = 'build/Dev-Resources', [string]$Configuration = 'Release')
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
 Push-Location $repo

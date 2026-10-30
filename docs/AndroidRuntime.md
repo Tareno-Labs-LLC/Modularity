@@ -23,13 +23,14 @@ powershell -ExecutionPolicy Bypass -File tools\Setup-Android.ps1 -AcceptLicenses
 .\build.bat --Android --editor --output=C:\Games\Modularity.apk
 ```
 
-The setup script installs tools under `build/android-sdk`, verifies Google's
+The setup script installs tools under `Build-Android/android-sdk`, verifies Google's
 command-line tools archive checksum, and installs NDK 30.0.16248370, platform 36,
 build-tools 36.0.0, platform-tools, and SDK CMake/Ninja. Android Studio and Gradle
 are not required. It does not change machine-wide environment variables.
 `-CheckOnly` checks an existing installation without downloading packages.
 
-The exporter detects `build/android-sdk`, the standard Android Studio SDK
+The exporter detects `Build-Android/android-sdk` (`build/android-sdk` for
+`build.sh` trees), the standard Android Studio SDK
 directory, and side-by-side NDKs automatically. You can override discovery with:
 
 - `ANDROID_NDK_ROOT` (or `ANDROID_NDK_HOME` / `ANDROID_NDK`) pointing at the NDK
@@ -122,14 +123,31 @@ On desktop the left mouse button is reported as a single touch, so the same
 surface/framebuffer pixels; normalize against the viewport size yourself if you
 want 0..1.
 
+## Microphone
+
+`Microphone.Start()` (ModuInput) captures through miniaudio (AAudio/OpenSL) like on
+desktop, but `RECORD_AUDIO` is a runtime permission:
+
+- The manifest only declares it when a script under the project mentions
+  `Microphone` (`projectUsesMicrophone` in Engine.cpp); the editor APK always does.
+  It comes with `android.hardware.microphone` marked `required="false"`, so
+  mic-less devices can still install the game.
+- The first `Start()` asks. The editor APK asks through its Java bridge
+  (`modularityRequestMicrophonePermission`); an exported player has no Java
+  code, so it calls `Activity.requestPermissions` over JNI. `AudioSystem` then
+  polls `checkSelfPermission` and opens the device once permission is granted.
+- The prompt takes focus while it is showing. If the app comes back into focus
+  without a grant, or no prompt appears within 3 s (Android stops showing it after
+  repeated denials), `Microphone.Status()` reports the denial and points to
+  Settings. Polling keeps going, so a grant from Settings works without a restart.
+
 ## Scripts on device (the important constraint)
 
 ModuCPP scripts normally compile to a `.so` via the host C++ compiler and get
-`dlopen`'d at runtime. A phone has no C++ compiler, and worse, **modern Android
-will not let you `dlopen` a `.so` that lives in app data or unpacked from the
-content bundle.** Native libraries can only be loaded from the APK's
-`lib/<abi>/` directory (which the package manager extracts to the app's
-`nativeLibraryDir`).
+`dlopen`'d at runtime. Android does not supply an on-device C++ compiler.
+Exported games therefore cross-compile scripts and package the libraries in
+the APK's `lib/<abi>/` directory. The Android editor has a separate embedded
+compiler path for editing and recompiling scripts on the device.
 
 So the Android build does two things:
 
@@ -153,7 +171,14 @@ script was built against different struct layouts than the packaged
 recompile" message rather than corrupting memory. If you see that in logcat,
 rebuild the APK so the player and scripts come from the same source tree.
 
-For the editor APK, `./build.sh --Android --editor` also stages an on-device
+For the editor APK, `build.bat --Android --editor` (or the Bash equivalent)
+prepares embedded Cling/LLVM for C++ and ModuCPP and TinyCC for C. C scripts keep
+their generated C++ context bridge: TinyCC emits the C object, and Cling links
+it with the bridge in the JIT. Setup commands, caching, and the device probes are
+documented in [EmbeddedAndroidCompilers.md](EmbeddedAndroidCompilers.md).
+
+The existing external Clang option is still available for custom builds.
+With `MODULARITY_ANDROID_CLANG_DIR` explicitly supplied, Bash can stage an on-device
 compiler bundle under `build/android-clang/arm64-v8a/`: the NDK sysroot, engine
 script headers, GLM, and a trimmed Termux-derived aarch64 clang/lld payload.
 The NDK only ships host clang binaries, so `build.sh` fetches the current Termux

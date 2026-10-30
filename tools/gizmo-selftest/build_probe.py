@@ -5,7 +5,7 @@ import subprocess
 import sys
 
 repo = Path(__file__).resolve().parents[2]
-build = repo / "build"
+build = repo / "build/Dev-Resources"
 vswhere = Path(os.environ.get("ProgramFiles(x86)", "C:/Program Files (x86)")) / "Microsoft Visual Studio/Installer/vswhere.exe"
 installation = subprocess.check_output(
     [str(vswhere), "-latest", "-products", "*", "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"],

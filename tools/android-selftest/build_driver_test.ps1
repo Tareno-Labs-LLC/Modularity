@@ -18,7 +18,7 @@ function Invoke-ExternalStep($Label, $FilePath, $StepArguments) {
 function Invoke-InlineStep($Label, $Action) { & $Action; return $true }
 function Write-Info($Value) {}
 $root = $repo
-$buildDir = Join-Path $repo 'build'
+$buildDir = Join-Path $repo 'build\Dev-Resources'
 $playerCacheDir = Join-Path $buildDir 'player-cache'
 $generatorArgs = @(); $vsGlobalsArgs = @(); $monoArgs = @(); $buildExtraArgs = @()
 $buildType = 'Release'; $buildCppStandard = 'c++23'; $discordSdk = 'OFF'; $jobs = 3
@@ -37,12 +37,19 @@ foreach ($case in @(
     if ($apk.Args -notcontains '--build-android' -or $apk.Args -notcontains "--abi=$($case.Abi)") { throw 'Missing Android exporter arguments' }
     if (($apk.Args -contains '--debug') -ne $case.Debug -or ($apk.Args -contains '--editor') -ne $case.Editor) { throw 'Android mode flags lost' }
     if ($case.Editor -and $apk.Args -notcontains '--project=C:\Game With Spaces\project.modu') { throw 'Project path with spaces was split' }
-    if ($script:calls.Count -ne 4) { throw 'Unexpected player build or packaging command in Android pipeline' }
+    $expectedCalls = 4
+    if ($case.Editor -and -not $env:MODULARITY_ANDROID_CLANG_DIR -and
+        -not (Test-Path -LiteralPath (Join-Path $buildDir 'embedded-compilers\arm64-v8a\ready.json'))) {
+        $expectedCalls += 1
+    }
+    if ($script:calls.Count -ne $expectedCalls) { throw 'Unexpected player build or packaging command in Android pipeline' }
     Write-Output "PASS: Windows Android pipeline [$($case.Flags -join ' ')]"
 }
 
-$scratch = Join-Path $repo ('build\android-selftest\driver-' + [Guid]::NewGuid().ToString('N'))
+$scratch = Join-Path $repo ('build\Dev-Resources\android-selftest\driver-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path (Join-Path $scratch 'android-sdk\nested'), (Join-Path $scratch 'native') | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $scratch 'embedded-compilers\nested') | Out-Null
+Set-Content -LiteralPath (Join-Path $scratch 'embedded-compilers\nested\LLVM.dll') 'compiler marker'
 Set-Content -LiteralPath (Join-Path $scratch 'android-sdk\nested\compiler.dll') 'SDK marker'
 Set-Content -LiteralPath (Join-Path $scratch 'native\runtime.dll') 'runtime marker'
 $script:BinaryScanCache=@{}; $script:ExcludedLibs=@('core.lib','core_player.lib')
@@ -53,9 +60,10 @@ Write-Output 'PASS: Android SDK binaries excluded from desktop package candidate
 # Exercise the real clean callback only on this uniquely named fixture directory.
 $cleanBuild=$true; $buildDir=$scratch; $playerCacheDir=Join-Path $scratch 'player-cache'; $script:stopAtSync=$true
 $resolved=[IO.Path]::GetFullPath($scratch)
-$prefix=[IO.Path]::GetFullPath((Join-Path $repo 'build\android-selftest')).TrimEnd('\')+'\'
+$prefix=[IO.Path]::GetFullPath((Join-Path $repo 'build\Dev-Resources\android-selftest')).TrimEnd('\')+'\'
 if (-not $resolved.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { throw 'Fixture must stay inside android-selftest' }
 $null=Invoke-BuildPipeline
 if (-not (Test-Path -LiteralPath (Join-Path $scratch 'android-sdk\nested\compiler.dll'))) { throw 'Clean removed the SDK cache' }
+if (-not (Test-Path -LiteralPath (Join-Path $scratch 'embedded-compilers\nested\LLVM.dll'))) { throw 'Clean removed the embedded compiler cache' }
 if (Test-Path -LiteralPath (Join-Path $scratch 'native\runtime.dll')) { throw 'Clean left engine build outputs' }
 Write-Output 'PASS: clean removes engine outputs while preserving the Android SDK cache'

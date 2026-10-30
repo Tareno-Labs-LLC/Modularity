@@ -79,8 +79,13 @@ void Engine::updateXRSystem() {
             xr.activeTarget().renderMode = Modularity::XR::XRRenderMode::MultiPass;
             xr.activeTarget().interactionProfiles = Modularity::XR::DefaultInteractionProfiles(
                 Modularity::XR::ActivePlatformTarget());
-        }
+        } else
 #endif
+        {
+            // Start in the space the scene's XR Origin asks for, so the first frame is
+            // already right; updateXRComponents keeps it in step after that.
+            xr.trackingOrigin = resolveXRTrackingOrigin();
+        }
 
         if (Modularity::XR::ActivePlatformTarget() == Modularity::XR::XRPlatformTarget::PC) {
             std::string overrideError;
@@ -160,6 +165,10 @@ bool Engine::renderXRFrame() {
     {
         runtimeCam = findXRCameraObject();
         if (!runtimeCam) runtimeCam = findPlayerCameraObject();
+        // updateXRComponents set this before scripts and physics moved the rig. Rebuild it
+        // from where the origin ended up, so the eyes land where the XR Camera object (and
+        // the audio listener on it) already are instead of one physics step behind.
+        xrSystem.setOriginToWorld(computeXROriginToWorld(findXROriginObject()));
     }
     if (runtimeCam) {
         xrCamera = makeCameraFromObject(*runtimeCam);

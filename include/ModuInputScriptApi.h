@@ -591,6 +591,51 @@ inline void ClearImage() {
 }
 } // namespace Cursor
 
+// Microphone loudness, for mouths that flap when you talk, clap detection, "blow on the
+// mic" mechanics. Start() once (e.g. in Begin); the mic stays open until Stop() or play
+// stops. On Android the first Start() shows the microphone permission prompt and Level()
+// reads 0 until the player allows it; Status() says what it is waiting on.
+namespace Microphone {
+inline void Start() {
+    if (ScriptContext* c = ctxPtr()) c->RequestMicrophone();
+}
+
+inline void Stop() {
+    if (ScriptContext* c = ctxPtr()) c->ReleaseMicrophone();
+}
+
+inline bool IsActive() {
+    if (ScriptContext* c = ctxPtr()) return c->IsMicrophoneActive();
+    return false;
+}
+
+// RMS loudness averaged over ~50 ms, 0..1. Speech sits around 0.01-0.2, so for anything
+// that should track how loud someone is talking, Decibels() is usually easier to tune.
+inline float Level() {
+    if (ScriptContext* c = ctxPtr()) return c->GetMicrophoneLevel();
+    return 0.0f;
+}
+
+// Loudest sample recently, 0..1, falling back over ~300 ms. Good for claps and pops.
+inline float Peak() {
+    if (ScriptContext* c = ctxPtr()) return c->GetMicrophonePeak();
+    return 0.0f;
+}
+
+// Level() in dBFS: 0 is full scale, a quiet room is roughly -60..-50, normal talking
+// about -35..-20. Floors at -100 when silent or inactive.
+inline float Decibels() {
+    const float level = Level();
+    if (level <= 0.00001f) return -100.0f;
+    return 20.0f * std::log10(level);
+}
+
+inline std::string Status() {
+    if (ScriptContext* c = ctxPtr()) return c->GetMicrophoneStatus();
+    return "Off";
+}
+} // namespace Microphone
+
 inline bool IsSubmitDown() {
     return IsRuntimeKeyDown(GLFW_KEY_ENTER, ImGuiKey_Enter) ||
            IsRuntimeKeyDown(GLFW_KEY_KP_ENTER, ImGuiKey_KeypadEnter);

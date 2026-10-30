@@ -57,6 +57,19 @@ vec2 octEncode(vec3 n)
     return n.xy;
 }
 
+// A front-facing surface can have a back-facing shading normal after normal
+// mapping, even with RGB8 textures. Move only that normal's view component into
+// the visible hemisphere; keep the surface detail perpendicular to the view.
+// Apply the same correction in frag.glsl and gbuffer_frag.glsl so direct light,
+// cubemap reflection and SSR all use the same normal. True backfaces stay so.
+vec3 viewFacingMappedNormal(vec3 N, vec3 geometricN, vec3 V)
+{
+    if (dot(geometricN, V) <= 0.0) return N;
+    // Leave a small margin for the SSR buffer's half-float normal encoding.
+    float correction = max(0.001 - dot(N, V), 0.0);
+    return normalize(N + V * correction);
+}
+
 mat3 computeTBN(vec2 uv, vec3 N)
 {
     vec3 dp1 = dFdx(FragPos);
@@ -132,7 +145,7 @@ void main()
         vec3 mapN = texture(normalMap, uv).xyz * 2.0 - 1.0;
         mapN.xy *= max(normalMapIntensity, 0.0);
         mapN = normalize(mapN);
-        norm = normalize(TBN * mapN);
+        norm = viewFacingMappedNormal(normalize(TBN * mapN), normalize(Normal), viewDir);
     }
 
     float roughness;

@@ -44,6 +44,11 @@ bool XRSession::pollEvents() { return false; }
 
 void XRSession::requestExit() { exitRequested_ = true; }
 
+bool XRSession::setTrackingOrigin(XRTrackingOrigin, bool& outSwapped, std::string&) {
+    outSwapped = false;
+    return false;
+}
+
 #else
 
 namespace {
@@ -231,6 +236,56 @@ bool XRSession::createReferenceSpaces(const ProjectOpenXRSettings& settings,
                                       std::string& outError) {
     const XRSessionFunctions& fns = XRLoaderSessionFunctions();
 
+    requestedTrackingOrigin_ = settings.trackingOrigin;
+    if (!createAppSpace(settings.trackingOrigin, appSpace_, effectiveTrackingOrigin_,
+                        referenceSpaceFellBack_, outError)) {
+        return false;
+    }
+
+    XrReferenceSpaceCreateInfo viewInfo{};
+    viewInfo.type = XR_TYPE_REFERENCE_SPACE_CREATE_INFO;
+    viewInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+    viewInfo.poseInReferenceSpace.orientation.w = 1.0f;
+    XrResult result = fns.CreateReferenceSpace(session_, &viewInfo, &viewSpace_);
+    if (XR_FAILED(result) || viewSpace_ == XR_NULL_HANDLE) {
+        viewSpace_ = XR_NULL_HANDLE;
+        XRLogResultFailure("xrCreateReferenceSpace(VIEW)", static_cast<int32_t>(result));
+        outError = "xrCreateReferenceSpace failed for the VIEW space: " +
+                   XRResultString(static_cast<int32_t>(result));
+        return false;
+    }
+    return true;
+}
+
+bool XRSession::setTrackingOrigin(XRTrackingOrigin origin, bool& outSwapped,
+                                  std::string& outError) {
+    outSwapped = false;
+    if (session_ == XR_NULL_HANDLE) return false;
+    if (origin == requestedTrackingOrigin_) return true;
+
+    // Recorded up front so a failed create is reported once rather than retried every frame.
+    requestedTrackingOrigin_ = origin;
+    XrSpace space = XR_NULL_HANDLE;
+    XRTrackingOrigin effective = origin;
+    bool fellBack = false;
+    // Create the new space before dropping the old one, so a failure leaves the session
+    // tracking in the space it already had.
+    if (!createAppSpace(origin, space, effective, fellBack, outError)) return false;
+
+    const XRSessionFunctions& fns = XRLoaderSessionFunctions();
+    if (appSpace_ != XR_NULL_HANDLE && fns.DestroySpace) fns.DestroySpace(appSpace_);
+    appSpace_ = space;
+    effectiveTrackingOrigin_ = effective;
+    referenceSpaceFellBack_ = fellBack;
+    outSwapped = true;
+    return true;
+}
+
+bool XRSession::createAppSpace(XRTrackingOrigin origin, XrSpace& outSpace,
+                               XRTrackingOrigin& outEffective, bool& outFellBack,
+                               std::string& outError) {
+    const XRSessionFunctions& fns = XRLoaderSessionFunctions();
+
     std::vector<XrReferenceSpaceType> available;
     uint32_t spaceCount = 0;
     if (XR_SUCCEEDED(fns.EnumerateReferenceSpaces(session_, 0, &spaceCount, nullptr)) &&
@@ -246,17 +301,17 @@ bool XRSession::createReferenceSpaces(const ProjectOpenXRSettings& settings,
                std::find(available.begin(), available.end(), type) != available.end();
     };
 
-    XrReferenceSpaceType wanted = (settings.trackingOrigin == XRTrackingOrigin::Floor)
+    XrReferenceSpaceType wanted = (origin == XRTrackingOrigin::Floor)
                                       ? XR_REFERENCE_SPACE_TYPE_STAGE
                                       : XR_REFERENCE_SPACE_TYPE_LOCAL;
-    effectiveTrackingOrigin_ = settings.trackingOrigin;
-    referenceSpaceFellBack_ = false;
+    outEffective = origin;
+    outFellBack = false;
     if (wanted == XR_REFERENCE_SPACE_TYPE_STAGE && !offers(XR_REFERENCE_SPACE_TYPE_STAGE)) {
         XRLogWarn("Runtime does not offer a STAGE reference space; Floor tracking origin "
                   "falls back to Eye Level (LOCAL).");
         wanted = XR_REFERENCE_SPACE_TYPE_LOCAL;
-        effectiveTrackingOrigin_ = XRTrackingOrigin::Eye;
-        referenceSpaceFellBack_ = true;
+        outEffective = XRTrackingOrigin::Eye;
+        outFellBack = true;
     }
 
     XrReferenceSpaceCreateInfo spaceInfo{};
@@ -264,29 +319,16 @@ bool XRSession::createReferenceSpaces(const ProjectOpenXRSettings& settings,
     spaceInfo.referenceSpaceType = wanted;
     spaceInfo.poseInReferenceSpace.orientation.w = 1.0f;
 
-    XrResult result = fns.CreateReferenceSpace(session_, &spaceInfo, &appSpace_);
-    if (XR_FAILED(result) || appSpace_ == XR_NULL_HANDLE) {
-        appSpace_ = XR_NULL_HANDLE;
+    XrResult result = fns.CreateReferenceSpace(session_, &spaceInfo, &outSpace);
+    if (XR_FAILED(result) || outSpace == XR_NULL_HANDLE) {
+        outSpace = XR_NULL_HANDLE;
         XRLogResultFailure("xrCreateReferenceSpace", static_cast<int32_t>(result));
         outError = "xrCreateReferenceSpace failed for the tracking space: " +
                    XRResultString(static_cast<int32_t>(result));
         return false;
     }
 
-    XrReferenceSpaceCreateInfo viewInfo{};
-    viewInfo.type = XR_TYPE_REFERENCE_SPACE_CREATE_INFO;
-    viewInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
-    viewInfo.poseInReferenceSpace.orientation.w = 1.0f;
-    result = fns.CreateReferenceSpace(session_, &viewInfo, &viewSpace_);
-    if (XR_FAILED(result) || viewSpace_ == XR_NULL_HANDLE) {
-        viewSpace_ = XR_NULL_HANDLE;
-        XRLogResultFailure("xrCreateReferenceSpace(VIEW)", static_cast<int32_t>(result));
-        outError = "xrCreateReferenceSpace failed for the VIEW space: " +
-                   XRResultString(static_cast<int32_t>(result));
-        return false;
-    }
-
-    MutableDiagnostics().activeTrackingOrigin = ToString(effectiveTrackingOrigin_);
+    MutableDiagnostics().activeTrackingOrigin = ToString(outEffective);
     XRLogInfo(std::string("Reference space: ") +
               (wanted == XR_REFERENCE_SPACE_TYPE_STAGE ? "STAGE (Floor)" : "LOCAL (Eye Level)"));
     return true;

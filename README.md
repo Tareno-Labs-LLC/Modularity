@@ -127,7 +127,14 @@ git lfs pull
 build.bat
 ```
 
-The usual Release outputs are `build\Release\Modularity.exe` for the editor and `build\Release\ModularityPlayer.exe` for the standalone runtime.
+A Windows build leaves exactly three things in `build\`:
+- `Dev-ExportedBuild\`: the runnable editor (`Modularity.exe`) and standalone runtime (`ModularityPlayer.exe`) with their DLLs and `Resources\`.
+- `Dev-Resources\`: the CMake tree, debug files (`.pdb`, import `.lib`) and the export player cache.
+
+`build.ps1 --asan` builds an AddressSanitizer editor and player into `Build-ASAN\` instead (never packaged).
+
+Android work lives next to `build\` in `Build-Android\` (SDK/NDK, the Android editor's Cling/TinyCC caches, APKs and their signing key).
+- `Modularity V7.0 - Windows.zip`: the release archive (`build.ps1 --version=V7.1` changes the label, `--7z` the format).
 See [docs/Build.md](docs/Build.md) for build flags, Android requirements, packaging, CPU compatibility, and release verification details.
 
 ## Project status and known limitations

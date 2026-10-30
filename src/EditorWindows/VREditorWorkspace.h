@@ -4,7 +4,9 @@
 #include "XR/XRInput.h"
 #include "Rendering.h"
 #include "ThirdParty/ModuGuizmo/ImGuizmo.h"
+#include <chrono>
 #include <filesystem>
+#include <functional>
 #include <unordered_map>
 
 struct ImGuiContext;
@@ -34,6 +36,10 @@ public:
     glm::vec3 previewDirection{0,0,-1};
     int pendingAction = 0; // 1 play/stop, 2 pause, 3 desktop, 4 project selector, 5 spec
     std::string pendingProject;
+    // Locates the moduengine.vr-controllers ModuPAK (controller models and their
+    // .controller material files). Engine wires it to the PackageManager; it is
+    // polled every few seconds so installing the package mid-session just works.
+    std::function<std::filesystem::path()> findControllerPackage;
     glm::mat4 sceneFromTracking{1.0f};
     void updateNavigation(const Modularity::XR::XRInputState& state, float dt);
 
@@ -120,6 +126,8 @@ private:
     Target mirror;
     unsigned int program = 0, vao = 0, vbo = 0;
     std::unique_ptr<Shader> controllerShader;
+    std::filesystem::path controllerPackageRoot;
+    std::chrono::steady_clock::time_point nextControllerPackageLookup{};
     int pointerHand = 1;
     int capturedHand = -1;
     unsigned int hoveredPanel = 0, draggedPanel = 0, mousePanel = 0;

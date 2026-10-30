@@ -266,6 +266,49 @@ public class HandCursor : ModuNode
 }
 ```
 
+## The `Microphone` Facade
+
+### Overview
+How loud the default microphone is, for mouths that flap when you talk, clap detection or "blow on the mic" mechanics. Works in the editor, the desktop players and on Android.
+
+### `Microphone.Start()` / `Microphone.Stop()`
+`Start()` opens the default input device; call it once (for example in `Begin`). The mic stays open until `Stop()` or play stops. If the default mic changes or is unplugged and plugged back in, capture follows it on its own.
+
+On Android the first `Start()` shows the microphone permission prompt, and capture begins once the player allows it. Call `Start()` early so the prompt does not appear in the middle of the game. Exported APKs declare `RECORD_AUDIO` only when one of the project's scripts mentions `Microphone`; the editor APK always declares it.
+
+### `Microphone.Level()` / `Microphone.Decibels()`
+`Level()` is RMS loudness averaged over about 50 ms, `0..1`. Speech sits around `0.01-0.2`, so `Decibels()` (the same level in dBFS) is usually easier to tune: a quiet room reads roughly `-60..-50`, normal talking about `-35..-20`, and `0` is full scale. Both read `0` / `-100` while the mic is not active.
+
+### `Microphone.Peak()`
+The loudest recent sample, `0..1`, falling back over about 300 ms. Better than `Level()` for sharp sounds like claps.
+
+### `Microphone.IsActive()` / `Microphone.Status()`
+`IsActive()` is `true` while audio is coming in. `Status()` says why it is not: `"Waiting for microphone permission"`, `"Microphone permission denied - ..."`, `"Could not open a microphone (...)"`, or `"Listening: <device>"` when it works. It is handy to draw in an inspector `Run(...)` line while tuning.
+
+```cpp
+add ModuCPP;
+add ModuInput;
+
+public class TalkingMouth : ModuNode
+{
+    [Slider(-90.0f, 0.0f)] public float quietDb = -50.0f;
+    [Slider(-90.0f, 0.0f)] public float loudDb = -20.0f;
+    private float open = 0.0f;
+
+    void Begin()
+    {
+        Microphone.Start();
+    }
+
+    void TickUpdate()
+    {
+        const float target = Math.Clamp01((Microphone.Decibels() - quietDb) / Math.Max(1.0f, loudDb - quietDb));
+        open += (target - open) * Math.Min(1.0f, dt * (target > open ? 30.0f : 12.0f));
+        // drive a jaw rotation, a sprite frame, a blend shape... from `open`
+    }
+}
+```
+
 ## Common Mistakes
 - Forgetting `add ModuInput;`.
 - Using `input.WASD()` when normalized movement was intended.

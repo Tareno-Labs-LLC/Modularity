@@ -9526,8 +9526,11 @@ void Engine::renderInspectorPanel() {
                     endCompFields();
                 }
                 if (origin.trackingOriginMode == XROriginComponent::Mode::EyeLevel) {
-                    ImGui::TextWrapped("%s", "Eye Level puts the origin at the recentre pose. Use Camera Y "
-                                 "Offset to lift a seated player off the floor plane.");
+                    ImGui::TextWrapped("%s", "Eye Level puts the origin at the recentre pose. Camera Y "
+                                 "Offset lifts the head and hands together off the floor plane.");
+                } else {
+                    ImGui::TextWrapped("%s", "Floor tracking already includes the player's real height, "
+                                 "so Camera Y Offset is ignored unless the space is Eye Level.");
                 }
                 ImGui::PopID();
             }

@@ -1,17 +1,9 @@
 #version 330 core
 // Screen-space reflections.
 //
-// The march walks the ray in SCREEN space, one step per pixel it crosses, not in
-// fixed world-space increments. That matters twice over:
-//
-//   Banding. A fixed world step is many pixels wide near the camera and far
-//   below a pixel in the distance, so the same ray both skips over thin geometry
-//   (the gaps) and re-tests the same texel repeatedly (the stripes). Stepping by
-//   pixels samples the depth buffer exactly as finely as it is stored.
-//
-//   Cost. Step count becomes proportional to how far the reflection actually
-//   travels on screen rather than to a world distance guessed in advance, so a
-//   short reflection is cheap and `steps` is a ceiling instead of a fixed price.
+// March uniformly in projected screen coordinates, with perspective-correct
+// depth. Clip the ray before dividing by w so offscreen endpoints do not spend
+// the sample budget outside the viewport or across the camera plane.
 //
 // Output is premultiplied colour with the blend weight in alpha, composited with
 //   glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE)
@@ -36,8 +28,8 @@ uniform float nearPlane;
 uniform float farPlane;
 
 uniform float intensity = 1.0;
-// Ceiling on the march, not a fixed count. A ray crossing 40 pixels takes 40
-// steps whatever this says.
+// Maximum sample budget. Short rays use at most one sample per pixel; longer
+// rays distribute this budget over the visible segment.
 uniform int steps = 48;
 uniform int refineSteps = 6;
 uniform float maxDistance = 40.0;
@@ -83,6 +75,17 @@ float dither(vec2 pixel)
     return fract(52.9829189 * fract(dot(pixel, vec2(0.06711056, 0.00583715))));
 }
 
+// Clip the end of a segment against one homogeneous frustum plane. The
+// origin must be inside; plane distances are linear before perspective divide.
+bool clipRayPlane(float startDistance, float endDistance, inout float endT)
+{
+    if (startDistance < 0.0) return false;
+    if (endDistance < 0.0) {
+        endT = min(endT, startDistance / (startDistance - endDistance));
+    }
+    return true;
+}
+
 void main()
 {
     float depth = texture(sceneDepth, TexCoord).r;
@@ -126,79 +129,82 @@ void main()
     vec4 startClip = viewProj * vec4(startWorld, 1.0);
     vec4 endClip = viewProj * vec4(endWorld, 1.0);
 
-    // A ray heading behind the camera crosses w = 0, where the projection is
-    // undefined. Clip the segment to just in front of the eye instead of letting
-    // the interpolation pass through the singularity and wrap to nonsense.
-    const float kMinW = 0.001;
-    if (endClip.w < kMinW) {
-        float t = (kMinW - startClip.w) / (endClip.w - startClip.w);
-        endClip = mix(startClip, endClip, clamp(t, 0.0, 1.0));
-    }
-    if (startClip.w < kMinW) {
+    float endT = 1.0;
+    if (!clipRayPlane(startClip.w + startClip.x, endClip.w + endClip.x, endT) ||
+        !clipRayPlane(startClip.w - startClip.x, endClip.w - endClip.x, endT) ||
+        !clipRayPlane(startClip.w + startClip.y, endClip.w + endClip.y, endT) ||
+        !clipRayPlane(startClip.w - startClip.y, endClip.w - endClip.y, endT) ||
+        !clipRayPlane(startClip.w + startClip.z, endClip.w + endClip.z, endT) ||
+        !clipRayPlane(startClip.w - startClip.z, endClip.w - endClip.z, endT)) {
         FragColor = vec4(0.0);
         return;
     }
+    endClip = mix(startClip, endClip, endT);
+    if (startClip.w <= 0.0 || endClip.w <= 0.0) {
+        FragColor = vec4(0.0);
+        return;
+    }
+    vec3 startNdc = startClip.xyz / startClip.w;
+    vec3 endNdc = endClip.xyz / endClip.w;
+    vec2 startUv = startNdc.xy * 0.5 + 0.5;
+    vec2 endUv = endNdc.xy * 0.5 + 0.5;
 
-    vec2 startUv = (startClip.xy / startClip.w) * 0.5 + 0.5;
-    vec2 endUv = (endClip.xy / endClip.w) * 0.5 + 0.5;
-
-    // One step per pixel the ray crosses, capped by `steps`. This single line is
-    // what makes the cost track the reflection's real screen extent.
+    // NDC depth, like UV, is linear along the projected segment. Interpolating
+    // homogeneous clip coordinates here instead would bunch samples at one end
+    // and skip large spans near the eye (especially for camera-facing rays).
     vec2 deltaPixels = (endUv - startUv) * screenSize;
     float pixelSpan = max(abs(deltaPixels.x), abs(deltaPixels.y));
-    int stepCount = int(clamp(pixelSpan, 1.0, float(clamp(steps, 1, 256))));
+    int stepCount = int(clamp(ceil(pixelSpan), 1.0, float(clamp(steps, 1, 256))));
     float dt = 1.0 / float(stepCount);
-    float jitter = dither(gl_FragCoord.xy) * dt;
+    float jitter = dither(gl_FragCoord.xy);
 
     bool hit = false;
     vec2 hitUv = vec2(0.0);
+    float hitT = 0.0;
     float tPrev = 0.0;
+    float previousDelta = linearize(startNdc.z * 0.5 + 0.5) -
+                          linearize(texture(sceneDepth, startUv).r);
 
     for (int i = 1; i <= 256; ++i) {
         if (i > stepCount) break;
-        float t = min(float(i) * dt + jitter, 1.0);
-
-        // Linear interpolation in clip space is linear along the world-space
-        // ray, so this stays perspective-correct without tracking view depth
-        // separately.
-        vec4 clip = mix(startClip, endClip, t);
-        if (clip.w < kMinW) break;
-        vec3 ndc = clip.xyz / clip.w;
+        float t = (float(i) - jitter) * dt;
+        vec3 ndc = mix(startNdc, endNdc, t);
         vec2 uv = ndc.xy * 0.5 + 0.5;
-        if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) break;
-
-        float sceneD = linearize(texture(sceneDepth, uv).r);
+        float sampledDepth = texture(sceneDepth, uv).r;
+        float sceneD = linearize(sampledDepth);
         float rayD = linearize(ndc.z * 0.5 + 0.5);
         float delta = rayD - sceneD;
 
-        if (delta > 0.0 && delta < thickness) {
-            // Binary search between the last miss and this hit, in the same
-            // parameter. The march is deliberately coarse; this is what turns a
-            // crossing back into a sharp contact.
+        // Refine front-to-back crossings even if the coarse step overshot the
+        // thickness slab. Rejecting those before refinement cuts holes in the
+        // reflection as distance or viewing angle changes.
+        if (sampledDepth < 1.0 && previousDelta <= 0.0 && delta > 0.0) {
             float lo = tPrev;
             float hi = t;
             for (int r = 0; r < 16; ++r) {
                 if (r >= refineSteps) break;
                 float mid = (lo + hi) * 0.5;
-                vec4 midClip = mix(startClip, endClip, mid);
-                if (midClip.w < kMinW) break;
-                vec3 midNdc = midClip.xyz / midClip.w;
+                vec3 midNdc = mix(startNdc, endNdc, mid);
                 vec2 midUv = midNdc.xy * 0.5 + 0.5;
                 float midScene = linearize(texture(sceneDepth, midUv).r);
                 float midRay = linearize(midNdc.z * 0.5 + 0.5);
-                if (midRay - midScene > 0.0) {
-                    hi = mid;
-                    uv = midUv;
-                } else {
-                    lo = mid;
-                }
+                if (midRay > midScene) hi = mid;
+                else lo = mid;
             }
-            hit = true;
-            hitUv = uv;
-            break;
+            vec3 hitNdc = mix(startNdc, endNdc, hi);
+            vec2 candidateUv = hitNdc.xy * 0.5 + 0.5;
+            float candidateDepth = texture(sceneDepth, candidateUv).r;
+            float hitDelta = linearize(hitNdc.z * 0.5 + 0.5) - linearize(candidateDepth);
+            // A silhouette discontinuity is not necessarily an intersection.
+            if (candidateDepth < 1.0 && hitDelta >= 0.0 && hitDelta <= thickness) {
+                hit = true;
+                hitUv = candidateUv;
+                hitT = hi;
+                break;
+            }
         }
-
         tPrev = t;
+        previousDelta = delta;
     }
 
     vec3 reflectedColor = vec3(0.0);
@@ -212,6 +218,8 @@ void main()
         vec2 edge = smoothstep(vec2(0.0), vec2(0.15), hitUv) *
                     (1.0 - smoothstep(vec2(0.85), vec2(1.0), hitUv));
         confidence = edge.x * edge.y;
+        // Smooth the finite trace range too, including near/far-plane exits.
+        confidence *= 1.0 - smoothstep(0.8, 1.0, hitT);
         // Rays coming back toward the camera are the ones screen space cannot
         // resolve: what they would reflect is behind the viewer.
         confidence *= clamp(1.0 - max(dot(reflectDir, toEye), 0.0), 0.0, 1.0);
@@ -232,7 +240,8 @@ void main()
 
     // Fading out before the cutoff stops reflections popping out of existence
     // at maxRoughness.
-    float roughnessFade = 1.0 - smoothstep(maxRoughness * 0.5, maxRoughness, roughness);
+    float roughnessLimit = max(maxRoughness, 0.0001);
+    float roughnessFade = 1.0 - smoothstep(roughnessLimit * 0.5, roughnessLimit, roughness);
     float weight = clamp(fresnel * confidence * roughnessFade * max(intensity, 0.0), 0.0, 1.0);
 
     FragColor = vec4(reflectedColor * weight, weight);

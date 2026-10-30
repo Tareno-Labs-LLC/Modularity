@@ -399,16 +399,16 @@ float distributionGGX(float NdotH, float roughness)
     return a2 / max(PI * d * d, 0.0001);
 }
 
-float geometrySchlickGGX(float NdotX, float roughness)
+// Smith-Schlick visibility G / (4 * NdotV * NdotL), with the cosine
+// factors cancelled analytically. Forming G first and clamping that division
+// to 0.0001 incorrectly forces the highlight to zero at grazing angles.
+float visibilitySmithSchlick(float NdotV, float NdotL, float roughness)
 {
     float r = roughness + 1.0;
     float k = (r * r) / 8.0;
-    return NdotX / max(NdotX * (1.0 - k) + k, 0.0001);
-}
-
-float geometrySmith(float NdotV, float NdotL, float roughness)
-{
-    return geometrySchlickGGX(NdotV, roughness) * geometrySchlickGGX(NdotL, roughness);
+    float v = NdotV * (1.0 - k) + k;
+    float l = NdotL * (1.0 - k) + k;
+    return 0.25 / (v * l);
 }
 
 vec3 evaluateDirectSpecular(
@@ -429,9 +429,9 @@ vec3 evaluateDirectSpecular(
     float VdotH = max(dot(V, H), 0.0);
 
     float D = distributionGGX(NdotH, roughness);
-    float G = geometrySmith(NdotV, NdotL, roughness);
+    float visibility = visibilitySmithSchlick(NdotV, NdotL, roughness);
     vec3 F = fresnelSchlick(VdotH, F0);
-    vec3 microfacet = (D * G * F) / max(4.0 * NdotV * NdotL, 0.0001);
+    vec3 microfacet = D * visibility * F;
 
     if (energyConserving) {
         // Cook-Torrance alone. The extra lobe and the visibility scale below are
@@ -553,6 +553,19 @@ vec3 gatherGiDiffuse(vec3 P, vec3 N)
     return total;
 }
 #endif // !MODU_ES2 (voxel GI)
+
+// A front-facing surface can have a back-facing shading normal after normal
+// mapping, even with RGB8 textures. Move only that normal's view component into
+// the visible hemisphere; keep the surface detail perpendicular to the view.
+// Apply the same correction in frag.glsl and gbuffer_frag.glsl so direct light,
+// cubemap reflection and SSR all use the same normal. True backfaces stay so.
+vec3 viewFacingMappedNormal(vec3 N, vec3 geometricN, vec3 V)
+{
+    if (dot(geometricN, V) <= 0.0) return N;
+    // Leave a small margin for the SSR buffer's half-float normal encoding.
+    float correction = max(0.001 - dot(N, V), 0.0);
+    return normalize(N + V * correction);
+}
 
 // Tangent frame from screen-space derivatives rather than a vertex attribute.
 // The mesh vertex format is pos/normal/uv with no tangent, and adding one would
@@ -706,7 +719,7 @@ void main()
         vec3 mapN = texture(normalMap, uv).xyz * 2.0 - 1.0;
         mapN.xy *= max(normalMapIntensity, 0.0);
         mapN = normalize(mapN);
-        norm = normalize(TBN * mapN);
+        norm = viewFacingMappedNormal(normalize(TBN * mapN), normalize(Normal), viewDir);
     }
 
     vec3 albedo = pow(max(baseColor, vec3(0.0)), vec3(2.2));

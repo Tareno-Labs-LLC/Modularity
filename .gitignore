@@ -1,4 +1,6 @@
 build/
+Build-Android/
+Build-ASAN/
 .cache/
 Images-thingy/
 svgimagesamples/

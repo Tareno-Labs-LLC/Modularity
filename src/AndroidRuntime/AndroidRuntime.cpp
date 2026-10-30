@@ -92,6 +92,7 @@ struct RuntimeContext {
     int surfaceWidth = 0;
     int surfaceHeight = 0;
     bool paused = false;
+    unsigned focusRegainCount = 0;
 
     static constexpr int kMaxTouchPointers = 10;
     struct TouchPointer {
@@ -281,6 +282,7 @@ void HandleAppCmd(android_app* app, int32_t cmd) {
             break;
         case APP_CMD_GAINED_FOCUS:
         case APP_CMD_RESUME:
+            if (g_ctx.paused) ++g_ctx.focusRegainCount;
             g_ctx.paused = false;
             break;
         case APP_CMD_LOST_FOCUS:
@@ -756,6 +758,98 @@ bool RequestAllFilesAccess(std::string& error) {
             ok = true;
         }
     }
+    if (activityClass) env->DeleteLocalRef(activityClass);
+    DetachJniForActivity(attached);
+    return ok;
+}
+
+bool IsPaused() {
+    return g_ctx.paused;
+}
+
+unsigned GetFocusRegainCount() {
+    return g_ctx.focusRegainCount;
+}
+
+namespace {
+constexpr const char* kRecordAudioPermission = "android.permission.RECORD_AUDIO";
+constexpr jint kRequestMicrophonePermission = 6103;  // matches the Java bridge
+} // namespace
+
+bool HasMicrophonePermission() {
+    JNIEnv* env = nullptr;
+    bool attached = false;
+    if (!AttachJniForActivity(env, attached)) return false;
+
+    bool granted = false;
+    jobject activity = g_ctx.app->activity->clazz;
+    jclass activityClass = env->GetObjectClass(activity);
+    jmethodID method = activityClass
+        ? env->GetMethodID(activityClass, "checkSelfPermission", "(Ljava/lang/String;)I")
+        : nullptr;
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (method) {
+        jstring permission = env->NewStringUTF(kRecordAudioPermission);
+        const jint result = env->CallIntMethod(activity, method, permission);
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+        } else {
+            granted = result == 0;  // PackageManager.PERMISSION_GRANTED
+        }
+        if (permission) env->DeleteLocalRef(permission);
+    }
+    if (activityClass) env->DeleteLocalRef(activityClass);
+    DetachJniForActivity(attached);
+    return granted;
+}
+
+bool RequestMicrophonePermission(std::string& error) {
+    error.clear();
+
+    JNIEnv* env = nullptr;
+    bool attached = false;
+    if (!AttachJniForActivity(env, attached)) {
+        error = "Android activity is not available.";
+        return false;
+    }
+
+    jobject activity = g_ctx.app->activity->clazz;
+    jclass activityClass = env->GetObjectClass(activity);
+    // The editor APK's bridge asks from the UI thread. An exported player is a plain
+    // NativeActivity with no Java code, so it calls Activity.requestPermissions directly.
+    jmethodID bridge = activityClass
+        ? env->GetMethodID(activityClass, "modularityRequestMicrophonePermission", "()V")
+        : nullptr;
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        bridge = nullptr;
+    }
+
+    bool ok = false;
+    if (bridge) {
+        env->CallVoidMethod(activity, bridge);
+        ok = !env->ExceptionCheck();
+    } else {
+        jmethodID request = activityClass
+            ? env->GetMethodID(activityClass, "requestPermissions", "([Ljava/lang/String;I)V")
+            : nullptr;
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        jclass stringClass = env->FindClass("java/lang/String");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (request && stringClass) {
+            jstring permission = env->NewStringUTF(kRecordAudioPermission);
+            jobjectArray permissions = env->NewObjectArray(1, stringClass, permission);
+            if (permissions) {
+                env->CallVoidMethod(activity, request, permissions, kRequestMicrophonePermission);
+                ok = !env->ExceptionCheck();
+                env->DeleteLocalRef(permissions);
+            }
+            if (permission) env->DeleteLocalRef(permission);
+        }
+        if (stringClass) env->DeleteLocalRef(stringClass);
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (!ok) error = "Failed to request microphone permission.";
     if (activityClass) env->DeleteLocalRef(activityClass);
     DetachJniForActivity(attached);
     return ok;

@@ -1895,6 +1895,9 @@ private:
     void updateXRInteraction(float deltaTime);
     const SceneObject* findXROriginObject() const;
     const SceneObject* findXRCameraObject() const;
+    Modularity::XR::XRTrackingOrigin resolveXRTrackingOrigin() const;
+    glm::vec3 xrTrackingOffset(const SceneObject& origin) const;
+    glm::mat4 computeXROriginToWorld(const SceneObject* origin) const;
     bool beginXRGrab(SceneObject& interactable, SceneObject& interactor,
                      XRActionBasedControllerComponent* controller);
     void updateXRGrabFollow(SceneObject& interactable, SceneObject& interactor, float deltaTime);
@@ -2305,6 +2308,8 @@ public:
     bool setAudioVolumeFromScript(int id, float volume);
     bool setAudioClipFromScript(int id, const std::string& path);
     bool playAudioOneShotFromScript(int id, const std::string& clipPath, float volumeScale = 1.0f);
+    // Microphone capture lives on AudioSystem (requestMicrophone / getMicrophoneLevel ...).
+    AudioSystem& getAudioSystem() { return audio; }
     bool hasAnimationFromScript(int id) const;
     bool playAnimationFromScript(int id, bool restart = true);
     bool stopAnimationFromScript(int id, bool resetTime = true);

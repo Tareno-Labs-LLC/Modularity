@@ -1053,8 +1053,22 @@ configure_ccache() {
 
 clean_editor_build() {
     if [[ -d "${build_dir}" ]]; then
-        rm -rf "${build_dir}"
-        log_ok "Removed ${build_dir}"
+        # Keep repository-local SDKs and the expensive embedded compiler build.
+        local clean_root
+        clean_root="$(cd -- "${build_dir}" && pwd -P)"
+        if [[ "${clean_root}" != "${script_dir}/build" ]]; then
+            log_error "Refusing to clean a build directory outside the source tree."
+            exit 1
+        fi
+        local child
+        for child in "${clean_root}"/* "${clean_root}"/.[!.]* "${clean_root}"/..?*; do
+            [[ -e "${child}" || -L "${child}" ]] || continue
+            case "${child##*/}" in
+                android-sdk|android-sdk-smoke|android-clang|embedded-compilers) continue ;;
+            esac
+            rm -rf -- "${child}"
+        done
+        log_ok "Cleaned ${build_dir}; kept Android SDK/compiler caches"
     fi
 }
 
@@ -1092,10 +1106,10 @@ copy_third_party_libraries() {
 
     mkdir -p "${target_dir}/Packages/ThirdParty"
     if [[ "${build_platform}" == "windows" ]]; then
-        find "${target_dir}" \( -path "${target_dir}/android-sdk" -o -path "${target_dir}/android-sdk-smoke" -o -path "${target_dir}/android-clang" -o -path "${target_dir}/android" \) -prune -o -type f \( -name "*.a" -o -name "*.so" -o -name "*.dylib" -o -name "*.lib" -o -name "*.dll" -o -name "*.dll.a" \) \
+        find "${target_dir}" \( -path "${target_dir}/android-sdk" -o -path "${target_dir}/android-sdk-smoke" -o -path "${target_dir}/embedded-compilers" -o -path "${target_dir}/android-clang" -o -path "${target_dir}/android" \) -prune -o -type f \( -name "*.a" -o -name "*.so" -o -name "*.dylib" -o -name "*.lib" -o -name "*.dll" -o -name "*.dll.a" \) \
             -not -path "${target_dir}/Packages/*" -exec cp -f {} "${target_dir}/Packages/ThirdParty/" \;
     else
-        find "${target_dir}" \( -path "${target_dir}/android-sdk" -o -path "${target_dir}/android-sdk-smoke" -o -path "${target_dir}/android-clang" -o -path "${target_dir}/android" \) -prune -o -type f \( -name "*.a" -o -name "*.so" -o -name "*.dylib" -o -name "*.lib" \) \
+        find "${target_dir}" \( -path "${target_dir}/android-sdk" -o -path "${target_dir}/android-sdk-smoke" -o -path "${target_dir}/embedded-compilers" -o -path "${target_dir}/android-clang" -o -path "${target_dir}/android" \) -prune -o -type f \( -name "*.a" -o -name "*.so" -o -name "*.dylib" -o -name "*.lib" \) \
             -not -path "${target_dir}/Packages/*" -exec cp -f {} "${target_dir}/Packages/ThirdParty/" \;
     fi
 }
@@ -1104,7 +1118,7 @@ copy_engine_libraries() {
     local target_dir="$1"
 
     mkdir -p "${target_dir}/Packages/Engine"
-    find "${target_dir}" \( -path "${target_dir}/android-sdk" -o -path "${target_dir}/android-sdk-smoke" -o -path "${target_dir}/android-clang" -o -path "${target_dir}/android" \) -prune -o -type f \( -name "libcore*" -o -name "core*.lib" -o -name "core*.dll" \) \
+    find "${target_dir}" \( -path "${target_dir}/android-sdk" -o -path "${target_dir}/android-sdk-smoke" -o -path "${target_dir}/embedded-compilers" -o -path "${target_dir}/android-clang" -o -path "${target_dir}/android" \) -prune -o -type f \( -name "libcore*" -o -name "core*.lib" -o -name "core*.dll" \) \
         -not -path "${target_dir}/Packages/*" -exec cp -f {} "${target_dir}/Packages/Engine/" \;
 }
 
@@ -1359,11 +1373,21 @@ run_android_build() {
         exit 1
     fi
 
-    # Editor APK ships an on-device clang so scripts can be compiled on the phone.
-    # Best-effort: stage the bundle and let the editor pack it (warns if no clang).
+    # The editor defaults to embedded Cling/TinyCC. An explicitly supplied
+    # external Clang bundle remains available for existing custom builds.
     if [[ "${android_editor}" -eq 1 ]]; then
-        stage_android_clang_toolchain "${ndk}" "${android_abi}" || \
-            log_warn "Continuing editor APK build without an on-device compiler."
+        if [[ -n "${MODULARITY_ANDROID_CLANG_DIR:-}" ]]; then
+            stage_android_clang_toolchain "${ndk}" "${android_abi}"
+        else
+            if [[ "${android_abi}" != "arm64-v8a" ]]; then
+                log_error "Embedded Cling/TinyCC currently supports arm64-v8a."
+                exit 1
+            fi
+            local compiler_root="${MODULARITY_EMBEDDED_COMPILERS_ROOT:-${script_dir}/build/embedded-compilers/arm64-v8a}"
+            if [[ ! -f "${compiler_root}/ready.json" ]]; then
+                python3 "${script_dir}/tools/setup-embedded-compilers.py" --ndk "${ndk}" --jobs "${jobs}"
+            fi
+        fi
     fi
 
     local -a build_args=(--build-android "--abi=${android_abi}")

@@ -18,12 +18,12 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 if (-not $SdkRoot -and $CheckOnly) {
-    $roots = @($env:ANDROID_SDK_ROOT, $env:ANDROID_HOME, (Join-Path (Split-Path $PSScriptRoot -Parent) 'build\android-sdk'))
+    $roots = @($env:ANDROID_SDK_ROOT, $env:ANDROID_HOME, (Join-Path (Split-Path $PSScriptRoot -Parent) 'Build-Android\android-sdk'))
     if ($env:LOCALAPPDATA) { $roots += Join-Path $env:LOCALAPPDATA 'Android\Sdk' }
     $SdkRoot = $roots | Where-Object { $_ -and (Test-Path -LiteralPath (Join-Path $_ 'platforms')) -and (Test-Path -LiteralPath (Join-Path $_ 'build-tools')) } | Select-Object -First 1
     if (-not $SdkRoot) { throw 'Android SDK not found. Run tools\Setup-Android.ps1 first, or set ANDROID_SDK_ROOT to an installed SDK.' }
 }
-if (-not $SdkRoot) { $SdkRoot = Join-Path (Split-Path $PSScriptRoot -Parent) 'build\android-sdk' }
+if (-not $SdkRoot) { $SdkRoot = Join-Path (Split-Path $PSScriptRoot -Parent) 'Build-Android\android-sdk' }
 $SdkRoot = [IO.Path]::GetFullPath($SdkRoot)
 
 $javaRoots = @($env:JAVA_HOME)
@@ -45,7 +45,7 @@ $env:PATH = (Join-Path $jdk 'bin') + ';' + $env:PATH
 
 if ($CheckOnly) {
     $ndkRoots = @($env:ANDROID_NDK_ROOT, $env:ANDROID_NDK_HOME, $env:ANDROID_NDK)
-    foreach ($root in @($SdkRoot, (Join-Path (Split-Path $PSScriptRoot -Parent) 'build\android-sdk'))) {
+    foreach ($root in @($SdkRoot, (Join-Path (Split-Path $PSScriptRoot -Parent) 'Build-Android\android-sdk'))) {
         $sideBySide = Join-Path $root 'ndk'
         if (Test-Path -LiteralPath $sideBySide) {
             $ndkRoots += @(Get-ChildItem -LiteralPath $sideBySide -Directory | Where-Object { $_.Name -match '^\d+(\.\d+){1,3}$' } | Sort-Object { [version]$_.Name } -Descending | ForEach-Object { $_.FullName })

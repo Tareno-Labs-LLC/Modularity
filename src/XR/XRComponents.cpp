@@ -20,10 +20,13 @@ XRPoseKind ToXRPoseKind(XRControllerPoseSource source) {
     return (source == XRControllerPoseSource::Aim) ? XRPoseKind::Aim : XRPoseKind::Grip;
 }
 
+// Absolute, never accumulated: a frame with no valid pose leaves the last one in place
+// instead of stacking the tracking offset on top of it again.
 void ApplyPoseToLocalTransform(SceneObject& obj, const Modularity::XR::XRPose& pose,
-                               bool trackPosition, bool trackRotation, float scale) {
+                               bool trackPosition, bool trackRotation, float scale,
+                               const glm::vec3& trackingOffset) {
     if (trackPosition && pose.positionValid) {
-        obj.localPosition = pose.position * scale;
+        obj.localPosition = trackingOffset + pose.position * scale;
     }
     if (trackRotation && pose.orientationValid) {
         obj.localRotation = NormalizeEulerDegrees(QuatToEulerXYZDegrees(pose.rotation));
@@ -73,14 +76,53 @@ const SceneObject* Engine::findXRCameraObject() const {
     return nullptr;
 }
 
+Modularity::XR::XRTrackingOrigin Engine::resolveXRTrackingOrigin() const {
+    const Modularity::XR::XRTrackingOrigin project =
+        projectManager.currentProject.openXRSettings.trackingOrigin;
+    const SceneObject* origin = findXROriginObject();
+    if (!origin) return project;
+    switch (origin->xrOrigin.trackingOriginMode) {
+        case XROriginComponent::Mode::Floor: return Modularity::XR::XRTrackingOrigin::Floor;
+        case XROriginComponent::Mode::EyeLevel: return Modularity::XR::XRTrackingOrigin::Eye;
+        default: return project;
+    }
+}
+
+// Camera Y Offset lifts the whole tracking space (head and hands together) and only in
+// Eye Level, where the space's origin sits at the recentred head rather than on the floor.
+// In Floor the tracked height already is the player's height; adding to it floats them.
+glm::vec3 Engine::xrTrackingOffset(const SceneObject& origin) const {
+    const Modularity::XR::XRTrackingOrigin active = xrSystem.isCreated()
+        ? xrSystem.session().effectiveTrackingOrigin()
+        : resolveXRTrackingOrigin();
+    if (active != Modularity::XR::XRTrackingOrigin::Eye) return glm::vec3(0.0f);
+    return glm::vec3(0.0f, origin.xrOrigin.cameraYOffset, 0.0f);
+}
+
+// The same tracking-to-world transform has to drive the headset's eyes and the tracked
+// objects (XR Camera, controllers), or the camera object, its children and the audio
+// listener drift away from where the player actually sees from.
+glm::mat4 Engine::computeXROriginToWorld(const SceneObject* origin) const {
+    if (!origin) return glm::mat4(1.0f);
+    const float rigScale = std::max(0.01f, origin->xrOrigin.rigScale);
+    return glm::translate(glm::mat4(1.0f), origin->position) *
+           glm::mat4_cast(EulerXYZDegreesToQuat(origin->rotation)) *
+           glm::translate(glm::mat4(1.0f), xrTrackingOffset(*origin)) *
+           glm::scale(glm::mat4(1.0f), glm::vec3(rigScale));
+}
+
 void Engine::updateXRComponents(float deltaTime) {
 #if !MODULARITY_HAS_OPENXR
     (void)deltaTime;
 #else
     if (!isXRRequestedByProject()) return;
 #if !MODULARITY_RUNTIME_ONLY
-    // Editing must never write tracked poses into the saved scene rig.
+    // Editing must never write tracked poses into the saved scene rig. The workspace is laid
+    // out in the project's tracking space, so drop back to it if a Play session changed it.
     if (vrEditor.requested && !playerMode && !isPlaying) {
+        std::string trackingError;
+        xrSystem.setTrackingOrigin(projectManager.currentProject.openXRSettings.trackingOrigin,
+                                   trackingError);
         xrSystem.setOriginToWorld(vrEditor.sceneFromTracking);
         return;
     }
@@ -88,17 +130,28 @@ void Engine::updateXRComponents(float deltaTime) {
 
     const Modularity::XR::XRInputState& input = Modularity::XR::InputState();
 
-    glm::mat4 originToWorld(1.0f);
-    float rigScale = 1.0f;
-    float cameraYOffset = 0.0f;
-    if (const SceneObject* origin = findXROriginObject()) {
-        rigScale = std::max(0.01f, origin->xrOrigin.rigScale);
-        cameraYOffset = origin->xrOrigin.cameraYOffset;
-        originToWorld = glm::translate(glm::mat4(1.0f), origin->position) *
-                        glm::mat4_cast(glm::quat(glm::radians(origin->rotation))) *
-                        glm::scale(glm::mat4(1.0f), glm::vec3(rigScale));
+    // The scene's XR Origin picks the tracking space; Follow Project Settings keeps the
+    // project's. Swapped here, between frames, never inside beginFrame/endFrame.
+    if (xrSystem.isCreated()) {
+        Modularity::XR::XRTrackingOrigin wanted = resolveXRTrackingOrigin();
+#if !MODULARITY_RUNTIME_ONLY
+        // The VR editor's panels (Stop Play included) are anchored in the project's tracking
+        // space, so Play from the VR editor stays in it rather than stranding them overhead.
+        if (vrEditor.requested && !playerMode) {
+            wanted = projectManager.currentProject.openXRSettings.trackingOrigin;
+        }
+#endif
+        std::string trackingError;
+        if (!xrSystem.setTrackingOrigin(wanted, trackingError) && !trackingError.empty()) {
+            addConsoleMessage("OpenXR tracking origin: " + trackingError,
+                              ConsoleMessageType::Warning);
+        }
     }
-    xrSystem.setOriginToWorld(originToWorld);
+
+    const SceneObject* origin = findXROriginObject();
+    const float rigScale = origin ? std::max(0.01f, origin->xrOrigin.rigScale) : 1.0f;
+    const glm::vec3 trackingOffset = origin ? xrTrackingOffset(*origin) : glm::vec3(0.0f);
+    xrSystem.setOriginToWorld(computeXROriginToWorld(origin));
 
     if (!input.sessionActive) {
         return;
@@ -109,10 +162,7 @@ void Engine::updateXRComponents(float deltaTime) {
         if (!obj.xrCamera.applyTracking) continue;
         if (!IsObjectEnabledInHierarchy(obj)) continue;
         ApplyPoseToLocalTransform(obj, input.headPose, obj.xrCamera.trackPosition,
-                                  obj.xrCamera.trackRotation, rigScale);
-        if (obj.xrCamera.trackPosition) {
-            obj.localPosition.y += cameraYOffset;
-        }
+                                  obj.xrCamera.trackRotation, rigScale, trackingOffset);
     }
 
     for (SceneObject& obj : sceneObjects) {
@@ -129,7 +179,8 @@ void Engine::updateXRComponents(float deltaTime) {
         if (!IsObjectEnabledInHierarchy(obj)) continue;
 
         ApplyPoseToLocalTransform(obj, state.pose(ToXRPoseKind(controller.poseSource)),
-                                  controller.trackPosition, controller.trackRotation, rigScale);
+                                  controller.trackPosition, controller.trackRotation, rigScale,
+                                  trackingOffset);
     }
 
     for (SceneObject& obj : sceneObjects) {
@@ -231,7 +282,9 @@ void Engine::updateXRInteraction(float deltaTime) {
             XRRayInteractorComponent& ray = interactorObj.xrRayInteractor;
             ray.hasHit = false;
             const glm::vec3 origin = interactorObj.position;
-            const glm::quat rotation = glm::quat(glm::radians(interactorObj.rotation));
+            // The engine's XYZ order; glm::quat(euler) composes the other way round and
+            // points the ray wrong once the controller is turned on more than one axis.
+            const glm::quat rotation = EulerXYZDegreesToQuat(interactorObj.rotation);
             const glm::vec3 direction = glm::normalize(rotation * glm::vec3(0.0f, 0.0f, -1.0f));
 
             float bestDistance = ray.maxDistance;
@@ -359,7 +412,7 @@ void Engine::updateXRGrabFollow(SceneObject& interactable, SceneObject& interact
     const XRGrabInteractableComponent& grab = interactable.xrGrabInteractable;
 
     glm::vec3 targetPosition = interactor.position;
-    glm::quat targetRotation = glm::quat(glm::radians(interactor.rotation));
+    glm::quat targetRotation = EulerXYZDegreesToQuat(interactor.rotation);
     if (grab.attachTransformId >= 0) {
         if (const SceneObject* attach = findObjectById(grab.attachTransformId)) {
             const glm::vec3 offset = attach->position - interactable.position;

@@ -11,6 +11,7 @@
 #include "AudioExportCompression.h"
 #if defined(__ANDROID__)
 #include <cstdio>
+#include "AndroidRuntime/AndroidRuntime.h"
 #endif
 #if MODULARITY_HAS_SNDFILE
 #include <sndfile.h>
@@ -633,6 +634,7 @@ bool AudioSystem::init() {
 }
 
 void AudioSystem::shutdown() {
+    releaseMicrophone();
     stopPreview();
     stopWeatherAmbience();
     destroyVideoStreams();
@@ -764,6 +766,180 @@ void AudioSystem::onPlayStop() {
     destroyVideoStreams();
     destroyActiveSounds();
     destroyOneShotSounds();
+    releaseMicrophone();
+}
+
+void AudioSystem::microphoneDataCallback(ma_device* device, void* /*output*/, const void* input,
+                                         ma_uint32 frameCount) {
+    MicrophoneMeter* meter = device ? static_cast<MicrophoneMeter*>(device->pUserData) : nullptr;
+    if (!meter || !input || frameCount == 0) return;
+
+    // The device is opened as mono f32, so this is one float per frame.
+    const float* samples = static_cast<const float*>(input);
+    double sum = 0.0;
+    float blockPeak = 0.0f;
+    for (ma_uint32 i = 0; i < frameCount; ++i) {
+        const float s = samples[i];
+        sum += static_cast<double>(s) * s;
+        blockPeak = std::max(blockPeak, std::fabs(s));
+    }
+
+    // Time constants in frames, so the feel does not change with the callback size:
+    // the level averages ~50 ms of signal, the peak falls back over ~300 ms.
+    const float rate = static_cast<float>(std::max<ma_uint32>(1, meter->sampleRate));
+    const float frames = static_cast<float>(frameCount);
+    const float levelBlend = 1.0f - std::exp(-frames / (0.05f * rate));
+    const float peakDecay = std::exp(-frames / (0.3f * rate));
+
+    const float blockMeanSquare = static_cast<float>(sum / frameCount);
+    float meanSquare = meter->meanSquare.load(std::memory_order_relaxed);
+    meanSquare += (blockMeanSquare - meanSquare) * levelBlend;
+    meter->meanSquare.store(meanSquare, std::memory_order_relaxed);
+
+    const float peak = std::max(blockPeak, meter->peak.load(std::memory_order_relaxed) * peakDecay);
+    meter->peak.store(peak, std::memory_order_relaxed);
+}
+
+bool AudioSystem::openMicrophoneDevice() {
+    auto meter = std::make_unique<MicrophoneMeter>();
+    auto device = std::make_unique<ma_device>();
+
+    ma_device_config config = ma_device_config_init(ma_device_type_capture);
+    config.capture.format = ma_format_f32;
+    config.capture.channels = 1;
+    config.sampleRate = 0;  // the device's own rate; the meter only needs to know what it is
+    config.dataCallback = &AudioSystem::microphoneDataCallback;
+    config.pUserData = meter.get();
+
+    ma_result res = ma_device_init(nullptr, &config, device.get());
+    if (res != MA_SUCCESS) {
+        micStatus = std::string("Could not open a microphone (") + ma_result_description(res) + ")";
+        return false;
+    }
+    // Before start, so the capture thread never sees the placeholder rate.
+    if (device->sampleRate > 0) meter->sampleRate = device->sampleRate;
+    res = ma_device_start(device.get());
+    if (res != MA_SUCCESS) {
+        ma_device_uninit(device.get());
+        micStatus = std::string("Could not start the microphone (") + ma_result_description(res) + ")";
+        return false;
+    }
+
+    micListeningStatus = std::string("Listening: ") + device->capture.name;
+    micStatus = micListeningStatus;
+    micDevice = std::move(device);
+    micMeter = std::move(meter);
+    return true;
+}
+
+void AudioSystem::closeMicrophoneDevice() {
+    if (micDevice) {
+        // Stops and joins the capture thread, so the meter is safe to free after this.
+        ma_device_uninit(micDevice.get());
+        micDevice.reset();
+    }
+    micMeter.reset();
+}
+
+void AudioSystem::requestMicrophone() {
+    if (!micWanted) {
+        micWanted = true;
+        micRetryAfterSec = 0.0;
+    }
+    pumpMicrophone();
+}
+
+void AudioSystem::releaseMicrophone() {
+    closeMicrophoneDevice();
+    micWanted = false;
+    micPermissionRequested = false;
+    micPermissionAskedAtSec = 0.0;
+    micPermissionAskedResumeCount = 0;
+    micState = MicrophoneState::Off;
+    micStatus = "Off";
+    micRetryAfterSec = 0.0;
+}
+
+// Runs from update() every frame and from requestMicrophone(): opens the device once it may.
+void AudioSystem::pumpMicrophone() {
+    if (!micWanted) return;
+    if (micDevice) {
+        // Once open, miniaudio owns recovery: its notification thread stops the device when the
+        // mic is unplugged, restarts it when it comes back, and reroutes to a new default mic.
+        // Uninitialising it here could race that thread, so this only reports what it sees.
+        const bool running = ma_device_get_state(micDevice.get()) == ma_device_state_started;
+        if (running) {
+            micState = MicrophoneState::Active;
+            micStatus = micListeningStatus;
+        } else if (micState == MicrophoneState::Active) {
+            micState = MicrophoneState::Failed;
+            micStatus = "Microphone disconnected; waiting for it to come back";
+            std::cerr << "AudioSystem: " << micStatus << "\n";
+        }
+        return;
+    }
+
+    const double nowSec = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (nowSec < micRetryAfterSec) return;
+
+#if defined(__ANDROID__)
+    if (!Modularity::AndroidRuntime::HasMicrophonePermission()) {
+        if (!micPermissionRequested) {
+            micPermissionRequested = true;
+            micPermissionAskedAtSec = nowSec;
+            micPermissionAskedResumeCount = Modularity::AndroidRuntime::GetFocusRegainCount();
+            std::string error;
+            if (!Modularity::AndroidRuntime::RequestMicrophonePermission(error)) {
+                micState = MicrophoneState::Failed;
+                micStatus = error.empty() ? std::string("Could not ask for microphone permission") : error;
+                micRetryAfterSec = nowSec + 5.0;
+                return;
+            }
+        }
+        // The prompt takes focus while it is up. Back in focus without a grant means it was
+        // denied or dismissed; so does no prompt appearing at all, which is what Android does
+        // after repeated denials. Keep polling either way, so a grant from Settings still lands.
+        const bool answered =
+            !Modularity::AndroidRuntime::IsPaused() &&
+            (Modularity::AndroidRuntime::GetFocusRegainCount() != micPermissionAskedResumeCount ||
+             nowSec - micPermissionAskedAtSec > 3.0);
+        if (answered) {
+            if (micState != MicrophoneState::Failed) {
+                std::cerr << "AudioSystem: microphone permission denied\n";
+            }
+            micState = MicrophoneState::Failed;
+            micStatus = "Microphone permission denied - allow it in Settings > Apps > Permissions";
+        } else {
+            micState = MicrophoneState::WaitingForPermission;
+            micStatus = "Waiting for microphone permission";
+        }
+        micRetryAfterSec = nowSec + 0.5;
+        return;
+    }
+#endif
+
+    if (openMicrophoneDevice()) {
+        micState = MicrophoneState::Active;
+        return;
+    }
+    if (micState != MicrophoneState::Failed) {
+        std::cerr << "AudioSystem: " << micStatus << "\n";
+    }
+    micState = MicrophoneState::Failed;
+    // Opening enumerates devices, which is too slow to retry every frame.
+    micRetryAfterSec = nowSec + 5.0;
+}
+
+float AudioSystem::getMicrophoneLevel() const {
+    if (micState != MicrophoneState::Active || !micMeter) return 0.0f;
+    const float meanSquare = micMeter->meanSquare.load(std::memory_order_relaxed);
+    return std::clamp(std::sqrt(std::max(0.0f, meanSquare)), 0.0f, 1.0f);
+}
+
+float AudioSystem::getMicrophonePeak() const {
+    if (micState != MicrophoneState::Active || !micMeter) return 0.0f;
+    return std::clamp(micMeter->peak.load(std::memory_order_relaxed), 0.0f, 1.0f);
 }
 
 bool AudioSystem::ensureSoundFor(const SceneObject& obj) {
@@ -868,6 +1044,7 @@ void AudioSystem::applyAudioSourceParams(const SceneObject& obj, ma_sound& sound
 }
 
 void AudioSystem::update(const std::vector<SceneObject>& objects, const Camera& listenerCamera, bool playing) {
+    pumpMicrophone();  // capture has its own device, so it does not wait on the engine
     if (!initialized) return;
 
     lastListenerPosition = listenerCamera.position;

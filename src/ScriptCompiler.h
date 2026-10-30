@@ -1,5 +1,6 @@
 #pragma once
 #include "Common.h"
+#include "EmbeddedScript.h"
 inline std::string NativeScriptArtifactStem(const fs::path& sourcePath) {
     std::string stem = sourcePath.stem().string();
     std::string extension = sourcePath.extension().string();
@@ -25,6 +26,8 @@ struct ScriptBuildConfig {
     std::string crossCompilerDriver;
     std::vector<std::string> extraCompileFlags;
     std::vector<std::string> extraLinkFlags;
+    bool embeddedCompiler = false;
+    fs::path embeddedToolchain;
 };
 struct ScriptBuildCommands {
     std::string compile;
@@ -40,6 +43,8 @@ struct ScriptBuildCommands {
     fs::path signaturePath;
     std::string buildSignature;
     bool usedWrapper = false;
+    bool embeddedCompiler = false;
+    EmbeddedScript::Request embeddedRequest;
 };
 struct ScriptCompileOutput {
     std::string compileLog;

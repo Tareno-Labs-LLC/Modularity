@@ -43,7 +43,7 @@ int main(int argc, char** argv) {
     check(!ValidateMMeshAsset(asset, error), "non-wrapping out-of-bounds surface is rejected");
     if (argc > 1 && std::string(argv[1]) == "--range-only") return failures ? 1 : 0;
 
-    const fs::path folder = argc > 1 ? argv[1] : "build/engine-audit-check/fixtures";
+    const fs::path folder = argc > 1 ? argv[1] : "build/Dev-Resources/engine-audit-check/fixtures";
     fs::create_directories(folder);
     const auto path = folder / "mesh.mmesh";
     MMeshLoader loader;

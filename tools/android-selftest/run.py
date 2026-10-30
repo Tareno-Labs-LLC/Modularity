@@ -6,7 +6,7 @@ import tempfile
 import sys
 
 repo = Path(__file__).resolve().parents[2]
-out = repo / 'build/android-selftest'
+out = repo / 'build/Dev-Resources/android-selftest'
 out.mkdir(parents=True, exist_ok=True)
 vswhere = Path(os.environ.get('ProgramFiles(x86)', 'C:/Program Files (x86)')) / 'Microsoft Visual Studio/Installer/vswhere.exe'
 vs = subprocess.check_output([str(vswhere), '-latest', '-products', '*', '-requires',
@@ -20,7 +20,7 @@ fixture = tempfile.mkdtemp(prefix='fixture-', dir=out)
 subprocess.run([str(exe), fixture], cwd=out, check=True)
 
 if '--scripts' in sys.argv:
-    sdk = Path(os.environ.get('ANDROID_SDK_ROOT', repo / 'build/android-sdk'))
+    sdk = Path(os.environ.get('ANDROID_SDK_ROOT', repo / 'Build-Android/android-sdk'))
     ndk_value = os.environ.get('ANDROID_NDK_ROOT')
     if ndk_value:
         ndk = Path(ndk_value)
@@ -29,7 +29,7 @@ if '--scripts' in sys.argv:
         ndk = max(candidates, key=lambda p: tuple(int(n) for n in p.name.split('.')))
     driver = ndk / 'toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android26-clang++.cmd'
     sources = [repo / 'tools/android-selftest/script_test.cpp'] + [repo / 'src' / name for name in
-        ['ScriptCompiler.cpp', 'ModuCPPTranspiler.cpp', 'ModuCPPLanguagePack.cpp']]
+        ['ScriptCompiler.cpp', 'EmbeddedScript.cpp', 'ModuCPPTranspiler.cpp', 'ModuCPPLanguagePack.cpp']]
     includes = ['src', 'include', 'src/ThirdParty/ModuGUI', 'src/ThirdParty/glm',
                 'src/ThirdParty/glfw/include', 'src/ThirdParty/glad']
     exe = out / 'android-script-test.exe'

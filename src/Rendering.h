@@ -290,6 +290,10 @@ private:
     std::unordered_map<int, uint64_t> extraPreviewTargetLastUsed;
     RenderTarget postTarget;
     RenderTarget previewPostTarget;
+    // renderSceneToTarget's own post-FX output (the headset eyes). Sharing previewPostTarget
+    // made every eye overwrite the texture a cached scene preview (View Output) still shows.
+    RenderTarget externalPostTarget;
+    bool postFxUseExternalTarget = false;
     RenderTarget polarizationTarget;
     RenderTarget overlayCaptureTarget;
     RenderTarget bandLayerTarget;
@@ -471,6 +475,10 @@ private:
     };
     std::unordered_map<std::string, CachedTextureEntry> textureCacheBilinear;
     std::unordered_map<std::string, CachedTextureEntry> textureCachePoint;
+    // Normal vectors need full channel precision. Keep their uploads separate
+    // so a colour/preview request for the same file cannot reuse RGB565 data.
+    std::unordered_map<std::string, CachedTextureEntry> normalTextureCacheBilinear;
+    std::unordered_map<std::string, CachedTextureEntry> normalTextureCachePoint;
     std::unordered_map<std::string, double> missingTextureRetryAfter;
     std::unordered_map<std::string, std::string> textureLoadErrors;
     std::unordered_map<std::string, TextureFormatPolicy> textureFormatOverrides;
@@ -661,7 +669,11 @@ public:
     ~Renderer();
 
     void initialize();
-    Texture* getTexture(const std::string& path, MaterialProperties::TextureFilter filter = MaterialProperties::TextureFilter::Bilinear);
+    // Normal-map callers require full channel precision, regardless of colour
+    // compression settings. Data and colour uploads have separate cache entries.
+    Texture* getTexture(const std::string& path,
+                        MaterialProperties::TextureFilter filter = MaterialProperties::TextureFilter::Bilinear,
+                        bool preserveDataPrecision = false);
     unsigned int getDebugWhiteTextureId() const { return debugWhiteTexture; }
     void invalidateTexture(const std::string& path);
     std::string getTextureLoadError(const std::string& path) const;
@@ -800,7 +812,10 @@ public:
     const PostProcessStats& getLastPreviewPostStats() const { return previewPostStats; }
     uint64_t getTextureCacheUsageBytes() const { return static_cast<uint64_t>(textureCacheUsageBytes); }
     uint64_t getTextureCacheBudgetBytes() const { return static_cast<uint64_t>(textureCacheBudgetBytes); }
-    size_t getTextureCacheCount() const { return textureCacheBilinear.size() + textureCachePoint.size(); }
+    size_t getTextureCacheCount() const {
+        return textureCacheBilinear.size() + textureCachePoint.size() +
+               normalTextureCacheBilinear.size() + normalTextureCachePoint.size();
+    }
     size_t getShaderCacheCount() const { return shaderCache.size(); }
     size_t getExtraPreviewTargetCount() const { return extraPreviewTargets.size(); }
     size_t getReflectionCastTargetCount() const { return reflectionCastTargets.size(); }

@@ -34,11 +34,24 @@ int main(int argc, char** argv) {
     write(modu, "add ModuCPP;\npublic class Smoke : ModuNode { public float speed = 1.0f; void TickUpdate() {} }\n");
     const fs::path c = config.scriptsDir / "c_api.c";
     write(c, "typedef struct ModuScriptContext ModuScriptContext;\n#ifdef __cplusplus\nextern \"C\" {\n#endif\nvoid Modu_Begin(ModuScriptContext* context) { (void)context; }\n#ifdef __cplusplus\n}\n#endif\n");
+    config.embeddedCompiler = true;
+    config.embeddedToolchain = out / "device SDK";
+    if (!compiler.makeCommands(config, c, commands, error) || !commands.embeddedCompiler ||
+        commands.embeddedRequest.cSource != c || commands.embeddedRequest.cppSource != commands.wrapperPath ||
+        commands.embeddedRequest.cppSource.extension() != ".cpp") {
+        std::fprintf(stderr, "C must route its C source and C++ context bridge to separate compiler units: %s\n", error.c_str()); return 1;
+    }
+    if (!compiler.makeCommands(config, modu, commands, error) || !commands.embeddedCompiler ||
+        !commands.embeddedRequest.cSource.empty() || commands.embeddedRequest.cppSource != commands.wrapperPath) {
+        std::fprintf(stderr, "ModuCPP must use its generated C++ wrapper: %s\n", error.c_str()); return 1;
+    }
+    std::puts("[PASS] embedded C and ModuCPP requests preserve the C++ context wrappers");
+    config.embeddedCompiler = false;
     for (const auto& source : {cpp, modu, c}) {
         if (!compiler.makeCommands(config, source, commands, error)) {
             std::fprintf(stderr, "%s\n", error.c_str()); return 1;
         }
-        if (commands.binaryPath.extension() != ".so" || commands.objectPath.extension() != ".o" || commands.compile.find("-std=c++23") == std::string::npos || commands.compile.find("/std:") != std::string::npos || commands.link.find(".lib\"") != std::string::npos) {
+        if (commands.embeddedCompiler || commands.binaryPath.extension() != ".so" || commands.objectPath.extension() != ".o" || commands.compile.find("-std=c++23") == std::string::npos || commands.compile.find("/std:") != std::string::npos || commands.link.find(".lib\"") != std::string::npos) {
             std::fprintf(stderr, "Wrong Android commands: %s\n%s\n", commands.compile.c_str(), commands.link.c_str()); return 1;
         }
         ScriptCompileOutput result;

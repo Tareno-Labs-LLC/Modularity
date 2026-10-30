@@ -76,6 +76,19 @@ void Engine::renderVREditorUI(const Modularity::XR::XRInputState& trackedInput) 
         ? projectManager.currentProject.projectPath/"ProjectUserSettings"/"VRWorkspace"
         : fs::path("Resources")/"VRWorkspace";
     vrEditor.setStorage(layoutRoot);
+    if(!vrEditor.findControllerPackage) {
+        vrEditor.findControllerPackage=[this]() {
+            const fs::path root=packageManager.installedPackageRoot("moduengine.vr-controllers");
+            static bool reported=false;
+            if(root.empty() && !reported) {
+                reported=true;
+                addConsoleMessage("VR controller models are not installed. Add the \"VR Controller Models\" ModuPAK "
+                                  "(moduengine.vr-controllers) from the Package Manager to see your controllers in VR.",
+                                  ConsoleMessageType::Info);
+            }
+            return root;
+        };
+    }
     auto* mainContext=ImGui::GetCurrentContext();
     vrEditor.wristToolsVisible=!showLauncher && !isPlaying;
     if(vrEditor.wristToolsVisible && !sceneLoadInProgress && input.headPose.isValid()) {

@@ -1,6 +1,7 @@
 #include "Engine.h"
 #include "CrashReporter.h"
 #include "ScriptHostExports.h"
+#include "AsanReportPath.h"
 #include <filesystem>
 #include <iostream>
 #include <string>
@@ -42,6 +43,7 @@ static std::filesystem::path getExecutableDir() {
   #endif
 }
 static int ModularityPlayerMain(int argc, char** argv) {
+  ModularityRouteAsanReports();
   if (Modularity::CrashReporter::HandleCrashReporterMode(argc, argv)) return 0;
   if (auto exeDir = getExecutableDir(); !exeDir.empty()) {
     std::error_code ec;

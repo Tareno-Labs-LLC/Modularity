@@ -22,9 +22,9 @@ Don't worry if some of those words are new, each gets its own section below.
 The build scripts do the heavy lifting so you don't have to memorize CMake. They install system dependencies, sync submodules, configure, build, and package for you.
 - `build.sh` (Linux/macOS) and `build.bat` (Windows) build the full editor + player.
   - Initializes git submodules.
-  - Builds the editor into `build/`.
-  - Builds a player-only target into `build/player-cache/`.
-  - Copies built libraries into `Packages/Engine` and `Packages/ThirdParty` inside each build folder.
+  - Builds the editor into `build/` (`build.sh`), or on Windows (`build.ps1`) keeps the CMake tree in `build/Dev-Resources/` and links the editor and player into `build/Dev-ExportedBuild/`.
+  - Builds a player-only target into `player-cache/` inside that CMake tree; game exports reuse it.
+  - Packages a release archive (`build/Modularity V7.0 - Windows.zip` on Windows).
 - `build.sh --Windows` cross-builds a Windows target from Linux using MinGW-w64.
   - Needs `x86_64-w64-mingw32-g++` or `x86_64-w64-mingw32-clang++` plus `windres`.
   - Uses the vendored GLFW MinGW toolchain file.

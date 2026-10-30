@@ -1,6 +1,7 @@
 #include "ScriptCompiler.h"
 #include "ModuCPPTranspiler.h"
 #include "ScriptRuntime.h"
+#include "DevBuildDir.h"
 #include <algorithm>
 #include <functional>
 #include <set>
@@ -459,8 +460,14 @@ namespace {
         appendExistingUniquePath(exactCandidates, seen, exeDir / libName);
         appendExistingUniquePath(exactCandidates, seen, exeDir.parent_path() / libName);
         appendExistingUniquePath(exactCandidates, seen, exeDir.parent_path() / exeDir.filename() / libName);
+        // build.ps1 layouts link <root>/Dev-ExportedBuild/<exe> and keep its import lib in
+        // <root>/Dev-Resources/<config>/ - for build/ and Build-ASAN/ alike, so scripts
+        // link against the exe that is actually running.
+        for (const char* config : {"Release", "Debug", "RelWithDebInfo", "MinSizeRel"}) {
+            appendExistingUniquePath(exactCandidates, seen, exeDir.parent_path() / "Dev-Resources" / config / libName);
+        }
         if (auto engineRoot = findEngineRootFrom(exeDir)) {
-            const fs::path buildDir = *engineRoot / "build";
+            const fs::path buildDir = ModularityDevBuildDir(*engineRoot);
             appendExistingUniquePath(exactCandidates, seen, buildDir / libName);
             appendExistingUniquePath(exactCandidates, seen, buildDir / "Debug" / libName);
             appendExistingUniquePath(exactCandidates, seen, buildDir / "Release" / libName);
@@ -470,7 +477,11 @@ namespace {
             appendExistingUniquePath(exactCandidates, seen, buildDir / "player-cache" / "Release" / libName);
             appendExistingUniquePath(exactCandidates, seen, buildDir / "player-cache" / "RelWithDebInfo" / libName);
             appendExistingUniquePath(exactCandidates, seen, buildDir / "player-cache" / "MinSizeRel" / libName);
-            if (auto recursiveMatch = findNamedFileRecursively(buildDir, libName)) appendExistingUniquePath(exactCandidates, seen, *recursiveMatch);
+            // Last resort only: the build tree also holds the Android SDK and embedded
+            // compilers (tens of thousands of files), so never walk it when a fixed path hit.
+            if (exactCandidates.empty()) {
+                if (auto recursiveMatch = findNamedFileRecursively(buildDir, libName)) appendExistingUniquePath(exactCandidates, seen, *recursiveMatch);
+            }
         }
 
         if (!exactCandidates.empty()) {
@@ -621,12 +632,14 @@ namespace {
     }
 
     std::string posixScriptCompileDriver(const ScriptBuildConfig& config) {
+        if (config.embeddedCompiler) return "embedded-cling";
         if (!config.crossCompilerDriver.empty()) {
             return "\"" + config.crossCompilerDriver + "\"";
         }
         return posixCompileDriver(true);
     }
     std::string posixScriptLinkDriver(const ScriptBuildConfig& config) {
+        if (config.embeddedCompiler) return "embedded-cling";
         if (!config.crossCompilerDriver.empty()) {
             return "\"" + config.crossCompilerDriver + "\"";
         }
@@ -650,6 +663,7 @@ namespace {
     }
 
     void appendPerModuleStoreFlags(std::ostringstream& cmd, const ScriptBuildConfig& config) {
+        if (config.embeddedCompiler) return;
         if (!config.crossCompilerDriver.empty()) return;
         if (!posixScriptCompilerSupportsNoGnuUnique()) return;
         cmd << " -fno-gnu-unique";
@@ -1249,8 +1263,9 @@ bool ScriptCompiler::loadConfig(const fs::path& configPath, ScriptBuildConfig& o
                 // Assimp headers live under include/, and generated config/revision headers
                 // are emitted under build/*/src/ThirdParty/assimp/include.
                 addIfExists(candidate / "src/ThirdParty/assimp/include");
-                addIfExists(candidate / "build/src/ThirdParty/assimp/include");
-                addIfExists(candidate / "build/player-cache/src/ThirdParty/assimp/include");
+                const fs::path devBuildDir = ModularityDevBuildDir(candidate);
+                addIfExists(devBuildDir / "src/ThirdParty/assimp/include");
+                addIfExists(devBuildDir / "player-cache/src/ThirdParty/assimp/include");
                 return true;
             }
             candidate = candidate.parent_path();
@@ -1302,6 +1317,7 @@ std::string ScriptCompiler::formatLinkFlag(const std::string& lib) {
 
 bool ScriptCompiler::makeCommands(const ScriptBuildConfig& config, const fs::path& scriptPath,
                                   ScriptBuildCommands& outCommands, std::string& error) const {
+    outCommands = ScriptBuildCommands{};
     if (!fs::exists(scriptPath)) {
         error = "Script file not found: " + scriptPath.string();
         return false;
@@ -1334,7 +1350,7 @@ bool ScriptCompiler::makeCommands(const ScriptBuildConfig& config, const fs::pat
     const bool isMakoSource = extLower == ".mko" || extLower == ".modumako";
     std::string baseName = NativeScriptArtifactStem(scriptAbs);
 #ifdef _WIN32
-    const bool msvcTarget = config.crossCompilerDriver.empty();
+    const bool msvcTarget = config.crossCompilerDriver.empty() && !config.embeddedCompiler;
     const std::string cppStandardFlag = msvcTarget
         ? compilerCppStandardFlag(config.cppStandard) : canonicalizeCppStandard(config.cppStandard);
 #else
@@ -1671,7 +1687,145 @@ bool ScriptCompiler::makeCommands(const ScriptBuildConfig& config, const fs::pat
     std::ostringstream linkCmd;
     std::string buildSignaturePayload;
 
-    if (isCSource) {
+    if (isCSource && !config.embeddedCompiler) {
+        // C scripts compile on their own now. The Modu_* API is implemented once in the engine
+        // (ScriptRuntimeCAPI.cpp, exported from the editor and player), so all a script needs
+        // is this tiny bridge: it includes the script and exports its Modu_* hooks under the
+        // Script_* names the runtime looks up. No Engine.h, ImGui or PCH - the bridge only sees
+        // C headers. (The on-device Android editor's TinyCC + Cling path below still generates
+        // the old self-contained C++ wrapper.)
+        const std::string cContextPattern = "(?:struct\\s+)?ModuScriptContext\\s*\\*";
+        FunctionSpec beginSpec = detectFunction(scriptSource, "Modu_Begin", cContextPattern);
+        FunctionSpec specSpec = detectFunction(scriptSource, "Modu_Spec", cContextPattern);
+        FunctionSpec testEditorSpec = detectFunction(scriptSource, "Modu_TestEditor", cContextPattern);
+        FunctionSpec updateSpec = detectFunction(scriptSource, "Modu_Update", cContextPattern);
+        FunctionSpec tickUpdateSpec = detectFunction(scriptSource, "Modu_TickUpdate", cContextPattern);
+        FunctionSpec inspectorSpec = detectFunction(scriptSource, "Modu_OnInspector", cContextPattern);
+        FunctionSpec editorRenderSpec = detectFunction(scriptSource, "Modu_RenderEditorWindow", cContextPattern);
+        FunctionSpec editorExitSpec = detectFunction(scriptSource, "Modu_ExitRenderEditorWindow", cContextPattern);
+
+        useWrapper = beginSpec.present || specSpec.present || testEditorSpec.present ||
+                     updateSpec.present || tickUpdateSpec.present || inspectorSpec.present ||
+                     editorRenderSpec.present || editorExitSpec.present;
+        if (!useWrapper) {
+            error = "C script has no Modu_ hooks. Expected one of Modu_Begin/Modu_TickUpdate/Modu_OnInspector.";
+            return false;
+        }
+
+        wrapperPath = config.outDir / relativeParent / (baseName + ".capi.bridge.c");
+        std::ostringstream bridge;
+        bridge << "// generated from " << compileSourcePath.filename().string() << " - do not edit.\n"
+               << "// Exports the script's Modu_* hooks under the entry points the script runtime\n"
+               << "// looks up. The Modu_* API itself lives in the engine (ScriptRuntimeCAPI.cpp).\n"
+               << "#include \"ScriptRuntimeCAPI.h\"\n"
+               << "#include \"" << compileSourcePath.lexically_normal().generic_string() << "\"\n\n"
+               << "#if defined(_WIN32)\n"
+               << "#define MODU_BRIDGE_EXPORT __declspec(dllexport)\n"
+               << "#else\n"
+               << "#define MODU_BRIDGE_EXPORT __attribute__((visibility(\"default\")))\n"
+               << "#endif\n"
+               << "#ifdef __cplusplus\n"
+               << "#define MODU_BRIDGE_ENTRY extern \"C\" MODU_BRIDGE_EXPORT\n"
+               << "#else\n"
+               << "#define MODU_BRIDGE_ENTRY MODU_BRIDGE_EXPORT\n"
+               << "#endif\n\n"
+               << "// Same layout the engine uses: the runtime hands entry points its ScriptContext*.\n"
+               << "struct ModuScriptContext { void* nativeContext; };\n\n"
+               // No Modularity_ScriptLayoutSignature: that guards C++ struct layouts, which a C
+               // script never touches, and the runtime only checks it when it is exported.
+               << "MODU_BRIDGE_ENTRY int Modularity_ScriptAbiVersion(void) { return "
+               << MODULARITY_NATIVE_SCRIPT_ABI_VERSION << "; }\n\n";
+
+        auto emitBridge = [&](const char* exportedName, const char* implName,
+                              const FunctionSpec& spec, bool runtimeHook) {
+            if (!spec.present) return;
+            bridge << "MODU_BRIDGE_ENTRY void " << exportedName << "(void* nativeContext"
+                   << (runtimeHook ? ", float deltaTime" : "") << ") {\n"
+                   << "    ModuScriptContext ctx;\n"
+                   << "    ctx.nativeContext = nativeContext;\n";
+            if (spec.takesContext && spec.takesDelta) {
+                bridge << "    " << implName << "(&ctx, " << (runtimeHook ? "deltaTime" : "0.0f") << ");\n";
+            } else if (spec.takesContext) {
+                bridge << "    " << implName << "(&ctx);\n";
+            } else if (spec.takesDelta) {
+                bridge << "    " << implName << "(" << (runtimeHook ? "deltaTime" : "0.0f") << ");\n";
+            } else {
+                bridge << "    " << implName << "();\n";
+            }
+            if (runtimeHook && !spec.takesDelta) bridge << "    (void)deltaTime;\n";
+            if (!spec.takesContext) bridge << "    (void)ctx;\n";
+            bridge << "}\n\n";
+        };
+        emitBridge("Script_Begin", "Modu_Begin", beginSpec, true);
+        emitBridge("Script_Spec", "Modu_Spec", specSpec, true);
+        emitBridge("Script_TestEditor", "Modu_TestEditor", testEditorSpec, true);
+        emitBridge("Script_Update", "Modu_Update", updateSpec, true);
+        emitBridge("Script_TickUpdate", "Modu_TickUpdate", tickUpdateSpec, true);
+        emitBridge("Script_OnInspector", "Modu_OnInspector", inspectorSpec, false);
+        emitBridge("RenderEditorWindow", "Modu_RenderEditorWindow", editorRenderSpec, false);
+        emitBridge("ExitRenderEditorWindow", "Modu_ExitRenderEditorWindow", editorExitSpec, false);
+        // Clears per-object state on Stop (ModuCPP's C backend emits Modu_ResetState for scripts
+        // with private fields; a hand-written C script may define one too).
+        if (detectFunction(scriptSource, "Modu_ResetState", cContextPattern).present) {
+            bridge << "MODU_BRIDGE_ENTRY void Script_ResetState(void) { Modu_ResetState(); }\n\n";
+        }
+        if (!writeTextFileIfChanged(wrapperPath, bridge.str(), error)) {
+            return false;
+        }
+
+        // Compiled as C++ like C scripts always were (/TP, the C++ driver), so hand-written
+        // .c scripts that lean on C++-isms keep building; transpiled ModuCPP C is valid as both.
+#ifdef _WIN32
+        if (msvcTarget) {
+        fs::path bridgeRspPath = config.outDir / relativeParent / (baseName + ".compile.rsp");
+        fs::path linkRspPath = config.outDir / relativeParent / (baseName + ".link.rsp");
+        const fs::path producedBinaryPath = outCommands.linkBinaryPath.empty() ? binaryPath : outCommands.linkBinaryPath;
+        const fs::path importLibPath = config.outDir / ".staging" / relativeParent / (baseName + ".lib");
+        const fs::path pdbPath = config.outDir / ".staging" / relativeParent / (baseName + ".pdb");
+
+        std::ostringstream bridgeRsp;
+        bridgeRsp << "/nologo /TP /std:" << cppStandardFlag << " /MD /Z7" << msvcOptFlags(config);
+        appendWindowsIncludesAndDefines(bridgeRsp);
+        bridgeRsp << " /c \"" << wrapperPath.string() << "\" /Fo\"" << objectPath.string() << "\"";
+
+        std::ostringstream linkRsp;
+        linkRsp << "/nologo /DLL /DEBUG"
+                << (config.optimization == ScriptOptimizationLevel::Speed ? " /OPT:REF /OPT:ICF" : "")
+                << " \"" << objectPath.string() << "\""
+                << " /OUT:\"" << producedBinaryPath.string() << "\""
+                << " /IMPLIB:\"" << importLibPath.string() << "\""
+                << " /PDB:\"" << pdbPath.string() << "\""
+                << " \"" << hostImportLib->string() << "\"";
+        for (const auto& lib : config.windowsLinkLibs) {
+            linkRsp << " " << lib;
+        }
+
+        if (!writeTextFileIfChanged(bridgeRspPath, bridgeRsp.str(), error) ||
+            !writeTextFileIfChanged(linkRspPath, linkRsp.str(), error)) {
+            return false;
+        }
+
+        compileCmd << "cl @\"" << bridgeRspPath.string() << "\"";
+        linkCmd << "link @\"" << linkRspPath.string() << "\"";
+        buildSignaturePayload = bridgeRsp.str() + "\n---rsp---\n" + linkRsp.str();
+        } else
+#endif
+        {
+        compileCmd << posixScriptCompileDriver(config) << " -std=" << cppStandardFlag << " -fPIC -g" << posixOptFlags(config);
+        appendPerModuleStoreFlags(compileCmd, config);
+        appendExtraCompileFlags(compileCmd, config);
+        appendPosixIncludesAndDefines(compileCmd);
+        compileCmd << " -MMD -MF \"" << dependencyPath.string() << "\"";
+        compileCmd << " -c \"" << wrapperPath.string() << "\" -o \"" << objectPath.string() << "\"";
+        const fs::path producedBinaryPath = outCommands.linkBinaryPath.empty() ? binaryPath : outCommands.linkBinaryPath;
+        linkCmd << posixScriptLinkDriver(config) << " -shared \"" << objectPath.string()
+                << "\" -o \"" << producedBinaryPath.string() << "\"";
+        for (const auto& lib : config.linuxLinkLibs) {
+            linkCmd << " " << formatLinkFlag(lib);
+        }
+        appendExtraLinkFlags(linkCmd, config);
+        }
+    } else if (isCSource) {
         const std::string cContextPattern = "(?:struct\\s+)?ModuScriptContext\\s*\\*";
         FunctionSpec beginSpec = detectFunction(scriptSource, "Modu_Begin", cContextPattern);
         FunctionSpec specSpec = detectFunction(scriptSource, "Modu_Spec", cContextPattern);
@@ -2465,6 +2619,17 @@ bool ScriptCompiler::makeCommands(const ScriptBuildConfig& config, const fs::pat
     outCommands.buildSignature = compileStr + "\n---link---\n" + linkStr +
                                  "\n---payload---\n" + buildSignaturePayload;
     outCommands.usedWrapper = useWrapper;
+    if (config.embeddedCompiler) {
+        outCommands.embeddedCompiler = true;
+        auto& request = outCommands.embeddedRequest;
+        request.cppSource = useWrapper ? wrapperPath : compileSourcePath;
+        if (isCSource) request.cSource = compileSourcePath;
+        request.toolchain = config.embeddedToolchain;
+        request.arguments = config.extraCompileFlags;
+        request.arguments.push_back("-std=" + canonicalizeCppStandard(config.cppStandard));
+        request.includes = config.includeDirs;
+        request.defines = config.defines;
+    }
     return true;
 }
 
@@ -2498,6 +2663,12 @@ bool ScriptCompiler::runCommand(const std::string& command, std::string& output)
 
 bool ScriptCompiler::compile(const ScriptBuildCommands& commands, ScriptCompileOutput& output,
                              std::string& error) const {
+    if (commands.embeddedCompiler) {
+        const fs::path artifact = commands.linkBinaryPath.empty() ? commands.binaryPath : commands.linkBinaryPath;
+        if (!EmbeddedScript::Compile(commands.embeddedRequest, artifact, output.compileLog, error)) return false;
+        output.producedBinaryPath = artifact;
+        return true;
+    }
     if (!commands.objectPath.empty()) {
         std::error_code ec;
         fs::create_directories(commands.objectPath.parent_path(), ec);

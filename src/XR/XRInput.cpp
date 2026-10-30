@@ -29,6 +29,18 @@ void ResetInputState() {
     hapticQueue().clear();
 }
 
+void InvalidateTrackedPoses() {
+    const auto invalidate = [](XRPose& pose) {
+        pose.positionValid = false;
+        pose.orientationValid = false;
+    };
+    invalidate(g_inputState.headPose);
+    for (XRControllerState& controller : g_inputState.controllers) {
+        invalidate(controller.gripPose);
+        invalidate(controller.aimPose);
+    }
+}
+
 void RequestHapticPulse(const XRHapticRequest& request) {
     std::vector<XRHapticRequest>& queue = hapticQueue();
     if (queue.size() >= kMaxQueuedHaptics) return;
@@ -526,7 +538,25 @@ void XRInput::syncFrame(const XRSession& session, XrTime predictedDisplayTime) {
     g_inputState.sessionActive = session.isRunning();
     g_inputState.hasFocus = session.hasFocus();
 
-    if (!initialized_ || !session.isRunning()) {
+    if (!session.isRunning()) {
+        hapticQueue().clear();
+        return;
+    }
+
+    // Located ahead of the action sync: locating spaces is legal while the session is only
+    // VISIBLE, and only actions need focus. Behind the focus check, the head froze whenever
+    // the runtime withheld focus (dashboard open, headset not worn) while the eyes it
+    // renders from kept tracking, so the XR Camera object and listener split from the view.
+    if (session.viewSpace() != XR_NULL_HANDLE && session.appSpace() != XR_NULL_HANDLE) {
+        XrSpaceLocation location{};
+        location.type = XR_TYPE_SPACE_LOCATION;
+        if (XR_SUCCEEDED(XRLoaderSessionFunctions().LocateSpace(
+                session.viewSpace(), session.appSpace(), predictedDisplayTime, &location))) {
+            g_inputState.headPose = ToXRPose(location.pose, location.locationFlags);
+        }
+    }
+
+    if (!initialized_) {
         hapticQueue().clear();
         return;
     }
@@ -548,15 +578,6 @@ void XRInput::syncFrame(const XRSession& session, XrTime predictedDisplayTime) {
         return;
     }
     if (result == XR_SESSION_NOT_FOCUSED) return;
-
-    if (session.viewSpace() != XR_NULL_HANDLE && session.appSpace() != XR_NULL_HANDLE) {
-        XrSpaceLocation location{};
-        location.type = XR_TYPE_SPACE_LOCATION;
-        if (XR_SUCCEEDED(XRLoaderSessionFunctions().LocateSpace(
-                session.viewSpace(), session.appSpace(), predictedDisplayTime, &location))) {
-            g_inputState.headPose = ToXRPose(location.pose, location.locationFlags);
-        }
-    }
 
     readController(session, XRDevice::Left, predictedDisplayTime);
     readController(session, XRDevice::Right, predictedDisplayTime);

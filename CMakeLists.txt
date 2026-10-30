@@ -120,11 +120,20 @@ endif()
 
 # ==================== Compiler flags ====================
 if(MSVC)
-    # /Z7 keeps debug info inside each .obj rather than in a shared PDB written by
-    # mspdbsrv, which is what lets it coexist with /MP - and it means optimised
-    # builds still resolve to function names and source lines in CrashReporter's
-    # stack traces. The linker gathers it into a real .pdb (see /DEBUG below).
-    set(MODULARITY_WARNING_FLAGS /W4 /O2 /permissive- /MP /Z7)
+    # Debug info, kept to what crash stacks need. Symbols and line tables stay in every
+    # .obj, so optimised builds still resolve to function names and source lines in
+    # CrashReporter's stack traces (the linker gathers them into a real .pdb, see /DEBUG
+    # below). Type records - ~64% of the debug info - go once per target into a shared
+    # compiler PDB (/Zi) instead of being repeated in every .obj and again in each static
+    # .lib (/Z7), which made the Windows tree several times the size of Linux's (built
+    # without -g). /FS lets the parallel compilers (/MP, MultiToolTask) share that PDB.
+    # ccache/sccache can only cache /Z7, so a Ninja/Makefile build that uses one keeps it.
+    if(CMAKE_CXX_COMPILER_LAUNCHER AND NOT CMAKE_GENERATOR MATCHES "Visual Studio")
+        set(_modularity_debug_info_flags /Z7)
+    else()
+        set(_modularity_debug_info_flags /Zi /FS)
+    endif()
+    set(MODULARITY_WARNING_FLAGS /W4 /O2 /permissive- /MP ${_modularity_debug_info_flags})
 else()
     set(MODULARITY_WARNING_FLAGS -Wall -Wextra -Wpedantic -O2)
 endif()
@@ -277,13 +286,32 @@ function(modularity_apply_cpu_target target_name)
 endfunction()
 
 # ==================== Sanitizers (opt-in) ====================
-option(MODULARITY_ENABLE_ASAN "Enable AddressSanitizer + UBSan on engine targets" OFF)
+option(MODULARITY_ENABLE_ASAN "Enable AddressSanitizer (+ UBSan on GCC/Clang)" OFF)
 
 set(MODULARITY_SANITIZER_FLAGS "")
 if(MODULARITY_ENABLE_ASAN)
     if(MSVC)
-        message(WARNING "MODULARITY_ENABLE_ASAN is not supported on MSVC builds; disabling.")
-        set(MODULARITY_ENABLE_ASAN OFF CACHE BOOL "" FORCE)
+        # MSVC ships AddressSanitizer only (no UBSan). build.ps1 --asan builds this into
+        # <repo>/Build-ASAN. It goes on every target, third-party included, rather than
+        # only the engine like the GCC/Clang path: the STL stamps objects built with and
+        # without /fsanitize=address differently (detect_mismatch "annotate_vector"), so
+        # mixing them fails to link - and instrumenting PhysX/Jolt/assimp also catches
+        # heap writes that come from inside them. Must run before any add_subdirectory.
+        # /bigobj: instrumentation adds enough sections that Engine.cpp exceeds the
+        # 2^16 COFF limit (C1128).
+        add_compile_options(/fsanitize=address /bigobj)
+        # The prebuilt Photon libs are not instrumented, so their STL stamps say
+        # annotate_vector/annotate_string=0 and the link fails (LNK2038). Turning the
+        # annotations off only drops the container-overflow check (writes between size()
+        # and capacity(), still inside the allocation); heap overflows and use-after-free
+        # are still caught.
+        add_compile_definitions(_DISABLE_VECTOR_ANNOTATION _DISABLE_STRING_ANNOTATION)
+        add_link_options(/INCREMENTAL:NO)
+        # /RTC1, CMake's Debug default, cannot be combined with /fsanitize=address.
+        foreach(_modularity_flags_var CMAKE_C_FLAGS_DEBUG CMAKE_CXX_FLAGS_DEBUG)
+            string(REPLACE "/RTC1" "" ${_modularity_flags_var} "${${_modularity_flags_var}}")
+        endforeach()
+        message(STATUS "AddressSanitizer enabled on all targets (MSVC /fsanitize=address).")
     else()
         set(MODULARITY_SANITIZER_FLAGS
             -fsanitize=address
@@ -1054,7 +1082,9 @@ if(WIN32 AND EXISTS "${MODULARITY_FFMPEG_VENDOR_DIR}/include/libavformat/avforma
     endif()
 
     add_library(modularity_ffmpeg INTERFACE)
-    target_include_directories(modularity_ffmpeg INTERFACE "${MODULARITY_FFMPEG_VENDOR_DIR}/include")
+    # SYSTEM: FFmpeg's own inline helpers (libavutil/common.h) trip C4244 in every
+    # engine file that includes them - hundreds of warnings that are not ours to fix.
+    target_include_directories(modularity_ffmpeg SYSTEM INTERFACE "${MODULARITY_FFMPEG_VENDOR_DIR}/include")
     target_link_libraries(modularity_ffmpeg INTERFACE ${ffmpeg_vendor_libs})
 
     # The shared build suffixes its DLLs with the ABI major (avcodec-62.dll),
@@ -1075,7 +1105,9 @@ if(WIN32 AND EXISTS "${MODULARITY_FFMPEG_VENDOR_DIR}/include/libavformat/avforma
                 "DLL for ${ffmpeg_component} in bin/.")
         endif()
     endforeach()
-    list(APPEND MODULARITY_FFMPEG_RUNTIME_DLL_DIRS "${MODULARITY_FFMPEG_VENDOR_DIR}/bin")
+    # No MODULARITY_FFMPEG_RUNTIME_DLL_DIRS entry here: the vendored build's
+    # five linked DLLs depend only on each other, and copying all of bin/ also
+    # dragged avfilter (~109 MB) and avdevice next to every dev executable.
 
     message(STATUS "Using vendored Windows FFmpeg: ${MODULARITY_FFMPEG_VENDOR_DIR}")
     message(STATUS "Windows FFmpeg runtime DLLs: ${MODULARITY_FFMPEG_RUNTIME_DLLS}")
@@ -1396,6 +1428,11 @@ list(REMOVE_ITEM ENGINE_PLAYER_SOURCES ${MODULARITY_PLAYER_EDITOR_ONLY_SOURCES})
 
 add_library(core STATIC ${ENGINE_SOURCES} ${ENGINE_HEADERS})
 modularity_apply_cxx_api_standard(core)
+include(cmake/EmbeddedCompilers.cmake)
+if(MODULARITY_ENABLE_EMBEDDED_COMPILERS)
+    target_link_libraries(core PUBLIC modularity_embedded_compilers)
+    target_compile_definitions(core PRIVATE MODULARITY_HAS_EMBEDDED_COMPILERS=1)
+endif()
 
 # Photon Realtime backend. Only src/Network/PhotonBackend.cpp sees these headers
 # and libraries; the rest of the engine stays transport-agnostic.
@@ -1633,6 +1670,13 @@ function(modularity_stage_windows_runtime_dlls target_name)
     endif()
     if(MODULARITY_FFMPEG_RUNTIME_DLLS)
         list(APPEND runtime_dlls ${MODULARITY_FFMPEG_RUNTIME_DLLS})
+    endif()
+    if(MSVC AND MODULARITY_ENABLE_ASAN)
+        # /fsanitize=address with /MD(d) imports the ASan runtime DLL, which ships next
+        # to cl.exe and is on no PATH a double-clicked exe would see.
+        get_filename_component(_modularity_msvc_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+        file(GLOB _modularity_asan_runtime "${_modularity_msvc_bin}/clang_rt.asan*_dynamic-x86_64.dll")
+        list(APPEND runtime_dlls ${_modularity_asan_runtime})
     endif()
 
     set(runtime_dll_dirs ${MODULARITY_FFMPEG_RUNTIME_DLL_DIRS})
@@ -1955,6 +1999,32 @@ else()
     endif()
 endif()
 
+# ==================== Dev export layout ====================
+# build.ps1 configures into build/Dev-Resources and sets this to
+# build/Dev-ExportedBuild, so the linker writes the editor and player straight
+# into a clean, runnable folder. Debug files (.pdb, and the import .lib/.exp that
+# scripts link against) stay in <binary dir>/<config> beside the rest of the
+# CMake tree. Empty keeps CMake's per-config folders, which build.sh and the
+# editor's own player-cache export build still use.
+set(MODULARITY_DEV_EXPORT_DIR "" CACHE PATH
+    "Folder the editor and player executables are linked into (empty: per-config build folder)")
+if(MODULARITY_DEV_EXPORT_DIR AND NOT ANDROID)
+    set(_modularity_dev_export_targets ModularityPlayer)
+    if(MODULARITY_BUILD_EDITOR)
+        list(APPEND _modularity_dev_export_targets Modularity)
+    endif()
+    foreach(_modularity_dev_target IN LISTS _modularity_dev_export_targets)
+        # A generator expression stops multi-config generators from appending
+        # a per-config subfolder, so Release and Debug share the one folder.
+        set_target_properties(${_modularity_dev_target} PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${MODULARITY_DEV_EXPORT_DIR}$<0:>"
+            ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>"
+            PDB_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+        )
+    endforeach()
+    message(STATUS "Dev executables link into: ${MODULARITY_DEV_EXPORT_DIR}")
+endif()
+
 # Keep the Social SDK next to development executables. Windows' exported-build
 # staging already collects every DLL next to ModularityPlayer; installed Unix
 # packages use the lib/ copy below through the existing $ORIGIN/../lib rpath.
@@ -2056,6 +2126,16 @@ endif()
 
 include(GNUInstallDirs)
 
+# Where the editor, player and everything they load at runtime are installed.
+# Windows packages are flat (Modularity.exe at the archive root, the layout
+# ModuHub and the V6.x zips use); Unix keeps the bin/ + lib/ layout its rpath
+# expects.
+if(WIN32)
+    set(MODULARITY_INSTALL_APPDIR ".")
+else()
+    set(MODULARITY_INSTALL_APPDIR "${CMAKE_INSTALL_BINDIR}")
+endif()
+
 set(MODULARITY_MODUMAKO_COMPILER "" CACHE FILEPATH
     "Path to the mko executable bundled with the Modularity editor")
 if(NOT MODULARITY_MODUMAKO_COMPILER)
@@ -2080,7 +2160,7 @@ if(MODULARITY_BUILD_EDITOR AND EXISTS "${MODULARITY_MODUMAKO_COMPILER}")
         COMMENT "Staging bundled ModuMAKO compiler"
     )
     install(PROGRAMS "${MODULARITY_MODUMAKO_COMPILER}"
-        DESTINATION "${CMAKE_INSTALL_BINDIR}/Tools"
+        DESTINATION "${MODULARITY_INSTALL_APPDIR}/Tools"
     )
 elseif(MODULARITY_BUILD_EDITOR)
     message(STATUS "ModuMAKO compiler not bundled; set MODULARITY_MODUMAKO_COMPILER to package .mko support")
@@ -2133,7 +2213,7 @@ if(MODULARITY_BUILD_NEBULA_BINDINGS AND MODULARITY_BUILD_EDITOR)
         add_dependencies(Modularity NebulaBindings)
 
         install(FILES "${_nebula_lib}"
-            DESTINATION ${CMAKE_INSTALL_BINDIR}
+            DESTINATION ${MODULARITY_INSTALL_APPDIR}
             OPTIONAL
         )
         message(STATUS "Nebula bindings enabled: ${CARGO_EXECUTABLE} (${_nebula_cargo_profile_dir})")
@@ -2149,27 +2229,30 @@ configure_file(
 
 if(MODULARITY_BUILD_EDITOR)
     install(TARGETS Modularity
-        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        RUNTIME DESTINATION ${MODULARITY_INSTALL_APPDIR}
     )
 endif()
 
 # Desktop install: ModularityPlayer is an executable; on Android core_player
 # is the .so and gets packaged separately by the APK pipeline (Stage 4).
+# On Windows it sits beside the editor so it shares the FFmpeg/PhysX/OpenXR DLLs
+# and can actually start; alone in "Runtime Manager" it had none of them.
+if(WIN32)
+    set(MODULARITY_INSTALL_PLAYERDIR "${MODULARITY_INSTALL_APPDIR}")
+else()
+    set(MODULARITY_INSTALL_PLAYERDIR "Runtime Manager")
+endif()
 if(NOT ANDROID)
     install(TARGETS ModularityPlayer
-        RUNTIME DESTINATION "Runtime Manager"
+        RUNTIME DESTINATION "${MODULARITY_INSTALL_PLAYERDIR}"
     )
     install(SCRIPT ${MODULARITY_SCRIPT_SDK_INSTALL_SCRIPT})
 endif()
 
 if(MODULARITY_HAS_DISCORD_SOCIAL_SDK)
     if(WIN32)
-        if(MODULARITY_BUILD_EDITOR)
-            install(FILES "${MODULARITY_DISCORD_SOCIAL_RUNTIME}"
-                DESTINATION ${CMAKE_INSTALL_BINDIR})
-        endif()
         install(FILES "${MODULARITY_DISCORD_SOCIAL_RUNTIME}"
-            DESTINATION "Runtime Manager")
+            DESTINATION "${MODULARITY_INSTALL_PLAYERDIR}")
     else()
         install(FILES "${MODULARITY_DISCORD_SOCIAL_RUNTIME}"
             DESTINATION ${CMAKE_INSTALL_LIBDIR})
@@ -2203,14 +2286,26 @@ if(WIN32)
     # (~6 MB), which the engine doesn't reference.
     if(MODULARITY_FFMPEG_RUNTIME_DLLS)
         install(FILES ${MODULARITY_FFMPEG_RUNTIME_DLLS}
-            DESTINATION ${CMAKE_INSTALL_BINDIR}
+            DESTINATION ${MODULARITY_INSTALL_APPDIR}
         )
     endif()
 
     if(MODULARITY_USE_MONO AND MONO_RUNTIME_DLL)
         install(FILES "${MONO_RUNTIME_DLL}"
-            DESTINATION ${CMAKE_INSTALL_BINDIR}
+            DESTINATION ${MODULARITY_INSTALL_APPDIR}
         )
+    endif()
+
+    # redist/<arch> DLLs (the OpenXR loader, optionally Mesa / toolchain
+    # runtimes) were copied next to dev executables but never installed, so the
+    # packaged editor reported "No OpenXR loader found" on working VR machines.
+    if(MODULARITY_BUNDLE_REDIST_DLLS AND MODULARITY_REDIST_DLL_DIR AND IS_DIRECTORY "${MODULARITY_REDIST_DLL_DIR}")
+        file(GLOB _modularity_redist_install_dlls "${MODULARITY_REDIST_DLL_DIR}/*.dll")
+        if(_modularity_redist_install_dlls)
+            install(FILES ${_modularity_redist_install_dlls}
+                DESTINATION ${MODULARITY_INSTALL_APPDIR}
+            )
+        endif()
     endif()
 
     if(MODULARITY_ENABLE_PHYSX)
@@ -2221,7 +2316,7 @@ if(WIN32)
                 \"${CMAKE_BINARY_DIR}/physx/sdk_source_bin/*.dll\"
             )
             foreach(_physx_dll IN LISTS _modularity_physx_dlls)
-                file(INSTALL \"\${_physx_dll}\" DESTINATION \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}\")
+                file(INSTALL \"\${_physx_dll}\" DESTINATION \"\${CMAKE_INSTALL_PREFIX}/${MODULARITY_INSTALL_APPDIR}\")
             endforeach()
         ")
     endif()
@@ -2233,37 +2328,34 @@ if(WIN32)
     # the CPack-produced ZIP stays close to the actual runtime payload.
     install(CODE "
         file(GLOB_RECURSE _modularity_runtime_junk
-            \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}/*.lib\"
-            \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}/*.pdb\"
-            \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}/*.exp\"
+            \"\${CMAKE_INSTALL_PREFIX}/${MODULARITY_INSTALL_APPDIR}/*.lib\"
+            \"\${CMAKE_INSTALL_PREFIX}/${MODULARITY_INSTALL_APPDIR}/*.pdb\"
+            \"\${CMAKE_INSTALL_PREFIX}/${MODULARITY_INSTALL_APPDIR}/*.exp\"
         )
         foreach(_f IN LISTS _modularity_runtime_junk)
             message(STATUS \"Pruning non-runtime artifact from package: \${_f}\")
             file(REMOVE \"\${_f}\")
         endforeach()
 
-        # Drop empty PhysX layout directories that get left behind
-        # (e.g. bin/win.x86_64.vc143.md/release after we strip its .lib/.pdb).
-        file(GLOB _modularity_empty_dirs LIST_DIRECTORIES true
-            \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}/win.*\"
-        )
-        foreach(_d IN LISTS _modularity_empty_dirs)
-            if(IS_DIRECTORY \"\${_d}\")
-                file(GLOB _remaining \"\${_d}/*\" \"\${_d}/*/*\")
-                if(NOT _remaining)
-                    file(REMOVE_RECURSE \"\${_d}\")
-                endif()
+        # PhysX's own install rules add an SDK layout the runtime never reads:
+        # include/ (its headers) and bin/win.x86_64.*/release/ (second copies of
+        # the DLLs already installed beside the executables above). Our files are
+        # installed flat at the root on Windows, so both folders are PhysX-only.
+        foreach(_physx_sdk_dir IN ITEMS include bin)
+            if(IS_DIRECTORY \"\${CMAKE_INSTALL_PREFIX}/\${_physx_sdk_dir}\")
+                message(STATUS \"Pruning PhysX SDK folder from package: \${_physx_sdk_dir}/\")
+                file(REMOVE_RECURSE \"\${CMAKE_INSTALL_PREFIX}/\${_physx_sdk_dir}\")
             endif()
         endforeach()
     ")
 endif()
 
 install(DIRECTORY ${CMAKE_SOURCE_DIR}/Resources
-    DESTINATION ./bin/
+    DESTINATION ${MODULARITY_INSTALL_APPDIR}
 )
 
 install(DIRECTORY ${MODULARITY_TEMPLATE_PROJECTS_DIR}
-    DESTINATION ./bin/
+    DESTINATION ${MODULARITY_INSTALL_APPDIR}
 )
 
 # ==================== Linux desktop integration ====================
@@ -2304,14 +2396,21 @@ endif()
 # so skip CPack entirely on Android.
 if(NOT ANDROID)
 
+# The release label in the archive name: "Modularity V7.0 - Windows.zip", whose
+# top folder carries the same name. build.ps1 --version=V7.1 overrides it, and
+# moves the finished archive from the binary dir up next to Dev-ExportedBuild.
+set(MODULARITY_RELEASE_VERSION "V7.0" CACHE STRING
+    "Release label used in the packaged archive name (e.g. V7.0)")
+
+string(REGEX REPLACE "^[Vv]" "" _modularity_release_number "${MODULARITY_RELEASE_VERSION}")
 set(CPACK_PACKAGE_NAME "Modularity")
 set(CPACK_PACKAGE_VENDOR "Modularity")
-set(CPACK_PACKAGE_VERSION "1.0.0")
+set(CPACK_PACKAGE_VERSION "${_modularity_release_number}")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Modularity Game Engine")
 set(CPACK_PACKAGE_CONTACT "support@moduengine.xyz")
 
 set(CPACK_PACKAGE_FILE_NAME
-    "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-${CMAKE_SYSTEM_NAME}"
+    "${CPACK_PACKAGE_NAME} ${MODULARITY_RELEASE_VERSION} - ${CMAKE_SYSTEM_NAME}"
 )
 
 set(CPACK_GENERATOR "7Z")

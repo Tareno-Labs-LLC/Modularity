@@ -1561,6 +1561,8 @@ Renderer::~Renderer() {
     releaseXREyePreviews();
     releaseRenderTarget(polarizationTarget);
     releaseRenderTarget(externalSceneTarget);
+    releaseRenderTarget(previewPostTarget);
+    releaseRenderTarget(externalPostTarget);
     releaseRenderTarget(overlayCaptureTarget);
     releaseRenderTarget(bandLayerTarget);
     releaseRenderTarget(bandCaptureTarget);
@@ -1615,7 +1617,8 @@ Renderer::~Renderer() {
     if (missingMaterialFallbackTexture) glDeleteTextures(1, &missingMaterialFallbackTexture);
 }
 
-Texture* Renderer::getTexture(const std::string& path, MaterialProperties::TextureFilter filter) {
+Texture* Renderer::getTexture(const std::string& path, MaterialProperties::TextureFilter filter,
+                              bool preserveDataPrecision) {
     if (path.empty()) return nullptr;
     if (!moduRenderContextLive()) {
         static bool warnedNoContext = false;
@@ -1626,7 +1629,9 @@ Texture* Renderer::getTexture(const std::string& path, MaterialProperties::Textu
         return nullptr;
     }
     bool point = (filter == MaterialProperties::TextureFilter::Point);
-    auto& cache = point ? textureCachePoint : textureCacheBilinear;
+    auto& cache = preserveDataPrecision
+        ? (point ? normalTextureCachePoint : normalTextureCacheBilinear)
+        : (point ? textureCachePoint : textureCacheBilinear);
     const double nowSec = glfwGetTime();
     auto missingIt = missingTextureRetryAfter.find(path);
     if (missingIt != missingTextureRetryAfter.end()) {
@@ -1644,7 +1649,8 @@ Texture* Renderer::getTexture(const std::string& path, MaterialProperties::Textu
 
     GLenum minFilter = point ? GL_NEAREST_MIPMAP_NEAREST : GL_LINEAR_MIPMAP_LINEAR;
     GLenum magFilter = point ? GL_NEAREST : GL_LINEAR;
-    TextureFormatPolicy policy = getTextureFormatOverride(path);
+    TextureFormatPolicy policy = preserveDataPrecision
+        ? TextureFormatPolicy::Full : getTextureFormatOverride(path);
     if (policy == TextureFormatPolicy::Auto) policy = defaultTextureFormatPolicy;
     const std::string loadPath = Modularity::ResolveLoadableTexturePath(path);
     auto tex = std::make_unique<Texture>(loadPath, GL_REPEAT, GL_REPEAT, minFilter, magFilter, policy);
@@ -1686,6 +1692,8 @@ void Renderer::invalidateTexture(const std::string& path) {
     };
     eraseFromCache(textureCacheBilinear);
     eraseFromCache(textureCachePoint);
+    eraseFromCache(normalTextureCacheBilinear);
+    eraseFromCache(normalTextureCachePoint);
 }
 
 std::string Renderer::normalizeTextureKey(const std::string& path) const {
@@ -1726,6 +1734,8 @@ void Renderer::setTextureFormatOverride(const std::string& path, TextureFormatPo
     };
     evictMatching(textureCacheBilinear);
     evictMatching(textureCachePoint);
+    evictMatching(normalTextureCacheBilinear);
+    evictMatching(normalTextureCachePoint);
     ++textureCacheGeneration;
 }
 
@@ -1740,6 +1750,8 @@ void Renderer::setMaxTextureDimension(int maxDimension) {
     ++textureCacheGeneration;
     textureCacheBilinear.clear();
     textureCachePoint.clear();
+    normalTextureCacheBilinear.clear();
+    normalTextureCachePoint.clear();
     textureCacheUsageBytes = 0;
     missingTextureRetryAfter.clear();
     warnedTextureCacheThrashing = false;
@@ -1877,6 +1889,8 @@ void Renderer::setDefaultTextureFormatPolicy(TextureFormatPolicy policy) {
     defaultTextureFormatPolicy = policy;
     textureCacheBilinear.clear();
     textureCachePoint.clear();
+    normalTextureCacheBilinear.clear();
+    normalTextureCachePoint.clear();
     textureCacheUsageBytes = 0;
     missingTextureRetryAfter.clear();
 }
@@ -1899,24 +1913,26 @@ void Renderer::purgeTextureCacheIfNeeded() {
     }
 
     struct EvictionCandidate {
-        bool point = false;
+        std::unordered_map<std::string, CachedTextureEntry>* cache = nullptr;
         double lastUsedTime = 0.0;
         size_t approxBytes = 0;
         std::string path;
     };
 
     std::vector<EvictionCandidate> candidates;
-    candidates.reserve(textureCacheBilinear.size() + textureCachePoint.size());
+    candidates.reserve(getTextureCacheCount());
 
     const uint64_t currentFrame = frameSerial;
-    auto collect = [&candidates, currentFrame](const auto& cache, bool point) {
+    auto collect = [&candidates, currentFrame](auto& cache) {
         for (const auto& [path, entry] : cache) {
             if (entry.lastUsedFrame == currentFrame) continue;
-            candidates.push_back({point, entry.lastUsedTime, entry.approxBytes, path});
+            candidates.push_back({&cache, entry.lastUsedTime, entry.approxBytes, path});
         }
     };
-    collect(textureCacheBilinear, false);
-    collect(textureCachePoint, true);
+    collect(textureCacheBilinear);
+    collect(textureCachePoint);
+    collect(normalTextureCacheBilinear);
+    collect(normalTextureCachePoint);
 
     std::sort(candidates.begin(), candidates.end(),
               [](const EvictionCandidate& a, const EvictionCandidate& b) {
@@ -1937,7 +1953,7 @@ void Renderer::purgeTextureCacheIfNeeded() {
                 continue;
             }
 
-            auto& cache = candidate.point ? textureCachePoint : textureCacheBilinear;
+            auto& cache = *candidate.cache;
             auto it = cache.find(candidate.path);
             if (it == cache.end()) continue;
 
@@ -3630,6 +3646,7 @@ unsigned int Renderer::findFramebufferForTexture(unsigned int texture) const {
     if (unsigned int match = findTargetMatch(externalSceneTarget)) return match;
     if (unsigned int match = findTargetMatch(postTarget)) return match;
     if (unsigned int match = findTargetMatch(previewPostTarget)) return match;
+    if (unsigned int match = findTargetMatch(externalPostTarget)) return match;
     if (unsigned int match = findTargetMatch(historyTarget)) return match;
     if (unsigned int match = findTargetMatch(bloomTargetA)) return match;
     if (unsigned int match = findTargetMatch(bloomTargetB)) return match;
@@ -3862,7 +3879,7 @@ void Renderer::renderObject(const SceneObject& obj) {
 
     bool normalUsed = false;
     if (!obj.normalMapPath.empty()) {
-        if (auto* t = getTexture(obj.normalMapPath, obj.material.textureFilter)) {
+        if (auto* t = getTexture(obj.normalMapPath, obj.material.textureFilter, true)) {
             t->Bind(GL_TEXTURE2);
             normalUsed = true;
         }
@@ -6947,7 +6964,7 @@ void Renderer::renderSceneInternal(const Camera& camera, const std::vector<Scene
 
         bool normalUsed = false;
         if (!normalMapPath.empty()) {
-            if (auto* t = getTexture(normalMapPath, item.material.textureFilter)) {
+            if (auto* t = getTexture(normalMapPath, item.material.textureFilter, true)) {
                 bindTexture2D(GL_TEXTURE2, t->GetID());
                 normalUsed = true;
             }
@@ -7433,7 +7450,7 @@ void Renderer::renderSceneInternal(const Camera& camera, const std::vector<Scene
                     const std::string& nPath = item.normalMapPath ? *item.normalMapPath : emptyPath;
                     bool nUsed = false;
                     if (!nPath.empty()) {
-                        if (auto* t = getTexture(nPath, item.material.textureFilter)) {
+                        if (auto* t = getTexture(nPath, item.material.textureFilter, true)) {
                             glActiveTexture(GL_TEXTURE2);
                             glBindTexture(GL_TEXTURE_2D, t->GetID());
                             nUsed = true;
@@ -8329,7 +8346,9 @@ unsigned int Renderer::applyPostProcessing(const Camera& camera, const std::vect
 
     RenderTarget& target = postFxTargetOverride
                                ? *postFxTargetOverride
-                               : (allowHistory ? postTarget : previewPostTarget);
+                               : (allowHistory ? postTarget
+                                               : (postFxUseExternalTarget ? externalPostTarget
+                                                                          : previewPostTarget));
     ensureRenderTarget(target, width, height, true, true);
     if (allowHistory) {
         ensureRenderTarget(historyTarget, width, height, false, true);
@@ -9044,8 +9063,10 @@ void Renderer::renderSceneToTarget(const Camera& camera,
     if (applyPostFX) {
         // Do not share temporal history between the left eye, right eye and
         // desktop viewport. Each eye is processed before its swapchain releases.
+        postFxUseExternalTarget = true;
         const unsigned int processed = applyPostProcessing(
             camera, sceneObjects, externalSceneTarget.texture, width, height, false);
+        postFxUseExternalTarget = false;
         const unsigned int presented = processed ? processed : externalSceneTarget.texture;
         const unsigned int sourceFramebuffer = findFramebufferForTexture(presented);
         glBindFramebuffer(GL_READ_FRAMEBUFFER, sourceFramebuffer ? sourceFramebuffer : sceneFramebuffer);

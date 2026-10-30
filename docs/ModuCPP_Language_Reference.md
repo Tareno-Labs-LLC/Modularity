@@ -682,8 +682,12 @@ thing off if you ever need to rule it out while debugging.
 
 What currently fits through the C path:
 ```text
-public float / bool fields        (with [Header], [Separator] and [Slider], read-only in method bodies)
-private float / int / bool / vec3 fields   (per-object state, literal initializers)
+public float / int / bool / vec3 fields   ([Header], [Separator], [Slider], [Range], [Step];
+                                           read-only in method bodies, same inspector widgets
+                                           and saved values as the C++ backend)
+public string fields              (passed as call arguments, e.g. AddLog(message); no + or ==)
+public SceneObj / [ObjectRef] string fields   (inspector slot only for now, not usable in code)
+private float / int / bool / vec3 fields   (per-object state, literal initializers, reset on Stop)
 Begin / TickUpdate / Update       (plus pure helper methods without ctx)
 Math.*                            (Sin, Cos, Clamp, Lerp, the usual suspects)
 vec3 construction and .x/.y/.z    (but NOT vec3 arithmetic like a + b)
@@ -691,6 +695,12 @@ obj.Transform.position/rotation/scale   (reads, writes and compound writes)
 AddLog(message, Type.X)
 a ctx.* subset that maps 1:1 onto Modu_* C calls
 ```
-Anything else, `each` loops, object refs, strings beyond literals, vec3 math,
-custom inspectors, falls back. `Scripts/Spinny.moducpp` is the living demo of a
-script that qualifies.
+Anything else, `each` loops, arrays, using object refs in code, string concatenation,
+vec3 math, custom inspectors, obj.UI, timers, falls back. `Scripts/Spinny.moducpp`
+is the living demo of a script that qualifies.
+
+On desktop a C-lowered script compiles as one tiny unit: the generated `.gen.c` plus a
+`.capi.bridge.c` that exports its hooks. The `Modu_*` API it calls is implemented once
+in the engine (`src/ScriptRuntimeCAPI.cpp`), so no engine header, ImGui or PCH is
+involved. Before that, every C script also compiled a per-script C++ wrapper of about
+3 seconds; the on-device Android editor still uses that wrapper.

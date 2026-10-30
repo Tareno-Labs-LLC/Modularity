@@ -2,6 +2,7 @@
 #include "CrashReporter.h"
 #include "ModularityLspServer.h"
 #include "ScriptHostExports.h"
+#include "AsanReportPath.h"
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -114,6 +115,7 @@ static std::string startupProjectPathFromArgs(int argc, char** argv) {
   return "";
 }
 static int ModularityMain(int argc, char** argv) {
+  ModularityRouteAsanReports();
   setProcessDisplayName(argc, argv);
   if (isLspMode(argc, argv)) {
     if (auto exeDir = getExecutableDir(); !exeDir.empty()) {

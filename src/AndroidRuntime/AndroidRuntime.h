@@ -54,6 +54,16 @@ bool HasAllFilesAccess();
 
 bool RequestAllFilesAccess(std::string& error);
 
+// RECORD_AUDIO is a runtime permission. The request is async: poll HasMicrophonePermission.
+bool HasMicrophonePermission();
+bool RequestMicrophonePermission(std::string& error);
+
+// Lost focus or paused (a system dialog such as a permission prompt is up, or the app is in
+// the background), and how many times it has come back from that. A permission request can
+// compare the count to tell "prompt still showing" from "prompt answered".
+bool IsPaused();
+unsigned GetFocusRegainCount();
+
 float GetDisplayDensityScale();
 
 } // namespace Modularity::AndroidRuntime

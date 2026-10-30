@@ -5,10 +5,10 @@ import sys
 import xml.etree.ElementTree as ET
 
 repo = Path(__file__).resolve().parents[2]
-build = repo / 'build/vr-editor-check'
+build = repo / 'build/Dev-Resources/vr-editor-check'
 build.mkdir(exist_ok=True)
 ns = {'m': 'http://schemas.microsoft.com/developer/msbuild/2003'}
-tree = ET.parse(repo / 'build/core.vcxproj').getroot()
+tree = ET.parse(repo / 'build/Dev-Resources/core.vcxproj').getroot()
 group = next(g for g in tree.findall('m:ItemDefinitionGroup', ns) if 'release|x64' in g.attrib.get('Condition', '').lower())
 compiler = group.find('m:ClCompile', ns)
 def values(name):
@@ -19,8 +19,8 @@ flags += ' ' + ' '.join('/I"' + v + '"' for v in values('AdditionalIncludeDirect
 source = repo / 'tools/vr-editor/probe.cpp'
 obj = build / 'probe.obj'
 (build / 'probe.compile.rsp').write_text(flags + f' /c "{source}" /Fo:"{obj}"')
-line = (repo / 'build/Modularity.dir/Release/Modularity.tlog/link.command.1.tlog').read_text(encoding='utf-16').splitlines()[1]
-line = re.sub(r'/OUT:"[^"]+"', '/OUT:"' + (repo / 'build/release/VREditorProbe.exe').as_posix() + '"', line, flags=re.I)
+line = (repo / 'build/Dev-Resources/Modularity.dir/Release/Modularity.tlog/link.command.1.tlog').read_text(encoding='utf-16').splitlines()[1]
+line = re.sub(r'/OUT:"[^"]+"', '/OUT:"' + (repo / 'build/Dev-ExportedBuild/VREditorProbe.exe').as_posix() + '"', line, flags=re.I)
 for arg in ('PDB', 'IMPLIB', 'DEF'):
     line = re.sub('/' + arg + r':"[^"]+"', '', line, flags=re.I)
 line = line.replace('/SUBSYSTEM:WINDOWS', '/SUBSYSTEM:CONSOLE')
@@ -35,4 +35,4 @@ vcvars = r'C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Bu
 command = f'call "{vcvars}" >nul && cl @"{build / "probe.compile.rsp"}"'
 if '--compile-only' not in sys.argv:
     command += f' && link @"{build / "probe.link.rsp"}" /LTCG'
-subprocess.run(command, shell=True, check=True, cwd=repo / 'build')
+subprocess.run(command, shell=True, check=True, cwd=repo / 'build/Dev-Resources')

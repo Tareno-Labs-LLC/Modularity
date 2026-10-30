@@ -524,6 +524,8 @@ function Show-Usage {
     Write-Host '  --no-discord            Build without the Discord Social SDK'
     Write-Host '  --zip                   Package as .zip (default; fast to compress)'
     Write-Host '  --7z                    Package as .7z (smaller, but much slower)'
+    Write-Host '  --version=<label>       Release label in the archive name (default: V7.0)'
+    Write-Host '  --asan                  AddressSanitizer build into Build-ASAN\ (also --ASANDEBUG, --fsanitize)'
     Write-Host '  --help                  Show this help message'
 }
 
@@ -543,6 +545,10 @@ $buildCppStandard = 'c++23'
 # rival the compile time on a 4-core machine. Pass --7z for release builds.
 $packageFormat = 'ZIP'
 $packageExt = 'zip'
+# Release label for the archive name: "Modularity V7.0 - Windows.zip". Also
+# baked into CMake (MODULARITY_RELEASE_VERSION) so a bare cpack run agrees.
+$releaseVersion = 'V7.0'
+$asanBuild = $false
 $jobs = 0
 
 foreach ($arg in $Arguments) {
@@ -561,6 +567,8 @@ foreach ($arg in $Arguments) {
         '^--no-discord$' { $discordSdk = 'OFF'; continue }
         '^--zip$'        { $packageFormat = 'ZIP'; $packageExt = 'zip'; continue }
         '^--7z$'         { $packageFormat = '7Z'; $packageExt = '7z'; continue }
+        '^--version=(.+)$' { $releaseVersion = $Matches[1]; continue }
+        '^--asan$|^--asandebug$|^--fsanitize$' { $asanBuild = $true; continue }
         '^--help$|^-h$'  { Show-Usage; exit 0 }
         '^--build-type=(.+)$' { $buildType = $Matches[1]; continue }
         '^--jobs=(\d+)$' { $jobs = [int]$Matches[1]; continue }
@@ -582,6 +590,12 @@ if ($jobs -le 0) {
     $jobsDefaulted = $false
 }
 if ($jobs -lt 1) { $jobs = 1 }
+if ($asanBuild) {
+    if ($androidBuild) { Write-Err '--asan is a desktop build; it cannot be combined with --Android.'; exit 1 }
+    # ASan builds are for hunting memory bugs in the editor and player you run
+    # from Build-ASAN\Dev-ExportedBuild; exports keep using build\'s player-cache.
+    $skipPlayer = $true
+}
 if ($androidBuild) {
     $skipPlayer = $true
     if ($jobsDefaulted) { $jobs = [Math]::Min($jobs, 4) }
@@ -607,8 +621,41 @@ if (-not $root) {
 }
 Set-Location $root
 
-$buildDir = Join-Path $root 'build'
+# build\ holds exactly three things:
+#   Dev-Resources\      the CMake trees, debug files (.pdb, import .lib) and
+#                        downloaded SDKs - everything you only open to debug
+#   Dev-ExportedBuild\  the runnable editor + player, linked straight here
+#   Modularity <version> - Windows.zip   the release archive
+# $buildDir keeps its name because it is still "the CMake binary dir".
+$buildRootDir = Join-Path $root 'build'
+# An AddressSanitizer build gets its own tree next to build\, laid out the same way
+# but never packaged: instrumented binaries are 2-3x slower and must not ship.
+if ($asanBuild) { $buildRootDir = Join-Path $root 'Build-ASAN' }
+$buildDir = Join-Path $buildRootDir 'Dev-Resources'
+$devExportDir = Join-Path $buildRootDir 'Dev-ExportedBuild'
 $playerCacheDir = Join-Path $buildDir 'player-cache'
+$releaseArchiveName = "Modularity $releaseVersion - Windows.$packageExt"
+# Before Dev-Resources existed the CMake tree sat directly in build\.
+$legacyLayout = Test-Path -LiteralPath (Join-Path $buildRootDir 'CMakeCache.txt')
+
+# State that survives --clean and is carried over from the old layout: the
+# GitHub snapshot push records.
+$script:PersistentDevItems = @('github-publish')
+
+# Android lives outside build\ entirely, in <repo>\Build-Android: the SDK/NDK,
+# the Cling/TinyCC caches for the Android editor (hours to rebuild) and APK
+# builds, whose signing\debug.keystore installed APKs are signed with. --clean
+# never touches it. Old name -> new name; older layouts kept these in build\
+# or build\Dev-Resources.
+$androidRootDir = Join-Path $root 'Build-Android'
+$script:AndroidItems = [ordered]@{
+    'android-sdk' = 'android-sdk'; 'android-sdk-smoke' = 'android-sdk-smoke'; 'android-clang' = 'android-clang'
+    'embedded-compilers' = 'embedded-compilers'; 'android' = 'APK-Output'
+}
+$androidMigration = $false
+foreach ($oldName in $script:AndroidItems.Keys) {
+    if ((Test-Path -LiteralPath (Join-Path $buildRootDir $oldName)) -or (Test-Path -LiteralPath (Join-Path $buildDir $oldName))) { $androidMigration = $true }
+}
 
 # Resolve the CMake generator explicitly. Without -G, CMake uses the machine's
 # default generator, which is "NMake Makefiles" on some setups. That default
@@ -646,10 +693,13 @@ $monoArgs = @()
 if ($env:MONO_ROOT) { $monoArgs = @("-DMONO_ROOT=$env:MONO_ROOT") }
 
 # --- Step accounting. Keep in sync with the hierarchy printed below. --------
-$script:TotalSteps = 6
-if ($androidBuild) { $script:TotalSteps -= 1 }
+$script:TotalSteps = 4
+if ($androidBuild) { $script:TotalSteps += 1 }
+if ($asanBuild) { $script:TotalSteps -= 1 }
+if ($androidBuild -and $androidEditor) { $script:TotalSteps += 1 }
+if ($legacyLayout -or $androidMigration) { $script:TotalSteps += 1 }
 if ($cleanBuild) { $script:TotalSteps += 2 }
-if (-not $skipPlayer) { $script:TotalSteps += 4 }
+if (-not $skipPlayer) { $script:TotalSteps += 2 }
 
 # --- Banner ----------------------------------------------------------------
 $overallTimer = [System.Diagnostics.Stopwatch]::StartNew()
@@ -664,7 +714,11 @@ if ($jobsDefaulted -and $jobs -lt $coreCount -and -not $androidBuild) {
     Write-Info "Build type: $buildType  -  C++: $buildCppStandard  -  Jobs: $jobs"
 }
 Write-Info "CMake generator: $generatorDisplay"
-Write-Info "Package format: $packageFormat"
+if ($asanBuild) {
+    Write-Info 'AddressSanitizer build: Build-ASAN\ (not packaged; reports go to asan-report.<pid> beside the exe)'
+} else {
+    Write-Info "Package format: $packageFormat  -  Release: $releaseArchiveName"
+}
 Write-Info "Discord Social SDK: $discordSdk (optional; --discord to enable)"
 Write-Info "Modularity root: $root"
 if (-not $generator) {
@@ -736,25 +790,21 @@ if (Test-Path (Join-Path $buildDir 'CMakeCache.txt')) {
 
 # --- Stage hierarchy -------------------------------------------------------
 $stages = New-Object System.Collections.Generic.List[string]
+if ($legacyLayout -or $androidMigration) { $stages.Add('Move the old build tree into Dev-Resources / Build-Android') }
 if ($androidBuild) { $stages.Add('Check Android SDK, NDK and JDK') }
 if ($cleanBuild) {
-    $stages.Add('Clean editor build directory')
-    $stages.Add('Clean player cache directory')
+    $stages.Add('Clean Dev-Resources (SDK downloads kept)')
+    $stages.Add('Clean Dev-ExportedBuild')
 }
 $stages.Add('Sync git submodules')
 $stages.Add('Configure editor build')
-$stages.Add('Build editor + engine targets')
-if (-not $androidBuild) {
-    $stages.Add('Collect editor libraries')
-    $stages.Add('Copy resources')
-}
+$stages.Add('Build editor + engine targets (linked into Dev-ExportedBuild)')
 if (-not $skipPlayer) {
     $stages.Add('Configure player-only cache build')
     $stages.Add('Build ModularityPlayer target')
-    $stages.Add('Collect player third-party libraries')
-    $stages.Add('Collect player engine libraries')
 }
-if ($androidBuild) { $stages.Add('Build and sign Android APK') } else { $stages.Add('Package artifacts and resources') }
+if ($androidBuild -and $androidEditor) { $stages.Add('Prepare embedded Cling and TinyCC') }
+if ($androidBuild) { $stages.Add('Build and sign Android APK') } elseif (-not $asanBuild) { $stages.Add('Package artifacts and resources') }
 
 Write-Info 'Build stage hierarchy:'
 for ($i = 0; $i -lt $stages.Count; $i++) {
@@ -764,68 +814,101 @@ for ($i = 0; $i -lt $stages.Count; $i++) {
 }
 
 # ---------------------------------------------------------------------------
-# Library collection. Engine static libs and per-target import libs are
-# link-time only - not needed at runtime and individually huge (core.lib and
-# core_player.lib are ~100 MB each), so they never go into the package.
+# Layout migration. Builds from before Dev-Resources kept the whole CMake tree
+# (and whatever tools had dropped there) directly in build\. The new configure
+# starts a fresh tree in Dev-Resources, so the old one is dead weight: carry
+# the slow-to-fetch downloads over, delete what CMake/CPack/this script made,
+# and only *name* anything unrecognized rather than deleting it.
 # ---------------------------------------------------------------------------
 
-$script:ExcludedLibs = @(
-    'core.lib', 'core_player.lib', 'Modularity.lib', 'ModularityPlayer.lib',
-    'glad.lib', 'imgui.lib', 'imguizmo.lib'
+$script:LegacyGeneratedNames = @(
+    'CMakeCache.txt', 'CMakeFiles', 'cmake_install.cmake', 'CPackConfig.cmake',
+    'CPackSourceConfig.cmake', 'InstallScriptSDK.cmake', 'install_manifest.txt',
+    'compile_commands.json', 'imgui.ini', 'Release', 'Debug', 'RelWithDebInfo',
+    'MinSizeRel', 'x64', 'src', 'physx', 'jolt', 'player-cache', 'Packages',
+    'Resources', '_CPack_Packages', 'nebula-bindings', 'generated-empty',
+    'linux-desktop', 'modularity-zlib', 'Testing', '.cmake'
+)
+$script:LegacyGeneratedPatterns = @(
+    '*.vcxproj', '*.vcxproj.filters', '*.vcxproj.user', '*.dir', '*.sln', '*.slnx',
+    'Modularity-*-Windows.zip', 'Modularity-*-Windows.7z'
 )
 
-$script:BinaryScanCache = @{}
+function Move-LegacyBuildTree {
+    New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
+    $rootFull = [IO.Path]::GetFullPath($buildRootDir).TrimEnd('\')
 
-function Get-PackageBinaryCandidates {
-    <#
-        One recursive scan per target directory, reused across the ThirdParty and
-        Engine stages.
+    foreach ($oldName in $script:AndroidItems.Keys) {
+        $to = Join-Path $androidRootDir $script:AndroidItems[$oldName]
+        foreach ($from in @((Join-Path $buildDir $oldName), (Join-Path $buildRootDir $oldName))) {
+            if (-not (Test-Path -LiteralPath $from)) { continue }
+            if (Test-Path -LiteralPath $to) {
+                $script:Warnings.Add("[Layout] Both $from and $to exist; kept the Build-Android copy. Delete the other by hand once you have checked it.")
+                continue
+            }
+            New-Item -ItemType Directory -Force -Path $androidRootDir | Out-Null
+            # Same volume, so a rename. CMake trees inside embedded-compilers record
+            # absolute paths; tools\setup-embedded-compilers.py restarts moved ones.
+            Move-Item -LiteralPath $from -Destination $to
+            Write-Info "Moved $oldName into Build-Android\$($script:AndroidItems[$oldName])."
+        }
+    }
+    if (-not $legacyLayout) { return }
 
-        -Filter, not -Include: -Include is applied after the provider has already
-        enumerated every entry, which over this build tree (PhysX, assimp, ffmpeg)
-        turned a ~40s collect into ~180s. -Filter is evaluated by the filesystem
-        itself. The engine DLLs are a subset of the DLL scan, so they cost nothing
-        extra rather than a third walk.
-    #>
-    param([string] $TargetDir)
-
-    if ($script:BinaryScanCache.ContainsKey($TargetDir)) {
-        return $script:BinaryScanCache[$TargetDir]
+    foreach ($name in $script:PersistentDevItems) {
+        $from = Join-Path $buildRootDir $name
+        $to = Join-Path $buildDir $name
+        if (-not (Test-Path -LiteralPath $from)) { continue }
+        if (Test-Path -LiteralPath $to) {
+            $script:Warnings.Add("[Layout] Both build\$name and build\Dev-Resources\$name exist; kept the Dev-Resources copy. Delete build\$name by hand once you have checked it.")
+            continue
+        }
+        # Same volume, so this is a rename.
+        Move-Item -LiteralPath $from -Destination $to
+        Write-Info "Moved build\$name into Dev-Resources."
     }
 
-    $libs = @(Get-ChildItem -LiteralPath $TargetDir -Recurse -File -Filter '*.lib' -ErrorAction SilentlyContinue |
-        Where-Object { $_.FullName -notmatch '\\(Packages|android-sdk(?:-smoke)?|android-clang|android)\\' })
-    $dlls = @(Get-ChildItem -LiteralPath $TargetDir -Recurse -File -Filter '*.dll' -ErrorAction SilentlyContinue |
-        Where-Object { $_.FullName -notmatch '\\(Packages|android-sdk(?:-smoke)?|android-clang|android)\\' })
-
-    $result = @{
-        Libs = @($libs | Where-Object { $script:ExcludedLibs -notcontains $_.Name })
-        Dlls = $dlls
-        EngineDlls = @($dlls | Where-Object { $_.Name -like 'core*.dll' })
+    # An editor still running from the old build\Release would lose its Resources
+    # mid-session, so leave the old tree for the next run (the new one does not
+    # need it; this step repeats until build\CMakeCache.txt is gone).
+    $running = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
+        try { $_.Path -and $_.Path.StartsWith($rootFull + '\', [StringComparison]::OrdinalIgnoreCase) -and
+              -not $_.Path.StartsWith(([IO.Path]::GetFullPath($buildDir).TrimEnd('\')) + '\', [StringComparison]::OrdinalIgnoreCase) -and
+              -not $_.Path.StartsWith(([IO.Path]::GetFullPath($devExportDir).TrimEnd('\')) + '\', [StringComparison]::OrdinalIgnoreCase) } catch { $false }
+    })
+    if ($running.Count -gt 0) {
+        $names = ($running | ForEach-Object { "$($_.Name) ($($_.Id))" }) -join ', '
+        $script:Warnings.Add("[Layout] Old build tree left in place because $names still runs from it. Close it and build again to finish the cleanup.")
+        return
     }
-    $script:BinaryScanCache[$TargetDir] = $result
-    return $result
-}
 
-function Copy-PackageBinaries {
-    param([string] $TargetDir, [switch] $IncludeEngine, [switch] $IncludeThirdParty)
+    $leftovers = New-Object System.Collections.Generic.List[string]
+    foreach ($item in Get-ChildItem -LiteralPath $buildRootDir -Force) {
+        if ($item.Name -in @('Dev-Resources', 'Dev-ExportedBuild')) { continue }
+        if ($item.Name -like 'Modularity * - *.zip' -or $item.Name -like 'Modularity * - *.7z') { continue }
+        $generated = $script:LegacyGeneratedNames -contains $item.Name
+        if (-not $generated) {
+            foreach ($pattern in $script:LegacyGeneratedPatterns) {
+                if ($item.Name -like $pattern) { $generated = $true; break }
+            }
+        }
+        if (-not $generated) { $leftovers.Add($item.Name); continue }
 
-    $found = Get-PackageBinaryCandidates -TargetDir $TargetDir
-
-    if ($IncludeThirdParty) {
-        $thirdParty = Join-Path $TargetDir 'Packages\ThirdParty'
-        New-Item -ItemType Directory -Force -Path $thirdParty | Out-Null
-        foreach ($file in ($found.Libs + $found.Dlls)) {
-            Copy-Item -LiteralPath $file.FullName -Destination $thirdParty -Force
+        $target = [IO.Path]::GetFullPath($item.FullName)
+        if (-not $target.StartsWith($rootFull + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Legacy cleanup escaped the build directory.' }
+        try {
+            Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction Stop
+        } catch {
+            # Usually an editor still running from build\Release. Not fatal: the
+            # new tree does not need it, and the next run tries again.
+            $script:Warnings.Add("[Layout] Could not delete build\$($item.Name) (in use?): $($_.Exception.Message)")
         }
     }
 
-    if ($IncludeEngine) {
-        $engine = Join-Path $TargetDir 'Packages\Engine'
-        New-Item -ItemType Directory -Force -Path $engine | Out-Null
-        foreach ($file in $found.EngineDlls) {
-            Copy-Item -LiteralPath $file.FullName -Destination $engine -Force
-        }
+    if ($leftovers.Count -gt 0) {
+        $shown = ($leftovers | Select-Object -First 12) -join ', '
+        if ($leftovers.Count -gt 12) { $shown += ", ... ($($leftovers.Count) total)" }
+        $script:Warnings.Add("[Layout] build\ still has items this script did not create, left alone: $shown")
     }
 }
 
@@ -834,6 +917,10 @@ function Copy-PackageBinaries {
 # ---------------------------------------------------------------------------
 
 function Invoke-BuildPipeline {
+    # First, so the Android SDK check below already sees build\Dev-Resources\android-sdk.
+    if ($legacyLayout -or $androidMigration) {
+        if (-not (Invoke-InlineStep 'Migrating Build Layout' { Move-LegacyBuildTree })) { return $false }
+    }
     if ($androidBuild) {
         if (-not (Invoke-InlineStep 'Checking Android Tools' {
             & (Join-Path $root 'tools\Setup-Android.ps1') -CheckOnly
@@ -841,14 +928,14 @@ function Invoke-BuildPipeline {
         })) { return $false }
     }
     if ($cleanBuild) {
-        if (-not (Invoke-InlineStep 'Cleaning Editor' {
-            # Keep downloaded Android tools when cleaning engine outputs.
+        if (-not (Invoke-InlineStep 'Cleaning Dev-Resources' {
+            # Keep downloaded SDKs, compilers and signing keys when cleaning engine outputs.
             $cleanRoot = [IO.Path]::GetFullPath($buildDir).TrimEnd('\')
             $sourcePrefix = [IO.Path]::GetFullPath($root).TrimEnd('\') + '\'
             if (-not $cleanRoot.StartsWith($sourcePrefix, [StringComparison]::OrdinalIgnoreCase)) { throw 'Build directory must stay inside the source root.' }
             if (Test-Path -LiteralPath $cleanRoot) {
                 foreach ($item in Get-ChildItem -LiteralPath $cleanRoot -Force) {
-                    if ($item.Name -in @('android-sdk', 'android-sdk-smoke', 'android-clang')) { continue }
+                    if ($item.Name -in $script:PersistentDevItems) { continue }
                     $target = [IO.Path]::GetFullPath($item.FullName)
                     if (-not $target.StartsWith($cleanRoot + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Clean target escaped the build directory.' }
                     Remove-Item -LiteralPath $target -Recurse -Force
@@ -856,16 +943,26 @@ function Invoke-BuildPipeline {
             }
         })) { return $false }
 
-        if (-not (Invoke-InlineStep 'Cleaning Player' {
-            if (Test-Path $playerCacheDir) { Remove-Item -LiteralPath $playerCacheDir -Recurse -Force }
+        if (-not (Invoke-InlineStep 'Cleaning Dev-ExportedBuild' {
+            if (Test-Path -LiteralPath $devExportDir) { Remove-Item -LiteralPath $devExportDir -Recurse -Force }
         })) { return $false }
     }
 
     if (-not (Invoke-ExternalStep 'Syncing Submodules' 'git' @('submodule', 'update', '--init', '--recursive'))) { return $false }
 
+    # Forward slashes: these land in CMake strings and generated project files.
     $configureArgs = @() + $generatorArgs + @('-S', $root, '-B', $buildDir,
         "-DCMAKE_BUILD_TYPE=$buildType", "-DMODULARITY_BUILD_CPP_STANDARD=$buildCppStandard",
-        "-DMODULARITY_ENABLE_DISCORD_SOCIAL_SDK=$discordSdk") + $vsGlobalsArgs + $monoArgs
+        "-DMODULARITY_ENABLE_DISCORD_SOCIAL_SDK=$discordSdk",
+        "-DMODULARITY_DEV_EXPORT_DIR=$($devExportDir.Replace('\', '/'))",
+        "-DMODULARITY_RELEASE_VERSION=$releaseVersion") + $vsGlobalsArgs + $monoArgs
+    # Always explicit, so neither tree can inherit the other's setting. Jolt's LTO
+    # (/GL) is dropped under ASan: whole-program codegen buys nothing there.
+    if ($asanBuild) {
+        $configureArgs += @('-DMODULARITY_ENABLE_ASAN=ON', '-DMODULARITY_JOLT_LTO=OFF')
+    } else {
+        $configureArgs += @('-DMODULARITY_ENABLE_ASAN=OFF')
+    }
     if (-not (Invoke-ExternalStep 'Configuring Editor' 'cmake' $configureArgs)) { return $false }
 
     $buildArgs = @('--build', $buildDir, '--config', $buildType, '--parallel', "$jobs") + $buildExtraArgs
@@ -875,11 +972,26 @@ function Invoke-BuildPipeline {
     if (-not (Invoke-ExternalStep 'Building Editor' 'cmake' $buildArgs)) { return $false }
 
     if ($androidBuild) {
-        $editorExe = Join-Path $buildDir "$buildType\Modularity.exe"
-        if (-not (Test-Path -LiteralPath $editorExe)) { $editorExe = Join-Path $buildDir 'Modularity.exe' }
+        if ($androidEditor) {
+            $compilerRoot = $env:MODULARITY_EMBEDDED_COMPILERS_ROOT
+            if (-not $compilerRoot) { $compilerRoot = Join-Path $androidRootDir 'embedded-compilers\arm64-v8a' }
+            if ($env:MODULARITY_ANDROID_CLANG_DIR -and -not $env:MODULARITY_EMBEDDED_COMPILERS_ROOT) {
+                if (-not (Invoke-InlineStep 'Preparing Embedded Compilers' {
+                    Write-Info 'Using the explicitly supplied external Android Clang bundle.'
+                })) { return $false }
+            } elseif (Test-Path -LiteralPath (Join-Path $compilerRoot 'ready.json')) {
+                if (-not (Invoke-InlineStep 'Preparing Embedded Compilers' {
+                    Write-Info "Using embedded Cling/TinyCC at $compilerRoot"
+                })) { return $false }
+            } else {
+                if (-not (Invoke-ExternalStep 'Preparing Embedded Compilers' 'python' @(
+                    (Join-Path $root 'tools\setup-embedded-compilers.py'), '--jobs', "$jobs"))) { return $false }
+            }
+        }
+        $editorExe = Join-Path $devExportDir 'Modularity.exe'
         if (-not $androidOutput) {
             $stem = 'ModularityPlayer'; if ($androidEditor) { $stem = 'Modularity' }
-            $script:androidOutput = Join-Path $buildDir "android\$stem.apk"
+            $script:androidOutput = Join-Path $androidRootDir "APK-Output\$stem.apk"
         }
         $apkArgs = @('--build-android', "--abi=$androidAbi", "--output=$androidOutput")
         if ($androidProject) { $apkArgs += "--project=$androidProject" }
@@ -888,17 +1000,10 @@ function Invoke-BuildPipeline {
         return (Invoke-ExternalStep 'Building Android APK' $editorExe $apkArgs)
     }
 
-    if (-not (Invoke-InlineStep 'Collecting Editor Libs' {
-        Copy-PackageBinaries -TargetDir $buildDir -IncludeThirdParty -IncludeEngine
-    })) { return $false }
-
-    if (-not (Invoke-InlineStep 'Copying Resources' {
-        $dest = Join-Path $buildDir 'Resources'
-        New-Item -ItemType Directory -Force -Path $dest | Out-Null
-        Copy-Item -Path (Join-Path $root 'Resources\*') -Destination $dest -Recurse -Force
-        $ini = Join-Path $dest 'imgui.ini'
-        if (Test-Path $ini) { Copy-Item -LiteralPath $ini -Destination $buildDir -Force }
-    })) { return $false }
+    # No separate library collection or Resources copy any more: the link and
+    # its POST_BUILD steps already put the exes, DLLs, Resources and Script SDK
+    # in Dev-ExportedBuild, and the editor's export scans player-cache itself
+    # (copyPrecompiledPackages), so the old build\Packages copies were unread.
 
     if ($skipPlayer) {
         Write-Info '--no-player: skipping the ModularityPlayer runtime build.'
@@ -912,15 +1017,9 @@ function Invoke-BuildPipeline {
         $playerBuildArgs = @('--build', $playerCacheDir, '--config', $buildType,
             '--target', 'ModularityPlayer', '--parallel', "$jobs") + $buildExtraArgs
         if (-not (Invoke-ExternalStep 'Building Player' 'cmake' $playerBuildArgs)) { return $false }
-
-        if (-not (Invoke-InlineStep 'Collecting Player Libs' {
-            Copy-PackageBinaries -TargetDir $playerCacheDir -IncludeThirdParty
-        })) { return $false }
-
-        if (-not (Invoke-InlineStep 'Collecting Player Engine Libs' {
-            Copy-PackageBinaries -TargetDir $playerCacheDir -IncludeEngine
-        })) { return $false }
     }
+
+    if ($asanBuild) { return $true }
 
     # CPack failing is a packaging problem, not a build problem: the editor and
     # player are already built and usable, so this warns rather than failing.
@@ -937,6 +1036,17 @@ function Invoke-BuildPipeline {
     Read-StepOutput -Label 'Packaging Engine' -Lines ($packOutput | ForEach-Object { "$_" })
     if ($packExit -ne 0) {
         $script:Warnings.Add("[Packaging Engine] CPack failed with exit $packExit. Distribution archive was not produced.")
+    } else {
+        # CPack writes into the binary dir; the release belongs beside
+        # Dev-ExportedBuild. Its staging copy (a full second install) goes too.
+        $packed = Join-Path $buildDir $releaseArchiveName
+        if (Test-Path -LiteralPath $packed) {
+            Move-Item -LiteralPath $packed -Destination (Join-Path $buildRootDir $releaseArchiveName) -Force
+        } else {
+            $script:Warnings.Add("[Packaging Engine] CPack succeeded but $releaseArchiveName was not found in Dev-Resources.")
+        }
+        $staging = Join-Path $buildDir '_CPack_Packages'
+        if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue }
     }
     $packSeconds = [int]$packTimer.Elapsed.TotalSeconds
     # Recorded by hand because this is the one step that does not go through
@@ -1023,15 +1133,21 @@ if ($succeeded) {
     Write-Host '   Modularity - Native Windows Build Complete' -ForegroundColor $script:ColBold
     Write-Host '================================' -ForegroundColor $script:ColBold
     Write-Ok "Build completed in $($duration)s."
-    Write-Info "Editor:        build\$buildType\Modularity.exe"
+    $treeName = Split-Path $buildRootDir -Leaf
+    Write-Info "Editor:        $treeName\Dev-ExportedBuild\Modularity.exe"
     if ($androidBuild) {
         Write-Info "Android ABI:   $androidAbi"
-    } elseif ($skipPlayer) {
-        Write-Info 'Player:        skipped (--no-player)'
     } else {
-        Write-Info "Player:        build\$buildType\ModularityPlayer.exe"
+        Write-Info "Player:        $treeName\Dev-ExportedBuild\ModularityPlayer.exe"
     }
-    if ($androidBuild) { Write-Info "Android APK:   $androidOutput" } else { Write-Info "Distribution:  build\Modularity-1.0.0-Windows.$packageExt" }
+    if ($androidBuild) {
+        Write-Info "Android APK:   $androidOutput"
+    } elseif ($asanBuild) {
+        Write-Info "ASan reports:  $treeName\Dev-ExportedBuild\asan-report.<pid> (set ASAN_OPTIONS to override)"
+    } else {
+        Write-Info "Release:       build\$releaseArchiveName"
+    }
+    Write-Info "Debug files:   $treeName\Dev-Resources\$buildType (.pdb, import .lib)"
     Write-TimingSummary
     Write-IssueSummary
     exit 0

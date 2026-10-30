@@ -15,7 +15,7 @@ import subprocess
 import xml.etree.ElementTree as ET
 
 repo = Path(__file__).resolve().parents[2]
-out = repo / "build/engine-audit-check/full-build"
+out = repo / "build/Dev-Resources/engine-audit-check/full-build"
 out.mkdir(parents=True, exist_ok=True)
 ns = {"m": "http://schemas.microsoft.com/developer/msbuild/2003"}
 vswhere = Path(os.environ.get("ProgramFiles(x86)", "C:/Program Files (x86)")) / "Microsoft Visual Studio/Installer/vswhere.exe"
@@ -23,7 +23,7 @@ vs = subprocess.check_output([str(vswhere), "-latest", "-products", "*", "-requi
 vcvars = Path(vs) / "VC/Auxiliary/Build/vcvars64.bat"
 
 def project(name):
-    root = ET.parse(repo / f"build/{name}.vcxproj").getroot()
+    root = ET.parse(repo / f"build/Dev-Resources/{name}.vcxproj").getroot()
     group = next(g for g in root.findall("m:ItemDefinitionGroup", ns) if "release|x64" in g.get("Condition", "").lower())
     compiler = group.find("m:ClCompile", ns)
     def values(name):
@@ -38,7 +38,7 @@ def project(name):
     return flags, sources
 
 def run(command):
-    subprocess.run(f'call "{vcvars}" >nul && {command}', shell=True, cwd=repo / "build", check=True)
+    subprocess.run(f'call "{vcvars}" >nul && {command}', shell=True, cwd=repo / "build/Dev-Resources", check=True)
 
 install = "--install" in sys.argv
 backup = out / ("previous-build-" + time.strftime("%Y%m%d-%H%M%S"))
@@ -67,17 +67,17 @@ for core, app in [("core", "Modularity"), ("core_player", "ModularityPlayer")]:
     rsp = out / f"{app}-main.rsp"
     rsp.write_text(mainflags + " /c " + " ".join(f'"{p}"' for p in mains) + f' /Fo:"{objdir.as_posix()}/"')
     run(f'cl @"{rsp}"')
-    command = (repo / f"build/{app}.dir/Release/{app}.tlog/link.command.1.tlog").read_text(encoding="utf-16").splitlines()[1]
+    command = (repo / f"build/Dev-Resources/{app}.dir/Release/{app}.tlog/link.command.1.tlog").read_text(encoding="utf-16").splitlines()[1]
     command = re.sub(r'RELEASE\\' + core + r'\.LIB', lambda _: f'"{archive}"', command, flags=re.I)
     command = re.sub(r'/WHOLEARCHIVE:(?:"[^"\r\n]*[/\\]' + core + r'\.lib"|[^ \r\n]*[/\\]' + core + r'\.lib)',
                      lambda _: f'/WHOLEARCHIVE:"{archive}"', command, flags=re.I)
     # Preserve resources/SDK export lists and dependency libraries from CMake.
-    exe = repo / f"build/release/{app + ('' if install else '-audit')}.exe"
+    exe = repo / f"build/Dev-ExportedBuild/{app + ('' if install else '-audit')}.exe"
     if install:
         for extension in (".exe", ".pdb", ".lib", ".exp"):
             previous = exe.with_suffix(extension)
             if previous.exists(): shutil.copy2(previous, backup / previous.name)
-        previousArchive = repo / f"build/release/{core}.lib"
+        previousArchive = repo / f"build/Dev-Resources/Release/{core}.lib"
         if previousArchive.exists(): shutil.copy2(previousArchive, backup / previousArchive.name)
     command = re.sub(r'/OUT:"[^"]+"', lambda _: f'/OUT:"{exe}"', command, flags=re.I)
     for option in ("PDB", "IMPLIB"):
@@ -92,8 +92,8 @@ for core, app in [("core", "Modularity"), ("core_player", "ModularityPlayer")]:
     print(f"Built {exe}", flush=True)
     if install: shutil.copy2(archive, previousArchive)
 if install:
-    subprocess.run(["cmake", "-E", "copy_directory", str(repo / "Resources"), str(repo / "build/release/Resources")], check=True)
-    subprocess.run(["cmake", "-E", "copy_directory", str(repo / "docs"), str(repo / "build/release/docs")], check=True)
-    subprocess.run(["cmake", f"-DSRC_ROOT={repo}", f"-DBUILD_ROOT={repo / 'build'}",
-                    f"-DDST_ROOT={repo / 'build/release/Resources/ScriptSDK'}", "-P", str(repo / "cmake/CopyScriptSDK.cmake")], check=True)
+    subprocess.run(["cmake", "-E", "copy_directory", str(repo / "Resources"), str(repo / "build/Dev-ExportedBuild/Resources")], check=True)
+    subprocess.run(["cmake", "-E", "copy_directory", str(repo / "docs"), str(repo / "build/Dev-ExportedBuild/docs")], check=True)
+    subprocess.run(["cmake", f"-DSRC_ROOT={repo}", f"-DBUILD_ROOT={repo / 'build/Dev-Resources'}",
+                    f"-DDST_ROOT={repo / 'build/Dev-ExportedBuild/Resources/ScriptSDK'}", "-P", str(repo / "cmake/CopyScriptSDK.cmake")], check=True)
     print("Staged matching resources, documentation, and native script SDK.", flush=True)

@@ -4,7 +4,7 @@ import os
 import subprocess
 
 repo = Path(__file__).resolve().parents[2]
-out = repo / "build/vr-mouse-input-check"
+out = repo / "build/Dev-Resources/vr-mouse-input-check"
 pristine = out / "src/ThirdParty/ModuGUI"
 pristine.mkdir(parents=True, exist_ok=True)
 # Read HEAD rather than the working submodule: an uncommitted declaration or

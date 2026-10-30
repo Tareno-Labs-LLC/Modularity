@@ -73,6 +73,16 @@ public:
     const XRRuntime& runtime() const { return runtime_; }
     const XRSession& session() const { return session_; }
 
+    // The cached head and controller poses were located in the old space; applying them with
+    // the new space's offset would throw the rig ~a standing height for a frame. Dropping
+    // them makes tracked objects hold still until syncFrame locates them in the new space.
+    bool setTrackingOrigin(XRTrackingOrigin origin, std::string& outError) {
+        bool swapped = false;
+        const bool ok = session_.setTrackingOrigin(origin, swapped, outError);
+        if (swapped) InvalidateTrackedPoses();
+        return ok;
+    }
+
     glm::mat4 viewMatrix(uint32_t viewIndex) const;
     glm::mat4 projectionMatrix(uint32_t viewIndex) const;
 

@@ -872,7 +872,7 @@ ScriptLanguageServiceProjectData ScriptLanguageService::scanProjectFiles(const f
             if (includeFilesScanned >= kMaxIncludeFiles) break;
             if (it->is_directory()) {
                 const std::string dirName = it->path().filename().string();
-                if (dirName == ".git" || dirName == "build" || dirName == "ThirdParty") {
+                if (dirName == ".git" || dirName == "build" || dirName == "Build-Android" || dirName == "Build-ASAN" || dirName == "ThirdParty") {
                     it.disable_recursion_pending();
                 }
                 continue;
@@ -917,7 +917,7 @@ ScriptLanguageServiceProjectData ScriptLanguageService::scanProjectFiles(const f
             }
             if (it->is_directory()) {
                 const std::string dirName = it->path().filename().string();
-                if (dirName == ".git" || dirName == "build" || dirName == "cmake-build-debug" ||
+                if (dirName == ".git" || dirName == "build" || dirName == "Build-Android" || dirName == "Build-ASAN" || dirName == "cmake-build-debug" ||
                     dirName == "cmake-build-release" || dirName == "ThirdParty" || dirName == "Library" ||
                     dirName == "Cache") {
                     it.disable_recursion_pending();
@@ -953,7 +953,7 @@ ScriptLanguageServiceProjectData ScriptLanguageService::scanProjectFiles(const f
             }
             if (it->is_directory()) {
                 const std::string dirName = it->path().filename().string();
-                if (dirName == ".git" || dirName == "build" || dirName == "cmake-build-debug" ||
+                if (dirName == ".git" || dirName == "build" || dirName == "Build-Android" || dirName == "Build-ASAN" || dirName == "cmake-build-debug" ||
                     dirName == "cmake-build-release" || dirName == "ThirdParty") {
                     it.disable_recursion_pending();
                 }

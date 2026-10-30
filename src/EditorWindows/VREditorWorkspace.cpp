@@ -8,6 +8,7 @@
 #include "ThirdParty/ModuGUI/backends/imgui_impl_opengl3.h"
 #include <fstream>
 #include <iomanip>
+#include <iterator>
 #include <sstream>
 #include <cfloat>
 #include <cctype>
@@ -875,21 +876,42 @@ void VREditorWorkspace::drawControllers(Renderer& renderer,const glm::mat4& vp,g
         glm::vec3 offset{0},rotation{0};
     };
     static std::unordered_map<std::string,Visual> visuals;
+    // The models live in the moduengine.vr-controllers package, whose payload mirrors the
+    // engine layout under Editor/: its .controller files keep their "Resources/..." paths
+    // and resolve against <package>/Editor. Without the package, fall back to the engine's
+    // own Resources/ in case someone dropped the files there.
+    const auto now=std::chrono::steady_clock::now();
+    if(now>=nextControllerPackageLookup) {
+        nextControllerPackageLookup=now+std::chrono::seconds(3);
+        controllerPackageRoot=findControllerPackage?findControllerPackage():std::filesystem::path{};
+    }
+    const std::filesystem::path resourceBase=controllerPackageRoot.empty()?std::filesystem::path{}:controllerPackageRoot/"Editor";
+    const auto resolve=[&](const std::string& value) {
+        if(resourceBase.empty() || value.rfind("Resources/",0)!=0)return value;
+        return (resourceBase/value).generic_string();
+    };
     for(int h=0;h<2;++h) {
         const auto& hand=input.controllers[h];if(!hand.active || !hand.gripPose.isValid())continue;
         const bool touch=hand.interactionProfile.find("oculus")!=std::string::npos || hand.interactionProfile.find("meta")!=std::string::npos;
-        const std::string config=std::string("Resources/VR-Engine-Root/ControllerMaterials/")+(touch?"quest-touch-plus":"valve-index")+(h?"-right.controller":"-left.controller");
+        const std::string config=resolve(std::string("Resources/VR-Engine-Root/ControllerMaterials/")+(touch?"quest-touch-plus":"valve-index")+(h?"-right.controller":"-left.controller"));
         auto it=visuals.find(config);
         if(it==visuals.end()) {
             Visual visual;
-            auto bytes=Modularity::Platform::GetAssetSource().ReadAll(config);
-            std::istringstream stream(std::string(bytes.begin(),bytes.end()));std::string line;
+            std::string text;
+            if(!resourceBase.empty()) {
+                std::ifstream file(config,std::ios::binary);
+                text.assign(std::istreambuf_iterator<char>(file),std::istreambuf_iterator<char>());
+            } else {
+                auto bytes=Modularity::Platform::GetAssetSource().ReadAll(config);
+                text.assign(bytes.begin(),bytes.end());
+            }
+            std::istringstream stream(text);std::string line;
             while(std::getline(stream,line)) {
                 while(!line.empty() && std::isspace(static_cast<unsigned char>(line.back())))line.pop_back();
                 const auto split=line.find('=');if(split==std::string::npos || line[0]=='#')continue;
                 const auto key=line.substr(0,split),value=line.substr(split+1);
-                if(key=="mesh")visual.mesh=value;else if(key=="albedo")visual.albedo=value;
-                else if(key=="specular")visual.specular=value;else if(key=="normal")visual.normal=value;else if(key=="orm")visual.orm=value;
+                if(key=="mesh")visual.mesh=resolve(value);else if(key=="albedo")visual.albedo=resolve(value);
+                else if(key=="specular")visual.specular=resolve(value);else if(key=="normal")visual.normal=resolve(value);else if(key=="orm")visual.orm=resolve(value);
                 else if(key=="scale"||key=="metallic"||key=="roughness"||key=="ambient") {
                     float number;std::istringstream numberStream(value);if(!(numberStream>>number)||!std::isfinite(number))continue;
                     if(key=="scale")visual.scale=std::clamp(number,.001f,10.f);

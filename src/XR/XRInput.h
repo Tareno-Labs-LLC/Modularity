@@ -70,6 +70,8 @@ struct XRInputState {
 XRInputState& MutableInputState();
 const XRInputState& InputState();
 void ResetInputState();
+// Marks the head and controller poses invalid while keeping buttons and tracking flags.
+void InvalidateTrackedPoses();
 
 struct XRHapticRequest {
     XRDevice device = XRDevice::Right;

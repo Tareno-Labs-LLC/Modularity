@@ -27,7 +27,7 @@ class Engine;
     #define MODULARITY_SCRIPT_EXPORT __attribute__((visibility("default")))
 #endif
 
-#define MODULARITY_NATIVE_SCRIPT_ABI_VERSION 61
+#define MODULARITY_NATIVE_SCRIPT_ABI_VERSION 62
 
 #define MODULARITY_SCRIPT_LAYOUT_SIGNATURE() \
     ((static_cast<unsigned long long>(sizeof(SceneObject)) << 40) ^ \
@@ -108,6 +108,16 @@ struct MODULARITY_SCRIPT_API ScriptContext {
     bool GetTouch(int index, float& x, float& y) const;
     bool GetPrimaryTouch(float& x, float& y) const;
     bool IsTouchActive() const;
+    // Microphone input. RequestMicrophone opens the default input device and keeps it open
+    // until ReleaseMicrophone or play stops; on Android the first request shows the
+    // RECORD_AUDIO prompt and capture starts once it is granted. Level is RMS and peak is a
+    // decaying peak, both 0..1; both read 0 until the device is active.
+    void RequestMicrophone();
+    void ReleaseMicrophone();
+    bool IsMicrophoneActive() const;
+    float GetMicrophoneLevel() const;
+    float GetMicrophonePeak() const;
+    std::string GetMicrophoneStatus() const;
     bool IsXRActive() const;
     bool IsXRDeviceTracked(int device) const;
     int GetXRTrackingState(int device) const;

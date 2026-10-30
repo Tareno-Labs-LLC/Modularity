@@ -4,9 +4,19 @@ import argparse
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--original-right', type=Path, help='Optional original OBJ: verify UVs/positions/faces remain unchanged')
+parser.add_argument('--package', type=Path, help='moduengine.vr-controllers-<version> folder (default: newest in the sibling Modu-Package-Manager checkout)')
 args = parser.parse_args()
 
-root = Path(__file__).resolve().parents[2]
+# The controller assets moved out of the engine into the moduengine.vr-controllers
+# ModuPAK. Its payload mirrors the engine layout under Editor/, so the .controller
+# files' "Resources/..." values resolve against <package>/Editor.
+package = args.package
+if package is None:
+    registry = Path(__file__).resolve().parents[3] / 'Modu-Package-Manager' / 'Packages'
+    found = sorted(registry.glob('*/*/moduengine.vr-controllers-*'))
+    assert found, f'no moduengine.vr-controllers package under {registry}; pass --package'
+    package = found[-1]
+root = package / 'Editor'
 assets = root / 'Resources/VR-Engine-Root'
 for config in (assets / 'ControllerMaterials').glob('*.controller'):
     for line in config.read_text().splitlines():

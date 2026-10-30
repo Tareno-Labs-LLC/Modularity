@@ -2,6 +2,7 @@
 
 #include <unordered_set>
 #include <array>
+#include <cctype>
 #include <cstdio>
 #include <chrono>
 #include <cstdlib>
@@ -442,6 +443,62 @@ bool PackageManager::isGloballyInstalled(const std::string& id) const {
     const bool installed = findVersionedPackageAtAnyVersion(globalPackagesFolder(), *pkg).has_value();
     globalInstallCache.emplace(id, installed);
     return installed;
+}
+
+namespace {
+// "1.10.0" > "1.9.2": compare dotted numbers field by field, missing fields as 0.
+bool packageVersionLess(const std::string& a, const std::string& b) {
+    std::istringstream sa(a), sb(b);
+    std::string fa, fb;
+    while (true) {
+        const bool hasA = static_cast<bool>(std::getline(sa, fa, '.'));
+        const bool hasB = static_cast<bool>(std::getline(sb, fb, '.'));
+        if (!hasA && !hasB) return false;
+        const long va = hasA ? std::strtol(fa.c_str(), nullptr, 10) : 0;
+        const long vb = hasB ? std::strtol(fb.c_str(), nullptr, 10) : 0;
+        if (va != vb) return va < vb;
+    }
+}
+
+// Newest "<id>-<version>" folder at most `depth` levels below root. The global and
+// registry layouts nest packages under <engine line>/<author>/.
+void findNewestPackageFolder(const fs::path& root, const std::string& id, int depth,
+                             fs::path& best, std::string& bestVersion) {
+    std::error_code ec;
+    if (root.empty() || !fs::is_directory(root, ec)) return;
+    const std::string prefix = id + "-";
+    for (const auto& entry : fs::directory_iterator(root, fs::directory_options::skip_permission_denied, ec)) {
+        std::error_code entryEc;
+        if (!entry.is_directory(entryEc)) continue;
+        const std::string name = entry.path().filename().string();
+        if (name.size() > prefix.size() && name.compare(0, prefix.size(), prefix) == 0 &&
+            std::isdigit(static_cast<unsigned char>(name[prefix.size()]))) {
+            const std::string version = name.substr(prefix.size());
+            if (best.empty() || packageVersionLess(bestVersion, version)) {
+                best = entry.path();
+                bestVersion = version;
+            }
+        } else if (depth > 0) {
+            findNewestPackageFolder(entry.path(), id, depth - 1, best, bestVersion);
+        }
+    }
+}
+} // namespace
+
+fs::path PackageManager::installedPackageRoot(const std::string& id) const {
+    if (id.empty()) return {};
+    const fs::path roots[] = {
+        projectRoot.empty() ? fs::path() : packagesFolder(),
+        globalPackagesFolder(),
+        registryRoot.empty() ? fs::path() : registryRoot / "Packages",
+    };
+    for (const fs::path& root : roots) {
+        fs::path best;
+        std::string bestVersion;
+        findNewestPackageFolder(root, id, 2, best, bestVersion);
+        if (!best.empty()) return normalizePath(best);
+    }
+    return {};
 }
 
 bool PackageManager::hasUpdateAvailable(const std::string& id) const {

@@ -119,8 +119,13 @@ and Inspector selection.
 
 ## Controller visuals
 
-`Resources/VR-Engine-Root/ControllerMaterials/*.controller` configure Valve Index
-and Touch Plus meshes, texture maps, PBR values and grip-relative alignment.
+The controller models ship as the `moduengine.vr-controllers` ModuPAK (7.0+), not
+in the engine's `Resources/`. Its `Editor/Resources/VR-Engine-Root/ControllerMaterials/*.controller`
+files configure Valve Index and Touch Plus meshes, texture maps, PBR values and
+grip-relative alignment; their `Resources/...` paths resolve against the package's
+`Editor/` folder. `PackageManager::installedPackageRoot` finds the package in the
+project, the global install, or a sibling Modu-Package-Manager checkout. Without it
+the VR editor logs one console hint and draws no controller models.
 Touch Plus model units are already meters. A small studio-light shader keeps
 controllers visible even in an empty project selector. The right Index OBJ's
 inverted/inconsistent normals were repaired in the resource and VR Thingy asset;
@@ -140,7 +145,7 @@ python tools/vr-editor/check_assets.py
 python tools/vr-editor/build_probe.py
 ```
 
-Run `build/release/VREditorProbe.exe` from `build/release`. It uses a hidden real
+Run `build/Dev-ExportedBuild/VREditorProbe.exe` from `build/Dev-ExportedBuild`. It uses a hidden real
 OpenGL context to verify controller pointer clicks, physical panel dragging,
 native tab docking/tearing, focus release, root hit testing, return gestures,
 joystick tool selection, hand-strip movement, navigation direction/speed,
