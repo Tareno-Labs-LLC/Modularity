@@ -247,7 +247,11 @@ inline const char* ProjectQualityPresetNote(ProjectQualityPreset preset) {
 
 struct ProjectGraphicsSettings {
     bool vsync = true;
+#ifdef __ANDROID__
     int targetFps = 60;
+#else
+    int targetFps = 0; // Uncapped unless VSync or an explicit frame limit is enabled.
+#endif
     int shadowQuality = 2;
     float renderResolutionScale = 1.0f;
     ProjectTextureFiltering textureFiltering = ProjectTextureFiltering::Bilinear;

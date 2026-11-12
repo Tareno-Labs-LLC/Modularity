@@ -446,12 +446,13 @@ const std::vector<ComponentSchema>& GetComponentSchemas() {
                 "materialOcclusionStrength", "materialEmissionColor", "materialEmissionStrength",
                 "materialAlphaCutoff",
                 "materialHeightScale", "materialParallaxSteps", "materialParallaxInvertHeight",
+                "materialshaderProfile",
                 "materialPath", "albedoTex", "overlayTex", "normalMap",
                 "metallicRoughnessMap", "metallicMap", "roughnessMap", "opacityMap",
                 "emissiveMap", "occlusionMap", "heightMap",
                 "shaderPack", "vertexShader", "fragmentShader", "useOverlay", "additionalMaterialCount"
             },
-            {"additionalMaterial"},
+            {"additionalMaterial", "materialshaderValue"},
             {},
             {
                 {"materialColor", "color"},
@@ -488,6 +489,7 @@ const std::vector<ComponentSchema>& GetComponentSchemas() {
                 {"materialHeightScale", "heightScale"},
                 {"materialParallaxSteps", "parallaxSteps"},
                 {"materialParallaxInvertHeight", "parallaxInvertHeight"},
+                {"materialshaderProfile", "shaderProfile"},
                 {"materialPath", "materialPath"},
                 {"albedoTex", "albedoTexture"},
                 {"overlayTex", "overlayTexture"},
@@ -539,6 +541,7 @@ const std::vector<ComponentSchema>& GetComponentSchemas() {
                 {"heightScale", "materialHeightScale"},
                 {"parallaxSteps", "materialParallaxSteps"},
                 {"parallaxInvertHeight", "materialParallaxInvertHeight"},
+                {"shaderProfile", "materialshaderProfile"},
                 {"materialPath", "materialPath"},
                 {"albedoTexture", "albedoTex"},
                 {"overlayTexture", "overlayTex"},
@@ -1286,6 +1289,15 @@ bool WriteModularScene(std::ostream& out,
     WriteField(out, 4, "skyboxWeatherRainSound", doc.settings.count("skyboxWeatherRainSound") ? doc.settings["skyboxWeatherRainSound"] : "", true);
     WriteField(out, 4, "skyboxWeatherHeavyRainSound", doc.settings.count("skyboxWeatherHeavyRainSound") ? doc.settings["skyboxWeatherHeavyRainSound"] : "", true);
     WriteField(out, 4, "skyboxWeatherThunderSound", doc.settings.count("skyboxWeatherThunderSound") ? doc.settings["skyboxWeatherThunderSound"] : "", true);
+    WriteField(out, 4, "skyboxWindEnabled", doc.settings.count("skyboxWindEnabled") ? doc.settings["skyboxWindEnabled"] : "1");
+    WriteField(out, 4, "skyboxWindYaw", doc.settings.count("skyboxWindYaw") ? doc.settings["skyboxWindYaw"] : "0");
+    WriteField(out, 4, "skyboxWindPitch", doc.settings.count("skyboxWindPitch") ? doc.settings["skyboxWindPitch"] : "0");
+    WriteField(out, 4, "skyboxWindMain", doc.settings.count("skyboxWindMain") ? doc.settings["skyboxWindMain"] : "1");
+    WriteField(out, 4, "skyboxWindTurbulence", doc.settings.count("skyboxWindTurbulence") ? doc.settings["skyboxWindTurbulence"] : "0.5");
+    WriteField(out, 4, "skyboxWindPulseMagnitude", doc.settings.count("skyboxWindPulseMagnitude") ? doc.settings["skyboxWindPulseMagnitude"] : "0.5");
+    WriteField(out, 4, "skyboxWindPulseFrequency", doc.settings.count("skyboxWindPulseFrequency") ? doc.settings["skyboxWindPulseFrequency"] : "0.25");
+    WriteField(out, 4, "skyboxWindMultiplier", doc.settings.count("skyboxWindMultiplier") ? doc.settings["skyboxWindMultiplier"] : "1");
+    WriteField(out, 4, "skyboxWindFollowWeather", doc.settings.count("skyboxWindFollowWeather") ? doc.settings["skyboxWindFollowWeather"] : "1");
     WriteField(out, 4, "skyboxCloudHorizonFade", doc.settings.count("skyboxCloudHorizonFade") ? doc.settings["skyboxCloudHorizonFade"] : "0.16");
     WriteField(out, 4, "skyboxSkyResolution", doc.settings.count("skyboxSkyResolution") ? doc.settings["skyboxSkyResolution"] : "256");
     WriteField(out, 4, "skyboxSkyRefreshInterval", doc.settings.count("skyboxSkyRefreshInterval") ? doc.settings["skyboxSkyRefreshInterval"] : "0.1");
@@ -1619,6 +1631,15 @@ void EmitFlatSceneDocument(std::ostream& out, const FlatSceneDocument& doc) {
             "skyboxWeatherRainSound",
             "skyboxWeatherHeavyRainSound",
             "skyboxWeatherThunderSound",
+            "skyboxWindEnabled",
+            "skyboxWindYaw",
+            "skyboxWindPitch",
+            "skyboxWindMain",
+            "skyboxWindTurbulence",
+            "skyboxWindPulseMagnitude",
+            "skyboxWindPulseFrequency",
+            "skyboxWindMultiplier",
+            "skyboxWindFollowWeather",
             "skyboxCloudHorizonFade",
             "skyboxSkyResolution",
             "skyboxSkyRefreshInterval",
@@ -1818,6 +1839,40 @@ void EmitFlatSceneDocument(std::ostream& out, const FlatSceneDocument& doc) {
             "materialEmissionColor", "materialEmissionStrength", "materialAlphaCutoff",
             "materialPath", "albedoTex", "overlayTex", "normalMap",
             "materialHeightScale", "materialParallaxSteps", "materialParallaxInvertHeight",
+            "materialshaderProfile",
+            "materialshaderValue0",
+            "materialshaderValue1",
+            "materialshaderValue2",
+            "materialshaderValue3",
+            "materialshaderValue4",
+            "materialshaderValue5",
+            "materialshaderValue6",
+            "materialshaderValue7",
+            "materialshaderValue8",
+            "materialshaderValue9",
+            "materialshaderValue10",
+            "materialshaderValue11",
+            "materialshaderValue12",
+            "materialshaderValue13",
+            "materialshaderValue14",
+            "materialshaderValue15",
+            "materialshaderValue16",
+            "materialshaderValue17",
+            "materialshaderValue18",
+            "materialshaderValue19",
+            "materialshaderValue20",
+            "materialshaderValue21",
+            "materialshaderValue22",
+            "materialshaderValue23",
+            "materialshaderValue24",
+            "materialshaderValue25",
+            "materialshaderValue26",
+            "materialshaderValue27",
+            "materialshaderValue28",
+            "materialshaderValue29",
+            "materialshaderValue30",
+            "materialshaderValue31",
+
             "metallicRoughnessMap", "metallicMap", "roughnessMap", "opacityMap",
             "emissiveMap", "occlusionMap", "heightMap",
             "shaderPack", "vertexShader", "fragmentShader",
@@ -1835,7 +1890,9 @@ void EmitFlatSceneDocument(std::ostream& out, const FlatSceneDocument& doc) {
         const std::vector<std::string> postMaterialKeys = {
             "nextInspectorScriptId", "componentOrder", "scripts", "scriptCount",
             "lightColor", "lightType", "lightIntensity", "lightRange", "lightEdgeFade", "lightInner", "lightOuter",
-            "lightSize", "lightCastShadows", "lightSoftShadows", "lightShadowBias", "lightShadowSoftness", "lightShadowResolution", "lightEnabled",
+            "lightSize", "lightCastShadows", "lightSoftShadows", "lightShadowBias", "lightShadowSoftness", "lightShadowResolution",
+            "lightShadowOpacity", "lightDynamicShadowOpacity", "lightShadowOpacityOutside", "lightShadowOpacityMin",
+            "lightShadowOpacityMax", "lightShadowOpacityFadeIn", "lightShadowOpacityFadeOut", "lightEnabled",
             "reflectionCastEnabled", "reflectionCastUpdateMode", "reflectionCastBox", "reflectionCastBlend", "reflectionCastIntensity", "reflectionCastResolution",
             "light2dEnabled", "light2dType", "light2dColor", "light2dIntensity", "light2dRadius", "light2dInnerRadius",
             "light2dOuterRadius", "light2dFalloffStrength", "light2dInnerSpotAngle", "light2dOuterSpotAngle",

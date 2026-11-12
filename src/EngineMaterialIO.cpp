@@ -1,21 +1,64 @@
+#include "MaterialShaderProfile.h"
 #include "EngineMaterialIO.h"
 #include "DurableFile.h"
 #include "MaterialAssetUtils.h"
 #include <algorithm>
+#include <cctype>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <iostream>
+#include <limits>
 #include <sstream>
+
+namespace {
+// Unity's text-serialized .mat shares our extension and opens with "%YAML"
+// (optionally behind a UTF-8 BOM). Neither the reader nor the writer may treat
+// one as a Modularity material.
+bool StartsWithUnityYamlHeader(const std::string& text) {
+    size_t start = 0;
+    if (text.size() >= 3 && static_cast<unsigned char>(text[0]) == 0xEF &&
+        static_cast<unsigned char>(text[1]) == 0xBB && static_cast<unsigned char>(text[2]) == 0xBF) {
+        start = 3;
+    }
+    return text.compare(start, 5, "%YAML") == 0;
+}
+
+bool FileStartsWithUnityYamlHeader(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open()) return false;
+    char head[8] = {};
+    in.read(head, sizeof(head));
+    return StartsWithUnityYamlHeader(std::string(head, static_cast<size_t>(in.gcount())));
+}
+
+
+} // namespace
+
 // `path` only anchors a relative shaderPack reference; the text comes from `f`.
 static bool readMaterialStream(std::istream& f, const std::string& path, MaterialFileData& outData) {
     std::string line;
+    bool firstLine = true;
     while (std::getline(f, line)) {
+        if (firstLine) {
+            firstLine = false;
+            // A Unity YAML .mat would otherwise "parse" as an all-defaults material.
+            if (StartsWithUnityYamlHeader(line)) return false;
+        }
         line.erase(0, line.find_first_not_of(" \t\r\n"));
         if (line.empty() || line[0] == '#') continue;
         auto pos = line.find('=');
         if (pos == std::string::npos) continue;
         std::string key = line.substr(0, pos);
         std::string val = line.substr(pos + 1);
-        if (key == "color") {sscanf(val.c_str(), "%f,%f,%f", &outData.props.color.r, &outData.props.color.g, &outData.props.color.b);}
+        if (!val.empty() && val.back() == '\r') val.pop_back();
+        // One malformed value (a blank "alpha=" from a hand edit, say) skips that
+        // line instead of throwing out of the Inspector's frame.
+        try {
+        if (ParseMaterialShaderParameter(key, val, outData.props.shaderParameters)) {}
+        else if (key == "color") {sscanf(val.c_str(), "%f,%f,%f", &outData.props.color.r, &outData.props.color.g, &outData.props.color.b);}
         else if (key == "opacity" || key == "alpha") {outData.props.alpha = std::clamp(std::stof(val), 0.0f, 1.0f);}
         else if (key == "ambient")          {outData.props.ambientStrength = std::stof(val);}
         else if (key == "specular")         {outData.props.specularStrength = std::stof(val);}
@@ -64,10 +107,19 @@ static bool readMaterialStream(std::istream& f, const std::string& path, Materia
         else if (key == "overlay")          {outData.overlay = val;}
         else if (key == "normal")           {outData.normal = val;}
         else if (key == "useOverlay")       {outData.useOverlay = std::stoi(val) != 0;}
-        else if (key == "shaderPack")       {outData.shaderPack = ResolveShaderPackReferencedPath(fs::path(path), val).string();}
+        else if (key == "shaderPack") {
+            outData.shaderPack = val.empty() ? std::string() :
+                (Modularity::Platform::GetAssetSource().Exists(val)
+                    ? Modularity::Platform::ResolveAssetPath(val)
+                    : ResolveShaderPackReferencedPath(fs::path(path), val).string());
+        }
         else if (key == "vertexShader")     {outData.vertexShader = val;}
-        else if (key == "fragmentShader")   {outData.fragmentShader = val;} }
+        else if (key == "fragmentShader")   {outData.fragmentShader = val;}
+        } catch (const std::exception&) {}
+    }
     if (!outData.shaderPack.empty()) {
+        if (!outData.props.usesProjectShader())
+            SetMaterialShaderProfile(outData.props.shaderParameters, outData.shaderPack);
         ShaderPackAssetData shaderPackData;
         if (ReadShaderPackFile(outData.shaderPack, shaderPackData)) {outData.vertexShader = shaderPackData.vertexShaderPath; outData.fragmentShader = shaderPackData.fragmentShaderPath;}}
     return true;
@@ -84,6 +136,10 @@ bool writeMaterialFile(const MaterialFileData& data, const std::string& path) {
     // Built in memory and written through WriteFileDurably: the Inspector autosaves a material
     // every time an edit settles, and a plain ofstream truncates first, so a crash right after
     // could leave the .mat as zero bytes (see DurableFile.h).
+    if (FileStartsWithUnityYamlHeader(path)) {
+        std::cerr << "[Material] Refusing to overwrite a Unity YAML .mat: " << path << "\n";
+        return false;
+    }
     std::ostringstream f;
     f << "# Material\n";
     f << "color=" << data.props.color.r << "," << data.props.color.g << "," << data.props.color.b << "\n";
@@ -119,6 +175,7 @@ bool writeMaterialFile(const MaterialFileData& data, const std::string& path) {
     f << "heightScale=" << data.props.heightScale << "\n";
     f << "parallaxSteps=" << data.props.parallaxSteps << "\n";
     f << "parallaxInvertHeight=" << (data.props.parallaxInvertHeight ? 1 : 0) << "\n";
+    WriteMaterialShaderParameters(f, data.props.shaderParameters);
     f << "useOverlay=" << (data.useOverlay ? 1 : 0) << "\n";
     f << "albedo=" << data.albedo << "\n";
     f << "overlay=" << data.overlay << "\n";

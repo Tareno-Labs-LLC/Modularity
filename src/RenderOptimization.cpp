@@ -704,7 +704,11 @@ int Renderer::OptimizationState::dispatchGpuCulling(const Pass& pass,
 
     const GLuint zero = 0;
     glBindBuffer(GL_COPY_WRITE_BUFFER, md.counterBuffer);
-    glBufferSubData(GL_COPY_WRITE_BUFFER, 0, sizeof(GLuint), &zero);
+    // Reset on the GPU timeline. A CPU subdata write here implicitly waits for
+    // earlier culling dispatches/readback copies using this same counter.
+    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+    glClearBufferSubData(GL_COPY_WRITE_BUFFER, GL_R32UI, 0, sizeof(GLuint),
+                         GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
     glBindBuffer(GL_COPY_WRITE_BUFFER, 0);
 
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, md.boundsBuffer);
@@ -719,7 +723,7 @@ int Renderer::OptimizationState::dispatchGpuCulling(const Pass& pass,
     for (const GpuReadback& candidate : readbacks) {
         anyPending = anyPending || candidate.pending;
     }
-    if (!anyPending && pass.frameSerial >= readbackIssueFrame + 15) {
+    if (!pass.multiview && !anyPending && pass.frameSerial >= readbackIssueFrame + 15) {
         readback = &readbacks[0];
         readbackIssueFrame = pass.frameSerial;
     }

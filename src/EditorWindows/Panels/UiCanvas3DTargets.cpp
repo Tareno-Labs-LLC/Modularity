@@ -22,6 +22,8 @@ void Engine::renderUiCanvas3DTargets() {
   if (!mainContext)
     return;
 
+  updateXRUiInput();
+
   MODU_PROFILE_SCOPE("UI Canvas 3D", ProfilerSampleCategory::UI);
   UiCanvas3DFrameStats frameStats;
   ImGuiStyle mainStyle = ImGui::GetStyle();
@@ -255,6 +257,7 @@ void Engine::renderUiCanvas3DTargets() {
       return obj.ui.textEffectFlags != 0;
     if (obj.ui.type == UIElementType::Image ||
         obj.ui.type == UIElementType::Sprite2D) {
+      if (HasUiImageMaterialShader(obj)) return true;
       const glm::vec2 dir = obj.material.scrollDirection;
       return obj.material.uvScrollEnabled &&
              std::abs(obj.material.scrollSpeed) > 0.0f &&
@@ -803,17 +806,31 @@ void Engine::renderUiCanvas3DTargets() {
           }
         }
         std::array<ImVec2, 4> uvQuad = buildSpriteSheetUvs(obj);
+        bool renderedMaterialShader = false;
+        if (HasUiImageMaterialShader(obj)) {
+          spriteBatch.flush();
+          const unsigned int shadedTexture = RenderUiImageMaterialShader(
+              renderer, obj, drawSize, uvQuad, texId, ImGui::GetTime());
+          if (shadedTexture != 0) {
+            texId = shadedTexture;
+            uvQuad = {ImVec2(0.0f, 1.0f), ImVec2(1.0f, 1.0f),
+                      ImVec2(1.0f, 0.0f), ImVec2(0.0f, 0.0f)};
+            renderedMaterialShader = true;
+          }
+        }
         const int frame = resolveSpriteSheetFrame(obj);
         const ImVec2 sourceFrameSizePx =
             ResolveUiSourceFrameSizePx(obj, frame, spriteTex);
         ImVec4 tint(obj.ui.color.r, obj.ui.color.g, obj.ui.color.b,
                     obj.ui.color.a);
-        const ImU32 tintColor = ImGui::GetColorU32(tint);
+        const ImU32 tintColor = renderedMaterialShader
+                                    ? IM_COL32_WHITE
+                                    : ImGui::GetColorU32(tint);
         float angle = elementRotRad;
-        if (DrawScrollingUiSprite(spriteBatch, (ImTextureID)(intptr_t)texId,
+        if (!renderedMaterialShader && DrawScrollingUiSprite(spriteBatch, (ImTextureID)(intptr_t)texId,
                                   obj, drawMin, drawMax, angle, tintColor,
                                   ImGui::GetTime())) {
-        } else if (DrawNineSliceSprite(spriteBatch, (ImTextureID)(intptr_t)texId, obj,
+        } else if (!renderedMaterialShader && DrawNineSliceSprite(spriteBatch, (ImTextureID)(intptr_t)texId, obj,
                                 drawMin, drawMax, uvQuad, sourceFrameSizePx,
                                 angle, tintColor)) {
         } else if (std::abs(angle) > 1e-4f) {

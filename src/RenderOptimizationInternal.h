@@ -57,6 +57,7 @@ struct CachedRenderable {
     RenderType renderType = RenderType::None;
     bool faceCamera = false;
     bool hasLocalBounds = false;
+    bool windPadded = false;      // cull bounds were grown for auxiliary wind sway
     bool transformValid = false;
 
     glm::mat4 model{1.0f};
@@ -78,6 +79,12 @@ struct CachedRenderable {
     uint64_t alphaTextureGeneration = UINT64_MAX;
     bool albedoAlphaBlend = false;
     bool overlayAlphaBlend = false;
+
+    // Whether the shadow pass must sample this caster's alpha (cut-out, translucent or
+    // textured with alpha), valid for the same (materialVersion, texture generation).
+    uint32_t shadowAlphaMaterialVersion = 0;
+    uint64_t shadowAlphaTextureGeneration = UINT64_MAX;
+    bool shadowNeedsAlpha = false;
 
     // Merged into a static batch, valid for the static merge generation.
     bool staticMergeSource = false;
@@ -273,6 +280,7 @@ struct Renderer::OptimizationState {
         uint32_t cullingMask = 0xFFFFFFFFu;
         bool drawMirrorObjects = true;
         bool reflectionCapture = false;
+        bool multiview = false;      // timer queries are undefined for OVR multiview
         unsigned int depthTexture = 0;   // sampleable scene depth, 0 when not published
 
         std::vector<uint32_t> candidates;          // renderable in this view, not batched
@@ -469,6 +477,10 @@ struct Renderer::OptimizationState {
     void refreshMaterials(const std::vector<SceneObject>& sceneObjects, uint64_t frameSerial,
                           bool forceRecompute);
     bool resolveAlphaBlend(Renderer& renderer, uint32_t objectIndex, const SceneObject& obj);
+    // Whether a shadow caster must sample alpha (opacity map, translucency, or an albedo
+    // with binary/partial alpha). Cached on (materialVersion, texture generation).
+    bool shadowNeedsAlphaSampling(Renderer& renderer, uint32_t objectIndex, const SceneObject& obj);
+    static bool albedoNeedsShadowAlpha(Renderer& renderer, const SceneObject& obj);
     void refreshStaticMerge(Renderer& renderer, const std::vector<SceneObject>& sceneObjects,
                             bool useCachedSignature);
     bool isMultiDrawEligible(Renderer& renderer, const Pass& pass, uint32_t objectIndex,

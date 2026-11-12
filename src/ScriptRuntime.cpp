@@ -3047,7 +3047,7 @@ ScriptRuntime::Module* ScriptRuntime::getModule(const fs::path& binaryPath) {
     if (androidSonameLoad) {
         mod.loadedPath = androidSoname;
         mod.loadedFromShadowCopy = false;
-        mod.handle = dlopen(androidSoname.c_str(), RTLD_LAZY);
+        mod.handle = dlopen(androidSoname.c_str(), RTLD_NOW);
     } else
 #endif
     {

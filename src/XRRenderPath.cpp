@@ -184,6 +184,40 @@ bool Engine::renderXRFrame() {
 #endif
     if (render) {
         const uint32_t viewCount = xrSystem.viewCount();
+        if (viewCount == 2 && xrSystem.activeRenderMode() == Modularity::XR::XRRenderMode::SinglePassMultiview) {
+            Modularity::XR::XRRenderView views[2];
+            Camera eyes[2] = {xrCamera, xrCamera};
+            glm::mat4 projections[2];
+            unsigned int targets[2]{};
+            bool ready = true;
+            for (uint32_t i = 0; i < 2; ++i) {
+                if (!xrSystem.beginView(i, views[i])) { ready = false; break; }
+                const glm::mat4 eyeToWorld = glm::inverse(xrSystem.viewMatrix(i));
+                eyes[i].position = glm::vec3(eyeToWorld[3]);
+                eyes[i].front = glm::normalize(-glm::vec3(eyeToWorld[2]));
+                eyes[i].up = glm::normalize(glm::vec3(eyeToWorld[1]));
+                projections[i] = xrSystem.projectionMatrix(i);
+                targets[i] = views[i].framebuffer;
+            }
+            if (ready) {
+                const bool shared = renderer.renderStereoSceneToTargets(eyes, sceneObjects, targets,
+                    static_cast<int>(views[0].width), static_cast<int>(views[0].height),
+                    projections, nearPlane, farPlane);
+                Modularity::XR::MutableDiagnostics().activeRenderMode = shared
+                    ? "Single Pass / Multiview" : "Multi Pass (material fallback)";
+                if (!shared) {
+                    // A custom shader or CPU billboard may require separate views.
+                    // The same acquired image's individual layers remain valid targets.
+                    for (int i = 0; i < 2; ++i) {
+                        renderer.renderSceneToTarget(eyes[i], sceneObjects, targets[i],
+                            static_cast<int>(views[i].width), static_cast<int>(views[i].height),
+                            projections[i], nearPlane, farPlane, true, true, i);
+                    }
+                }
+                renderer.endRender();
+            }
+            xrSystem.endView(1);
+        } else {
         for (uint32_t viewIndex = 0; viewIndex < viewCount; ++viewIndex) {
             Modularity::XR::XRRenderView view;
             if (!xrSystem.beginView(viewIndex, view)) continue;
@@ -200,7 +234,7 @@ bool Engine::renderXRFrame() {
             renderer.renderSceneToTarget(xrCamera, sceneObjects, view.framebuffer,
                                          static_cast<int>(view.width),
                                          static_cast<int>(view.height), projection, nearPlane,
-                                         farPlane, true, true);
+                                         farPlane, true, true, static_cast<int>(viewIndex));
             renderer.endRender();
 
 #if !MODULARITY_RUNTIME_ONLY
@@ -224,6 +258,7 @@ bool Engine::renderXRFrame() {
 #endif
 
             xrSystem.endView(viewIndex);
+        }
         }
     }
 

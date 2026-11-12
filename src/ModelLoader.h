@@ -157,6 +157,14 @@ private:
     ModelLoader(const ModelLoader&) = delete;
     ModelLoader& operator=(const ModelLoader&) = delete;
 
+    // Unity Mesh .asset files (UnityAssetImport). They need no assimp, so these live outside
+    // the assimp guard and work in runtime builds that compile it out.
+    // loadUnityMeshMerged: every submesh in one mesh, for thumbnails and previews.
+    // loadUnityMeshScene: one mesh per submesh, named after the prefab's materials when the
+    // Unity project is around.
+    ModelLoadResult loadUnityMeshMerged(const std::string& filepath);
+    bool loadUnityMeshScene(const std::string& filepath, ModelSceneData& out, std::string& errorMsg);
+
 #if MODULARITY_ENABLE_ASSIMP
     // Process Assimp scene
     void processNode(aiNode* node, const aiScene* scene, const aiMatrix4x4& parentTransform,

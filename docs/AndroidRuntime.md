@@ -96,6 +96,14 @@ adb logcat -s Modularity:V Modularity.stderr:V Modularity.stdout:V
 > buffer format and the EGL config disagree, some phones just composite nothing
 > and tell you absolutely nothing about it. been there.
 
+If the player stays on the purple background, inspect renderer initialization in
+logcat before assuming the scene is absent. Mali requires an explicit precision
+for `sampler3D`; the GLES shader preamble supplies it even when voxel GI is off.
+A failed default shader prevents the engine from reaching scene loading.
+Project files are read in binary mode with CRLF normalized explicitly, so values
+such as `pipeline=2D`, scene names, and booleans parse identically when a Windows
+export runs on Android.
+
 ## Touch input
 
 Touch is wired all the way through, so you don't have to special-case Android in
@@ -158,6 +166,23 @@ So the Android build does two things:
    and drops a 0-byte placeholder at the script's normal bundle path so the
    engine's "is this script compiled?" check still passes.
 
+Each exported script links explicitly against `libModularityPlayer.so` and the
+NDK shared C++ runtime. Missing engine exports fail the build at link time;
+NativeActivity's local library loading scope must not be relied on to expose
+engine symbols to unrelated script libraries. Script ELF load segments support
+16 KB pages, matching the player and APK alignment.
+
+Android exports also preserve runtime files under the project's `Assets` tree.
+This includes script-loaded files (numbered animation frames, font files, voice
+variants, and paths in script defaults) that scene reference scanning cannot
+discover. Script/editor sources and unselected scenes are excluded from this
+copy; selected scenes are serialized through the usual staging process. This
+can make APKs larger than a build that only copies explicit scene references.
+Android's asset source also resolves Windows-authored paths against extracted
+project content, including compressed audio sidecars. APK-only bundle extraction
+checks a content hash before reusing its cache, so an app update cannot retain
+the previous build's assets even when the bundle name and size are unchanged.
+
 At runtime, `ScriptRuntime::getModule` (`src/ScriptRuntime.cpp`) detects the
 Android case and `dlopen`s the library **by soname** from `nativeLibraryDir`
 instead of by bundle path. The packager and the loader derive that soname from
@@ -208,6 +233,10 @@ import an entire external folder in one action.
 
 ## Requirements / gotchas
 
+- Player startup width/height control the desktop window. Android uses the saved
+  Game Viewport resolution and scales its camera framing to the device surface.
+  A custom 900x600 viewport therefore shows the same world area on a tablet as
+  in the editor, regardless of the tablet's physical pixel resolution.
 - Needs a working desktop build environment, since the APK build builds the
   native editor first. (This is why it isn't a pure cross-compile.)
 - APK packaging and the debug signing key need a JDK. `JAVA_HOME` and the

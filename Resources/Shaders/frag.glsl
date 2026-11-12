@@ -138,6 +138,10 @@ uniform float lightShadowBiasArr[MAX_LIGHTS];
 uniform float lightShadowSoftnessArr[MAX_LIGHTS];
 uniform float lightShadowFarArr[MAX_LIGHTS];
 uniform mat4 lightShadowMatrixArr[MAX_LIGHTS];
+// x opacity, y outside opacity, z min distance, w max distance. Static opacity
+// is sent as x == y, so the distance terms drop out.
+uniform vec4 lightShadowOpacityArr[MAX_LIGHTS];
+uniform vec2 lightShadowOpacityFadeArr[MAX_LIGHTS]; // x fade in, y fade out
 
 uniform samplerCube shadowCube0;
 uniform samplerCube shadowCube1;
@@ -263,15 +267,11 @@ float computeShadowOcclusion(int lightIndex, vec3 lightToFrag, float nl, vec3 wo
         if (projCoords.z <= 0.0 || projCoords.z >= 1.0) return 0.0;
         if (projCoords.x <= 0.0 || projCoords.x >= 1.0 || projCoords.y <= 0.0 || projCoords.y >= 1.0) return 0.0;
 
-        float closestDepth = sampleDirectionalShadow(mapIndex, projCoords.xy);
-        if (mode == 1) {
-            return (projCoords.z - bias > closestDepth) ? 1.0 : 0.0;
-        }
-
         float softness = max(lightShadowSoftnessArr[lightIndex], 0.0);
         vec2 texelSize = getDirectionalShadowTexelSize(mapIndex);
-        if (softness <= 0.0001 || texelSize.x <= 0.0 || texelSize.y <= 0.0 ||
+        if (mode == 1 || softness <= 0.0001 || texelSize.x <= 0.0 || texelSize.y <= 0.0 ||
             shadowFilterQuality <= 0) {
+            float closestDepth = sampleDirectionalShadow(mapIndex, projCoords.xy);
             return (projCoords.z - bias > closestDepth) ? 1.0 : 0.0;
         }
 
@@ -314,17 +314,9 @@ float computeShadowOcclusion(int lightIndex, vec3 lightToFrag, float nl, vec3 wo
     float farPlane = max(lightShadowFarArr[lightIndex], 0.001);
     float currentDepth = length(lightToFrag);
     if (currentDepth <= 0.0001) return 0.0;
-    float hardDepth = sampleShadowCube(mapIndex, lightToFrag) * farPlane;
-    if (mode == 1) {
-        return (currentDepth - bias > hardDepth) ? 1.0 : 0.0;
-    }
-
     float softness = max(lightShadowSoftnessArr[lightIndex], 0.0);
-    if (softness <= 0.0001) {
-        return (currentDepth - bias > hardDepth) ? 1.0 : 0.0;
-    }
-
-    if (shadowFilterQuality <= 0) {
+    if (mode == 1 || softness <= 0.0001 || shadowFilterQuality <= 0) {
+        float hardDepth = sampleShadowCube(mapIndex, lightToFrag) * farPlane;
         return (currentDepth - bias > hardDepth) ? 1.0 : 0.0;
     }
 
@@ -376,6 +368,23 @@ float computeShadowOcclusion(int lightIndex, vec3 lightToFrag, float nl, vec3 wo
         weightSum += w;
     }
     return shadow / max(weightSum, 0.0001);
+}
+
+// How strongly this light's shadow darkens a receiver at lightDistance. The
+// light's opacity holds from min to max distance and blends to the outside
+// opacity across fade in (inward of min) and fade out (outward of max). A
+// zero-width fade is a hard edge; smoothstep is undefined there, so it's
+// branched rather than passed equal edges.
+float shadowOpacityAt(int lightIndex, float lightDistance)
+{
+    vec4 o = lightShadowOpacityArr[lightIndex];
+    if (o.x == o.y) return o.x;
+    vec2 fade = lightShadowOpacityFadeArr[lightIndex];
+    float inner = (fade.x > 0.0) ? smoothstep(o.z - fade.x, o.z, lightDistance)
+                                 : step(o.z, lightDistance);
+    float outer = (fade.y > 0.0) ? 1.0 - smoothstep(o.w, o.w + fade.y, lightDistance)
+                                 : step(lightDistance, o.w);
+    return mix(o.y, o.x, inner * outer);
 }
 #endif // !MODU_ES2 (shadows)
 
@@ -867,7 +876,13 @@ void main()
             attenuation *= spotAtten;
         }
 
+        // Outside the spot/area falloff this light contributes nothing.
+        if (attenuation <= 0.0) continue;
+
         float nl = max(dot(norm, lDirN), 0.0);
+        // Both diffuse and direct specular are zero on this side of the
+        // normal. Area samples can face differently from their centre ray.
+        if (nl <= 0.0 && !isArea) continue;
         vec3 diffuse = nl * diffuseColor * lightColorArr[i] * intensity;
         if (usePbr) {
             // Energy split: light the microfacet layer reflects cannot also
@@ -948,10 +963,14 @@ void main()
 #ifndef MODU_ES2
         if (lightShadowKindArr[i] != 0) {
             shadow = computeShadowOcclusion(i, FragPos - lightPosArr[i], nl, FragPos);
+            if (shadow > 0.0 && lightTypeArr[i] != 0) {
+                shadow *= shadowOpacityAt(i, length(FragPos - lightPosArr[i]));
+            }
         }
 #endif
 
         lighting += (1.0 - shadow) * (attenuation * diffuse + specular);
+
     }
 
     // Indirect diffuse from the voxel volume. Scaled by the occlusion map for

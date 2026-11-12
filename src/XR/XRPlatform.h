@@ -21,6 +21,15 @@
     #define XR_USE_PLATFORM_WIN32
 #endif
 
+// The Xlib binding struct names Display, GLXFBConfig, GLXDrawable and GLXContext,
+// so the binding TU must have <X11/Xlib.h> and <GL/glx.h> included before this
+// header (XRDesktopGL.cpp gets both from glfw3native.h). Every other TU stays free
+// of X11's macro namespace (None, Bool, Status, Success...).
+#if defined(MODULARITY_XR_PLATFORM_BINDING_TU) && defined(XR_USE_GRAPHICS_API_OPENGL) && \
+    defined(__linux__) && !defined(__ANDROID__)
+    #define XR_USE_PLATFORM_XLIB
+#endif
+
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
@@ -48,7 +57,8 @@
     #define MODULARITY_XR_HAS_GRAPHICS_BINDING 0
 #endif
 
-#if defined(XR_USE_GRAPHICS_API_OPENGL) && defined(_WIN32)
+#if defined(XR_USE_GRAPHICS_API_OPENGL) && \
+    (defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__)))
     #define MODULARITY_XR_HAS_DESKTOP_GL_BINDING 1
 #else
     #define MODULARITY_XR_HAS_DESKTOP_GL_BINDING 0

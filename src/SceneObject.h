@@ -1,9 +1,11 @@
 #pragma once
+#include "MaterialShaderParameters.h"
 
 #include "ScriptSdkCommon.h"
 #include "Lighting2DTypes.h"
 #include "AudioFX.h"
 #include <algorithm>
+#include <type_traits>
 #include <unordered_set>
 
 enum class ObjectType {
@@ -118,7 +120,16 @@ struct MaterialProperties {
     float heightScale = 0.0f;
     int parallaxSteps = 32;
     bool parallaxInvertHeight = false;
+
+    MaterialShaderParameters shaderParameters;
+    bool usesProjectShader() const { return shaderParameters.profileId != 0; }
+
 };
+
+// The renderer compares and hashes materials as raw bytes (refreshMaterials'
+// memcmp), so nothing here may own heap memory.
+static_assert(std::is_trivially_copyable<MaterialProperties>::value,
+              "MaterialProperties must stay trivially copyable");
 
 enum class LightType {
     Directional = 0,
@@ -391,6 +402,18 @@ struct LightComponent {
     float shadowSoftness = 0.04f;
     int shadowResolution = 0; // 0 = use renderer default
     bool enabled = true;
+    // Shadow opacity (point/spot/area; directional shadows stay opaque).
+    // 1 = full shadow, 0 = no shadow. With dynamicShadowOpacity on, the
+    // opacity applies between min and max distance from the light, fading
+    // to shadowOpacityOutside over fadeIn (inward of min) and fadeOut
+    // (outward of max). A fade of 0 is a hard edge.
+    float shadowOpacity = 1.0f;
+    bool dynamicShadowOpacity = false;
+    float shadowOpacityOutside = 1.0f;
+    float shadowOpacityMinDistance = 0.0f;
+    float shadowOpacityMaxDistance = 5.0f;
+    float shadowOpacityFadeIn = 0.0f;
+    float shadowOpacityFadeOut = 2.0f;
 };
 
 struct ReflectionCastComponent {
@@ -516,9 +539,9 @@ struct PostFXSettings {
     float saturation = 1.0f;
     glm::vec3 colorFilter = glm::vec3(1.0f);
     bool motionBlurEnabled = false;
-    float motionBlurStrength = 0.15f; // 0..1 blend with previous frame
-    float motionBlurThreshold = 0.04f;
-    float motionBlurClamp = 0.35f;
+    float motionBlurStrength = 0.15f; // Shutter duration relative to 1/60 second
+    float motionBlurThreshold = 0.04f; // Minimum motion in pixels / 10
+    float motionBlurClamp = 0.35f; // Maximum trail as a fraction of image height / 0.1
     bool vignetteEnabled = false;
     float vignetteIntensity = 0.35f;
     float vignetteSmoothness = 0.25f;
@@ -541,7 +564,7 @@ struct PostFXSettings {
     bool sharpenEnabled = false;
     float sharpenStrength = 0.15f;
     bool ambientOcclusionEnabled = false;
-    float aoRadius = 0.0035f;
+    float aoRadius = 0.0035f; // World-space radius in meters / 100 (legacy serialization scale)
     float aoStrength = 0.6f;
     bool ditherEnabled = false;
     float ditherIntensity = 0.65f;

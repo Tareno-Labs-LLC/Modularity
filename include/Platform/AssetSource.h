@@ -77,7 +77,8 @@ std::unique_ptr<AssetSource> MakeBundleAssetSource(std::unique_ptr<AssetSource> 
 // e.g. /home/<someone>/ModularityProjects/<name>/Assets/... - which exists nowhere locally
 // and silently loads as a missing texture. With this set, DesktopAssetSource re-roots such a
 // path onto the open project when (and only when) that produces a file that actually exists.
-// Pass an empty string to disable. No effect on the Android source, which is APK-relative.
+// Pass an empty string to disable. Android applies this to extracted filesystem
+// content before falling back to the APK's assets.
 void SetPortableAssetRoot(const std::string& projectRoot);
 
 // Apply that same rescue to a single path and hand back something openable. Returns `path`

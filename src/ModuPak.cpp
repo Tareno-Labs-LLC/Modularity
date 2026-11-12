@@ -1,3 +1,4 @@
+#include "MaterialShaderProfile.h"
 #include "ModuPak.h"
 #include "ProjectManager.h"
 #include "../include/Platform/AssetSource.h"
@@ -748,7 +749,19 @@ bool ModuObjExporter::exportObject(const fs::path& projectRoot,
         collectDependency(deps, projectRoot, obj.albedoTexturePath);
         collectDependency(deps, projectRoot, obj.overlayTexturePath);
         collectDependency(deps, projectRoot, obj.normalMapPath);
+        collectDependency(deps, projectRoot, obj.metallicRoughnessMapPath);
+        collectDependency(deps, projectRoot, obj.metallicMapPath);
+        collectDependency(deps, projectRoot, obj.roughnessMapPath);
+        collectDependency(deps, projectRoot, obj.opacityMapPath);
+        collectDependency(deps, projectRoot, obj.emissiveMapPath);
+        collectDependency(deps, projectRoot, obj.occlusionMapPath);
+        collectDependency(deps, projectRoot, obj.heightMapPath);
         collectDependency(deps, projectRoot, obj.shaderPackPath);
+        collectDependency(deps, projectRoot, obj.material.shaderParameters.profilePath);
+        const auto& profile=GetMaterialShaderProfile(obj.material.shaderParameters.profileId);
+        for(const auto* stage : {&profile.vert,&profile.frag,&profile.gbufferFrag,&profile.shadowDirVert,&profile.shadowCubeVert}) {
+            collectDependency(deps,projectRoot,stage->substr(0,stage->find('?')));
+        }
         collectDependency(deps, projectRoot, obj.vertexShaderPath);
         collectDependency(deps, projectRoot, obj.fragmentShaderPath);
         for (const ScriptComponent& script : obj.scripts) collectDependency(deps, projectRoot, script.path);

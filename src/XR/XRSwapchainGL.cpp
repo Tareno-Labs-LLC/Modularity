@@ -167,9 +167,10 @@ bool XRSwapchainGL::create(XrSession session, int64_t colorFormat, uint32_t widt
     XrSwapchainCreateInfo createInfo{};
     createInfo.type = XR_TYPE_SWAPCHAIN_CREATE_INFO;
     createInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
-                            XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+                            XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
     createInfo.format = colorFormat;
-    createInfo.sampleCount = std::max(1u, sampleCount);
+    // The renderer resolves its own HDR/depth arrays before presentation.
+    createInfo.sampleCount = arraySize > 1 ? 1u : std::max(1u, sampleCount);
     createInfo.width = width;
     createInfo.height = height;
     createInfo.faceCount = 1;
@@ -289,6 +290,24 @@ bool XRSwapchainGL::buildFramebuffers(std::string& outError) {
             ok = false;
             break;
         }
+        if (layered) {
+            glGenFramebuffers(2, target.layerFramebuffers);
+            for (uint32_t layer = 0; layer < 2; ++layer) {
+                glBindFramebuffer(GL_FRAMEBUFFER, target.layerFramebuffers[layer]);
+                glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, target.colorTexture, 0, layer);
+                glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, target.depthTexture, 0, layer);
+                if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+                    outError = "OpenXR eye-layer framebuffer is incomplete.";
+                    ok = false;
+                }
+            }
+            if (!ok) {
+                glDeleteFramebuffers(2, target.layerFramebuffers);
+                glDeleteFramebuffers(1, &target.framebuffer);
+                glDeleteTextures(1, &target.depthTexture);
+                break;
+            }
+        }
         images_.push_back(target);
     }
 
@@ -343,7 +362,7 @@ bool XRSwapchainGL::acquireAndWait(uint32_t& outFramebuffer, std::string& outErr
     }
 
     acquiredIndex_ = static_cast<int>(index);
-    outFramebuffer = images_[index].framebuffer;
+    outFramebuffer = acquiredLayerFramebuffer(0);
     return true;
 }
 
@@ -364,9 +383,16 @@ bool XRSwapchainGL::release(std::string& outError) {
     return true;
 }
 
+uint32_t XRSwapchainGL::acquiredLayerFramebuffer(uint32_t layer) const {
+    if (acquiredIndex_ < 0 || static_cast<size_t>(acquiredIndex_) >= images_.size() || layer >= arraySize_) return 0;
+    const auto& target = images_[static_cast<size_t>(acquiredIndex_)];
+    return arraySize_ > 1 && layer < 2 ? target.layerFramebuffers[layer] : target.framebuffer;
+}
+
 void XRSwapchainGL::destroy() {
     for (ImageTarget& target : images_) {
         if (target.framebuffer) glDeleteFramebuffers(1, &target.framebuffer);
+        glDeleteFramebuffers(2, target.layerFramebuffers);
         if (target.depthTexture) glDeleteTextures(1, &target.depthTexture);
     }
     images_.clear();
@@ -386,6 +412,7 @@ void XRSwapchainGL::destroy() {
 bool XRSwapchainSetGL::create(XrSession session, const std::vector<XRViewInfo>& views,
                               XRRenderMode requestedMode, std::string& outError) {
     destroy();
+    outError.clear();
     if (views.empty()) {
         outError = "Cannot create XR swapchains before the view configuration is known.";
         return false;
@@ -408,18 +435,13 @@ bool XRSwapchainSetGL::create(XrSession session, const std::vector<XRViewInfo>& 
     }
 
     const bool wantsMultiview = (requestedMode == XRRenderMode::SinglePassMultiview);
-    // The scene renderer currently issues per-eye draws with ordinary shaders.
-    // A multiview attachment also requires multiview shader variants; accepting
-    // the GL extension alone otherwise produces invalid draws or identical eyes.
-    constexpr bool rendererHasMultiviewShaders = false;
     const bool canMultiview = wantsMultiview && viewCount_ == 2 &&
-                              XRMultiviewSupported() && rendererHasMultiviewShaders;
+                              XRMultiviewSupported() && resolveMultiviewEntryPoint();
     multiviewFellBack_ = wantsMultiview && !canMultiview;
     resolvedMode_ = canMultiview ? XRRenderMode::SinglePassMultiview : XRRenderMode::MultiPass;
     if (multiviewFellBack_) {
-        XRLogWarn("Single Pass / Multiview was requested, but the scene renderer "
-                  "does not yet supply multiview shader variants; using Multi Pass "
-                  "so each eye receives its own view and post-processing.");
+        XRLogWarn("Single Pass / Multiview requires two views and GL_OVR_multiview2; "
+                  "using Multi Pass on this graphics device.");
     }
 
     const size_t swapchainCount = canMultiview ? 1u : viewCount_;
@@ -428,6 +450,13 @@ bool XRSwapchainSetGL::create(XrSession session, const std::vector<XRViewInfo>& 
     for (size_t i = 0; i < swapchainCount; ++i) {
         if (!swapchains_[i].create(session, colorFormat_, viewWidth_, viewHeight_, arraySize,
                                    sampleCount, outError)) {
+            if (canMultiview) {
+                XRLogWarn("Runtime rejected the array swapchain (" + outError +
+                          "); retrying with separate eye swapchains.");
+                const bool recovered = create(session, views, XRRenderMode::MultiPass, outError);
+                multiviewFellBack_ = true;
+                return recovered;
+            }
             destroy();
             return false;
         }

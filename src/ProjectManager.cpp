@@ -1,3 +1,4 @@
+#include "MaterialShaderProfile.h"
 #include "ProjectManager.h"
 #include "UIControlsData.h"
 #include "../include/Platform/AssetSource.h"
@@ -12,9 +13,11 @@
 #endif
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <system_error>
 #include <unordered_map>
@@ -412,7 +415,9 @@ bool Project::load(const fs::path& projectFilePath) {
         usesNewLayout = useNewLayout;
 
         Modularity::FlushDurableWrites();
-        std::ifstream file(projectFilePath);
+        // Read the same bytes on every platform. Android does not translate the
+        // CRLF endings written by the Windows editor into LF for us.
+        std::ifstream file(projectFilePath, std::ios::binary);
         if (!file.is_open()) return false;
         // A crash right after a save used to leave project.modu the right size but all zero
         // bytes. Parsing that "succeeds" with every setting at its default, and the next save
@@ -439,6 +444,7 @@ bool Project::load(const fs::path& projectFilePath) {
 
         std::string line;
         while (std::getline(file, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
             const size_t equals = line.find('=');
             const std::string key = equals == std::string::npos ? line : line.substr(0, equals);
             const std::string value = equals == std::string::npos ? std::string() : line.substr(equals + 1);
@@ -501,7 +507,7 @@ bool Project::load(const fs::path& projectFilePath) {
             } else if (key == "graphicsVSync") {
                 graphicsSettings.vsync = ParseProjectBool(value);
             } else if (key == "graphicsTargetFps") {
-                graphicsSettings.targetFps = std::clamp(std::stoi(value), 1, 500);
+                graphicsSettings.targetFps = std::clamp(std::stoi(value), 0, 500);
             } else if (key == "graphicsShadowQuality") {
                 graphicsSettings.shadowQuality = std::clamp(std::stoi(value), 0, 3);
             } else if (key == "graphicsRenderResolutionScale") {
@@ -802,7 +808,7 @@ void Project::saveProjectFile() const {
         file << "textureFormatOverride=" << texPath << "|" << format << "\n";
     }
     file << "graphicsVSync=" << (graphicsSettings.vsync ? 1 : 0) << "\n";
-    file << "graphicsTargetFps=" << std::clamp(graphicsSettings.targetFps, 1, 500) << "\n";
+    file << "graphicsTargetFps=" << std::clamp(graphicsSettings.targetFps, 0, 500) << "\n";
     file << "graphicsShadowQuality=" << std::clamp(graphicsSettings.shadowQuality, 0, 3) << "\n";
     file << "graphicsRenderResolutionScale=" << std::clamp(graphicsSettings.renderResolutionScale, 0.25f, 2.0f) << "\n";
     file << "graphicsTextureFiltering=" << SerializeProjectTextureFiltering(graphicsSettings.textureFiltering) << "\n";
@@ -1227,6 +1233,14 @@ bool ProjectManager::loadProject(const std::string& path) {
     return false;
 }
 
+namespace {
+float ParseFloatNoThrow(const std::string& value, float fallback) {
+    char* end=nullptr;
+    const float parsed=std::strtof(value.c_str(),&end);
+    return end!=value.c_str() && std::isfinite(parsed) ? parsed : fallback;
+}
+} // namespace
+
 bool SceneSerializationInternal::WriteLegacySceneStream(std::ostream& file,
                                                         const std::vector<SceneObject>& objects,
                                                         int nextId,
@@ -1263,6 +1277,15 @@ bool SceneSerializationInternal::WriteLegacySceneStream(std::ostream& file,
         file << "skyboxWeatherRainSound=" << skyboxSettings.weather.rainSoundPath << "\n";
         file << "skyboxWeatherHeavyRainSound=" << skyboxSettings.weather.heavyRainSoundPath << "\n";
         file << "skyboxWeatherThunderSound=" << skyboxSettings.weather.thunderSoundPath << "\n";
+        file << "skyboxWindEnabled=" << (skyboxSettings.wind.enabled ? 1 : 0) << "\n";
+        file << "skyboxWindYaw=" << skyboxSettings.wind.yawDegrees << "\n";
+        file << "skyboxWindPitch=" << skyboxSettings.wind.pitchDegrees << "\n";
+        file << "skyboxWindMain=" << skyboxSettings.wind.main << "\n";
+        file << "skyboxWindTurbulence=" << skyboxSettings.wind.turbulence << "\n";
+        file << "skyboxWindPulseMagnitude=" << skyboxSettings.wind.pulseMagnitude << "\n";
+        file << "skyboxWindPulseFrequency=" << skyboxSettings.wind.pulseFrequency << "\n";
+        file << "skyboxWindMultiplier=" << skyboxSettings.wind.multiplier << "\n";
+        file << "skyboxWindFollowWeather=" << (skyboxSettings.wind.followWeather ? 1 : 0) << "\n";
         file << "skyboxCloudHorizonFade=" << skyboxSettings.cloudHorizonFade << "\n";
         file << "skyboxSkyResolution=" << skyboxSettings.skyResolution << "\n";
         file << "skyboxSkyRefreshInterval=" << skyboxSettings.skyRefreshInterval << "\n";
@@ -1893,6 +1916,7 @@ bool SceneSerializationInternal::WriteLegacySceneStream(std::ostream& file,
             file << "materialHeightScale=" << obj.material.heightScale << "\n";
             file << "materialParallaxSteps=" << obj.material.parallaxSteps << "\n";
             file << "materialParallaxInvertHeight=" << (obj.material.parallaxInvertHeight ? 1 : 0) << "\n";
+            WriteMaterialShaderParameters(file, obj.material.shaderParameters, "material");
             file << "materialPath=" << obj.materialPath << "\n";
             file << "albedoTex=" << obj.albedoTexturePath << "\n";
             file << "overlayTex=" << obj.overlayTexturePath << "\n";
@@ -1947,6 +1971,13 @@ bool SceneSerializationInternal::WriteLegacySceneStream(std::ostream& file,
             file << "lightShadowBias=" << obj.light.shadowBias << "\n";
             file << "lightShadowSoftness=" << obj.light.shadowSoftness << "\n";
             file << "lightShadowResolution=" << obj.light.shadowResolution << "\n";
+            file << "lightShadowOpacity=" << obj.light.shadowOpacity << "\n";
+            file << "lightDynamicShadowOpacity=" << (obj.light.dynamicShadowOpacity ? 1 : 0) << "\n";
+            file << "lightShadowOpacityOutside=" << obj.light.shadowOpacityOutside << "\n";
+            file << "lightShadowOpacityMin=" << obj.light.shadowOpacityMinDistance << "\n";
+            file << "lightShadowOpacityMax=" << obj.light.shadowOpacityMaxDistance << "\n";
+            file << "lightShadowOpacityFadeIn=" << obj.light.shadowOpacityFadeIn << "\n";
+            file << "lightShadowOpacityFadeOut=" << obj.light.shadowOpacityFadeOut << "\n";
             file << "lightEnabled=" << (obj.light.enabled ? 1 : 0) << "\n";
             if (obj.hasReflectionCast) {
                 file << "reflectionCastEnabled=" << (obj.reflectionCast.enabled ? 1 : 0) << "\n";
@@ -3163,6 +3194,39 @@ const std::unordered_map<std::string, KeyHandler>& GetSceneObjectKeyHandlers() {
         {"materialHeightScale", +[](SceneObject& obj, const std::string& value) { obj.material.heightScale = std::clamp(std::stof(value), 0.0f, 1.0f); }},
         {"materialParallaxSteps", +[](SceneObject& obj, const std::string& value) { obj.material.parallaxSteps = std::clamp(std::stoi(value), 4, 256); }},
         {"materialParallaxInvertHeight", +[](SceneObject& obj, const std::string& value) { obj.material.parallaxInvertHeight = ParseProjectBool(value); }},
+        {"materialshaderProfile", +[](SceneObject& obj,const std::string& value) { SetMaterialShaderProfile(obj.material.shaderParameters,value); }},
+        {"materialshaderValue0", +[](SceneObject& obj,const std::string& value) { obj.material.shaderParameters.values[0]=ParseMaterialShaderValue(value); }},
+        {"materialshaderValue1", +[](SceneObject& obj,const std::string& value) { obj.material.shaderParameters.values[1]=ParseMaterialShaderValue(value); }},
+        {"materialshaderValue2", +[](SceneObject& obj,const std::string& value) { obj.material.shaderParameters.values[2]=ParseMaterialShaderValue(value); }},
+        {"materialshaderValue3", +[](SceneObject& obj,const std::string& value) { obj.material.shaderParameters.values[3]=ParseMaterialShaderValue(value); }},
+        {"materialshaderValue4", +[](SceneObject& obj,const std::string& value) { obj.material.shaderParameters.values[4]=ParseMaterialShaderValue(value); }},
+        {"materialshaderValue5", +[](SceneObject& obj,const std::string& value) { obj.material.shaderParameters.values[5]=ParseMaterialShaderValue(value); }},
+        {"materialshaderValue6", +[](SceneObject& obj,const std::string& value) { obj.material.shaderParameters.values[6]=ParseMaterialShaderValue(value); }},
+        {"materialshaderValue7", +[](SceneObject& obj,const std::string& value) { obj.material.shaderParameters.values[7]=ParseMaterialShaderValue(value); }},
+        {"materialshaderValue8", +[](SceneObject& obj,const std::string& value) { obj.material.shaderParameters.values[8]=ParseMaterialShaderValue(value); }},
+        {"materialshaderValue9", +[](SceneObject& obj,const std::string& value) { obj.material.shaderParameters.values[9]=ParseMaterialShaderValue(value); }},
+        {"materialshaderValue10", +[](SceneObject& obj,const std::string& value) { obj.material.shaderParameters.values[10]=ParseMaterialShaderValue(value); }},
+        {"materialshaderValue11", +[](SceneObject& obj,const std::string& value) { obj.material.shaderParameters.values[11]=ParseMaterialShaderValue(value); }},
+        {"materialshaderValue12", +[](SceneObject& obj,const std::string& value) { obj.material.shaderParameters.values[12]=ParseMaterialShaderValue(value); }},
+        {"materialshaderValue13", +[](SceneObject& obj,const std::string& value) { obj.material.shaderParameters.values[13]=ParseMaterialShaderValue(value); }},
+        {"materialshaderValue14", +[](SceneObject& obj,const std::string& value) { obj.material.shaderParameters.values[14]=ParseMaterialShaderValue(value); }},
+        {"materialshaderValue15", +[](SceneObject& obj,const std::string& value) { obj.material.shaderParameters.values[15]=ParseMaterialShaderValue(value); }},
+        {"materialshaderValue16", +[](SceneObject& obj,const std::string& value) { obj.material.shaderParameters.values[16]=ParseMaterialShaderValue(value); }},
+        {"materialshaderValue17", +[](SceneObject& obj,const std::string& value) { obj.material.shaderParameters.values[17]=ParseMaterialShaderValue(value); }},
+        {"materialshaderValue18", +[](SceneObject& obj,const std::string& value) { obj.material.shaderParameters.values[18]=ParseMaterialShaderValue(value); }},
+        {"materialshaderValue19", +[](SceneObject& obj,const std::string& value) { obj.material.shaderParameters.values[19]=ParseMaterialShaderValue(value); }},
+        {"materialshaderValue20", +[](SceneObject& obj,const std::string& value) { obj.material.shaderParameters.values[20]=ParseMaterialShaderValue(value); }},
+        {"materialshaderValue21", +[](SceneObject& obj,const std::string& value) { obj.material.shaderParameters.values[21]=ParseMaterialShaderValue(value); }},
+        {"materialshaderValue22", +[](SceneObject& obj,const std::string& value) { obj.material.shaderParameters.values[22]=ParseMaterialShaderValue(value); }},
+        {"materialshaderValue23", +[](SceneObject& obj,const std::string& value) { obj.material.shaderParameters.values[23]=ParseMaterialShaderValue(value); }},
+        {"materialshaderValue24", +[](SceneObject& obj,const std::string& value) { obj.material.shaderParameters.values[24]=ParseMaterialShaderValue(value); }},
+        {"materialshaderValue25", +[](SceneObject& obj,const std::string& value) { obj.material.shaderParameters.values[25]=ParseMaterialShaderValue(value); }},
+        {"materialshaderValue26", +[](SceneObject& obj,const std::string& value) { obj.material.shaderParameters.values[26]=ParseMaterialShaderValue(value); }},
+        {"materialshaderValue27", +[](SceneObject& obj,const std::string& value) { obj.material.shaderParameters.values[27]=ParseMaterialShaderValue(value); }},
+        {"materialshaderValue28", +[](SceneObject& obj,const std::string& value) { obj.material.shaderParameters.values[28]=ParseMaterialShaderValue(value); }},
+        {"materialshaderValue29", +[](SceneObject& obj,const std::string& value) { obj.material.shaderParameters.values[29]=ParseMaterialShaderValue(value); }},
+        {"materialshaderValue30", +[](SceneObject& obj,const std::string& value) { obj.material.shaderParameters.values[30]=ParseMaterialShaderValue(value); }},
+        {"materialshaderValue31", +[](SceneObject& obj,const std::string& value) { obj.material.shaderParameters.values[31]=ParseMaterialShaderValue(value); }},
         {"heightMap", +[](SceneObject& obj, const std::string& value) { obj.heightMapPath = value; }},
         {"metallicRoughnessMap", +[](SceneObject& obj, const std::string& value) { obj.metallicRoughnessMapPath = value; }},
         {"metallicMap", +[](SceneObject& obj, const std::string& value) { obj.metallicMapPath = value; }},
@@ -3224,6 +3288,13 @@ const std::unordered_map<std::string, KeyHandler>& GetSceneObjectKeyHandlers() {
         {"lightShadowBias", +[](SceneObject& obj, const std::string& value) { obj.light.shadowBias = std::stof(value); }},
         {"lightShadowSoftness", +[](SceneObject& obj, const std::string& value) { obj.light.shadowSoftness = std::stof(value); }},
         {"lightShadowResolution", +[](SceneObject& obj, const std::string& value) { obj.light.shadowResolution = std::clamp(std::stoi(value), 0, 8192); }},
+        {"lightShadowOpacity", +[](SceneObject& obj, const std::string& value) { obj.light.shadowOpacity = std::stof(value); }},
+        {"lightDynamicShadowOpacity", +[](SceneObject& obj, const std::string& value) { obj.light.dynamicShadowOpacity = (std::stoi(value) != 0); }},
+        {"lightShadowOpacityOutside", +[](SceneObject& obj, const std::string& value) { obj.light.shadowOpacityOutside = std::stof(value); }},
+        {"lightShadowOpacityMin", +[](SceneObject& obj, const std::string& value) { obj.light.shadowOpacityMinDistance = std::stof(value); }},
+        {"lightShadowOpacityMax", +[](SceneObject& obj, const std::string& value) { obj.light.shadowOpacityMaxDistance = std::stof(value); }},
+        {"lightShadowOpacityFadeIn", +[](SceneObject& obj, const std::string& value) { obj.light.shadowOpacityFadeIn = std::stof(value); }},
+        {"lightShadowOpacityFadeOut", +[](SceneObject& obj, const std::string& value) { obj.light.shadowOpacityFadeOut = std::stof(value); }},
         {"lightEnabled", +[](SceneObject& obj, const std::string& value) { obj.light.enabled = (std::stoi(value) != 0); }},
         {"reflectionCastEnabled", +[](SceneObject& obj, const std::string& value) { obj.hasReflectionCast = true; obj.reflectionCast.enabled = std::stoi(value) != 0; }},
         {"reflectionCastUpdateMode", +[](SceneObject& obj, const std::string& value) {
@@ -3847,6 +3918,31 @@ bool SceneSerializationInternal::LoadLegacySceneStream(std::istream& file,
                 sceneSkyboxSettings.weather.heavyRainSoundPath = value;
             } else if (key == "skyboxWeatherThunderSound") {
                 sceneSkyboxSettings.weather.thunderSoundPath = value;
+            } else if (key == "skyboxWindEnabled") {
+                sceneSkyboxSettings.wind.enabled = ParseProjectBool(TrimCopy(value));
+            } else if (key == "skyboxWindYaw") {
+                sceneSkyboxSettings.wind.yawDegrees =
+                    ParseFloatNoThrow(value, sceneSkyboxSettings.wind.yawDegrees);
+            } else if (key == "skyboxWindPitch") {
+                sceneSkyboxSettings.wind.pitchDegrees =
+                    std::clamp(ParseFloatNoThrow(value, sceneSkyboxSettings.wind.pitchDegrees), -90.0f, 90.0f);
+            } else if (key == "skyboxWindMain") {
+                sceneSkyboxSettings.wind.main =
+                    std::max(0.0f, ParseFloatNoThrow(value, sceneSkyboxSettings.wind.main));
+            } else if (key == "skyboxWindTurbulence") {
+                sceneSkyboxSettings.wind.turbulence =
+                    std::max(0.0f, ParseFloatNoThrow(value, sceneSkyboxSettings.wind.turbulence));
+            } else if (key == "skyboxWindPulseMagnitude") {
+                sceneSkyboxSettings.wind.pulseMagnitude =
+                    std::max(0.0f, ParseFloatNoThrow(value, sceneSkyboxSettings.wind.pulseMagnitude));
+            } else if (key == "skyboxWindPulseFrequency") {
+                sceneSkyboxSettings.wind.pulseFrequency =
+                    std::max(0.0f, ParseFloatNoThrow(value, sceneSkyboxSettings.wind.pulseFrequency));
+            } else if (key == "skyboxWindMultiplier") {
+                sceneSkyboxSettings.wind.multiplier =
+                    std::max(0.0f, ParseFloatNoThrow(value, sceneSkyboxSettings.wind.multiplier));
+            } else if (key == "skyboxWindFollowWeather") {
+                sceneSkyboxSettings.wind.followWeather = ParseProjectBool(TrimCopy(value));
             } else if (key == "skyboxCloudHorizonFade") {
                 sceneSkyboxSettings.cloudHorizonFade = std::clamp(std::stof(value), 0.0f, 1.0f);
             } else if (key == "skyboxSkyResolution") {

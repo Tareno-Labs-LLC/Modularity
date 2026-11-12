@@ -21,6 +21,112 @@
 
 namespace Loc = Modularity::Loc;
 
+namespace {
+
+bool envFloatDiffers(float a, float b) {
+    return std::abs(a - b) > 0.0001f;
+}
+
+bool envWeatherDiffers(const WeatherSettings& a, const WeatherSettings& b) {
+    return a.enabled != b.enabled ||
+        a.mode != b.mode ||
+        envFloatDiffers(a.intensity, b.intensity) ||
+        envFloatDiffers(a.windSpeed, b.windSpeed) ||
+        envFloatDiffers(a.rainOpacity, b.rainOpacity) ||
+        envFloatDiffers(a.rainSpeed, b.rainSpeed) ||
+        envFloatDiffers(a.rainScale, b.rainScale) ||
+        envFloatDiffers(a.lightningInterval, b.lightningInterval) ||
+        envFloatDiffers(a.lightningIntensity, b.lightningIntensity) ||
+        a.clearSoundPath != b.clearSoundPath ||
+        a.overcastSoundPath != b.overcastSoundPath ||
+        a.rainSoundPath != b.rainSoundPath ||
+        a.heavyRainSoundPath != b.heavyRainSoundPath ||
+        a.thunderSoundPath != b.thunderSoundPath ||
+        envFloatDiffers(a.ambienceVolume, b.ambienceVolume) ||
+        envFloatDiffers(a.heavyRainThreshold, b.heavyRainThreshold);
+}
+
+bool envWindDiffers(const WindSettings& a, const WindSettings& b) {
+    return a.enabled != b.enabled ||
+        envFloatDiffers(a.yawDegrees, b.yawDegrees) ||
+        envFloatDiffers(a.pitchDegrees, b.pitchDegrees) ||
+        envFloatDiffers(a.main, b.main) ||
+        envFloatDiffers(a.turbulence, b.turbulence) ||
+        envFloatDiffers(a.pulseMagnitude, b.pulseMagnitude) ||
+        envFloatDiffers(a.pulseFrequency, b.pulseFrequency) ||
+        envFloatDiffers(a.multiplier, b.multiplier) ||
+        a.followWeather != b.followWeather;
+}
+
+// True when the scene's sky settings no longer match what the panel last synced
+// from or wrote. Every field the panel mirrors has to be listed: a field left out
+// keeps its stale ui* copy across a scene load, and the next widget edit then
+// writes that stale value back over the loaded scene.
+bool envSkySettingsDiffer(const SkyboxSettings& a, const SkyboxSettings& b) {
+    return a.mode != b.mode ||
+        a.cachedSky != b.cachedSky ||
+        a.sunTexturePath != b.sunTexturePath ||
+        a.moonTexturePath != b.moonTexturePath ||
+        a.scrollingTexturePath != b.scrollingTexturePath ||
+        envFloatDiffers(a.scrollingRepeatX, b.scrollingRepeatX) ||
+        envFloatDiffers(a.scrollingRepeatY, b.scrollingRepeatY) ||
+        envFloatDiffers(a.scrollingLookSensitivity, b.scrollingLookSensitivity) ||
+        envFloatDiffers(a.scrollingVerticalInfluence, b.scrollingVerticalInfluence) ||
+        a.environmentReflections != b.environmentReflections ||
+        envFloatDiffers(a.environmentReflectionIntensity, b.environmentReflectionIntensity) ||
+        envFloatDiffers(a.reflectionDistanceFadeStart, b.reflectionDistanceFadeStart) ||
+        envFloatDiffers(a.reflectionDistanceFadeEnd, b.reflectionDistanceFadeEnd) ||
+        a.fogEnabled != b.fogEnabled ||
+        a.fogMode != b.fogMode ||
+        envFloatDiffers(a.fogStart, b.fogStart) ||
+        envFloatDiffers(a.fogEnd, b.fogEnd) ||
+        envFloatDiffers(a.fogDensity, b.fogDensity) ||
+        envFloatDiffers(a.fogHeight, b.fogHeight) ||
+        envFloatDiffers(a.fogHeightFalloff, b.fogHeightFalloff) ||
+        glm::length(a.fogColor - b.fogColor) > 0.0001f ||
+        a.sunFollowsDirectionalLight != b.sunFollowsDirectionalLight ||
+        a.cloudMode != b.cloudMode ||
+        envFloatDiffers(a.cloudCoverage, b.cloudCoverage) ||
+        envFloatDiffers(a.cloudDensity, b.cloudDensity) ||
+        a.cloudSteps != b.cloudSteps ||
+        a.cloudLightSteps != b.cloudLightSteps ||
+        envFloatDiffers(a.cloudBottom, b.cloudBottom) ||
+        envFloatDiffers(a.cloudTop, b.cloudTop) ||
+        envFloatDiffers(a.cloudWind, b.cloudWind) ||
+        envFloatDiffers(a.cloudDarkness, b.cloudDarkness) ||
+        envFloatDiffers(a.cloudHorizonFade, b.cloudHorizonFade) ||
+        a.skyResolution != b.skyResolution ||
+        envFloatDiffers(a.skyRefreshInterval, b.skyRefreshInterval) ||
+        envWeatherDiffers(a.weather, b.weather) ||
+        envWindDiffers(a.wind, b.wind) ||
+        a.volumetricEnabled != b.volumetricEnabled ||
+        envFloatDiffers(a.volumetricIntensity, b.volumetricIntensity) ||
+        a.volumetricSteps != b.volumetricSteps ||
+        envFloatDiffers(a.volumetricScattering, b.volumetricScattering) ||
+        envFloatDiffers(a.volumetricDensity, b.volumetricDensity) ||
+        envFloatDiffers(a.volumetricMaxDistance, b.volumetricMaxDistance) ||
+        a.volumetricHalfResolution != b.volumetricHalfResolution ||
+        envFloatDiffers(a.volumetricMaxIntensity, b.volumetricMaxIntensity) ||
+        a.volumetricDenoise != b.volumetricDenoise ||
+        a.volumetricDenoiseRadius != b.volumetricDenoiseRadius ||
+        a.ssrEnabled != b.ssrEnabled ||
+        envFloatDiffers(a.ssrIntensity, b.ssrIntensity) ||
+        a.ssrSteps != b.ssrSteps ||
+        a.ssrRefineSteps != b.ssrRefineSteps ||
+        envFloatDiffers(a.ssrMaxDistance, b.ssrMaxDistance) ||
+        envFloatDiffers(a.ssrThickness, b.ssrThickness) ||
+        envFloatDiffers(a.ssrMaxRoughness, b.ssrMaxRoughness) ||
+        a.ssrHalfResolution != b.ssrHalfResolution ||
+        a.giEnabled != b.giEnabled ||
+        envFloatDiffers(a.giIntensity, b.giIntensity) ||
+        a.giResolution != b.giResolution ||
+        envFloatDiffers(a.giMaxExtent, b.giMaxExtent) ||
+        a.giConeSteps != b.giConeSteps ||
+        a.giBounces != b.giBounces;
+}
+
+} // namespace
+
 #pragma region Environment Window
 void Engine::renderEnvironmentWindow() {
     if (!showEnvironmentWindow) return;
@@ -83,6 +189,15 @@ void Engine::renderEnvironmentWindow() {
     static std::string uiWeatherRainSound;
     static std::string uiWeatherHeavyRainSound;
     static std::string uiWeatherThunderSound;
+    static bool uiWindEnabled = true;
+    static float uiWindYaw = 0.0f;
+    static float uiWindPitch = 0.0f;
+    static float uiWindMain = 1.0f;
+    static float uiWindTurbulence = 0.5f;
+    static float uiWindPulseMagnitude = 0.5f;
+    static float uiWindPulseFrequency = 0.25f;
+    static float uiWindMultiplier = 1.0f;
+    static bool uiWindFollowWeather = true;
     static bool uiVolumetricEnabled = false;
     static float uiVolumetricIntensity = 1.0f;
     static int uiVolumetricSteps = 32;
@@ -105,50 +220,7 @@ void Engine::renderEnvironmentWindow() {
     static int uiGiConeSteps = 24;
     static int uiGiBounces = 2;
     static bool skyUiInitialized = false;
-    if (!skyUiInitialized ||
-        lastUiSkySettings.mode != skySettings.mode ||
-        lastUiSkySettings.sunTexturePath != skySettings.sunTexturePath ||
-        lastUiSkySettings.moonTexturePath != skySettings.moonTexturePath ||
-        lastUiSkySettings.scrollingTexturePath != skySettings.scrollingTexturePath ||
-        std::abs(lastUiSkySettings.scrollingRepeatX - skySettings.scrollingRepeatX) > 0.0001f ||
-        std::abs(lastUiSkySettings.scrollingRepeatY - skySettings.scrollingRepeatY) > 0.0001f ||
-        std::abs(lastUiSkySettings.scrollingLookSensitivity - skySettings.scrollingLookSensitivity) > 0.0001f ||
-        std::abs(lastUiSkySettings.scrollingVerticalInfluence - skySettings.scrollingVerticalInfluence) > 0.0001f ||
-        lastUiSkySettings.cachedSky != skySettings.cachedSky ||
-        lastUiSkySettings.sunFollowsDirectionalLight != skySettings.sunFollowsDirectionalLight ||
-        lastUiSkySettings.environmentReflections != skySettings.environmentReflections ||
-        std::abs(lastUiSkySettings.environmentReflectionIntensity - skySettings.environmentReflectionIntensity) > 0.0001f ||
-        std::abs(lastUiSkySettings.reflectionDistanceFadeStart - skySettings.reflectionDistanceFadeStart) > 0.0001f ||
-        std::abs(lastUiSkySettings.reflectionDistanceFadeEnd - skySettings.reflectionDistanceFadeEnd) > 0.0001f ||
-        lastUiSkySettings.fogEnabled != skySettings.fogEnabled ||
-        lastUiSkySettings.fogMode != skySettings.fogMode ||
-        glm::length(lastUiSkySettings.fogColor - skySettings.fogColor) > 0.0001f ||
-        std::abs(lastUiSkySettings.fogStart - skySettings.fogStart) > 0.0001f ||
-        std::abs(lastUiSkySettings.fogEnd - skySettings.fogEnd) > 0.0001f ||
-        std::abs(lastUiSkySettings.fogDensity - skySettings.fogDensity) > 0.0001f ||
-        std::abs(lastUiSkySettings.fogHeight - skySettings.fogHeight) > 0.0001f ||
-        std::abs(lastUiSkySettings.fogHeightFalloff - skySettings.fogHeightFalloff) > 0.0001f ||
-        lastUiSkySettings.volumetricEnabled != skySettings.volumetricEnabled ||
-        std::abs(lastUiSkySettings.volumetricIntensity - skySettings.volumetricIntensity) > 0.0001f ||
-        lastUiSkySettings.volumetricSteps != skySettings.volumetricSteps ||
-        std::abs(lastUiSkySettings.volumetricScattering - skySettings.volumetricScattering) > 0.0001f ||
-        std::abs(lastUiSkySettings.volumetricDensity - skySettings.volumetricDensity) > 0.0001f ||
-        std::abs(lastUiSkySettings.volumetricMaxDistance - skySettings.volumetricMaxDistance) > 0.0001f ||
-        lastUiSkySettings.volumetricHalfResolution != skySettings.volumetricHalfResolution ||
-        lastUiSkySettings.ssrEnabled != skySettings.ssrEnabled ||
-        std::abs(lastUiSkySettings.ssrIntensity - skySettings.ssrIntensity) > 0.0001f ||
-        lastUiSkySettings.ssrSteps != skySettings.ssrSteps ||
-        lastUiSkySettings.ssrRefineSteps != skySettings.ssrRefineSteps ||
-        std::abs(lastUiSkySettings.ssrMaxDistance - skySettings.ssrMaxDistance) > 0.0001f ||
-        std::abs(lastUiSkySettings.ssrThickness - skySettings.ssrThickness) > 0.0001f ||
-        std::abs(lastUiSkySettings.ssrMaxRoughness - skySettings.ssrMaxRoughness) > 0.0001f ||
-        lastUiSkySettings.ssrHalfResolution != skySettings.ssrHalfResolution ||
-        lastUiSkySettings.giEnabled != skySettings.giEnabled ||
-        std::abs(lastUiSkySettings.giIntensity - skySettings.giIntensity) > 0.0001f ||
-        lastUiSkySettings.giResolution != skySettings.giResolution ||
-        std::abs(lastUiSkySettings.giMaxExtent - skySettings.giMaxExtent) > 0.0001f ||
-        lastUiSkySettings.giConeSteps != skySettings.giConeSteps ||
-        lastUiSkySettings.giBounces != skySettings.giBounces) {
+    if (!skyUiInitialized || envSkySettingsDiffer(lastUiSkySettings, skySettings)) {
         std::snprintf(sunTexBuf, sizeof(sunTexBuf), "%s", skySettings.sunTexturePath.c_str());
         std::snprintf(moonTexBuf, sizeof(moonTexBuf), "%s", skySettings.moonTexturePath.c_str());
         std::snprintf(scrollTexBuf, sizeof(scrollTexBuf), "%s", skySettings.scrollingTexturePath.c_str());
@@ -189,6 +261,15 @@ void Engine::renderEnvironmentWindow() {
         uiWeatherRainSound = skySettings.weather.rainSoundPath;
         uiWeatherHeavyRainSound = skySettings.weather.heavyRainSoundPath;
         uiWeatherThunderSound = skySettings.weather.thunderSoundPath;
+        uiWindEnabled = skySettings.wind.enabled;
+        uiWindYaw = skySettings.wind.yawDegrees;
+        uiWindPitch = skySettings.wind.pitchDegrees;
+        uiWindMain = skySettings.wind.main;
+        uiWindTurbulence = skySettings.wind.turbulence;
+        uiWindPulseMagnitude = skySettings.wind.pulseMagnitude;
+        uiWindPulseFrequency = skySettings.wind.pulseFrequency;
+        uiWindMultiplier = skySettings.wind.multiplier;
+        uiWindFollowWeather = skySettings.wind.followWeather;
         uiVolumetricEnabled = skySettings.volumetricEnabled;
         uiVolumetricIntensity = skySettings.volumetricIntensity;
         uiVolumetricSteps = skySettings.volumetricSteps;
@@ -311,6 +392,15 @@ void Engine::renderEnvironmentWindow() {
         updated.weather.rainSoundPath = uiWeatherRainSound;
         updated.weather.heavyRainSoundPath = uiWeatherHeavyRainSound;
         updated.weather.thunderSoundPath = uiWeatherThunderSound;
+        updated.wind.enabled = uiWindEnabled;
+        updated.wind.yawDegrees = std::clamp(uiWindYaw, -180.0f, 180.0f);
+        updated.wind.pitchDegrees = std::clamp(uiWindPitch, -89.0f, 89.0f);
+        updated.wind.main = std::max(0.0f, uiWindMain);
+        updated.wind.turbulence = std::max(0.0f, uiWindTurbulence);
+        updated.wind.pulseMagnitude = std::max(0.0f, uiWindPulseMagnitude);
+        updated.wind.pulseFrequency = std::max(0.0f, uiWindPulseFrequency);
+        updated.wind.multiplier = std::max(0.0f, uiWindMultiplier);
+        updated.wind.followWeather = uiWindFollowWeather;
         updated.volumetricEnabled = uiVolumetricEnabled;
         updated.volumetricIntensity = std::max(0.0f, uiVolumetricIntensity);
         updated.volumetricSteps = std::clamp(uiVolumetricSteps, 4, 256);
@@ -910,6 +1000,89 @@ void Engine::renderEnvironmentWindow() {
                 drawWeatherSoundRow("Rain", "##WxRain", uiWeatherRainSound);
                 drawWeatherSoundRow("Heavy Rain", "##WxHeavyRain", uiWeatherHeavyRainSound);
                 drawWeatherSoundRow("Thunder", "##WxThunder", uiWeatherThunderSound);
+                ImGui::EndDisabled();
+                ImGui::EndTable();
+            }
+
+            drawSection("Wind");
+            if (beginSettingsTable("##EnvironmentWindTable")) {
+                drawSettingRow("Enabled", [&] {
+                    if (ImGui::Checkbox("##WindEnabled", &uiWindEnabled)) {
+                        applySkySettings();
+                    }
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                        ImGui::SetTooltip("Scene wind for project shader materials. One wind drives every\n"
+                                          "tree and bush, like a directional WindZone in Unity. Off\n"
+                                          "leaves foliage standing still.");
+                    }
+                });
+                ImGui::BeginDisabled(!uiWindEnabled);
+                drawSettingRow("Direction Yaw", [&] {
+                    if (ImGui::SliderFloat("##WindYaw", &uiWindYaw, -180.0f, 180.0f, "%.0f deg")) {
+                        applySkySettings();
+                    }
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                        ImGui::SetTooltip("Heading the wind blows toward: 0 is world +Z, 90 is +X.");
+                    }
+                });
+                drawSettingRow("Direction Pitch", [&] {
+                    if (ImGui::SliderFloat("##WindPitch", &uiWindPitch, -89.0f, 89.0f, "%.0f deg")) {
+                        applySkySettings();
+                    }
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                        ImGui::SetTooltip("Tilts the wind up (positive) or down. Usually left at 0.");
+                    }
+                });
+                drawSettingRow("Main", [&] {
+                    if (ImGui::SliderFloat("##WindMain", &uiWindMain, 0.0f, 10.0f, "%.2f")) {
+                        applySkySettings();
+                    }
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                        ImGui::SetTooltip("Base strength - how far trunks and branches bend.");
+                    }
+                });
+                drawSettingRow("Turbulence", [&] {
+                    if (ImGui::SliderFloat("##WindTurbulence", &uiWindTurbulence, 0.0f, 10.0f, "%.2f")) {
+                        applySkySettings();
+                    }
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                        ImGui::SetTooltip("Leaf flutter and edge bending. Scaled by Main, so it has\n"
+                                          "no effect while Main is 0.");
+                    }
+                });
+                drawSettingRow("Pulse Magnitude", [&] {
+                    if (ImGui::SliderFloat("##WindPulseMagnitude", &uiWindPulseMagnitude, 0.0f, 10.0f, "%.2f")) {
+                        applySkySettings();
+                    }
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                        ImGui::SetTooltip("How much gusts add on top of Main.");
+                    }
+                });
+                drawSettingRow("Pulse Frequency", [&] {
+                    if (ImGui::SliderFloat("##WindPulseFrequency", &uiWindPulseFrequency, 0.0f, 5.0f, "%.2f")) {
+                        applySkySettings();
+                    }
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                        ImGui::SetTooltip("How often gusts come and go.");
+                    }
+                });
+                drawSettingRow("Multiplier", [&] {
+                    if (ImGui::SliderFloat("##WindMultiplier", &uiWindMultiplier, 0.0f, 10.0f, "%.2f")) {
+                        applySkySettings();
+                    }
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                        ImGui::SetTooltip("Scales strength and turbulence together.");
+                    }
+                });
+                drawSettingRow("Follow Weather", [&] {
+                    if (ImGui::Checkbox("##WindFollowWeather", &uiWindFollowWeather)) {
+                        applySkySettings();
+                    }
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                        ImGui::SetTooltip("While Weather is enabled, scale the wind by the current\n"
+                                          "condition, so a storm bends the trees harder than a clear day.");
+                    }
+                });
                 ImGui::EndDisabled();
                 ImGui::EndTable();
             }

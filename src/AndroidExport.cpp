@@ -60,8 +60,14 @@ bool Engine::crossCompileAndroidScripts(const ScriptBuildConfig& scriptConfig, c
     androidConfig.outDir = scriptOutDir;
     androidConfig.scriptsDir = scriptsDir;
     androidConfig.crossCompilerDriver = compiler.string();
+    androidConfig.embeddedCompiler = false;
     androidConfig.linuxLinkLibs.clear();
-    androidConfig.extraLinkFlags.push_back("-s");
+    // NativeActivity loads its engine library locally. Declare it as a dependency
+    // so Android's linker can resolve ScriptContext/engine calls from each script.
+    // Reject missing exports here instead of shipping an APK with inert scripts.
+    androidConfig.extraLinkFlags.insert(androidConfig.extraLinkFlags.end(), {
+        "-L\"" + libDir.string() + "\"", "-lModularityPlayer", "-lc++_shared",
+        "-Wl,--no-undefined", "-Wl,-z,max-page-size=16384", "-s"});
     androidConfig.defines.push_back("MODULARITY_RUNTIME_ONLY=1");
     androidConfig.defines.push_back("MODULARITY_PLAYER=1");
     androidConfig.defines.push_back("MODULARITY_OPENGL_ES=1");
@@ -102,6 +108,8 @@ bool Engine::crossCompileAndroidScripts(const ScriptBuildConfig& scriptConfig, c
         }
         ScriptCompileOutput output;
         if (!scriptCompiler.compile(commands, output, buildError)) {
+            log(output.compileLog);
+            log(output.linkLog);
             error = "Android script compile failed for " + source.string() + ": " + buildError; return false;
         }
         const fs::path produced = output.producedBinaryPath.empty() ? commands.binaryPath : output.producedBinaryPath;
@@ -117,7 +125,10 @@ bool Engine::crossCompileAndroidScripts(const ScriptBuildConfig& scriptConfig, c
         const fs::path placeholder = runtimeStageRoot / compiledScriptsRel / relBinary;
         std::error_code dirEc;
         fs::create_directories(placeholder.parent_path(), dirEc);
-        std::ofstream(placeholder, std::ios::binary | std::ios::trunc).close();
+        if (dirEc) { error = "Cannot create Android script placeholder directory: " + dirEc.message(); return false; }
+        std::ofstream marker(placeholder, std::ios::binary | std::ios::trunc);
+        marker.close();
+        if (!marker) { error = "Cannot stage Android script placeholder: " + placeholder.string(); return false; }
         ++compiled;
     }
     log("Cross-compiled " + std::to_string(compiled) + " script(s) into apk/lib/" + androidAbi + "/.");

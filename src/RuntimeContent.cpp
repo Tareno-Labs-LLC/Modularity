@@ -77,10 +77,16 @@ bool EnsureParentDirectory(const fs::path& path, std::string& error) {
     return true;
 }
 
-bool IsReusableBundleExtraction(const fs::path& outputRoot) {
+bool IsReusableBundleExtraction(const fs::path& outputRoot, const std::string& bundleIdentity) {
     std::error_code ec;
     if (!fs::exists(outputRoot / kBundleReadyMarker, ec) || ec) {
         return false;
+    }
+    if (!bundleIdentity.empty()) {
+        std::ifstream marker(outputRoot / kBundleReadyMarker);
+        std::string filename, previousIdentity;
+        if (!std::getline(marker, filename) || !std::getline(marker, previousIdentity) ||
+            previousIdentity != bundleIdentity) return false;
     }
     ec.clear();
     return fs::exists(outputRoot / "project.modu", ec) && !ec;
@@ -88,6 +94,7 @@ bool IsReusableBundleExtraction(const fs::path& outputRoot) {
 
 bool WriteBundleReadyMarker(const fs::path& outputRoot,
                             const fs::path& bundlePath,
+                            const std::string& bundleIdentity,
                             std::string& error) {
     const fs::path markerPath = outputRoot / kBundleReadyMarker;
     if (!EnsureParentDirectory(markerPath, error)) {
@@ -101,6 +108,7 @@ bool WriteBundleReadyMarker(const fs::path& outputRoot,
     }
 
     marker << bundlePath.filename().string() << "\n";
+    if (!bundleIdentity.empty()) marker << bundleIdentity << "\n";
     if (!marker) {
         error = "Failed to finalize runtime extraction marker: " + markerPath.string();
         return false;
@@ -230,8 +238,39 @@ bool ExtractRuntimeContentBundle(const fs::path& bundlePath,
         return false;
     }
 
-    if (IsReusableBundleExtraction(outputRoot)) {
-        return WriteBundleReadyMarker(outputRoot, bundlePath, error);
+    std::string bundleIdentity;
+    std::error_code bundleStatEc;
+    if (!fs::is_regular_file(bundlePath, bundleStatEc)) {
+        // APK assets have no filesystem timestamp. The cache directory therefore
+        // stays the same across updates; compare content before reusing it.
+        const int64_t payloadStart = stream->Tell();
+        if (payloadStart < 0 || !stream->Seek(0, SEEK_SET)) {
+            error = "Cannot seek packaged runtime bundle for cache validation.";
+            return false;
+        }
+        Modularity::Sha256 hash;
+        std::vector<char> chunk(64 * 1024);
+        uint64_t total = 0;
+        for (size_t count = stream->Read(chunk.data(), chunk.size()); count;
+             count = stream->Read(chunk.data(), chunk.size())) {
+            hash.update(chunk.data(), count);
+            total += count;
+            if (progress && !progress(0, static_cast<uint64_t>(std::max<int64_t>(stream->Size(), 0)))) {
+                error = "Runtime content extraction cancelled.";
+                return false;
+            }
+        }
+        if ((stream->Size() >= 0 && total != static_cast<uint64_t>(stream->Size())) ||
+            !stream->Seek(payloadStart, SEEK_SET)) {
+            error = "Failed to read packaged runtime bundle for cache validation.";
+            return false;
+        }
+        uint8_t digest[32];
+        hash.finish(digest);
+        bundleIdentity = Modularity::Sha256::toHex(digest);
+    }
+    if (IsReusableBundleExtraction(outputRoot, bundleIdentity)) {
+        return WriteBundleReadyMarker(outputRoot, bundlePath, bundleIdentity, error);
     }
 
     std::error_code ec;
@@ -305,7 +344,7 @@ bool ExtractRuntimeContentBundle(const fs::path& bundlePath,
         }
     }
 
-    return WriteBundleReadyMarker(outputRoot, bundlePath, error);
+    return WriteBundleReadyMarker(outputRoot, bundlePath, bundleIdentity, error);
 }
 
 // ---------------------------------------------------------------------------

@@ -33,6 +33,7 @@
 #include "ThirdParty/ImGuiColorTextEdit/TextEditor.h"
 #include "Nebula/NebulaLightmap.h"
 #include "VersionControl.h"
+#include "EditorMatugenTheme.h"
 #include "EditorWindows/VREditorWorkspace.h"
 #endif
 #include "Vulkan/VulkanRenderer.h"
@@ -1866,6 +1867,11 @@ private:
     bool loadEditorThemeFile(const fs::path& path, std::string* outError = nullptr);
     bool saveEditorThemeFile(std::string* outError = nullptr);
     void pollEditorThemeFile();
+    ImGuiStyle getEditorBaseStyle() const;
+#if !MODULARITY_RUNTIME_ONLY
+    Modularity::EditorMatugenTheme editorMatugen;
+#endif
+    fs::path editorThemeFileTrackedPath;
     double editorThemeFileNextCheck = 0.0;
     fs::file_time_type editorThemeFileLastWrite{};
     bool editorThemeFileTracked = false;
@@ -1893,6 +1899,12 @@ private:
     fs::path getEditorLayoutPath() const;
     void updateXRComponents(float deltaTime);
     void updateXRInteraction(float deltaTime);
+    void updateXRUiInput();
+    XRActionBasedControllerComponent* findXRActionController(const SceneObject& interactor);
+    int raycastXRCanvas(const SceneObject& interactor, float& distance, ImVec2& position,
+                        int canvasId = -1) const;
+    int xrUiCapturedInteractorId = -1;
+    int xrUiCapturedCanvasId = -1;
     const SceneObject* findXROriginObject() const;
     const SceneObject* findXRCameraObject() const;
     Modularity::XR::XRTrackingOrigin resolveXRTrackingOrigin() const;

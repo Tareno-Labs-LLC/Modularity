@@ -9,9 +9,8 @@
 #include <fstream>
 #include <sstream>
 #include <iostream>
-#if MODULARITY_OPENGL_ES
 #include <regex>
-#endif
+#include <utility>
 
 namespace
 {
@@ -28,6 +27,60 @@ namespace
             return static_cast<char>(std::tolower(ch));
         });
         return value;
+    }
+
+    // "path?DEF1,DEF2": a shader path may carry preprocessor defines after a '?'
+    // (illegal in Windows file names, so unambiguous). The file is read from the
+    // stripped path and each define is inserted as "#define NAME 1" right after
+    // the #version line, so one source file can compile into several programs.
+    std::string stripShaderPathDefines(const char* path, std::string* definesOut = nullptr)
+    {
+        if (definesOut) definesOut->clear();
+        if (!path) return std::string();
+        std::string full(path);
+        const size_t q = full.find('?');
+        if (q == std::string::npos) return full;
+        if (definesOut) *definesOut = full.substr(q + 1);
+        return full.substr(0, q);
+    }
+
+    std::string injectShaderDefines(const std::string& source, const std::string& defines)
+    {
+        if (defines.empty()) return source;
+        std::string block;
+        size_t start = 0;
+        while (start <= defines.size())
+        {
+            size_t end = defines.find(',', start);
+            if (end == std::string::npos) end = defines.size();
+            std::string name = defines.substr(start, end - start);
+            name.erase(std::remove_if(name.begin(), name.end(), [](unsigned char ch) {
+                return std::isspace(ch) != 0;
+            }), name.end());
+            if (!name.empty()) block += "#define " + name + " 1\n";
+            start = end + 1;
+        }
+        if (block.empty()) return source;
+
+        // Directly after the #version line (a #version must be the first
+        // directive in the file, so it can't follow our defines).
+        size_t pos = 0;
+        while (pos < source.size())
+        {
+            size_t lineEnd = source.find('\n', pos);
+            const size_t next = lineEnd == std::string::npos ? source.size() : lineEnd + 1;
+            size_t first = pos;
+            while (first < next && (source[first] == ' ' || source[first] == '\t')) ++first;
+            if (source.compare(first, 8, "#version") == 0)
+            {
+                std::string result = source;
+                if (lineEnd == std::string::npos) result += '\n';
+                result.insert(lineEnd == std::string::npos ? result.size() : next, block);
+                return result;
+            }
+            pos = next;
+        }
+        return block + source;
     }
 
     bool splitCombinedShaderSource(const std::string& source, std::string& outVertex, std::string& outFragment)
@@ -90,11 +143,39 @@ namespace
     }
 #endif
 
+    // Keep the ordinary material contract, including project-owned shaders. The
+    // variant changes camera uniforms, never object/instance transforms or wind.
+    std::string prepareMultiviewSource(std::string source, bool vertex)
+    {
+        if (source.find("#define MODU_MULTIVIEW") == std::string::npos) return source;
+        const size_t headerEnd = source.find('\n');
+        const std::string declarations = vertex
+            ? "#extension GL_OVR_multiview2 : require\nlayout(num_views = 2) in;\nflat out highp int moduEyeIndex;\n"
+            : "#extension GL_OVR_multiview2 : require\nflat in highp int moduEyeIndex;\n";
+        source.insert(headerEnd == std::string::npos ? 0 : headerEnd + 1, declarations);
+        const char* index = vertex ? "int(gl_ViewID_OVR)" : "moduEyeIndex";
+        for (const auto& uniform : {std::pair{"mat4", "view"}, {"mat4", "projection"}, {"vec3", "viewPos"}}) {
+            const std::string name = uniform.second;
+            const std::string array = "moduStereo_" + name;
+            const std::regex declaration("uniform\\s+(?:highp\\s+|mediump\\s+|lowp\\s+)?" +
+                                         std::string(uniform.first) + "\\s+" + name + "\\s*(?:=\\s*[^;]+)?;");
+            source = std::regex_replace(source, declaration,
+                "uniform " + std::string(uniform.first) + " " + array + "[2];\n#define " + name + " " + array + "[" + index + "]\n");
+        }
+        if (vertex) {
+            const std::regex mainEntry(R"((void\s+main\s*\(\s*(?:void\s*)?\)\s*\{))");
+            source = std::regex_replace(source, mainEntry, "$1\nmoduEyeIndex = int(gl_ViewID_OVR);\n");
+        }
+        return source;
+    }
+
     std::string prepareShaderSourceForBackend(const std::string& source)
     {
 #if MODULARITY_OPENGL_ES
         std::string result = source;
-        const std::string esHeader = "#version 300 es\nprecision highp float;\nprecision highp int;\n";
+        // GLES does not define a default precision for sampler3D. Mali rejects
+        // the default material's voxelVolume even when GI is disabled at runtime.
+        const std::string esHeader = "#version 300 es\nprecision highp float;\nprecision highp int;\nprecision highp sampler3D;\nprecision highp sampler2DArray;\n";
 
         if (result.rfind("#version", 0) == 0)
         {
@@ -129,6 +210,10 @@ Shader::Shader(const char* vertexPath, const char* fragmentPath)
                                 std::string(vertexPath) == std::string(fragmentPath);
     std::string vertexCode;
     std::string fragmentCode;
+    std::string vertexDefines;
+    std::string fragmentDefines;
+    stripShaderPathDefines(vertexPath, &vertexDefines);
+    stripShaderPathDefines(fragmentPath, &fragmentDefines);
     if (sameShaderFile)
     {
         const std::string combinedCode = readShaderFile(vertexPath);
@@ -143,6 +228,8 @@ Shader::Shader(const char* vertexPath, const char* fragmentPath)
         vertexCode = readShaderFile(vertexPath);
         fragmentCode = readShaderFile(fragmentPath);
     }
+    vertexCode = injectShaderDefines(vertexCode, vertexDefines);
+    fragmentCode = injectShaderDefines(fragmentCode, fragmentDefines);
 
     compileShaders(vertexCode.c_str(), fragmentCode.c_str());
 }
@@ -150,9 +237,16 @@ Shader::Shader(const char* vertexPath, const char* fragmentPath)
 Shader::Shader(const char* vertexPath, const char* geometryPath, const char* fragmentPath)
 {
     const bool hasGeometry = geometryPath != nullptr && geometryPath[0] != '\0';
-    const std::string vertexCode = readShaderFile(vertexPath);
-    const std::string fragmentCode = readShaderFile(fragmentPath);
-    const std::string geometryCode = hasGeometry ? readShaderFile(geometryPath) : std::string();
+    std::string vertexDefines;
+    std::string fragmentDefines;
+    std::string geometryDefines;
+    stripShaderPathDefines(vertexPath, &vertexDefines);
+    stripShaderPathDefines(fragmentPath, &fragmentDefines);
+    if (hasGeometry) stripShaderPathDefines(geometryPath, &geometryDefines);
+    const std::string vertexCode = injectShaderDefines(readShaderFile(vertexPath), vertexDefines);
+    const std::string fragmentCode = injectShaderDefines(readShaderFile(fragmentPath), fragmentDefines);
+    const std::string geometryCode = hasGeometry
+        ? injectShaderDefines(readShaderFile(geometryPath), geometryDefines) : std::string();
     compileShaders(vertexCode.c_str(), fragmentCode.c_str(),
                    hasGeometry ? geometryCode.c_str() : nullptr);
 }
@@ -160,6 +254,9 @@ Shader::Shader(const char* vertexPath, const char* geometryPath, const char* fra
 std::string Shader::readShaderFile(const char* filePath)
 {
     if (!filePath) return "";
+    // Drop any "?DEFINES" suffix: the file on disk is the stripped path.
+    const std::string strippedPath = stripShaderPathDefines(filePath);
+    filePath = strippedPath.c_str();
 
     std::vector<uint8_t> bytes = Modularity::Platform::GetAssetSource().ReadAll(filePath);
     if (!bytes.empty()) {
@@ -181,6 +278,8 @@ void Shader::compileShaders(const char* vertexSource, const char* fragmentSource
 {
     std::string preparedVertexSource = prepareShaderSourceForBackend(vertexSource ? vertexSource : "");
     std::string preparedFragmentSource = prepareShaderSourceForBackend(fragmentSource ? fragmentSource : "");
+    preparedVertexSource = prepareMultiviewSource(std::move(preparedVertexSource), true);
+    preparedFragmentSource = prepareMultiviewSource(std::move(preparedFragmentSource), false);
     const char* preparedVertexCStr = preparedVertexSource.c_str();
     const char* preparedFragmentCStr = preparedFragmentSource.c_str();
 

@@ -222,6 +222,121 @@ void Engine::updateXRComponents(float deltaTime) {
 #endif
 }
 
+XRActionBasedControllerComponent* Engine::findXRActionController(const SceneObject& interactor) {
+    const SceneObject* node = &interactor;
+    for (size_t depth = 0; node && depth <= sceneObjects.size(); ++depth) {
+        if (node->hasXRActionBasedController) {
+            return node->xrActionBasedController.enabled
+                ? &const_cast<SceneObject*>(node)->xrActionBasedController : nullptr;
+        }
+        node = findObjectById(node->parentId);
+    }
+    return nullptr;
+}
+
+// Intersect in canvas-local space so rotation, nonuniform scale and negative
+// scale match the rendered quad. Distance remains in world units.
+int Engine::raycastXRCanvas(const SceneObject& interactor, float& distance,
+                            ImVec2& position, int canvasId) const {
+    const glm::vec3 direction = EulerXYZDegreesToQuat(interactor.rotation) * glm::vec3(0, 0, -1);
+    int hitId = -1;
+    for (const SceneObject& canvas : sceneObjects) {
+        if (!canvas.hasUI || canvas.ui.type != UIElementType::Canvas || !canvas.ui.renderIn3D ||
+            !canvas.ui.interactable || !IsObjectEnabledInHierarchy(canvas)) continue;
+        if (canvasId >= 0 && canvas.id != canvasId) continue;
+        if (canvas.layer >= 0 && canvas.layer < 32 &&
+            !(interactor.xrRayInteractor.interactionMask & (1u << canvas.layer))) continue;
+        if (std::abs(canvas.scale.x * canvas.scale.y * canvas.scale.z) < 1e-8f) continue;
+        const glm::mat4 model = glm::translate(glm::mat4(1), canvas.position) *
+            glm::mat4_cast(EulerXYZDegreesToQuat(canvas.rotation)) *
+            glm::scale(glm::mat4(1), canvas.scale);
+        const glm::mat4 inverse = glm::inverse(model);
+        const glm::vec3 localOrigin(inverse * glm::vec4(interactor.position, 1));
+        const glm::vec3 localDirection(inverse * glm::vec4(direction, 0));
+        if (std::abs(localDirection.z) < 1e-6f) continue;
+        const float t = -localOrigin.z / localDirection.z;
+        if (!std::isfinite(t) || t < 0 || t > distance) continue;
+        const glm::vec3 local = localOrigin + localDirection * t;
+        // A captured drag may leave the quad; keep its coordinates until release.
+        if (canvasId < 0 && (std::abs(local.x) > 0.5f || std::abs(local.y) > 0.5f)) continue;
+        distance = t;
+        position = ImVec2((local.x + 0.5f) * std::max(1.0f, canvas.ui.size.x),
+                          (0.5f - local.y) * std::max(1.0f, canvas.ui.size.y));
+        hitId = canvas.id;
+    }
+    return hitId;
+}
+
+void Engine::updateXRUiInput() {
+#if MODULARITY_HAS_OPENXR
+    const auto& input = Modularity::XR::InputState();
+    const bool active = (isPlaying || playerMode) && isXRRequestedByProject() &&
+        input.sessionActive && input.hasFocus && projectManager.currentProject.openXRSettings.interaction.enabled;
+    SceneObject* pointer = nullptr;
+    int canvasId = -1;
+    ImVec2 position(-FLT_MAX, -FLT_MAX);
+    float nearest = FLT_MAX;
+    bool held = false;
+    bool pressStarted = false;
+    if (active) {
+        for (SceneObject& obj : sceneObjects) {
+            if (!obj.hasXRRayInteractor || !obj.xrRayInteractor.enabled ||
+                !obj.xrRayInteractor.uiInteraction || !IsObjectEnabledInHierarchy(obj)) continue;
+            if (xrUiCapturedInteractorId >= 0 && obj.id != xrUiCapturedInteractorId) continue;
+            auto* controller = findXRActionController(obj);
+            if (!controller) continue;
+            const auto& state = input.controller(ToXRDevice(controller->hand));
+            if (!state.active || (!state.aimPose.isTracked() && !state.gripPose.isTracked())) continue;
+            const int button = controller->uiPressButton;
+            const bool started = button >= 0 && button < static_cast<int>(Modularity::XR::XRButton::Count) &&
+                state.buttons[static_cast<size_t>(button)] && !state.previousButtons[static_cast<size_t>(button)];
+            float distance = std::max(0.01f, obj.xrRayInteractor.maxDistance);
+            ImVec2 hitPosition(-FLT_MAX, -FLT_MAX);
+            const int hit = raycastXRCanvas(obj, distance, hitPosition, xrUiCapturedCanvasId);
+            if (xrUiCapturedInteractorId >= 0) {
+                pointer = &obj;
+                canvasId = xrUiCapturedCanvasId;
+                position = hitPosition;
+                held = controller->uiPressHeld;
+                break;
+            }
+            if (hit < 0 || distance >= nearest) continue;
+            // A nearer grabbed/hovered object takes precedence over UI behind it.
+            if (obj.xrRayInteractor.hasHit && obj.xrRayInteractor.hoveredObjectId >= 0 &&
+                DistanceSquared(obj.position, obj.xrRayInteractor.hitPoint) < distance * distance) continue;
+            pointer = &obj;
+            canvasId = hit;
+            position = hitPosition;
+            nearest = distance;
+            held = controller->uiPressHeld;
+            pressStarted = started;
+        }
+    }
+    // One ImGui pointer owns a press until release. Pressing before entering a
+    // canvas must not manufacture a new click when the ray later crosses it.
+    if (pointer && canvasId >= 0) {
+        if (xrUiCapturedInteractorId < 0) {
+            held = held && pressStarted;
+            if (held) {
+                xrUiCapturedInteractorId = pointer->id;
+                xrUiCapturedCanvasId = canvasId;
+            }
+        }
+        auto& canvasInput = uiCanvas3DInputs[canvasId];
+        canvasInput.mousePos = position;
+        canvasInput.mouseDown[0] = held;
+        canvasInput.mouseDown[1] = canvasInput.mouseDown[2] = false;
+        canvasInput.mouseWheel = 0;
+        canvasInput.hasInput = true;
+        canvasInput.hitT = -FLT_MAX; // XR pointer takes priority over the desktop mirror.
+    }
+    if (!held || !pointer) {
+        xrUiCapturedInteractorId = -1;
+        xrUiCapturedCanvasId = -1;
+    }
+#endif
+}
+
 void Engine::updateXRInteraction(float deltaTime) {
 #if !MODULARITY_HAS_OPENXR
     (void)deltaTime;
@@ -247,20 +362,6 @@ void Engine::updateXRInteraction(float deltaTime) {
         return (mask & (1u << static_cast<uint32_t>(layer))) != 0;
     };
 
-    const auto findController = [this](const SceneObject& interactor) -> XRActionBasedControllerComponent* {
-        if (interactor.hasXRActionBasedController) {
-            return &const_cast<SceneObject&>(interactor).xrActionBasedController;
-        }
-        int parentId = interactor.parentId;
-        for (int depth = 0; depth < 8 && parentId >= 0; ++depth) {
-            SceneObject* parent = findObjectById(parentId);
-            if (!parent) break;
-            if (parent->hasXRActionBasedController) return &parent->xrActionBasedController;
-            parentId = parent->parentId;
-        }
-        return nullptr;
-    };
-
     for (SceneObject& interactorObj : sceneObjects) {
         const bool isRay = interactorObj.hasXRRayInteractor && interactorObj.xrRayInteractor.enabled;
         const bool isDirect =
@@ -268,7 +369,7 @@ void Engine::updateXRInteraction(float deltaTime) {
         if (!isRay && !isDirect) continue;
         if (!IsObjectEnabledInHierarchy(interactorObj)) continue;
 
-        XRActionBasedControllerComponent* controller = findController(interactorObj);
+        XRActionBasedControllerComponent* controller = findXRActionController(interactorObj);
 
         int& hoveredId = isRay ? interactorObj.xrRayInteractor.hoveredObjectId
                                : interactorObj.xrDirectInteractor.hoveredObjectId;
@@ -303,6 +404,15 @@ void Engine::updateXRInteraction(float deltaTime) {
                 newHover = candidateId;
                 ray.hitPoint = closest;
                 ray.hasHit = true;
+            }
+            if (ray.uiInteraction) {
+                ImVec2 canvasPosition;
+                const int canvasId = raycastXRCanvas(interactorObj, bestDistance, canvasPosition);
+                if (canvasId >= 0) {
+                    newHover = -1; // UI in front of a grabbable consumes the ray.
+                    ray.hitPoint = origin + direction * bestDistance;
+                    ray.hasHit = true;
+                }
             }
         } else {
             const XRDirectInteractorComponent& direct = interactorObj.xrDirectInteractor;

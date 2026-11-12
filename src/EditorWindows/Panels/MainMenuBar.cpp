@@ -787,6 +787,33 @@ void Engine::renderMainMenuBar(bool embedded) {
         }
         ImGui::EndCombo();
       }
+#if !MODULARITY_RUNTIME_ONLY
+      ImGui::BeginDisabled(!projectManager.currentProject.isLoaded);
+      bool matugenChanged = ImGui::Checkbox("Use Matugen colors", &editorMatugen.enabled);
+      ImGui::SetItemTooltip("Use this computer's generated palette without replacing saved project or preset colors.");
+      if (editorMatugen.enabled) {
+        char palettePath[1024];
+        std::snprintf(palettePath, sizeof(palettePath), "%s", editorMatugen.palettePath.c_str());
+        if (ImGui::InputTextWithHint("Palette file", "Default: ~/.config/matugen/colors.css", palettePath, sizeof(palettePath), ImGuiInputTextFlags_EnterReturnsTrue)) {
+          editorMatugen.palettePath = palettePath;
+          matugenChanged = true;
+        }
+        ImGui::SetItemTooltip("Generated GTK CSS with theme_* colors. Press Enter to apply. Blank uses XDG_CONFIG_HOME, then ~/.config.");
+        ImGui::SliderFloat("Palette fade (seconds)", &editorMatugen.fadeSeconds, 0.0f, 2.0f, "%.2f");
+        // Persist once when the drag ends, not on every frame.
+        matugenChanged |= ImGui::IsItemDeactivatedAfterEdit();
+        ImGui::TextDisabled("%s", editorMatugen.status.c_str());
+      }
+      if (matugenChanged) {
+        editorMatugen.refresh();
+        std::string themeError;
+        if (!saveEditorThemeFile(&themeError)) {
+          addConsoleMessage("Could not save Matugen setting: " + themeError, ConsoleMessageType::Warning);
+        }
+      }
+      ImGui::EndDisabled();
+#endif
+
       if (ImGui::BeginCombo("Editor Font", currentFontLabel.c_str())) {
         for (size_t i = 0; i < fontCatalog.size(); ++i) {
           const bool selected = (fontCatalog[i].id == uiEditorFontAsset);

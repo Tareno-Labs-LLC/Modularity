@@ -25,7 +25,7 @@ fs::path Engine::ensureOnDeviceToolchain(std::string& error) {
         return {};
     }
     const auto versionBytes = assets.ReadAll(assetBase + "/bundle.id");
-    const std::string version = "modu-toolchain-abi62:" + std::string(versionBytes.begin(), versionBytes.end());
+    const std::string version = "modu-toolchain-abi63:" + std::string(versionBytes.begin(), versionBytes.end());
     const fs::path root = fs::path(dataPath) / "toolchain" / kAndroidAbi;
     const fs::path stamp = root / ".stamp";
     std::ifstream previous(stamp, std::ios::binary);

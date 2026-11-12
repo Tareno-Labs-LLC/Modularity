@@ -6904,8 +6904,9 @@ void Engine::renderProjectBrowserPanel() {
                 });
             }
             if (visible(ProjectSettingsVisibilityMode::Simple, "Runtime Graphics", "Target FPS", "frame cap")) {
-                changed |= DrawSettingRow(Loc::T("SETTINGS_GRAPHICS_TARGET_FPS", "Target FPS"), Loc::T("SETTINGS_GRAPHICS_TARGET_FPS_DESC", "Runtime frame-rate target when VSync is not controlling presentation."), [&]() {
-                    if (ImGui::DragInt("##GraphicsTargetFps", &graphics.targetFps, 1.0f, 1, 500)) {
+                changed |= DrawSettingRow(Loc::T("SETTINGS_GRAPHICS_TARGET_FPS", "Target FPS"), Loc::T("SETTINGS_GRAPHICS_TARGET_FPS_DESC", "Runtime frame-rate limit when VSync is off. Set 0 for uncapped rendering."), [&]() {
+                    if (ImGui::DragInt("##GraphicsTargetFps", &graphics.targetFps, 1.0f, 0, 500,
+                                       graphics.targetFps == 0 ? "Uncapped" : "%d FPS")) {
                         applyPresentationSettings();
                         return true;
                     }
@@ -7376,7 +7377,7 @@ void Engine::renderProjectBrowserPanel() {
         }
 
         if (changed) {
-            graphics.targetFps = std::clamp(graphics.targetFps, 1, 500);
+            graphics.targetFps = std::clamp(graphics.targetFps, 0, 500);
             graphics.shadowQuality = std::clamp(graphics.shadowQuality, 0, 3);
             graphics.renderResolutionScale = std::clamp(graphics.renderResolutionScale, 0.25f, 2.0f);
             projectManager.currentProject.saveProjectFile();
@@ -9185,9 +9186,9 @@ void Engine::renderProjectBrowserPanel() {
                 changed |= DrawSettingRow(
                     Loc::T("SETTINGS_OPENXR_RENDER_MODE", "Render Mode"),
                     Loc::T("SETTINGS_OPENXR_RENDER_MODE_DESC",
-                           "Multi Pass renders each eye separately. Single Pass requests multiview, "
-                           "but currently falls back to Multi Pass because the scene shaders do not "
-                           "yet support multiview. Runtime Diagnostics shows the mode actually in use."),
+                           "Single Pass shares scene and reflection-surface geometry between both eyes "
+                           "on GL_OVR_multiview2 devices. Each eye keeps its own projection and post-processing. "
+                           "Unsupported devices or materials use Multi Pass; Runtime Diagnostics shows the active mode."),
                     [&]() {
                         int mode = (target.renderMode == XR::XRRenderMode::MultiPass) ? 1 : 0;
                         const char* modes[] = { "Single Pass / Multiview", "Multi Pass" };
@@ -9199,8 +9200,8 @@ void Engine::renderProjectBrowserPanel() {
                         return false;
                     });
                 if (target.renderMode == XR::XRRenderMode::SinglePassMultiview) {
-                    DrawHelpText("The current scene renderer uses Multi Pass for this request. "
-                                 "Each eye keeps its own camera and receives post-processing.");
+                    DrawHelpText("Shares geometry submissions for both eyes. CPU-facing billboards "
+                                 "and incompatible custom shaders use the per-eye fallback.");
                 }
             }
             if (visible(ProjectSettingsVisibilityMode::Advanced, "Rendering", "Depth Submission",

@@ -969,15 +969,15 @@ namespace {
         }
     }
 
-    // stb_image covers the common cases; .dds and .exr need the engine decoders and are
-    // left to the scene cache.
+    // stb_image covers the common cases (.psd included: packed material maps are PSDs); .dds and
+    // .exr need the engine decoders and are left to the scene cache.
     bool PreviewFormatDecodableHere(const fs::path& path) {
         std::string ext = PathToUtf8(path.extension());
         for (char& c : ext) {
             if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
         }
         return ext == ".png" || ext == ".jpg" || ext == ".jpeg" ||
-               ext == ".bmp" || ext == ".tga" || ext == ".hdr";
+               ext == ".bmp" || ext == ".tga" || ext == ".hdr" || ext == ".psd";
     }
 
     // Decodes at full size (stb cannot decode partially) but uploads only the reduced copy,
@@ -1064,7 +1064,10 @@ namespace {
             // Falling through on a failed decode is deliberate: a .png that is really an EXR
             // still reaches the engine decoders, and a genuine failure gets recorded in
             // textureLoadErrors so TexturePreviewError can explain it.
-            if (!loaded) {
+            // A Texture2DArray .asset has no single image to show; the engine decoders would
+            // only log a failure for it.
+            const bool unityTextureArray = PathToUtf8(path.extension()) == ".asset";
+            if (!loaded && !unityTextureArray) {
                 if (Texture* tex = renderer.getTexture(key);
                     tex && tex->GetID() != 0 && tex->GetWidth() > 0 && tex->GetHeight() > 0) {
                     preview.textureId = tex->GetID();

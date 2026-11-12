@@ -496,16 +496,17 @@ struct WeatherProfile {
     float darkness;
     float rain;
     bool lightning;
+    float wind;  // foliage wind scale, 1 = calm baseline
 };
 
 WeatherProfile ProfileFor(WeatherMode mode) {
     switch (mode) {
-        case WeatherMode::Overcast:     return {0.75f, 0.35f, 0.0f, false};
-        case WeatherMode::DarkCloudy:   return {0.92f, 0.70f, 0.0f, false};
-        case WeatherMode::Rain:         return {0.90f, 0.55f, 0.75f, false};
-        case WeatherMode::Thunderstorm: return {0.98f, 0.85f, 1.0f, true};
+        case WeatherMode::Overcast:     return {0.75f, 0.35f, 0.0f, false, 1.3f};
+        case WeatherMode::DarkCloudy:   return {0.92f, 0.70f, 0.0f, false, 1.7f};
+        case WeatherMode::Rain:         return {0.90f, 0.55f, 0.75f, false, 2.0f};
+        case WeatherMode::Thunderstorm: return {0.98f, 0.85f, 1.0f, true, 2.5f};
         case WeatherMode::Clear:
-        default:                        return {0.25f, 0.0f, 0.0f, false};
+        default:                        return {0.25f, 0.0f, 0.0f, false, 1.0f};
     }
 }
 
@@ -532,6 +533,7 @@ WeatherDrive EvaluateWeather(const WeatherSettings& weather, WeatherRuntime& run
     out.cloudCoverage = clear.coverage + (target.coverage - clear.coverage) * t;
     out.cloudDarkness = clear.darkness + (target.darkness - clear.darkness) * t;
     out.rainAmount = clear.rain + (target.rain - clear.rain) * t;
+    out.windMultiplier = clear.wind + (target.wind - clear.wind) * t;
 
     const float dt = std::clamp(deltaSeconds, 0.0f, 0.25f);
     if (target.lightning && t > 0.01f) {

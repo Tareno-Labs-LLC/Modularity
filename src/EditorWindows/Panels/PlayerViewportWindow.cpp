@@ -352,7 +352,11 @@ void Engine::renderPlayerViewport() {
       if (runtimeCam && useWorldUi) {
         uiWorldCamera.position =
             glm::vec2(runtimeCam->position.x, runtimeCam->position.y);
-        uiWorldCamera.zoom = std::max(1.0f, runtimeCam->camera.pixelsPerUnit);
+        // World UI is drawn directly into the display overlay. Convert the
+        // camera's render-pixel scale to display pixels, just as the editor's
+        // Game viewport maps its internal resolution into the output panel.
+        uiWorldCamera.zoom =
+            std::max(1.0f, runtimeCam->camera.pixelsPerUnit) * uiScaleY;
       }
     }
     runtime2DProfilerStats.useWorldUi = useWorldUi;
@@ -370,13 +374,13 @@ void Engine::renderPlayerViewport() {
     glm::mat4 projectedUiProj =
         projectedUiCamera.orthographic
             ? glm::ortho(
-                  -overlaySize.x /
+                  -static_cast<float>(runtimeRenderWidth) /
                       (2.0f * std::max(1.0f, projectedUiCamera.pixelsPerUnit)),
-                  overlaySize.x /
+                  static_cast<float>(runtimeRenderWidth) /
                       (2.0f * std::max(1.0f, projectedUiCamera.pixelsPerUnit)),
-                  -overlaySize.y /
+                  -static_cast<float>(runtimeRenderHeight) /
                       (2.0f * std::max(1.0f, projectedUiCamera.pixelsPerUnit)),
-                  overlaySize.y /
+                  static_cast<float>(runtimeRenderHeight) /
                       (2.0f * std::max(1.0f, projectedUiCamera.pixelsPerUnit)),
                   runtimeNear, runtimeFar)
             : glm::perspective(

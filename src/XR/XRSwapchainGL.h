@@ -42,6 +42,7 @@ public:
     bool isValid() const { return swapchain_ != XR_NULL_HANDLE; }
 
     bool acquireAndWait(uint32_t& outFramebuffer, std::string& outError);
+    uint32_t acquiredLayerFramebuffer(uint32_t layer) const;
 
     bool release(std::string& outError);
 
@@ -59,6 +60,7 @@ private:
         uint32_t colorTexture = 0;
         uint32_t depthTexture = 0;
         uint32_t framebuffer = 0;
+        uint32_t layerFramebuffers[2] = {};
     };
 
     XrSwapchain swapchain_ = XR_NULL_HANDLE;

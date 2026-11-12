@@ -87,7 +87,7 @@ public:
 
     bool Exists(const std::string& path) const override {
         std::error_code ec;
-        if (fs::exists(fs::path(path), ec) && !ec) return true;
+        if (fs::exists(fs::path(ResolveAssetPath(path)), ec) && !ec) return true;
         if (!mMgr) return false;
         const std::string key = NormalizeAssetPath(path);
         AAsset* a = AAssetManager_open(mMgr, key.c_str(), AASSET_MODE_UNKNOWN);
@@ -97,7 +97,7 @@ public:
     }
 
     std::vector<uint8_t> ReadAll(const std::string& path) const override {
-        std::ifstream f(path, std::ios::binary | std::ios::ate);
+        std::ifstream f(ResolveAssetPath(path), std::ios::binary | std::ios::ate);
         if (f) {
             const std::streamsize n = f.tellg();
             if (n > 0) {
@@ -132,7 +132,7 @@ public:
 
     std::unique_ptr<AssetStream> Open(const std::string& path) const override {
         {
-            auto f = std::make_unique<std::ifstream>(path, std::ios::binary | std::ios::ate);
+            auto f = std::make_unique<std::ifstream>(ResolveAssetPath(path), std::ios::binary | std::ios::ate);
             if (*f) {
                 const int64_t size = f->tellg();
                 f->seekg(0, std::ios::beg);

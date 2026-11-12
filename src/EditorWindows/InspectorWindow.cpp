@@ -1,3 +1,4 @@
+#include "MaterialShaderProfileSelection.h"
 #include "../ScriptContextBinding.h"
 #include "UIInspector.h"
 #include "../EditorLocalization.h"
@@ -7,6 +8,7 @@
 #include "MaterialAssetUtils.h"
 #include "ModelLoader.h"
 #include "ParticleSystemRuntime.h"
+#include "UnityAssetImport.h"
 #include "SceneObjectIcons.h"
 #include "../../SpritesheetFormat.h"
 #include "DragPreviewOverlay.h"
@@ -2220,9 +2222,23 @@ void Engine::renderInspectorPanel() {
         return true;
     };
 
+    // channelHint names what the active shading model reads from each channel
+    // (shown in the empty slot and its tooltip). acceptTextureArrays lets the
+    // slot take Unity Texture2DArray .asset files, which the custom array material
+    // reads in place of a 2D image.
+    auto isUnityTextureArrayAsset = [](const fs::path& candidate) {
+        std::string ext = candidate.extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return ext == ".asset" &&
+               UnityAssetImport::SniffAsset(candidate.string()) == UnityAssetImport::AssetKind::Texture2DArray;
+    };
+
     auto drawMaterialTextureField = [&](const char* label,
                                         const char* idSuffix,
-                                        std::string& path) {
+                                        std::string& path,
+                                        const char* channelHint = nullptr,
+                                        bool acceptTextureArrays = false) {
         static std::unordered_map<std::string, std::string> popupFilters;
 
         bool changed = false;
@@ -2235,12 +2251,21 @@ void Engine::renderInspectorPanel() {
         const std::string popupId = std::string("##TexturePicker_") + idSuffix;
         const std::string displayName = assetDisplayName(path, "None");
         const fs::path resolvedPath = resolveEditorAssetPath(path);
+        std::string resolvedExt = resolvedPath.extension().string();
+        std::transform(resolvedExt.begin(), resolvedExt.end(), resolvedExt.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        // A Texture2DArray .asset is not an image the 2D loader can decode; asking
+        // it for a thumbnail would only fail every frame.
+        const bool pathIsArrayAsset = resolvedExt == ".asset";
 
         drawMaterialInlineLabel(label);
+        if (channelHint && ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s", channelHint);
+        }
         ImGui::SameLine();
 
         Texture* thumbTexture = nullptr;
-        if (!resolvedPath.empty()) {
+        if (!resolvedPath.empty() && !pathIsArrayAsset) {
             thumbTexture = renderer.getTexture(resolvedPath.string(), MaterialProperties::TextureFilter::Bilinear);
         }
 
@@ -2293,9 +2318,16 @@ void Engine::renderInspectorPanel() {
         );
         fieldDrawList->PopClipRect();
         if (ImGui::IsItemHovered()) {
-            if (path.empty()) {
-                ImGui::SetTooltip("%s\nDrag an image here or choose one from the asset list.",
-                                  assetHintLabel(path, "No texture assigned").c_str());
+            const char* dropHint = acceptTextureArrays
+                ? "Drag a Unity Texture2DArray .asset here."
+                : "Drag an image here or choose one from the asset list.";
+            if (path.empty() && channelHint) {
+                ImGui::SetTooltip("%s\n%s\n%s", assetHintLabel(path, "No texture assigned").c_str(),
+                                  channelHint, dropHint);
+            } else if (path.empty()) {
+                ImGui::SetTooltip("%s\n%s", assetHintLabel(path, "No texture assigned").c_str(), dropHint);
+            } else if (channelHint) {
+                ImGui::SetTooltip("%s\n%s", path.c_str(), channelHint);
             } else {
                 ImGui::SetTooltip("%s", path.c_str());
             }
@@ -2308,6 +2340,9 @@ void Engine::renderInspectorPanel() {
                 const fs::path droppedPath(dropped);
                 if ((!ec && fileBrowser.isTextureFile(droppedEntry)) || IsSpriteSheetSidecarPath(droppedPath)) {
                     path = ResolveSpriteSheetImagePath(droppedPath).string();
+                    changed = true;
+                } else if (acceptTextureArrays && isUnityTextureArrayAsset(droppedPath)) {
+                    path = droppedPath.string();
                     changed = true;
                 }
             }
@@ -2335,8 +2370,15 @@ void Engine::renderInspectorPanel() {
             }
 
             const bool canUseSelected = isTextureOrSpriteSheetSelection(fileBrowser.selectedFile);
+            const bool canUseSelectedArray = !canUseSelected && acceptTextureArrays &&
+                                             !fileBrowser.selectedFile.empty() &&
+                                             isUnityTextureArrayAsset(fileBrowser.selectedFile);
             if (canUseSelected && ImGui::Selectable("Use Selected Asset")) {
                 path = ResolveSpriteSheetImagePath(fileBrowser.selectedFile).string();
+                changed = true;
+                ImGui::CloseCurrentPopup();
+            } else if (canUseSelectedArray && ImGui::Selectable("Use Selected Texture Array")) {
+                path = fs::path(fileBrowser.selectedFile).string();
                 changed = true;
                 ImGui::CloseCurrentPopup();
             }
@@ -2569,7 +2611,8 @@ void Engine::renderInspectorPanel() {
                                                 std::string& vertShaderPath,
                                                 std::string& fragShaderPath,
                                                 float width,
-                                                float height) {
+                                                float height,
+                                                const char* activeProfileName) {
         static std::unordered_map<std::string, std::string> popupFilters;
 
         bool changed = false;
@@ -2587,7 +2630,9 @@ void Engine::renderInspectorPanel() {
             return true;
         };
 
-        const std::string selectionLabel = shaderDisplayName(shaderPackPath, vertShaderPath, fragShaderPath, false);
+        const std::string selectionLabel = activeProfileName && *activeProfileName
+            ? std::string(activeProfileName)
+            : shaderDisplayName(shaderPackPath, vertShaderPath, fragShaderPath, false);
         const float arrowRegionWidth = std::min(18.0f, std::max(12.0f, height - 2.0f));
         const std::string clippedLabel = fitLabelToWidth(selectionLabel, width - arrowRegionWidth - 14.0f);
         const ImVec2 fieldMin = ImGui::GetCursorScreenPos();
@@ -2729,7 +2774,7 @@ void Engine::renderInspectorPanel() {
                                          std::string& shaderPackPath,
                                          std::string& vertShaderPath,
                                          std::string& fragShaderPath,
-                                         const MaterialProperties& material,
+                                         MaterialProperties& material,
                                          const std::string& albedoPath,
                                          const std::string& overlayPath,
                                          const std::string& normalPath,
@@ -2831,7 +2876,10 @@ void Engine::renderInspectorPanel() {
                                                         vertShaderPath,
                                                         fragShaderPath,
                                                         textWidth,
-                                                        shaderFieldHeight);
+                                                        shaderFieldHeight,
+                                                        material.usesProjectShader()
+                                                            ? GetMaterialShaderProfile(material.shaderParameters.profileId).name.c_str()
+                                                            : nullptr);
         } else {
             ImGui::BeginDisabled();
             ImGui::Button(shaderDisplayName(shaderPackPath, vertShaderPath, fragShaderPath, false).c_str(),
@@ -2839,6 +2887,10 @@ void Engine::renderInspectorPanel() {
             ImGui::EndDisabled();
         }
 
+        if (changed) {
+            if (shaderPackPath.empty()) material.shaderParameters = {};
+            else SyncMaterialShaderProfileSelection(material.shaderParameters,shaderPackPath);
+        }
         ImGui::PopID();
         return std::pair<bool, bool>{open, changed};
     };
@@ -3127,6 +3179,67 @@ void Engine::renderInspectorPanel() {
                               "specular strength and Blinn-Phong exponent they stand in for.");
         }
 
+        changed |= SyncMaterialShaderProfileSelection(materialValue.shaderParameters, shaderPackPath);
+        // A project profile opts into this row. Projects without one keep the
+        // normal material Inspector, without an unrelated Standard mode row.
+        if (materialValue.usesProjectShader()) {
+            const auto& selectedProfile=GetMaterialShaderProfile(materialValue.shaderParameters.profileId);
+            drawMaterialInlineLabel("Shading Model");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(-1.0f);
+            if (ImGui::BeginCombo("##ProjectShadingModel", selectedProfile.name.c_str())) {
+                if (ImGui::Selectable("Standard", false)) {
+                    materialValue.shaderParameters = {};
+                    shaderPackPath.clear(); vertShaderPath.clear(); fragShaderPath.clear();
+                    changed = true;
+                }
+                const fs::path assetsRoot=projectManager.currentProject.isLoaded
+                    ? projectManager.currentProject.assetsPath : fileBrowser.projectRoot;
+                const auto profiles=collectAssetsInDirectory(assetsRoot, [](const fs::directory_entry& entry) {
+                    return IsShaderPackFile(entry.path());
+                });
+                for (const auto& path:profiles) {
+                    const uint8_t profileId=RegisterMaterialShaderProfile(path.string());
+                    if (profileId==0) continue;
+                    const auto& profile=GetMaterialShaderProfile(profileId);
+                    ImGui::PushID(path.string().c_str());
+                    if (ImGui::Selectable(profile.name.c_str(), profileId==materialValue.shaderParameters.profileId) &&
+                        profileId!=materialValue.shaderParameters.profileId) {
+                        SetMaterialShaderProfile(materialValue.shaderParameters,path.string());
+                        shaderPackPath=path.string();
+                        vertShaderPath=profile.vert; fragShaderPath=profile.frag;
+                        changed=true;
+                    }
+                    ImGui::PopID();
+                }
+                ImGui::EndCombo();
+            }
+        }
+        const auto& materialProfile=GetMaterialShaderProfile(materialValue.shaderParameters.profileId);
+
+        if (InspectorReveal _fs = drawInspectorSubsectionFoldout(
+                "Shader Controls", nullptr, true, materialValue.usesProjectShader())) {
+            for (const auto& field : materialProfile.fields) {
+                ImGui::PushID(field.slot);
+                auto& value=materialValue.shaderParameters.values[field.slot];
+                if (field.type=="bool") {
+                    bool enabled=value.x!=0.0f;
+                    if(ImGui::Checkbox(field.label.c_str(),&enabled)) { value.x=enabled?1.0f:0.0f; changed=true; }
+                } else if(field.type=="int") {
+                    int v=static_cast<int>(value.x);
+                    if(ImGui::SliderInt(field.label.c_str(),&v,static_cast<int>(field.minimum),static_cast<int>(field.maximum))) {value.x=static_cast<float>(v); changed=true;}
+                } else if(field.type=="vec2") changed |= ImGui::DragFloat2(field.label.c_str(),&value.x,0.01f,field.minimum,field.maximum);
+                else if(field.type=="vec3") changed |= ImGui::DragFloat3(field.label.c_str(),&value.x,0.01f,field.minimum,field.maximum);
+                else if(field.type=="vec4") changed |= ImGui::DragFloat4(field.label.c_str(),&value.x,0.01f,field.minimum,field.maximum);
+                else changed |= ImGui::SliderFloat(field.label.c_str(),&value.x,field.minimum,field.maximum);
+                ImGui::PopID();
+            }
+            if(ImGui::Button("Reset Shader Controls")) {
+                for(const auto& field:materialProfile.fields) materialValue.shaderParameters.values[field.slot]=field.defaults;
+                changed=true;
+            }
+        }
+
         const bool metallicFromMap = materialValue.pbrEnabled &&
                                      (!metallicMapPath.empty() || !metallicRoughnessPath.empty());
         const bool roughnessFromMap = materialValue.pbrEnabled &&
@@ -3204,9 +3317,15 @@ void Engine::renderInspectorPanel() {
         }
 
         ImGui::Spacing();
+        const char* albedoChannelHint = nullptr;
+        const char* normalChannelHint = nullptr;
+        const char* occlusionChannelHint = nullptr;
+        const bool projectTextureArrays = materialProfile.textureArrays;
         if (InspectorReveal _fs = drawInspectorSubsectionFoldout("Texture Maps", nullptr, true)) {
-            changed |= drawMaterialTextureField("Base Map", (std::string(idPrefix) + "Albedo").c_str(), albedoPath);
-            changed |= drawMaterialTextureField("Normal Map", (std::string(idPrefix) + "Normal").c_str(), normalPath);
+            changed |= drawMaterialTextureField("Base Map", (std::string(idPrefix) + "Albedo").c_str(), albedoPath,
+                                                albedoChannelHint, projectTextureArrays);
+            changed |= drawMaterialTextureField("Normal Map", (std::string(idPrefix) + "Normal").c_str(), normalPath,
+                                                normalChannelHint, projectTextureArrays);
             // frag.glsl reads these three only on its PBR branch; the legacy branch takes
             // metalness and smoothness from the sliders alone. The height/parallax rows
             // further down are PBR-only too (both fragment shaders gate parallax on
@@ -3259,7 +3378,8 @@ void Engine::renderInspectorPanel() {
                 ImGui::SetTooltip("Discard fragments below this alpha outright.\n"
                                   "0 disables the test and leaves the material blended.");
             }
-            changed |= drawMaterialTextureField("Occlusion", (std::string(idPrefix) + "Occlusion").c_str(), occlusionPath);
+            changed |= drawMaterialTextureField("Occlusion", (std::string(idPrefix) + "Occlusion").c_str(), occlusionPath,
+                                                occlusionChannelHint);
             drawMaterialInlineLabel("Occlusion Strength");
             ImGui::SameLine();
             ImGui::SetNextItemWidth(-1.0f);
@@ -9731,8 +9851,8 @@ void Engine::renderInspectorPanel() {
                     endCompFields();
                 }
                 if (ray.uiInteraction) {
-                    ImGui::TextWrapped("%s", "ModuGUI raycasting from an XR ray is not implemented yet; this "
-                                 "flag is stored but does nothing.");
+                    ImGui::TextWrapped("%s", "Points at world-space ModuGUI canvases. The controller UI Press action "
+                                 "clicks buttons and drags controls.");
                 }
                 ImGui::PopID();
             }
@@ -10369,10 +10489,17 @@ void Engine::renderInspectorPanel() {
                     ImGui::BeginDisabled(!obj.postFx.motionBlurEnabled);
                     fieldRow(Loc::T("COMPONENT_POST_FX_STRENGTH", "Strength"));
                     if (ImGui::SliderFloat("##MBStrength", &obj.postFx.motionBlurStrength, 0.0f, 0.95f, "%.2f")) { changed = true; }
-                    fieldRow(Loc::T("COMPONENT_POST_FX_THRESHOLD_2", "Threshold"));
-                    if (ImGui::SliderFloat("##MBThreshold", &obj.postFx.motionBlurThreshold, 0.0f, 0.25f, "%.3f")) { changed = true; }
-                    fieldRow(Loc::T("COMPONENT_POST_FX_CLAMP", "Clamp"));
-                    if (ImGui::SliderFloat("##MBClamp", &obj.postFx.motionBlurClamp, 0.0f, 1.5f, "%.2f")) { changed = true; }
+                    fieldRow("Min Motion (px)");
+                    float minimumMotionPixels = obj.postFx.motionBlurThreshold * 10.0f;
+                    if (ImGui::SliderFloat("##MBThreshold", &minimumMotionPixels, 0.0f, 2.5f, "%.2f")) {
+                        obj.postFx.motionBlurThreshold = minimumMotionPixels / 10.0f; changed = true;
+                    }
+                    fieldRow("Max Blur (%)");
+                    float maximumBlurPercent = obj.postFx.motionBlurClamp * 10.0f;
+                    if (ImGui::SliderFloat("##MBClamp", &maximumBlurPercent, 0.0f, 15.0f, "%.1f")) {
+                        obj.postFx.motionBlurClamp = maximumBlurPercent / 10.0f; changed = true;
+                    }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Maximum trail length as a percentage of image height. Camera motion, including each VR eye.");
                     ImGui::EndDisabled();
                     endCompFields();
                 }
@@ -10463,7 +10590,11 @@ void Engine::renderInspectorPanel() {
                     ImGui::TableSetColumnIndex(1); ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted("Enabled");
                     ImGui::BeginDisabled(!obj.postFx.ambientOcclusionEnabled);
                     fieldRow(Loc::T("COMPONENT_POST_FX_AO_RADIUS", "AO Radius"));
-                    if (ImGui::SliderFloat("##AORadius", &obj.postFx.aoRadius, 0.0005f, 0.01f, "%.4f")) { changed = true; }
+                    float radiusMeters = obj.postFx.aoRadius * 100.0f;
+                    if (ImGui::SliderFloat("##AORadius", &radiusMeters, 0.02f, 3.0f, "%.2f m")) {
+                        obj.postFx.aoRadius = radiusMeters / 100.0f; changed = true;
+                    }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("World-space contact radius. Half-resolution depth AO with edge-aware filtering.");
                     fieldRow(Loc::T("COMPONENT_POST_FX_AO_STRENGTH", "AO Strength"));
                     if (ImGui::SliderFloat("##AOStrength", &obj.postFx.aoStrength, 0.0f, 2.0f, "%.2f")) { changed = true; }
                     ImGui::EndDisabled();
@@ -11097,6 +11228,36 @@ void Engine::renderInspectorPanel() {
                     if (obj.light.softShadows) {
                         fieldRow(Loc::T("COMPONENT_LIGHT_SHADOW_SOFTNESS", "Shadow Softness"));
                         if (ImGui::SliderFloat("##ShadowSoftness", &obj.light.shadowSoftness, 0.001f, 0.20f, "%.3f")) { changed = true; }
+                    }
+                    if (obj.light.type != LightType::Directional) {
+                        if (boolRow(Loc::T("COMPONENT_LIGHT_DYNAMIC_OPACITY", "Dynamic Opacity"), &obj.light.dynamicShadowOpacity)) { changed = true; }
+                        fieldRow(Loc::T("COMPONENT_LIGHT_SHADOW_OPACITY", "Shadow Opacity"));
+                        if (ImGui::SliderFloat("##ShadowOpacity", &obj.light.shadowOpacity, 0.0f, 1.0f, "%.2f")) { changed = true; }
+                        if (obj.light.dynamicShadowOpacity) {
+                            fieldRow(Loc::T("COMPONENT_LIGHT_SHADOW_OPACITY_OUTSIDE", "Outside Opacity"));
+                            if (ImGui::SliderFloat("##ShadowOpacityOutside", &obj.light.shadowOpacityOutside, 0.0f, 1.0f, "%.2f")) { changed = true; }
+                            fieldRow(Loc::T("COMPONENT_LIGHT_SHADOW_OPACITY_MIN", "Min Distance"));
+                            if (ImGui::DragFloat("##ShadowOpacityMin", &obj.light.shadowOpacityMinDistance, 0.05f, 0.0f, 1000.0f, "%.2f")) {
+                                obj.light.shadowOpacityMinDistance = std::max(obj.light.shadowOpacityMinDistance, 0.0f);
+                                obj.light.shadowOpacityMaxDistance = std::max(obj.light.shadowOpacityMaxDistance, obj.light.shadowOpacityMinDistance);
+                                changed = true;
+                            }
+                            fieldRow(Loc::T("COMPONENT_LIGHT_SHADOW_OPACITY_MAX", "Max Distance"));
+                            if (ImGui::DragFloat("##ShadowOpacityMax", &obj.light.shadowOpacityMaxDistance, 0.05f, obj.light.shadowOpacityMinDistance, 1000.0f, "%.2f")) {
+                                obj.light.shadowOpacityMaxDistance = std::max(obj.light.shadowOpacityMaxDistance, obj.light.shadowOpacityMinDistance);
+                                changed = true;
+                            }
+                            fieldRow(Loc::T("COMPONENT_LIGHT_SHADOW_OPACITY_FADE_IN", "Fade In"));
+                            if (ImGui::DragFloat("##ShadowOpacityFadeIn", &obj.light.shadowOpacityFadeIn, 0.05f, 0.0f, 1000.0f, "%.2f")) {
+                                obj.light.shadowOpacityFadeIn = std::max(obj.light.shadowOpacityFadeIn, 0.0f);
+                                changed = true;
+                            }
+                            fieldRow(Loc::T("COMPONENT_LIGHT_SHADOW_OPACITY_FADE_OUT", "Fade Out"));
+                            if (ImGui::DragFloat("##ShadowOpacityFadeOut", &obj.light.shadowOpacityFadeOut, 0.05f, 0.0f, 1000.0f, "%.2f")) {
+                                obj.light.shadowOpacityFadeOut = std::max(obj.light.shadowOpacityFadeOut, 0.0f);
+                                changed = true;
+                            }
+                        }
                     }
                 }
                 endCompFields();
@@ -13253,7 +13414,7 @@ void Engine::renderInspectorPanel() {
         };
 
         std::string materialHeaderName = "Material";
-        const MaterialProperties* headerMaterial = &obj.material;
+        MaterialProperties* headerMaterial = &obj.material;
         const std::string* headerAlbedoPath = &obj.albedoTexturePath;
         const std::string* headerOverlayPath = &obj.overlayTexturePath;
         const std::string* headerNormalPath = &obj.normalMapPath;
@@ -13301,7 +13462,7 @@ void Engine::renderInspectorPanel() {
         if (materialHeaderState.first) {
             InspectorBodyScope _ibs(*this);
             if (selectedMaterialSlot == 0) {
-                const bool primaryMaterialChanged = renderMaterialEditorBody(
+                bool primaryMaterialChanged = renderMaterialEditorBody(
                     "ObjectMaterial",
                     obj.material,
                     obj.albedoTexturePath,
@@ -13322,6 +13483,7 @@ void Engine::renderInspectorPanel() {
                     objectMaterialPreviewScale,
                     1002
                 );
+                primaryMaterialChanged |= materialHeaderState.second;
 
                 // Reload / Save / Reload Shader and the shared-by count are in the Material
                 // header's right-click menu.
@@ -13362,7 +13524,7 @@ void Engine::renderInspectorPanel() {
                             ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f),
                                                "Failed to read material file for this slot.");
                         } else {
-                            const bool slotMaterialChanged = renderMaterialEditorBody(
+                            bool slotMaterialChanged = renderMaterialEditorBody(
                                 "SlotMaterial",
                                 slotInspectedMaterial,
                                 slotInspectedAlbedo,
@@ -13383,6 +13545,7 @@ void Engine::renderInspectorPanel() {
                                 objectMaterialPreviewScale,
                                 1003
                             );
+                slotMaterialChanged |= materialHeaderState.second;
 
                             // Reload / Save moved to the Material header's right-click menu, so
                             // slot edits save themselves like the primary material's do -
@@ -13665,6 +13828,34 @@ void Engine::renderInspectorPanel() {
             APPLY_CHANGED_MATERIAL_FIELD(cloudStars);
             APPLY_CHANGED_MATERIAL_FIELD(cloudHorizon);
             APPLY_CHANGED_MATERIAL_FIELD(textureFilter);
+            APPLY_CHANGED_MATERIAL_FIELD(pbrEnabled);
+            APPLY_CHANGED_MATERIAL_FIELD(metallic);
+            APPLY_CHANGED_MATERIAL_FIELD(roughness);
+            APPLY_CHANGED_MATERIAL_FIELD(occlusionStrength);
+            APPLY_CHANGED_MATERIAL_FIELD(emissionColor);
+            APPLY_CHANGED_MATERIAL_FIELD(emissionStrength);
+            APPLY_CHANGED_MATERIAL_FIELD(alphaCutoff);
+            APPLY_CHANGED_MATERIAL_FIELD(heightScale);
+            APPLY_CHANGED_MATERIAL_FIELD(parallaxSteps);
+            APPLY_CHANGED_MATERIAL_FIELD(parallaxInvertHeight);
+            if (before.material.shaderParameters.profileId != obj.material.shaderParameters.profileId ||
+                std::strcmp(before.material.shaderParameters.profilePath,
+                            obj.material.shaderParameters.profilePath) != 0) {
+                target.material.shaderParameters = obj.material.shaderParameters;
+            } else {
+                const auto& sourceProfile=GetMaterialShaderProfile(obj.material.shaderParameters.profileId);
+                const auto& targetProfile=GetMaterialShaderProfile(target.material.shaderParameters.profileId);
+                for(const auto& sourceField:sourceProfile.fields) {
+                    const auto& value=obj.material.shaderParameters.values[sourceField.slot];
+                    if(before.material.shaderParameters.values[sourceField.slot]==value) continue;
+                    for(const auto& targetField:targetProfile.fields) {
+                        if(sourceField.uniform==targetField.uniform && sourceField.type==targetField.type) {
+                            target.material.shaderParameters.values[targetField.slot]=value;
+                            break;
+                        }
+                    }
+                }
+            }
         }
 
         if (sharedCollider) {
@@ -14117,10 +14308,45 @@ void Engine::renderInspectorPanel() {
             APPLY_CHANGED_MATERIAL_FIELD(cloudStars);
             APPLY_CHANGED_MATERIAL_FIELD(cloudHorizon);
             APPLY_CHANGED_MATERIAL_FIELD(textureFilter);
+            APPLY_CHANGED_MATERIAL_FIELD(pbrEnabled);
+            APPLY_CHANGED_MATERIAL_FIELD(metallic);
+            APPLY_CHANGED_MATERIAL_FIELD(roughness);
+            APPLY_CHANGED_MATERIAL_FIELD(occlusionStrength);
+            APPLY_CHANGED_MATERIAL_FIELD(emissionColor);
+            APPLY_CHANGED_MATERIAL_FIELD(emissionStrength);
+            APPLY_CHANGED_MATERIAL_FIELD(alphaCutoff);
+            APPLY_CHANGED_MATERIAL_FIELD(heightScale);
+            APPLY_CHANGED_MATERIAL_FIELD(parallaxSteps);
+            APPLY_CHANGED_MATERIAL_FIELD(parallaxInvertHeight);
+            if (before.material.shaderParameters.profileId != obj.material.shaderParameters.profileId ||
+                std::strcmp(before.material.shaderParameters.profilePath,
+                            obj.material.shaderParameters.profilePath) != 0) {
+                target.material.shaderParameters = obj.material.shaderParameters;
+            } else {
+                const auto& sourceProfile=GetMaterialShaderProfile(obj.material.shaderParameters.profileId);
+                const auto& targetProfile=GetMaterialShaderProfile(target.material.shaderParameters.profileId);
+                for(const auto& sourceField:sourceProfile.fields) {
+                    const auto& value=obj.material.shaderParameters.values[sourceField.slot];
+                    if(before.material.shaderParameters.values[sourceField.slot]==value) continue;
+                    for(const auto& targetField:targetProfile.fields) {
+                        if(sourceField.uniform==targetField.uniform && sourceField.type==targetField.type) {
+                            target.material.shaderParameters.values[targetField.slot]=value;
+                            break;
+                        }
+                    }
+                }
+            }
             APPLY_CHANGED_FIELD(materialPath);
             APPLY_CHANGED_FIELD(albedoTexturePath);
             APPLY_CHANGED_FIELD(overlayTexturePath);
             APPLY_CHANGED_FIELD(normalMapPath);
+            APPLY_CHANGED_FIELD(metallicRoughnessMapPath);
+            APPLY_CHANGED_FIELD(metallicMapPath);
+            APPLY_CHANGED_FIELD(roughnessMapPath);
+            APPLY_CHANGED_FIELD(opacityMapPath);
+            APPLY_CHANGED_FIELD(emissiveMapPath);
+            APPLY_CHANGED_FIELD(occlusionMapPath);
+            APPLY_CHANGED_FIELD(heightMapPath);
             APPLY_CHANGED_FIELD(shaderPackPath);
             APPLY_CHANGED_FIELD(vertexShaderPath);
             APPLY_CHANGED_FIELD(fragmentShaderPath);
@@ -14143,6 +14369,13 @@ void Engine::renderInspectorPanel() {
             APPLY_CHANGED_COMPONENT_FIELD(light, shadowBias);
             APPLY_CHANGED_COMPONENT_FIELD(light, shadowSoftness);
             APPLY_CHANGED_COMPONENT_FIELD(light, shadowResolution);
+            APPLY_CHANGED_COMPONENT_FIELD(light, shadowOpacity);
+            APPLY_CHANGED_COMPONENT_FIELD(light, dynamicShadowOpacity);
+            APPLY_CHANGED_COMPONENT_FIELD(light, shadowOpacityOutside);
+            APPLY_CHANGED_COMPONENT_FIELD(light, shadowOpacityMinDistance);
+            APPLY_CHANGED_COMPONENT_FIELD(light, shadowOpacityMaxDistance);
+            APPLY_CHANGED_COMPONENT_FIELD(light, shadowOpacityFadeIn);
+            APPLY_CHANGED_COMPONENT_FIELD(light, shadowOpacityFadeOut);
             APPLY_CHANGED_COMPONENT_FIELD(light, enabled);
         }
 

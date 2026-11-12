@@ -1,9 +1,11 @@
 #include "EditorUI.h"
 #include "../include/Textures/TextureTranscode.h"
 #include "../include/Platform/AssetSource.h"
+#include "UnityAssetImport.h"
 #include <chrono>
 #include <cstring>
 #include <iomanip>
+#include <mutex>
 #include <sstream>
 #include <unordered_map>
 #if defined(IMGUI_ENABLE_FREETYPE)
@@ -41,6 +43,32 @@ namespace {
         if (!ec) return PathToUtf8(canonical.generic_u8string());
         return PathToUtf8(fs::absolute(path, ec).lexically_normal().generic_u8string());
     }
+    // Unity's .asset and .mat share their extensions with unrelated formats, so classifying them
+    // means reading the file header. The file browser classifies every entry every frame; the
+    // answer is remembered per path until the file's timestamp changes.
+    UnityAssetImport::AssetKind sniffUnityAssetCached(const fs::directory_entry& entry) {
+        struct SniffEntry {
+            fs::file_time_type stamp;
+            UnityAssetImport::AssetKind kind = UnityAssetImport::AssetKind::Unknown;
+        };
+        static std::mutex cacheMutex;
+        static std::unordered_map<std::string, SniffEntry> cache;
+        std::error_code ec;
+        const fs::file_time_type stamp = entry.last_write_time(ec);
+        const std::string key = entry.path().string();
+        {
+            std::lock_guard<std::mutex> lock(cacheMutex);
+            auto it = cache.find(key);
+            if (it != cache.end() && !ec && it->second.stamp == stamp) return it->second.kind;
+        }
+        const UnityAssetImport::AssetKind kind = UnityAssetImport::SniffAsset(key);
+        std::lock_guard<std::mutex> lock(cacheMutex);
+        if (cache.size() >= 8192) cache.clear();
+        SniffEntry& slot = cache[key];
+        slot.stamp = stamp;
+        slot.kind = kind;
+        return kind;
+    }
     FileCategory classifyFileBrowserEntry(const fs::directory_entry& entry) {
         if (entry.is_directory()) return FileCategory::Folder;
         std::string filename = entry.path().filename().string();
@@ -58,9 +86,22 @@ namespace {
             ext == ".rmesh" || ext == ".mmesh") {
             return FileCategory::Model;
         }
-        if (ext == ".mat") return FileCategory::Material;
+        if (ext == ".asset") {
+            switch (sniffUnityAssetCached(entry)) {
+                case UnityAssetImport::AssetKind::Mesh: return FileCategory::Model;
+                case UnityAssetImport::AssetKind::Texture2DArray: return FileCategory::Texture;
+                default: return FileCategory::Unknown;
+            }
+        }
+        if (ext == ".mat") {
+            // A Unity YAML material is not a Modularity material: opening it as one would show
+            // defaults and the first edit would overwrite the Unity file.
+            return sniffUnityAssetCached(entry) == UnityAssetImport::AssetKind::Material
+                ? FileCategory::Unknown
+                : FileCategory::Material;
+        }
         if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".bmp" ||
-            ext == ".tga" || ext == ".dds" || ext == ".hdr" || ext == ".exr") {
+            ext == ".tga" || ext == ".dds" || ext == ".hdr" || ext == ".exr" || ext == ".psd") {
             return FileCategory::Texture;
         }
         if (ext == ".mp4" || ext == ".m4v" || ext == ".mov" || ext == ".avi" ||

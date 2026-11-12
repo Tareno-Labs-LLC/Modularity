@@ -229,7 +229,7 @@
 	"SETTINGS_GRAPHICS_VSYNC": "VSync",
 	"SETTINGS_GRAPHICS_VSYNC_DESC": "Synchronize presentation to the display refresh.",
 	"SETTINGS_GRAPHICS_TARGET_FPS": "Target FPS",
-	"SETTINGS_GRAPHICS_TARGET_FPS_DESC": "Runtime frame-rate target when VSync is not controlling presentation.",
+	"SETTINGS_GRAPHICS_TARGET_FPS_DESC": "Runtime frame-rate limit when VSync is off. Set 0 for uncapped rendering.",
 	"SETTINGS_GRAPHICS_STARTUP_MODE": "Startup Mode",
 	"SETTINGS_GRAPHICS_STARTUP_MODE_DESC": "Default player window mode.",
 	"SETTINGS_GRAPHICS_SHADOW_QUALITY": "Shadow Quality",

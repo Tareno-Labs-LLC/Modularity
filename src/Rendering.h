@@ -48,12 +48,35 @@ public:
     ~Mesh();
 
     void draw() const;
+    void drawInstanced(unsigned int matrixBuffer, int count) const;
     void updateVertices(const float* vertexData, size_t dataSizeBytes);
     int getVertexCount() const { return vertexCount; }
     bool isDynamic() const { return dynamic; }
     bool usesBones() const { return hasBones; }
     unsigned int getVertexBuffer() const { return VBO; }
     uint64_t getSerial() const { return serial; }
+
+    // Optional per-vertex streams for foliage (auxiliary), in their own buffer on the
+    // same VAO so the 8-float main stream - which the MDI arena, CPU skinning and
+    // static merge all copy as 32-byte vertices - never changes. Arrays a mesh
+    // lacks stay disabled and read the GL default (0,0,0,1): AO 1, no motion.
+    static constexpr unsigned int kAttribColor = 9;  // vec4 vertex color
+    static constexpr unsigned int kAttribUV1 = 10;   // vec2 TEXCOORD1
+    static constexpr unsigned int kAttribUV2 = 11;   // vec2/vec3 TEXCOORD2
+    // Any pointer may be null. uv2 holds uv2Components (2 or 3) floats per vertex;
+    // vertexCount must equal getVertexCount().
+    void setExtraAttributes(const float* color4, const float* uv1, const float* uv2,
+                            int uv2Components, size_t vertexCount);
+    bool hasExtraAttributes() const { return extraVBO != 0; }
+    bool hasVertexColors() const { return extraHasColor; }
+    bool hasAuxiliaryStreams() const { return extraHasColor && extraHasUV1 && extraUV2Components >= 2; }
+    int getUV2Components() const { return extraUV2Components; }
+
+private:
+    unsigned int extraVBO = 0;
+    bool extraHasColor = false;
+    bool extraHasUV1 = false;
+    int extraUV2Components = 0;
 };
 
 class OBJLoader {
@@ -87,6 +110,10 @@ public:
         std::vector<float> baseVertices;
         std::vector<SubMesh> subMeshes;
         std::vector<std::string> materialSlots;
+        // Extra streams uploaded through Mesh::setExtraAttributes (informational).
+        bool hasVertexColors = false;
+        bool hasUV1 = false;
+        int uv2Components = 0;
     };
 
 private:
@@ -150,6 +177,14 @@ enum RenderOptimizationFeature : uint32_t {
     kRenderOptHiZ = 1u << 6,
 };
 
+// Foliage wind for one frame (see Renderer::setSceneWind).
+struct SceneWindState {
+    glm::vec3 direction = glm::vec3(0.0f, 0.0f, 1.0f); // world, normalized, blowing toward
+    float strength = 0.0f;   // auxiliary _CTI_SRP_Wind.w
+    float turbulence = 0.0f; // auxiliary _CTI_SRP_Turbulence
+    float time = 0.0f;       // seconds; auxiliary _Time.y
+};
+
 class Renderer {
 public:
     struct RenderStats {
@@ -165,6 +200,10 @@ public:
         int mdiObjects = 0;          // objects owned by multi-draw batches
         int mdiBatches = 0;
         int multiDrawCalls = 0;
+        int instancedDrawCalls = 0;
+        int instancedObjects = 0;
+        int shadowMapUpdates = 0;
+        int shadowMapReuses = 0;
         int indirectDrawCommands = 0;
         float cpuCullingMs = 0.0f;
         float queueBuildMs = 0.0f;
@@ -205,6 +244,13 @@ public:
         float bloomExtractMs = 0.0f;
         float bloomBlurMs = 0.0f;
         float compositeMs = 0.0f;
+        // GPU time from timestamp queries, a few frames old; -1 where timers are
+        // unavailable (GLES) or nothing has resolved yet. The *Ms fields above are
+        // CPU submission time only.
+        float gpuTotalMs = -1.0f;
+        float gpuBloomMs = -1.0f;
+        float gpuCompositeMs = -1.0f;
+        int bloomMipCount = 0;
         int activeVolumeCount = 0;
         int resolvedVolumeId = -1;
         std::string resolvedVolumeName;
@@ -267,6 +313,7 @@ private:
         bool hdr = false;
         bool hasDepth = true;
         bool depthSampleable = false;
+        bool rg16f = false;
         MaterialProperties::TextureFilter textureFilter = MaterialProperties::TextureFilter::Bilinear;
     };
     struct RenderTargetOptions {
@@ -274,6 +321,7 @@ private:
         bool hdr = false;
         bool depth = true;
         bool depthSampleable = false;
+        bool rg16f = false;
     };
     struct ResolvedPostFX {
         PostFXSettings settings;
@@ -304,7 +352,21 @@ private:
     int bandRegionHeight = 0;
     int bandPreviousFramebuffer = 0;
     bool bandRegionActive = false;
-    RenderTarget historyTarget;
+    // AO stores visibility + linear eye depth, independent of scene color precision.
+    RenderTarget aoTarget;
+    RenderTarget aoBlurTarget;
+    struct MotionHistory {
+        glm::mat4 viewProjection{1.0f};
+        glm::mat4 projection{1.0f};
+        glm::vec3 position{0.0f};
+        glm::vec3 forward{0.0f, 0.0f, -1.0f};
+        double time = 0.0;
+        int width = 0, height = 0;
+        bool valid = false;
+    };
+    MotionHistory viewportMotionHistory;
+    std::array<MotionHistory, 4> xrMotionHistory{};
+    std::unordered_map<int, MotionHistory> previewMotionHistory;
     RenderTarget volumetricTarget;
     RenderTarget volumetricBlurTarget;
     RenderTarget ssrTarget;
@@ -337,8 +399,33 @@ private:
     };
     XREyePreview xrEyePreview[2];
     uint64_t voxelSceneSignature = 0;
-    RenderTarget bloomTargetA;
-    RenderTarget bloomTargetB;
+    // Bloom runs on a mip chain starting at half the post size: down[0..n) are the
+    // filtered downsamples, up[i] combines down[i] with everything below it, and
+    // up[0] (down[0] when n == 1) is what the composite samples. The viewport and
+    // the other post callers keep separate chains so their sizes don't reallocate
+    // each other every frame.
+    static constexpr int kMaxBloomMips = 6;
+    struct BloomChain {
+        RenderTarget down[kMaxBloomMips];
+        RenderTarget up[kMaxBloomMips];
+    };
+    BloomChain viewportBloomChain;
+    BloomChain auxBloomChain;
+    // GPU time of the post chain via glQueryCounter timestamps (GL_TIME_ELAPSED
+    // can't nest inside the profiler's whole-frame query). Each slot holds the
+    // start / after-bloom / end stamps of one applyPostProcessing call.
+    struct PostGpuTimer {
+        static constexpr int kSlots = 3;
+        unsigned int queries[kSlots][3] = {};
+        bool pending[kSlots] = {};
+        int writeSlot = 0;
+        bool recording = false;
+        float totalMs = -1.0f;
+        float bloomMs = -1.0f;
+        float compositeMs = -1.0f;
+    };
+    PostGpuTimer viewportPostGpuTimer;
+    PostGpuTimer auxPostGpuTimer;
     bool postFxSettingsOverrideActive = false;
     PostFXSettings postFxSettingsOverride;
     RenderTarget* postFxTargetOverride = nullptr;
@@ -348,11 +435,13 @@ private:
         unsigned int fbo = 0;
         unsigned int depthCube = 0;
         int resolution = 0;
+        uint64_t renderedFrame = UINT64_MAX, contentKey = 0;
     };
     struct ShadowDirectionalMap {
         unsigned int fbo = 0;
         unsigned int depthTexture = 0;
         int resolution = 0;
+        uint64_t renderedFrame = UINT64_MAX, contentKey = 0;
     };
     struct MirrorUpdateState {
         glm::vec3 lastCameraPos = glm::vec3(FLT_MAX);
@@ -418,11 +507,16 @@ private:
         bool sortOpaque = false;
         bool unlit = false;
         bool doubleSided = false;
+        // auxiliary foliage program this item draws with (0 = Standard, else the Rendering.cpp
+        // ProjectModel value). vertPath/fragPath already point at that program's stages.
+        uint8_t projectModel = 0;
         float cameraDepth = 0.0f;
         float cameraDistanceSq = 0.0f;
         uint64_t opaqueSortKey = 0;
         // Set only by the optimized path; the legacy path leaves the defaults.
         Shader* shader = nullptr;         // resolved once per shader pair per pass
+        int instanceGroup = -1;
+        bool instanceFollower = false;
         int multiDrawBatch = -1;          // >= 0: this item draws a whole multi-draw batch
         bool reflectionResolved = false;  // reflectionCube/Intensity already looked up
         unsigned int reflectionCube = 0;
@@ -430,6 +524,11 @@ private:
     };
     // Everything behind Project Settings > Optimization: per-object caches, pass
     // buffers, multi-draw and GPU culling resources. RenderOptimizationInternal.h.
+    struct InstanceState;
+    std::unique_ptr<InstanceState> instanceState;
+    struct StereoState;
+    std::unique_ptr<StereoState> stereoState;
+    void uploadStereoUniforms(Shader* program);
     struct OptimizationState;
     std::unique_ptr<OptimizationState> optState;
     RenderOptimizationSettings optimizationSettings;
@@ -454,9 +553,11 @@ private:
     Shader* shader = nullptr;
     Shader* defaultShader = nullptr;
     Shader* postShader = nullptr;
+    Shader* aoShader = nullptr;
+    Shader* aoBlurShader = nullptr;
     Shader* compositeShader = nullptr;
-    Shader* brightShader = nullptr;
-    Shader* blurShader = nullptr;
+    Shader* bloomDownShader = nullptr;
+    Shader* bloomUpShader = nullptr;
     Shader* volumetricShader = nullptr;
     Shader* ssrShader = nullptr;
     Shader* gbufferShader = nullptr;
@@ -481,6 +582,22 @@ private:
     std::unordered_map<std::string, CachedTextureEntry> normalTextureCachePoint;
     std::unordered_map<std::string, double> missingTextureRetryAfter;
     std::unordered_map<std::string, std::string> textureLoadErrors;
+    // GL_TEXTURE_2D_ARRAY textures for the auxiliary Bark Array model, keyed by the Unity
+    // Texture2DArray .asset path. Evicted least-recently-used once over budget, but
+    // never an array handed out this frame.
+    struct CachedTextureArrayEntry {
+        unsigned int id = 0;
+        size_t approxBytes = 0;
+        uint64_t lastUsedFrame = 0;
+    };
+    std::unordered_map<std::string, CachedTextureArrayEntry> textureArrayCache;
+    std::unordered_map<std::string, double> textureArrayRetryAfter;
+    size_t textureArrayUsageBytes = 0;
+    static constexpr size_t kTextureArrayBudgetBytes = 192ull * 1024ull * 1024ull;
+    // Returns the GL texture of the array at `path`, loading it on first use; 0 when it
+    // cannot be loaded (retried after a delay, like getTexture).
+    unsigned int getTextureArray(const std::string& path);
+    void releaseTextureArrays();
     std::unordered_map<std::string, TextureFormatPolicy> textureFormatOverrides;
     std::string textureKeyRoot;
     struct ShaderEntry {
@@ -500,8 +617,8 @@ private:
     std::string postVertPath = "Resources/Shaders/postfx_vert.glsl";
     std::string postFragPath = "Resources/Shaders/postfx_frag.glsl";
     std::string postCompositeFragPath = "Resources/Shaders/postfx_composite_frag.glsl";
-    std::string postBrightFragPath = "Resources/Shaders/postfx_bright_frag.glsl";
-    std::string postBlurFragPath = "Resources/Shaders/postfx_blur_frag.glsl";
+    std::string postBloomDownFragPath = "Resources/Shaders/postfx_bloom_down_frag.glsl";
+    std::string postBloomUpFragPath = "Resources/Shaders/postfx_bloom_up_frag.glsl";
     std::string selectionMaskVertPath = "Resources/Shaders/selection_mask_vert.glsl";
     std::string selectionMaskFragPath = "Resources/Shaders/selection_mask_frag.glsl";
     std::string wireframeFragPath = "Resources/Shaders/wireframe_frag.glsl";
@@ -554,7 +671,6 @@ private:
     std::vector<uint32_t> particleOrderScratch;
     std::vector<float> particleDepthScratch;
     unsigned int displayTexture = 0;
-    bool historyValid = false;
     size_t textureCacheBudgetBytes = 384ull * 1024ull * 1024ull;
     size_t textureCacheUsageBytes = 0;
     // Bumped whenever a texture is loaded, fails, or leaves the cache, so answers
@@ -562,6 +678,7 @@ private:
     uint64_t textureCacheGeneration = 0;
     WeatherDrive weatherDrive;
     float weatherTime = 0.0f;
+    SceneWindState sceneWind;
 
     bool warnedTextureCacheThrashing = false;
     bool warnedTextureCacheOverCommitted = false;
@@ -638,9 +755,12 @@ private:
     void drawFullscreenQuad();
     // Every Particle System as camera-facing quads in the 3D scene: depth-tested against what
     // is already drawn, drawn after the scene's transparent surfaces. RenderParticles.cpp.
+    void renderXRRayVisuals(const Camera& camera, const std::vector<SceneObject>& sceneObjects,
+                            const glm::mat4& view, const glm::mat4& projection);
     void renderParticleSystems(const std::vector<SceneObject>& sceneObjects,
                                const glm::mat4& view, const glm::mat4& proj);
     void releaseParticleBuffers();
+    void refreshTextureCacheBudget(bool force = false);
     void purgeTextureCacheIfNeeded();
     float updateEyeAdaptation(unsigned int sourceTexture, int width, int height,
                               const PostFXSettings& settings);
@@ -657,11 +777,22 @@ private:
                                 const std::vector<SceneObject>& sceneObjects,
                                 float fovDeg, float nearPlane, float farPlane,
                                 bool shadedSurface);
-    unsigned int applyPostProcessing(const Camera& camera, const std::vector<SceneObject>& sceneObjects, unsigned int sourceTexture, int width, int height, bool allowHistory);
+    unsigned int applyPostProcessing(const Camera& camera, const std::vector<SceneObject>& sceneObjects, unsigned int sourceTexture, int width, int height, bool allowHistory,
+                                     unsigned int depthTexture = 0, const glm::mat4* projection = nullptr,
+                                     MotionHistory* motionHistory = nullptr);
     bool postFxPreserveAlpha = false;
     ResolvedPostFX gatherPostFX(const Camera& camera, const std::vector<SceneObject>& sceneObjects) const;
     unsigned int findFramebufferForTexture(unsigned int texture) const;
     void logPostFxDebug(const PostProcessStats& stats, bool allowHistory) const;
+    unsigned int renderAmbientOcclusion(unsigned int depthTexture, int width, int height,
+                                         const glm::mat4& projection, float radius);
+    int ensureBloomChain(BloomChain& chain, int width, int height);
+    unsigned int renderBloom(BloomChain& chain, unsigned int sourceTexture, int width, int height,
+                             const PostFXSettings& settings, PostProcessStats& postStats);
+    void releaseBloomChain(BloomChain& chain);
+    int beginPostGpuTimer(PostGpuTimer& timer);
+    void stampPostGpuTimer(PostGpuTimer& timer, int slot, int stamp);
+    void releasePostGpuTimer(PostGpuTimer& timer);
 
 public:
     // Out of line: optState's type is only complete in the renderer's own sources.
@@ -722,6 +853,10 @@ public:
         weatherDrive = drive;
         weatherTime = weatherTimeSeconds;
     }
+    // Foliage wind, resolved once per frame by the engine before any view renders,
+    // so every view, XR eye and shadow pass animates from the same time and value.
+    void setSceneWind(const SceneWindState& wind) { sceneWind = wind; }
+    const SceneWindState& getSceneWind() const { return sceneWind; }
     void setShadowQuality(int filterQuality, float lodDistance, bool contactHardening);
     void setShaderAutoReload(bool enabled) { autoReloadShaders = enabled; }
     bool isShaderAutoReloadEnabled() const { return autoReloadShaders; }
@@ -733,6 +868,7 @@ public:
     int getHeight() const { return currentHeight; }
     void setFrameSerial(uint64_t serial) {
         frameSerial = serial;
+        refreshTextureCacheBudget();
         capturedSceneFrustums.clear();
         capturedSceneViews.clear();
     }
@@ -774,9 +910,16 @@ public:
                              int width, int height,
                              const glm::mat4& projection,
                              float nearPlane, float farPlane,
-                             bool clearTarget, bool applyPostFX);
+                             bool clearTarget, bool applyPostFX, int temporalView = -1);
     void renderCollisionOverlay(const Camera& camera, const std::vector<SceneObject>& sceneObjects, int width, int height, float fovDeg, float nearPlane, float farPlane, const std::vector<int>* previewIds = nullptr);
     void endRender();
+    // Both cameras use their runtime's asymmetric projection. Returns false when
+    // multiview is unavailable, so the caller can render the same targets per eye.
+    bool renderStereoSceneToTargets(const Camera* eyes,
+                                   const std::vector<SceneObject>& sceneObjects,
+                                   const unsigned int* targetFramebuffers,
+                                   int width, int height, const glm::mat4* projections,
+                                   float nearPlane, float farPlane);
     PostFXSettings resolvePostFXSettings(const Camera& camera, const std::vector<SceneObject>& sceneObjects) const;
     unsigned int postProcessTexture(const Camera& camera, const std::vector<SceneObject>& sceneObjects, unsigned int sourceTexture, int width, int height, bool allowHistory = false);
     bool postProcessFramebufferRegion(const Camera& camera,

@@ -42,10 +42,11 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "C must route its C source and C++ context bridge to separate compiler units: %s\n", error.c_str()); return 1;
     }
     if (!compiler.makeCommands(config, modu, commands, error) || !commands.embeddedCompiler ||
-        !commands.embeddedRequest.cSource.empty() || commands.embeddedRequest.cppSource != commands.wrapperPath) {
+        commands.embeddedRequest.cppSource != commands.wrapperPath ||
+        (!commands.embeddedRequest.cSource.empty() && commands.embeddedRequest.cSource.extension() != ".c")) {
         std::fprintf(stderr, "ModuCPP must use its generated C++ wrapper: %s\n", error.c_str()); return 1;
     }
-    std::puts("[PASS] embedded C and ModuCPP requests preserve the C++ context wrappers");
+    std::puts("[PASS] embedded C and ModuCPP requests preserve the C++ context wrappers, including the ModuCPP C backend");
     config.embeddedCompiler = false;
     for (const auto& source : {cpp, modu, c}) {
         if (!compiler.makeCommands(config, source, commands, error)) {

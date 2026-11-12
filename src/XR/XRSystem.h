@@ -110,6 +110,7 @@ private:
 
     bool frameStarted_ = false;
     bool shouldRender_ = false;
+    uint32_t preparedViewCount_ = 0;
 };
 
 }

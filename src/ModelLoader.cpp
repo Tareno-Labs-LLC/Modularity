@@ -5,6 +5,7 @@
 #endif
 #include "Render25D/MMeshConvert.h"
 #include "Render25D/MMeshLoader.h"
+#include "UnityAssetImport.h"
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -46,6 +47,252 @@ static glm::mat4 aiToGlm(const aiMatrix4x4& m);
 
 ModelLoader& getModelLoader() {
     return ModelLoader::getInstance();
+}
+
+// ---- Unity Mesh .asset ------------------------------------------------------------------
+// Not behind the assimp guard: the parser is native, so scenes that reference .asset meshes
+// load in builds that compile assimp out.
+
+namespace {
+
+std::string LowerExtensionOf(const std::string& filepath) {
+    std::string ext = fs::path(filepath).extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    return ext;
+}
+
+// ".asset" says nothing by itself (texture arrays, billboards, binary terrains); only a
+// Unity Mesh counts as a model.
+bool IsUnityMeshAssetPath(const std::string& filepath) {
+    return LowerExtensionOf(filepath) == ".asset" &&
+           UnityAssetImport::SniffAsset(filepath) == UnityAssetImport::AssetKind::Mesh;
+}
+
+// The merged preview mesh and the per-submesh scene meshes share one path; the merged one is
+// told apart by wearing the bare file name.
+std::string UnitySubmeshMeshName(const std::string& filepath, const std::string& materialName) {
+    return fs::path(filepath).stem().string() + " - " + materialName;
+}
+
+void FillLoadedMeshFromUnitySubmesh(OBJLoader::LoadedMesh& loaded, const UnityAssetImport::MeshData::Submesh& sm) {
+    const size_t corners = sm.vertices.size() / 8;
+    loaded.mesh = std::make_unique<Mesh>(sm.vertices.data(), sm.vertices.size() * sizeof(float));
+    if (!sm.colors.empty() || !sm.uv1.empty() || !sm.uv2.empty()) {
+        loaded.mesh->setExtraAttributes(sm.colors.empty() ? nullptr : sm.colors.data(),
+                                        sm.uv1.empty() ? nullptr : sm.uv1.data(),
+                                        sm.uv2.empty() ? nullptr : sm.uv2.data(),
+                                        sm.uv2Components, corners);
+    }
+    loaded.vertexCount = static_cast<int>(corners);
+    loaded.faceCount = static_cast<int>(corners / 3);
+    loaded.hasNormals = true;
+    loaded.hasTexCoords = true;
+    loaded.boundsMin = sm.boundsMin;
+    loaded.boundsMax = sm.boundsMax;
+    loaded.triangleVertices.reserve(corners);
+    for (size_t i = 0; i < corners; ++i) {
+        loaded.triangleVertices.emplace_back(sm.vertices[i * 8], sm.vertices[i * 8 + 1], sm.vertices[i * 8 + 2]);
+    }
+    loaded.positions = sm.positions;
+    loaded.triangleIndices = sm.triangleIndices;
+    loaded.hasVertexColors = !sm.colors.empty();
+    loaded.hasUV1 = !sm.uv1.empty();
+    loaded.uv2Components = sm.uv2.empty() ? 0 : sm.uv2Components;
+}
+
+} // namespace
+
+ModelLoadResult ModelLoader::loadUnityMeshMerged(const std::string& filepath) {
+    ModelLoadResult result;
+    const std::string mergedName = fs::path(filepath).stem().string();
+
+    for (size_t i = 0; i < loadedMeshes.size(); i++) {
+        if (loadedMeshes[i].path == filepath && loadedMeshes[i].name == mergedName) {
+            const auto& mesh = loadedMeshes[i];
+            result.success = true;
+            result.meshIndex = static_cast<int>(i);
+            result.meshIndices.push_back(result.meshIndex);
+            result.vertexCount = mesh.vertexCount;
+            result.faceCount = mesh.faceCount;
+            result.hasNormals = mesh.hasNormals;
+            result.hasTexCoords = mesh.hasTexCoords;
+            result.meshCount = 1;
+            return result;
+        }
+    }
+
+    if (!IsUnityMeshAssetPath(filepath)) {
+        result.errorMessage = "Not a Unity Mesh asset: " + filepath;
+        return result;
+    }
+
+    UnityAssetImport::MeshData data;
+    if (!UnityAssetImport::LoadMesh(filepath, data, result.errorMessage)) {
+        result.errorMessage = "Unity mesh import failed: " + result.errorMessage;
+        return result;
+    }
+
+    // One mesh for every submesh. Streams a submesh lacks are filled with neutral values so
+    // the extra-attribute arrays stay parallel to the vertices.
+    std::vector<float> vertices;
+    std::vector<float> colors;
+    std::vector<float> uv1;
+    std::vector<float> uv2;
+    std::vector<glm::vec3> triPositions;
+    std::vector<glm::vec3> positions;
+    std::vector<uint32_t> triIndices;
+    bool anyColors = false, anyUV1 = false;
+    int uv2Components = 0;
+    for (const auto& sm : data.submeshes) {
+        anyColors = anyColors || !sm.colors.empty();
+        anyUV1 = anyUV1 || !sm.uv1.empty();
+        if (!sm.uv2.empty()) uv2Components = std::max(uv2Components, sm.uv2Components);
+    }
+    glm::vec3 boundsMin(FLT_MAX);
+    glm::vec3 boundsMax(-FLT_MAX);
+    for (const auto& sm : data.submeshes) {
+        const size_t corners = sm.vertices.size() / 8;
+        if (corners == 0) continue;
+        const uint32_t base = static_cast<uint32_t>(positions.size());
+        vertices.insert(vertices.end(), sm.vertices.begin(), sm.vertices.end());
+        for (size_t i = 0; i < corners; ++i) {
+            triPositions.emplace_back(sm.vertices[i * 8], sm.vertices[i * 8 + 1], sm.vertices[i * 8 + 2]);
+        }
+        positions.insert(positions.end(), sm.positions.begin(), sm.positions.end());
+        for (uint32_t idx : sm.triangleIndices) triIndices.push_back(base + idx);
+        boundsMin = glm::min(boundsMin, sm.boundsMin);
+        boundsMax = glm::max(boundsMax, sm.boundsMax);
+        if (anyColors) {
+            if (sm.colors.empty()) colors.insert(colors.end(), corners * 4, 1.0f);
+            else colors.insert(colors.end(), sm.colors.begin(), sm.colors.end());
+        }
+        if (anyUV1) {
+            if (sm.uv1.empty()) uv1.insert(uv1.end(), corners * 2, 0.0f);
+            else uv1.insert(uv1.end(), sm.uv1.begin(), sm.uv1.end());
+        }
+        if (uv2Components > 0) {
+            if (sm.uv2.empty()) {
+                uv2.insert(uv2.end(), corners * static_cast<size_t>(uv2Components), 0.0f);
+            } else if (sm.uv2Components == uv2Components) {
+                uv2.insert(uv2.end(), sm.uv2.begin(), sm.uv2.end());
+            } else {
+                // 2-component submesh in a 3-component mesh: widen with a zero z.
+                for (size_t i = 0; i < corners; ++i) {
+                    uv2.push_back(sm.uv2[i * 2]);
+                    uv2.push_back(sm.uv2[i * 2 + 1]);
+                    uv2.push_back(0.0f);
+                }
+            }
+        }
+    }
+    if (vertices.empty()) {
+        result.errorMessage = "No triangles found in Unity mesh";
+        return result;
+    }
+
+    OBJLoader::LoadedMesh loaded;
+    loaded.path = filepath;
+    loaded.name = mergedName;
+    loaded.mesh = std::make_unique<Mesh>(vertices.data(), vertices.size() * sizeof(float));
+    const size_t corners = vertices.size() / 8;
+    if (anyColors || anyUV1 || uv2Components > 0) {
+        loaded.mesh->setExtraAttributes(anyColors ? colors.data() : nullptr, anyUV1 ? uv1.data() : nullptr,
+                                        uv2Components > 0 ? uv2.data() : nullptr, uv2Components, corners);
+    }
+    loaded.vertexCount = static_cast<int>(corners);
+    loaded.faceCount = static_cast<int>(corners / 3);
+    loaded.hasNormals = true;
+    loaded.hasTexCoords = true;
+    loaded.boundsMin = boundsMin;
+    loaded.boundsMax = boundsMax;
+    loaded.triangleVertices = std::move(triPositions);
+    loaded.positions = std::move(positions);
+    loaded.triangleIndices = std::move(triIndices);
+    loaded.hasVertexColors = anyColors;
+    loaded.hasUV1 = anyUV1;
+    loaded.uv2Components = uv2Components;
+    loadedMeshes.push_back(std::move(loaded));
+
+    result.success = true;
+    result.meshIndex = static_cast<int>(loadedMeshes.size() - 1);
+    result.meshIndices.push_back(result.meshIndex);
+    result.vertexCount = static_cast<int>(corners);
+    result.faceCount = static_cast<int>(corners / 3);
+    result.meshCount = static_cast<int>(data.submeshes.size());
+    result.hasNormals = true;
+    result.hasTexCoords = true;
+    result.meshNames.push_back(mergedName);
+    return result;
+}
+
+bool ModelLoader::loadUnityMeshScene(const std::string& filepath, ModelSceneData& out, std::string& errorMsg) {
+    out = ModelSceneData();
+    auto cached = cachedScenes.find(filepath);
+    if (cached != cachedScenes.end()) {
+        out = cached->second;
+        return true;
+    }
+    if (!IsUnityMeshAssetPath(filepath)) {
+        errorMsg = "Not a Unity Mesh asset: " + filepath;
+        return false;
+    }
+
+    UnityAssetImport::MeshData data;
+    std::string loadError;
+    if (!UnityAssetImport::LoadMesh(filepath, data, loadError)) {
+        errorMsg = "Unity mesh import failed: " + loadError;
+        return false;
+    }
+
+    // Material names come from the prefab that renders the mesh when the Unity project is
+    // around (the importer reads the full materials again at import time); otherwise the
+    // slots are just numbered.
+    std::vector<UnityAssetImport::ImportedMaterial> resolved;
+    std::string resolveLog;
+    UnityAssetImport::ResolveMeshMaterials(filepath, resolved, resolveLog);
+
+    const size_t submeshCount = data.submeshes.size();
+    out.meshIndices.assign(submeshCount, -1);
+    out.meshMaterialIndices.assign(submeshCount, -1);
+    out.materials.reserve(submeshCount);
+    std::vector<OBJLoader::LoadedMesh> built;
+    built.reserve(submeshCount);
+    std::vector<size_t> builtFor;
+    for (size_t i = 0; i < submeshCount; ++i) {
+        ModelMaterialInfo info;
+        if (i < resolved.size() && resolved[i].valid && !resolved[i].name.empty()) {
+            info.name = resolved[i].name;
+        } else {
+            info.name = "Submesh " + std::to_string(i);
+        }
+        out.materials.push_back(std::move(info));
+
+        const auto& sm = data.submeshes[i];
+        if (sm.vertices.empty()) continue;
+        OBJLoader::LoadedMesh loaded;
+        loaded.path = filepath;
+        loaded.name = UnitySubmeshMeshName(filepath, out.materials.back().name);
+        FillLoadedMeshFromUnitySubmesh(loaded, sm);
+        built.push_back(std::move(loaded));
+        builtFor.push_back(i);
+    }
+    if (built.empty()) {
+        errorMsg = "No triangles found in Unity mesh";
+        return false;
+    }
+    for (size_t b = 0; b < built.size(); ++b) {
+        out.meshIndices[builtFor[b]] = static_cast<int>(loadedMeshes.size());
+        out.meshMaterialIndices[builtFor[b]] = static_cast<int>(builtFor[b]);
+        loadedMeshes.push_back(std::move(built[b]));
+    }
+
+    ModelNodeInfo root;
+    root.name = fs::path(filepath).stem().string();
+    root.parentIndex = -1;
+    for (size_t i = 0; i < submeshCount; ++i) root.meshIndices.push_back(static_cast<int>(i));
+    out.nodes.push_back(std::move(root));
+    cachedScenes[filepath] = out;
+    return true;
 }
 
 #if MODULARITY_ENABLE_ASSIMP
@@ -669,6 +916,7 @@ std::vector<ModelFormat> ModelLoader::getSupportedFormats() {
         {".irrmesh", "Irrlicht Mesh", false},
         {".rmesh", "Modularity Raw Mesh", false},
         {".mmesh", "Modularity 2.5D Mesh", false},
+        {".asset", "Unity Mesh", false},
         {".irr", "Irrlicht Scene", false},
         {".mdl", "Quake MDL", true},
         {".md2", "Quake II MD2", true},
@@ -700,6 +948,8 @@ bool ModelLoader::isSupported(const std::string& filepath) const {
     auto formats = getSupportedFormats();
     for (const auto& format : formats) {
         if (format.extension == ext) {
+            // ".asset" is Unity's catch-all extension: only a Mesh counts as a model.
+            if (ext == ".asset") return IsUnityMeshAssetPath(filepath);
             return true;
         }
     }
@@ -710,6 +960,10 @@ ModelLoadResult ModelLoader::loadModel(const std::string& filepath) {
     ModelLoadResult result;
     std::string extLower = fs::path(filepath).extension().string();
     std::transform(extLower.begin(), extLower.end(), extLower.begin(), ::tolower);
+
+    if (extLower == ".asset") {
+        return loadUnityMeshMerged(filepath);
+    }
 
     // Check if already loaded
     for (size_t i = 0; i < loadedMeshes.size(); i++) {
@@ -876,6 +1130,10 @@ bool ModelLoader::loadModelScene(const std::string& filepath, ModelSceneData& ou
     if (!isSupported(filepath)) {
         errorMsg = "Unsupported file format: " + fs::path(filepath).extension().string();
         return false;
+    }
+
+    if (extLower == ".asset") {
+        return loadUnityMeshScene(filepath, out, errorMsg);
     }
 
     if (extLower != ".rmesh") {
@@ -1053,6 +1311,11 @@ bool ModelLoader::exportRawMesh(const std::string& inputFile, const std::string&
     }
     if (!isSupported(inputFile)) {
         errorMsg = "Unsupported file format for raw export";
+        return false;
+    }
+    if (LowerExtensionOf(inputFile) == ".asset") {
+        // A raw mesh has no slots for the vertex colors and extra UVs these carry.
+        errorMsg = "Unity mesh assets cannot be converted to editable raw meshes";
         return false;
     }
 
@@ -1609,6 +1872,18 @@ static bool buildSceneMeshes(const std::string& filepath, const aiScene* scene,
         std::vector<glm::vec3> triPositions;
         std::vector<glm::vec3> positions;
         std::vector<uint32_t> triangleIndices;
+        // Vertex colors and TEXCOORD1/2 ride along in a side buffer (Mesh::setExtraAttributes),
+        // de-indexed in step with the main stream. Meshes without them skip all of it.
+        const bool hasColors0 = mesh->HasVertexColors(0);
+        const bool hasUV1 = mesh->HasTextureCoords(1);
+        const bool hasUV2 = mesh->HasTextureCoords(2);
+        const int uv2Components = hasUV2 ? (mesh->mNumUVComponents[2] >= 3 ? 3 : 2) : 0;
+        std::vector<float> extraColors;
+        std::vector<float> extraUV1;
+        std::vector<float> extraUV2;
+        if (hasColors0) extraColors.reserve(static_cast<size_t>(mesh->mNumFaces) * 3 * 4);
+        if (hasUV1) extraUV1.reserve(static_cast<size_t>(mesh->mNumFaces) * 3 * 2);
+        if (hasUV2) extraUV2.reserve(static_cast<size_t>(mesh->mNumFaces) * 3 * static_cast<size_t>(uv2Components));
         vertices.reserve(mesh->mNumFaces * 3 * 8);
         boneVertices.reserve(mesh->mNumFaces * 3);
         triPositions.reserve(mesh->mNumFaces * 3);
@@ -1713,6 +1988,23 @@ static bool buildSceneMeshes(const std::string& filepath, const aiScene* scene,
                     vertices.push_back(0.0f);
                 }
 
+                if (hasColors0) {
+                    const aiColor4D& c = mesh->mColors[0][index];
+                    extraColors.push_back(c.r);
+                    extraColors.push_back(c.g);
+                    extraColors.push_back(c.b);
+                    extraColors.push_back(c.a);
+                }
+                if (hasUV1) {
+                    extraUV1.push_back(mesh->mTextureCoords[1][index].x);
+                    extraUV1.push_back(mesh->mTextureCoords[1][index].y);
+                }
+                if (hasUV2) {
+                    extraUV2.push_back(mesh->mTextureCoords[2][index].x);
+                    extraUV2.push_back(mesh->mTextureCoords[2][index].y);
+                    if (uv2Components == 3) extraUV2.push_back(mesh->mTextureCoords[2][index].z);
+                }
+
                 BoneVertex bv{};
                 glm::ivec4 ids = vertexBoneIds[index];
                 glm::vec4 weights = vertexBoneWeights[index];
@@ -1748,6 +2040,15 @@ static bool buildSceneMeshes(const std::string& filepath, const aiScene* scene,
                                                  boneVertices.data(), boneVertices.size() * sizeof(BoneVertex));
         } else {
             loaded.mesh = std::make_unique<Mesh>(vertices.data(), vertices.size() * sizeof(float));
+        }
+        if (hasColors0 || hasUV1 || hasUV2) {
+            loaded.mesh->setExtraAttributes(hasColors0 ? extraColors.data() : nullptr,
+                                            hasUV1 ? extraUV1.data() : nullptr,
+                                            hasUV2 ? extraUV2.data() : nullptr,
+                                            uv2Components, vertices.size() / 8);
+            loaded.hasVertexColors = hasColors0;
+            loaded.hasUV1 = hasUV1;
+            loaded.uv2Components = uv2Components;
         }
         loaded.vertexCount = static_cast<int>(vertices.size() / 8);
         loaded.faceCount = static_cast<int>(mesh->mNumFaces);
@@ -1925,6 +2226,10 @@ bool ModelLoader::buildRawMeshFromScene(const std::string& filepath, RawMeshAsse
         errorMsg = "Unsupported file format for raw mesh build";
         return false;
     }
+    if (LowerExtensionOf(filepath) == ".asset") {
+        errorMsg = "Unity mesh assets cannot be merged into a raw mesh";
+        return false;
+    }
 
     Assimp::Importer localImporter;
     unsigned int importFlags =
@@ -2095,25 +2400,46 @@ void ModelLoader::processMesh(aiMesh* mesh, const aiMatrix4x4& transform,
 #else
 
 std::vector<ModelFormat> ModelLoader::getSupportedFormats() {
-    return {};
+    // Without assimp only the native Unity mesh importer is available.
+    return {
+        {".asset", "Unity Mesh", false},
+    };
 }
 
-bool ModelLoader::isSupported(const std::string&) const {
-    return false;
+bool ModelLoader::isSupported(const std::string& filepath) const {
+    return IsUnityMeshAssetPath(filepath);
 }
 
-ModelLoadResult ModelLoader::loadModel(const std::string&) {
+ModelLoadResult ModelLoader::loadModel(const std::string& filepath) {
+    if (LowerExtensionOf(filepath) == ".asset") {
+        return loadUnityMeshMerged(filepath);
+    }
     ModelLoadResult result;
     result.errorMessage = "Model loading is not available in this runtime build.";
     return result;
 }
 
-bool ModelLoader::loadModelScene(const std::string&, ModelSceneData&, std::string& errorMsg) {
+bool ModelLoader::loadModelScene(const std::string& filepath, ModelSceneData& out, std::string& errorMsg) {
+    if (LowerExtensionOf(filepath) == ".asset") {
+        return loadUnityMeshScene(filepath, out, errorMsg);
+    }
     errorMsg = "Model loading is not available in this runtime build.";
     return false;
 }
 
-const ModelSceneData* ModelLoader::loadModelSceneCached(const std::string&, std::string& errorMsg) {
+const ModelSceneData* ModelLoader::loadModelSceneCached(const std::string& filepath, std::string& errorMsg) {
+    if (LowerExtensionOf(filepath) == ".asset") {
+        auto cached = cachedScenes.find(filepath);
+        if (cached != cachedScenes.end()) {
+            return &cached->second;
+        }
+        sceneRefScratch = ModelSceneData();
+        if (!loadUnityMeshScene(filepath, sceneRefScratch, errorMsg)) {
+            return nullptr;
+        }
+        cached = cachedScenes.find(filepath);
+        return cached != cachedScenes.end() ? &cached->second : &sceneRefScratch;
+    }
     errorMsg = "Model loading is not available in this runtime build.";
     return nullptr;
 }

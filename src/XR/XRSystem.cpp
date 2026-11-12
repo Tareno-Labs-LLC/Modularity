@@ -134,6 +134,7 @@ bool XRSystem::update() {
 }
 
 bool XRSystem::beginFrame() {
+    preparedViewCount_ = 0;
     shouldRender_ = false;
     frameStarted_ = false;
     if (!session_.isRunning()) return false;
@@ -182,7 +183,7 @@ bool XRSystem::beginFrame() {
         return false;
     }
     if ((viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) == 0 ||
-        (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) == 0) {
+        (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) == 0 || located != views_.size()) {
         return false;
     }
 
@@ -212,7 +213,8 @@ bool XRSystem::beginView(uint32_t viewIndex, XRRenderView& outView) {
         views_[viewIndex].framebuffer = framebuffer;
     }
     if (multiview && viewIndex > 0) {
-        views_[viewIndex].framebuffer = views_[0].framebuffer;
+        views_[viewIndex].framebuffer = swapchain->acquiredLayerFramebuffer(viewIndex);
+        if (!views_[viewIndex].framebuffer) return false;
     }
 
     views_[viewIndex].width = swapchains_.viewWidth();
@@ -230,6 +232,7 @@ bool XRSystem::beginView(uint32_t viewIndex, XRRenderView& outView) {
     projection.subImage.imageRect.extent = { static_cast<int32_t>(swapchains_.viewWidth()),
                                              static_cast<int32_t>(swapchains_.viewHeight()) };
     projection.subImage.imageArrayIndex = views_[viewIndex].arrayLayer;
+    ++preparedViewCount_;
     return true;
 #else
     (void)viewIndex;
@@ -268,7 +271,7 @@ void XRSystem::endFrame() {
     endInfo.environmentBlendMode = session_.blendMode();
 
     const XrCompositionLayerBaseHeader* layers[1] = { nullptr };
-    if (shouldRender_ && !projectionViews_.empty()) {
+    if (shouldRender_ && !projectionViews_.empty() && preparedViewCount_ == views_.size()) {
         projectionLayer_ = XrCompositionLayerProjection{};
         projectionLayer_.type = XR_TYPE_COMPOSITION_LAYER_PROJECTION;
         projectionLayer_.space = session_.appSpace();

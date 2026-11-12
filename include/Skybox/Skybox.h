@@ -82,9 +82,27 @@ struct WeatherRuntime {
     uint32_t rngState = 0x9E3779B9u;
 };
 
+// Scene wind for animated project materials:
+// strength = (main + pulseMagnitude * ((1 + sin(t f)) + (1 + sin(3 t f))) / 2) * multiplier,
+// turbulence = turbulence * main * multiplier.
+struct WindSettings {
+    bool enabled = true;
+    float yawDegrees = 0.0f;    // 0 blows toward world +Z, 90 toward +X
+    float pitchDegrees = 0.0f;  // positive tilts the wind upward
+    float main = 1.0f;
+    float turbulence = 0.5f;
+    float pulseMagnitude = 0.5f;
+    float pulseFrequency = 0.25f;
+    float multiplier = 1.0f;
+    // Scale strength and turbulence by the active weather mode's wind column.
+    bool followWeather = true;
+};
+
 // What the weather resolves to this frame.
 struct WeatherDrive {
     bool active = false;
+    // Foliage wind scale for the current weather (1 = calm baseline).
+    float windMultiplier = 1.0f;
     float cloudCoverage = 0.45f;
     float cloudDarkness = 0.0f;
     float rainAmount = 0.0f;       // 0..1
@@ -163,6 +181,7 @@ struct SkyboxSettings {
     float skyRefreshInterval = 0.1f;
 
     WeatherSettings weather;
+    WindSettings wind;
 
     // -- Volumetric lighting --
     //

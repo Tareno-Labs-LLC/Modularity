@@ -6280,6 +6280,12 @@ static void *stbi__psd_load(stbi__context *s, int *x, int *y, int *comp, int req
    }
 
    // remove weird white matte from PSD
+   // MODULARITY: opt-in (define STBI_PSD_REMOVE_WHITE_MATTE). The un-matte divides the colour by
+   // the 4th channel, which is only right for premultiplied transparency. Unity's PSD importer
+   // never does it, and engine textures (some materials pack normals and smoothness into the extra
+   // channels, e.g. "Alpha 1") store plain data there, so the divide wrecks them and, once cast
+   // back to 8 bits, overflows. Off by default so PSD channels load exactly as stored.
+#ifdef STBI_PSD_REMOVE_WHITE_MATTE
    if (channelCount >= 4) {
       if (ri->bits_per_channel == 16) {
          for (i=0; i < w*h; ++i) {
@@ -6307,6 +6313,7 @@ static void *stbi__psd_load(stbi__context *s, int *x, int *y, int *comp, int req
          }
       }
    }
+#endif // STBI_PSD_REMOVE_WHITE_MATTE
 
    // convert to desired output format
    if (req_comp && req_comp != 4) {

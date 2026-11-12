@@ -740,9 +740,16 @@ void Engine::renderGameViewportWindow() {
       std::snprintf(line4, sizeof(line4), "Meshes: %d", stats.meshDraws);
       std::snprintf(line5, sizeof(line5), "Render: %dx%d @ %d%%", renderWidth,
                     renderHeight, zoomPercent);
-      std::snprintf(line6, sizeof(line6),
-                    "PostFX: %.2f ms | Bloom: %.2f / %.2f", postStats.totalMs,
-                    postStats.bloomExtractMs, postStats.bloomBlurMs);
+      if (postStats.gpuTotalMs >= 0.0f) {
+        std::snprintf(line6, sizeof(line6),
+                      "PostFX GPU: %.2f ms | Bloom: %.2f (%d mips) | CPU: %.2f",
+                      postStats.gpuTotalMs, postStats.gpuBloomMs,
+                      postStats.bloomMipCount, postStats.totalMs);
+      } else {
+        std::snprintf(line6, sizeof(line6),
+                      "PostFX CPU: %.2f ms | Bloom: %.2f / %.2f", postStats.totalMs,
+                      postStats.bloomExtractMs, postStats.bloomBlurMs);
+      }
       std::snprintf(line7, sizeof(line7), "ModuVolume: %s x%.2f (%d active)",
                     postStats.resolvedVolumeName.empty()
                         ? "None"

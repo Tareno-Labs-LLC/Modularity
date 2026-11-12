@@ -152,7 +152,7 @@ bool IsPlatformTargetSupported(XRPlatformTarget target) {
 #else
     switch (target) {
         case XRPlatformTarget::PC:
-#if defined(_WIN32) && !MODULARITY_OPENGL_ES
+#if (defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))) && !MODULARITY_OPENGL_ES
             return true;
 #else
             return false;

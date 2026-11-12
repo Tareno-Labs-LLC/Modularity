@@ -19,6 +19,27 @@ subprocess.run(f'call "{vcvars}" >nul && cl /nologo /std:c++20 /EHsc /MD /O2 '
 fixture = tempfile.mkdtemp(prefix='fixture-', dir=out)
 subprocess.run([str(exe), fixture], cwd=out, check=True)
 
+if '--runtime' in sys.argv:
+    # Compile the real Android filesystem fallback with only AAssetManager/log
+    # calls stubbed. The rest runs natively, including portable path resolution.
+    android_obj = out / 'android-assets.obj'
+    subprocess.run(f'call "{vcvars}" >nul && cl /nologo /std:c++20 /EHsc /MD /O2 '
+        f'/D__ANDROID__ /I"{repo / "tools/android-selftest/stubs"}" '
+        f'/c "{repo / "src/Platform/AssetSourceAndroid.cpp"}" /Fo:"{android_obj}"',
+        shell=True, cwd=out, check=True)
+    exe = out / 'android-runtime-test.exe'
+    rsp = out / 'runtime-test.rsp'
+    includes = ['src', 'include', 'src/ThirdParty/ModuGUI', 'src/ThirdParty/glm',
+                'src/ThirdParty/glfw/include', 'src/ThirdParty/glad']
+    sources = ['tools/android-selftest/runtime_test.cpp', 'src/RuntimeContent.cpp',
+               'src/Platform/AssetSourceDesktop.cpp']
+    rsp.write_text('/nologo /std:c++20 /EHsc /MD /O2 /DNOMINMAX /DWIN32_LEAN_AND_MEAN ' +
+        ' '.join(f'/I"{repo / p}"' for p in includes) + ' ' +
+        ' '.join(f'"{repo / p}"' for p in sources) + f' "{android_obj}" '
+        f'/Fo:"{out.as_posix()}/" /Fe:"{exe}"')
+    subprocess.run(f'call "{vcvars}" >nul && cl @"{rsp}"', shell=True, cwd=out, check=True)
+    subprocess.run([str(exe), tempfile.mkdtemp(prefix='runtime-', dir=out)], cwd=out, check=True)
+
 if '--scripts' in sys.argv:
     sdk = Path(os.environ.get('ANDROID_SDK_ROOT', repo / 'Build-Android/android-sdk'))
     ndk_value = os.environ.get('ANDROID_NDK_ROOT')

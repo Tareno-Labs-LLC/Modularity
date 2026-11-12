@@ -1,3 +1,4 @@
+#include "MaterialShaderProfile.h"
 #include "EditorLocalization.h"
 namespace Loc = Modularity::Loc;
 #if defined(_WIN32) && !defined(__ANDROID__)
@@ -31,6 +32,7 @@ namespace Loc = Modularity::Loc;
 #include "MaterialAssetUtils.h"
 #include "EngineMaterialIO.h"
 #include "ModelLoader.h"
+#include "UnityAssetImport.h"
 #include "../include/Platform/AssetSource.h"
 #include "Render25D/MMeshConvert.h"
 #include "Render25D/MMeshLoader.h"
@@ -726,6 +728,19 @@ private:
             }
             return false;
         };
+        if (tokens == &kAlbedo) {
+            // A name that says outright it is the albedo keeps that role even when it also
+            // says the alpha channel is packed in it ("Oak Branches [Albedo] [Alpha]"): only
+            // the alpha-ish tokens lose their veto, every other map type still rejects.
+            static const std::vector<std::string> kExplicitAlbedo = {
+                "albedo", "diffuse", "basecolor", "base_color"};
+            static const std::vector<std::string> kExplicitAlbedoReject = {
+                "rough", "metal", "spec", "_ao", "arm", "disp", "height", "bump",
+                "emissive", "emission", "nor", "gloss"};
+            if (contains(kExplicitAlbedo)) {
+                return !contains(kExplicitAlbedoReject);
+            }
+        }
         return contains(tokens->want) && !contains(tokens->reject);
     }
 
@@ -780,7 +795,7 @@ private:
 
     static bool isTextureFile(const fs::path& path) {
         static const std::set<std::string> kExtensions = {
-            ".png", ".jpg", ".jpeg", ".tga", ".bmp", ".dds", ".hdr", ".exr"};
+            ".png", ".jpg", ".jpeg", ".tga", ".bmp", ".dds", ".hdr", ".exr", ".psd"};
         return kExtensions.count(lowerAscii(path.extension().string())) > 0;
     }
 
@@ -2480,12 +2495,26 @@ bool appendAssimpImporterForExtension(const std::string& ext, std::set<std::stri
         importers.insert("X");
     } else if (ext == ".x3d") {
         importers.insert("X3D");
-    } else if (ext == ".rmesh" || ext == ".mmesh") {
+    } else if (ext == ".rmesh" || ext == ".mmesh" || ext == ".asset") {
+        // Unity mesh .asset files are parsed by our own reader, but it lives in the model loader
+        // module like the raw formats, so they keep that module (and its smallest importer) on.
         importers.insert("OBJ");
     } else {
         return false;
     }
     return true;
+}
+
+// The same as appendAssimpImporterForExtension for a file on disk. ".asset" alone says nothing
+// (Unity stores ScriptableObjects, texture arrays and terrain under it too), so only a Unity Mesh
+// .asset counts as a model; the other extensions are decided by name.
+bool appendAssimpImporterForFile(const fs::path& path, const std::string& ext,
+                                 std::set<std::string>& importers) {
+    if (ext == ".asset" &&
+        UnityAssetImport::SniffAsset(path.string()) != UnityAssetImport::AssetKind::Mesh) {
+        return false;
+    }
+    return appendAssimpImporterForExtension(ext, importers);
 }
 
 void scanTextForAndroidModelImporters(const std::string& text, std::set<std::string>& importers) {
@@ -2582,7 +2611,7 @@ std::vector<std::string> detectAndroidAssimpImporters(const fs::path& projectRoo
              !ec && it != fs::recursive_directory_iterator();
              it.increment(ec)) {
             if (ec || !it->is_regular_file()) continue;
-            appendAssimpImporterForExtension(lowerExtension(it->path()), importers);
+            appendAssimpImporterForFile(it->path(), lowerExtension(it->path()), importers);
         }
     }
 
@@ -4075,6 +4104,41 @@ bool CopyDirectoryIntoRuntimeRoot(const fs::path& sourceDir,
     return true;
 }
 
+// Scripts can construct filenames (animation frames, voice variants, etc.) that
+// never appear as scene component references. Preserve their project asset paths.
+// Scenes still go through StageRuntimeScene; native sources are compiled separately.
+bool CopyAndroidScriptAssets(const fs::path& projectRoot,
+                             const fs::path& runtimeRoot,
+                             std::string& error) {
+    const fs::path assets = projectRoot / "Assets";
+    std::error_code ec;
+    if (!fs::exists(assets, ec)) {
+        if (!ec) return true;
+        error = "Cannot read Android project assets: " + ec.message();
+        return false;
+    }
+    for (fs::recursive_directory_iterator it(assets, ec), end; it != end && !ec; it.increment(ec)) {
+        const fs::path path = it->path();
+        if (it->is_directory(ec)) {
+            const std::string name = path.filename().string();
+            if (name == "Scenes" || name == "Editor" || name == ".git")
+                it.disable_recursion_pending();
+            continue;
+        }
+        if (!it->is_regular_file(ec) || IsRuntimeExportJunk(path)) continue;
+        const std::string ext = lowerExtension(path);
+        if (ext == ".moducpp" || ext == ".modumako" || ext == ".mko" || ext == ".cpp" || ext == ".cc" || ext == ".cxx" ||
+            ext == ".c" || ext == ".h" || ext == ".hpp" || ext == ".cs" ||
+            ext == ".scene" || ext == ".dll" || ext == ".so" || ext == ".obj" || ext == ".o") continue;
+        if (!CopyFileIntoRuntimeRoot(path, runtimeRoot, path.lexically_relative(projectRoot), error)) return false;
+    }
+    if (ec) {
+        error = "Failed to stage Android script assets: " + ec.message();
+        return false;
+    }
+    return true;
+}
+
 // Only what the player loads: resolveScriptBinary looks for <stem>.dll (or .so) and never enters
 // the dot directories. The compiler leaves far more beside them - the shared precompiled header
 // (~270 MB), per-script .obj and .pdb files, .cpp/.rsp/.buildsig inputs and import libraries -
@@ -4274,6 +4338,13 @@ public:
                             const std::string& externalCategory,
                             std::string& error) {
         if (value.empty()) return true;
+        const auto query=value.find('?');
+        if(query!=std::string::npos) {
+            const std::string defines=value.substr(query);
+            std::string file=value.substr(0,query);
+            if(!stageFileReference(file,externalCategory,error)) return false;
+            value=file+defines; return true;
+        }
         std::error_code ec;
         const fs::path sourcePath = resolveSource(value);
         if (sourcePath.empty()) {
@@ -4436,6 +4507,14 @@ bool RemapSkyboxSettingsForRuntime(SkyboxSettings& settings,
 // the player can look them up in its shader cache under the exact same key.
 using RuntimeShaderPairs = std::set<std::pair<std::string, std::string>>;
 
+// A shader path may carry "?NAME,NAME" defines after the file name ('?' never appears in a
+// Windows file name); this is the file it reads.
+std::string ShaderFilePathWithoutDefines(const std::string& shaderPath) {
+    const size_t query = shaderPath.find('?');
+    return query == std::string::npos ? shaderPath : shaderPath.substr(0, query);
+}
+
+
 bool StageRuntimeScene(const fs::path& sourceScenePath,
                        const std::string& sceneName,
                        RuntimeExportStager& stager,
@@ -4454,12 +4533,24 @@ bool StageRuntimeScene(const fs::path& sourceScenePath,
 
     for (SceneObject& obj : sceneObjects) {
         stager.setReferenceOwner("Scene '" + sceneName + "' > '" + obj.name + "'");
+        if (obj.material.shaderParameters.profilePath[0]) {
+            std::string profilePath=obj.material.shaderParameters.profilePath;
+            if(!stager.stageDirectoryBackedReference(profilePath,"Shaders",error)) return false;
+            SetMaterialShaderProfile(obj.material.shaderParameters,profilePath,false);
+        }
         if (!RemapSceneObjectForRuntime(obj, stager, error)) {
             error = "Scene '" + sceneName + "': " + error;
             return false;
         }
         if (shaderPairs && obj.hasRenderer && obj.renderType != RenderType::None) {
             shaderPairs->emplace(obj.vertexShaderPath, obj.fragmentShaderPath);
+            if (obj.material.usesProjectShader()) {
+                const auto& profile=GetMaterialShaderProfile(obj.material.shaderParameters.profileId);
+                std::string vert=profile.vert,frag=profile.frag;
+                if(!stager.stageFileReference(vert,"Shaders",error) ||
+                   !stager.stageFileReference(frag,"Shaders",error)) return false;
+                shaderPairs->emplace(vert,frag);
+            }
         }
     }
     stager.setReferenceOwner("Scene '" + sceneName + "' skybox");
@@ -4497,6 +4588,8 @@ bool StageRuntimeShaderPrograms(const fs::path& runtimeRoot,
                                 std::string& error) {
     if (!gles2Shaders && !preloadShaders) return true;
 
+    const RuntimeShaderPairs& programPairs = pairs;
+
     const fs::path listPath = runtimeRoot / "Resources" / "Shaders" / "preload.list";
     if (!EnsureDirectoryForFile(listPath, error)) return false;
     {
@@ -4505,19 +4598,22 @@ bool StageRuntimeShaderPrograms(const fs::path& runtimeRoot,
             error = "Failed to write " + listPath.string();
             return false;
         }
-        for (const auto& [vert, frag] : pairs) {
+        for (const auto& [vert, frag] : programPairs) {
             out << vert << "|" << frag << "\n";
         }
     }
-    log("Shader preload: " + std::to_string(pairs.size()) + " program(s) listed for boot.");
+    log("Shader preload: " + std::to_string(programPairs.size()) + " program(s) listed for boot.");
     if (!gles2Shaders) return true;
 
     const std::string defaultVert = "Resources/Shaders/vert.glsl";
     const std::string defaultFrag = "Resources/Shaders/frag.glsl";
     std::set<std::pair<std::string, Modularity::Gles2ShaderStage>> stages;
-    for (const auto& [vert, frag] : pairs) {
-        stages.emplace(vert.empty() ? defaultVert : vert, Modularity::Gles2ShaderStage::Vertex);
-        stages.emplace(frag.empty() ? defaultFrag : frag, Modularity::Gles2ShaderStage::Fragment);
+    for (const auto& [vert, frag] : programPairs) {
+        // One .es2.glsl sibling per file: the loader injects a path's "?DEFINES" at load time.
+        stages.emplace(vert.empty() ? defaultVert : ShaderFilePathWithoutDefines(vert),
+                       Modularity::Gles2ShaderStage::Vertex);
+        stages.emplace(frag.empty() ? defaultFrag : ShaderFilePathWithoutDefines(frag),
+                       Modularity::Gles2ShaderStage::Fragment);
     }
     stages.emplace("Resources/Shaders/skybox_vert.glsl", Modularity::Gles2ShaderStage::Vertex);
     stages.emplace("Resources/Shaders/skybox_frag.glsl", Modularity::Gles2ShaderStage::Fragment);
@@ -5927,6 +6023,19 @@ void Engine::applySceneSkyboxSettings(const SkyboxSettings& settings) {
     sceneSkyboxSettings.fogEnd = std::max(sceneSkyboxSettings.fogStart + 0.01f, sceneSkyboxSettings.fogEnd);
     sceneSkyboxSettings.fogDensity = std::clamp(sceneSkyboxSettings.fogDensity, 0.0f, 1.0f);
     sceneSkyboxSettings.fogHeightFalloff = std::clamp(sceneSkyboxSettings.fogHeightFalloff, 0.0f, 1.0f);
+    {
+        WindSettings& wind = sceneSkyboxSettings.wind;
+        auto finiteNonNegative = [](float v) { return std::isfinite(v) ? std::max(0.0f, v) : 0.0f; };
+        wind.yawDegrees = std::isfinite(wind.yawDegrees) ? wind.yawDegrees : 0.0f;
+        wind.pitchDegrees = std::isfinite(wind.pitchDegrees)
+                                ? std::clamp(wind.pitchDegrees, -89.0f, 89.0f)
+                                : 0.0f;
+        wind.main = finiteNonNegative(wind.main);
+        wind.turbulence = finiteNonNegative(wind.turbulence);
+        wind.pulseMagnitude = finiteNonNegative(wind.pulseMagnitude);
+        wind.pulseFrequency = finiteNonNegative(wind.pulseFrequency);
+        wind.multiplier = finiteNonNegative(wind.multiplier);
+    }
 
     if (Skybox* skybox = renderer.getSkybox()) {
         skybox->setSettings(sceneSkyboxSettings);
@@ -6564,6 +6673,44 @@ bool EditorFrameHadUserInput() {
 } // namespace
 #endif
 
+namespace {
+// Scene wind: a gusting main strength plus a turbulence term, both
+// scaled by the weather's wind column when the scene asks to follow the weather.
+SceneWindState computeSceneWindState(const WindSettings& wind, const WeatherDrive& drive,
+                                     double timeSeconds) {
+    SceneWindState state;
+    state.time = static_cast<float>(timeSeconds);
+
+    const float yaw = glm::radians(wind.yawDegrees);
+    const float pitch = glm::radians(std::clamp(wind.pitchDegrees, -89.0f, 89.0f));
+    glm::vec3 direction(std::sin(yaw) * std::cos(pitch),
+                        std::sin(pitch),
+                        std::cos(yaw) * std::cos(pitch));
+    const float directionLength = glm::length(direction);
+    state.direction = (std::isfinite(directionLength) && directionLength > 1e-6f)
+                          ? direction / directionLength
+                          : glm::vec3(0.0f, 0.0f, 1.0f);
+
+    if (!wind.enabled) {
+        state.strength = 0.0f;
+        state.turbulence = 0.0f;
+        return state;
+    }
+
+    const float tf = state.time * wind.pulseFrequency;
+    const float pulse = ((1.0f + std::sin(tf)) + (1.0f + std::sin(3.0f * tf))) * 0.5f;
+    float strength = (wind.main + wind.pulseMagnitude * pulse) * wind.multiplier;
+    float turbulence = wind.turbulence * wind.main * wind.multiplier;
+    if (wind.followWeather && drive.active) {
+        strength *= drive.windMultiplier;
+        turbulence *= drive.windMultiplier;
+    }
+    state.strength = std::isfinite(strength) ? std::max(0.0f, strength) : 0.0f;
+    state.turbulence = std::isfinite(turbulence) ? std::max(0.0f, turbulence) : 0.0f;
+    return state;
+}
+} // namespace
+
 void Engine::run() {
     constexpr float kRigidbody2DFixedStep = 1.0f / 120.0f;
     constexpr int kMaxRigidbody2DStepsPerFrame = 4;
@@ -6594,6 +6741,10 @@ void Engine::run() {
                 weatherSkybox->setWeatherDrive(drive);
             }
 
+            // Foliage wind: one frame-constant state for every view, XR eye and shadow pass,
+            // so leaf shadows never drift against their leaves and both eyes agree.
+            renderer.setSceneWind(computeSceneWindState(sceneSkyboxSettings.wind, drive, weatherNow));
+
             if (drive.active && !drive.ambiencePath.empty()) {
                 audio.playWeatherAmbience(drive.ambiencePath,
                                           sceneSkyboxSettings.weather.ambienceVolume);
@@ -6615,8 +6766,12 @@ void Engine::run() {
             const char* rec = std::getenv("MODULARITY_PROFILER_RECORD");
             if (rec && *rec && *rec != '0') profiler.setRecording(true);
         }
+        // OVR multiview leaves timer-query results undefined. Keep per-eye
+        // post-processing timings, but do not label a shared XR frame's timer valid.
+        const bool multiviewGpuFrame = xrSystem.isRunning() &&
+            xrSystem.activeRenderMode() == Modularity::XR::XRRenderMode::SinglePassMultiview;
         const bool gpuFrameQueryOpen =
-            gpuFrameTimerEnabled ? profiler.beginOpenGlGpuFrame(true) : false;
+            gpuFrameTimerEnabled && !multiviewGpuFrame ? profiler.beginOpenGlGpuFrame(true) : false;
         Modu2DStats::Reset();
         double frameStart = glfwGetTime();
         const auto frameStartClock = Runtime2DClock::now();
@@ -7052,7 +7207,7 @@ void Engine::run() {
                     renderFar = std::max(renderNear + 0.01f, runtimeCam->camera.farClip);
                 }
             }
-            const bool ownsGpuQuery = profiler.beginOpenGlGpuFrame();
+            const bool ownsGpuQuery = !multiviewGpuFrame && profiler.beginOpenGlGpuFrame();
             const bool pure2DRender =
                 isProject2DPipeline() ||
                 (runtimeCameraObject && runtimeCameraObject->camera.use2D);
@@ -7890,6 +8045,37 @@ void Engine::importModelToScene(const std::string& filepath, const std::string& 
     std::string baseName = objectName.empty() ? fs::path(filepath).stem().string() : objectName;
     std::vector<std::string> materialPaths(sceneData.materials.size());
 
+    // A Unity mesh .asset carries no materials of its own: they live on the prefab that renders
+    // it. Resolve them per submesh (meshSourceIndex == submesh index) and use them in place of
+    // the texture-name guesses. Project-owned native sidecars supply custom shading.
+    const bool unityMeshAsset =
+        lowerExtension(fs::path(filepath)) == ".asset" &&
+        UnityAssetImport::SniffAsset(filepath) == UnityAssetImport::AssetKind::Mesh;
+    std::vector<UnityAssetImport::ImportedMaterial> unityMaterials;
+    if (unityMeshAsset) {
+        std::string resolveLog;
+        UnityAssetImport::ResolveMeshMaterials(filepath, unityMaterials, resolveLog);
+        std::istringstream logLines(resolveLog);
+        std::string logLine;
+        while (std::getline(logLines, logLine)) {
+            if (!logLine.empty() && logLine.back() == '\r') logLine.pop_back();
+            if (!logLine.empty()) addConsoleMessage(logLine, ConsoleMessageType::Info);
+        }
+    }
+    const auto unityMaterialForSubmesh = [&](int meshSourceIndex) -> const UnityAssetImport::ImportedMaterial* {
+        if (meshSourceIndex < 0 || meshSourceIndex >= static_cast<int>(unityMaterials.size())) return nullptr;
+        const auto& imported = unityMaterials[static_cast<size_t>(meshSourceIndex)];
+        return imported.valid ? &imported : nullptr;
+    };
+    // The first submesh that wears material slot `matIndex`; materials are written per slot.
+    const auto firstSubmeshForMaterial = [&](size_t matIndex) -> int {
+        for (size_t s = 0; s < sceneData.meshMaterialIndices.size(); ++s) {
+            if (sceneData.meshMaterialIndices[s] == static_cast<int>(matIndex)) return static_cast<int>(s);
+        }
+        return static_cast<int>(matIndex);
+    };
+
+
     if (projectManager.currentProject.isLoaded && !sceneData.materials.empty()) {
         fs::path materialsDir = projectManager.currentProject.assetsPath / "Materials" / "Imported" / baseName;
         std::error_code ec;
@@ -7900,6 +8086,26 @@ void Engine::importModelToScene(const std::string& filepath, const std::string& 
         } else {
             for (size_t i = 0; i < sceneData.materials.size(); ++i) {
                 const auto& mat = sceneData.materials[i];
+                const int unitySubmesh = unityMeshAsset ? firstSubmeshForMaterial(i) : -1;
+                if (const auto* imported = unityMaterialForSubmesh(unitySubmesh)) {
+                    // Converted from the Unity material: its own textures, no name guessing.
+                    const std::string matName =
+                        sanitizeMaterialName(imported->name.empty() ? mat.name : imported->name);
+                    const fs::path matPath = materialsDir / (matName + ".mat");
+                    MaterialFileData data;
+                    data.props = imported->props;
+                    data.albedo = imported->albedoPath;
+                    data.normal = imported->normalPath;
+                    data.occlusion = imported->occlusionPath;
+                    data.useOverlay = false;
+                    if (writeMaterialFile(data, matPath.string())) {
+                        materialPaths[i] = matPath.string();
+                    }
+                    for (const std::string* slot : {&data.albedo, &data.normal, &data.occlusion}) {
+                        if (!slot->empty()) importedTexturePaths.insert(*slot);
+                    }
+                    continue;
+                }
                 std::string matName = sanitizeMaterialName(mat.name);
                 fs::path matPath = materialsDir / (matName + ".mat");
                 MaterialFileData data;
@@ -8001,7 +8207,9 @@ void Engine::importModelToScene(const std::string& filepath, const std::string& 
         singleMaterial = !mixed;
     }
 
-    if (validMeshCount >= kStaticBatchMeshThreshold &&
+    // Never for a Unity mesh .asset: the collapse goes through assimp and keeps only
+    // position/normal/uv, dropping the vertex color and UV1/UV2 streams project foliage wind reads.
+    if (!unityMeshAsset && validMeshCount >= kStaticBatchMeshThreshold &&
         !hasSkinnedMeshes && !hasAnimations && singleMaterial) {
         RawMeshAsset raw;
         glm::vec3 rootPos(0.0f);
@@ -8179,9 +8387,25 @@ void Engine::importModelToScene(const std::string& filepath, const std::string& 
             int matIndex = (meshSourceIndex >= 0 && meshSourceIndex < (int)sceneData.meshMaterialIndices.size())
                 ? sceneData.meshMaterialIndices[meshSourceIndex]
                 : -1;
+            const UnityAssetImport::ImportedMaterial* unityMaterial =
+                unityMeshAsset ? unityMaterialForSubmesh(meshSourceIndex) : nullptr;
             if (matIndex >= 0 && matIndex < (int)materialPaths.size() && !materialPaths[matIndex].empty()) {
                 meshObj.materialPath = materialPaths[matIndex];
                 loadMaterialFromFile(meshObj);
+                if (unityMaterial && firstSubmeshForMaterial(static_cast<size_t>(matIndex)) != meshSourceIndex) {
+                    // The slot's .mat was written from another submesh's material; this one
+                    // resolved its own, so it wears that directly instead.
+                    meshObj.materialPath.clear();
+                    meshObj.material = unityMaterial->props;
+                    meshObj.albedoTexturePath = unityMaterial->albedoPath;
+                    meshObj.normalMapPath = unityMaterial->normalPath;
+                    meshObj.occlusionMapPath = unityMaterial->occlusionPath;
+                }
+            } else if (unityMaterial) {
+                meshObj.material = unityMaterial->props;
+                meshObj.albedoTexturePath = unityMaterial->albedoPath;
+                meshObj.normalMapPath = unityMaterial->normalPath;
+                meshObj.occlusionMapPath = unityMaterial->occlusionPath;
             } else if (matIndex >= 0 && matIndex < (int)sceneData.materials.size()) {
                 const auto& mat = sceneData.materials[matIndex];
                 meshObj.material = mat.props;
@@ -8768,8 +8992,15 @@ fs::path Engine::resolveMaterialAssetPath(const std::string& rawPath) const {
 void Engine::loadMaterialFromFile(SceneObject& obj) {
     if (obj.materialPath.empty()) return;
     try {
+        const std::string filePath = resolveMaterialAssetPath(obj.materialPath).string();
+        if (UnityAssetImport::IsUnityYamlFile(filePath)) {
+            addConsoleMessage("Not a Modularity material (Unity YAML .mat): " + obj.materialPath +
+                                  ". Import the Unity mesh that uses it instead.",
+                              ConsoleMessageType::Warning);
+            return;
+        }
         MaterialFileData data;
-        if (!readMaterialFile(resolveMaterialAssetPath(obj.materialPath).string(), data)) {
+        if (!readMaterialFile(filePath, data)) {
             addConsoleMessage("Failed to open material: " + obj.materialPath, ConsoleMessageType::Error);
             return;
         }
@@ -8795,8 +9026,14 @@ bool Engine::loadMaterialData(const std::string& path, MaterialProperties& props
                               std::string* occlusionOut,
                               std::string* heightOut)
 {
+    const std::string filePath = resolveMaterialAssetPath(path).string();
+    // A Unity YAML .mat would parse as an all-defaults material, and the Inspector's autosave
+    // would then write that over the Unity file.
+    if (UnityAssetImport::IsUnityYamlFile(filePath)) {
+        return false;
+    }
     MaterialFileData data;
-    if (!readMaterialFile(resolveMaterialAssetPath(path).string(), data)) {
+    if (!readMaterialFile(filePath, data)) {
         return false;
     }
     props = data.props;
@@ -8832,6 +9069,11 @@ bool Engine::saveMaterialData(const std::string& path, const MaterialProperties&
                               const std::string* height)
 {
     const std::string filePath = resolveMaterialAssetPath(path).string();
+    if (UnityAssetImport::IsUnityYamlFile(filePath)) {
+        addConsoleMessage("Refusing to overwrite a Unity YAML .mat: " + filePath,
+                          ConsoleMessageType::Warning);
+        return false;
+    }
     MaterialFileData data;
     readMaterialFile(filePath, data);
     data.props = props;
@@ -8885,7 +9127,13 @@ int Engine::autoAssignProjectMaterialMaps() {
     int changedCount = 0;
     int slotsFilled = 0;
 
+    int unitySkipped = 0;
     for (const fs::path& matPath : materials) {
+        // Unity's .mat shares the extension; never read one as, or write it back as, ours.
+        if (UnityAssetImport::IsUnityYamlFile(matPath.string())) {
+            ++unitySkipped;
+            continue;
+        }
         MaterialFileData data;
         if (!readMaterialFile(matPath.string(), data)) continue;
 
@@ -8929,6 +9177,11 @@ int Engine::autoAssignProjectMaterialMaps() {
             ++changedCount;
             addConsoleMessage("Updated " + matStem, ConsoleMessageType::Info);
         }
+    }
+    if (unitySkipped > 0) {
+        addConsoleMessage("Auto-assign: skipped " + std::to_string(unitySkipped) +
+                              " Unity YAML material(s).",
+                          ConsoleMessageType::Info);
     }
 
     addConsoleMessage("Auto-assign: " + std::to_string(slotsFilled) + " map(s) filled across " +
@@ -9034,6 +9287,11 @@ void Engine::saveMaterialToFile(const SceneObject& obj) {
     try {
         const MaterialFileData data = materialFileDataFromObject(obj);
         const std::string filePath = resolveMaterialAssetPath(obj.materialPath).string();
+        if (UnityAssetImport::IsUnityYamlFile(filePath)) {
+            addConsoleMessage("Refusing to overwrite a Unity YAML .mat: " + obj.materialPath,
+                              ConsoleMessageType::Warning);
+            return;
+        }
         if (!writeMaterialFile(data, filePath)) {
             addConsoleMessage("Failed to open material for writing: " + filePath, ConsoleMessageType::Error);
             return;
@@ -13938,7 +14196,7 @@ Engine::BuildModuleProjectScan Engine::scanProjectForBuildModules() const {
             const std::string ext = lowerExtension(path);
             if (scan.modelAsset.empty()) {
                 std::set<std::string> importers;
-                if (appendAssimpImporterForExtension(ext, importers)) scan.modelAsset = path.filename().string();
+                if (appendAssimpImporterForFile(path, ext, importers)) scan.modelAsset = path.filename().string();
             }
             if (scan.sndfileClip.empty() && isSndfileOnlyAudioExtension(ext)) {
                 scan.sndfileClip = path.filename().string();
@@ -14467,6 +14725,11 @@ void Engine::startExportBuild(const fs::path& outputDir, bool runAfter) {
                 return result;
             }
             appendLog("Skipping desktop package cache copy for Android; native code is staged into apk/lib/" + androidAbi + ".");
+            if (!CopyAndroidScriptAssets(projectRoot, runtimeStageRoot, copyError)) {
+                result.message = copyError;
+                return result;
+            }
+            appendLog("Staged project assets for script-loaded frames, fonts, and audio.");
             if (!CopyFileIntoRuntimeRoot(projectRoot / "project.modu", runtimeStageRoot, "project.modu", copyError)) {
                 result.message = copyError;
                 return result;
@@ -17706,7 +17969,9 @@ void Engine::refreshParticleAssets(SceneObject& obj, double now) {
             ps.runtimeMaterialStamp = stamp;
             MaterialFileData data;
             const std::string text = ReadParticleAssetText(ps.materialPath, resolved);
-            if (!text.empty() && parseMaterialText(text, resolved.string(), data)) {
+            // A Unity YAML .mat shares the extension and would parse as an all-defaults material.
+            const bool unityYaml = text.compare(0, 5, "%YAML") == 0;
+            if (!text.empty() && !unityYaml && parseMaterialText(text, resolved.string(), data)) {
                 ps.runtimeMaterialTexture = data.albedo;
                 ps.runtimeMaterialTint = glm::vec4(data.props.color, data.props.alpha);
                 ps.runtimeMaterialEmission = data.props.emissionColor * data.props.emissionStrength;
@@ -21301,7 +21566,7 @@ bool Engine::saveCurrentUIStyleToPreset(const std::string& name, bool replaceExi
         return false;
     }
     const ImGuiShadeTheme currentShade = ImGui::GetShadeTheme();
-    upsertUIStylePreset(name, ImGui::GetStyle(), uiEditorFontAsset, replaceExisting, &currentShade);
+    upsertUIStylePreset(name, getEditorBaseStyle(), uiEditorFontAsset, replaceExisting, &currentShade);
     uiStylePresetName = name;
     uiStylePresetIndex = findUIStylePreset(name);
     saveEditorUserSettings();
@@ -21313,6 +21578,9 @@ bool Engine::applyUIStylePresetByName(const std::string& name) {
     if (idx < 0) {
         return false;
     }
+#if !MODULARITY_RUNTIME_ONLY
+    editorMatugen.restore(ImGui::GetStyle());
+#endif
     uiStylePresetIndex = idx;
     uiStylePresetName = uiStylePresets[idx].name;
     ImGui::GetStyle() = uiStylePresets[idx].style;
@@ -21498,6 +21766,13 @@ void Engine::autosaveWorkspaceLayout() {
 }
 
 void Engine::loadEditorUserSettings() {
+#if !MODULARITY_RUNTIME_ONLY
+    editorMatugen.restore(ImGui::GetStyle());
+    editorMatugen = Modularity::EditorMatugenTheme{};
+#endif
+    editorThemeFileTracked = false;
+    editorThemeFileTrackedPath.clear();
+    editorThemeFileNextCheck = 0;
     if (!projectManager.currentProject.isLoaded) {
         return;
     }
@@ -22404,7 +22679,7 @@ void Engine::saveEditorUserSettings() const {
             WriteShadeTheme(file, prefix.str(), preset.shade);
         }
     }
-    const ImGuiStyle& style = ImGui::GetStyle();
+    const ImGuiStyle style = getEditorBaseStyle();
     for (int i = 0; i < ImGuiCol_COUNT; ++i) {
         const ImVec4& c = style.Colors[i];
         file << "color." << ImGui::GetStyleColorName(i) << "="
@@ -22569,6 +22844,14 @@ std::vector<std::string> Engine::installDefaultPackagesIntoProject() {
 #pragma endregion
 
 #pragma region Theme Hot Reload
+ImGuiStyle Engine::getEditorBaseStyle() const {
+#if !MODULARITY_RUNTIME_ONLY
+    return editorMatugen.baseStyle(ImGui::GetStyle());
+#else
+    return ImGui::GetStyle();
+#endif
+}
+
 fs::path Engine::getEditorThemeFilePath() const {
     if (!projectManager.currentProject.isLoaded) {
         return fs::path();
@@ -22590,6 +22873,12 @@ bool Engine::loadEditorThemeFile(const fs::path& path, std::string* outError) {
         }
     }
 
+#if !MODULARITY_RUNTIME_ONLY
+    editorMatugen.restore(ImGui::GetStyle());
+    editorMatugen.enabled = false;
+    editorMatugen.palettePath.clear();
+    editorMatugen.fadeSeconds = 0.35f;
+#endif
     ImGuiStyle& style = ImGui::GetStyle();
     ImGuiShadeTheme shade = ImGui::GetShadeTheme();
     bool touchedShade = false;
@@ -22602,6 +22891,24 @@ bool Engine::loadEditorThemeFile(const fs::path& path, std::string* outError) {
         const std::string key = RenameTrim(line.substr(0, eq));
         const std::string value = RenameTrim(line.substr(eq + 1));
 
+#if !MODULARITY_RUNTIME_ONLY
+        if (key == "matugen.enabled") {
+            editorMatugen.enabled = value == "true" || value == "1";
+            continue;
+        }
+        if (key == "matugen.palette") {
+            editorMatugen.palettePath = value;
+            continue;
+        }
+        if (key == "matugen.fadeSeconds") {
+            std::istringstream input(value);
+            float seconds;
+            if ((input >> seconds) && std::isfinite(seconds)) {
+                editorMatugen.fadeSeconds = std::clamp(seconds, 0.0f, 5.0f);
+            }
+            continue;
+        }
+#endif
         if (key.rfind("color.", 0) == 0) {
             auto it = colorIndex.find(key.substr(6));
             if (it == colorIndex.end()) continue;
@@ -22639,9 +22946,15 @@ bool Engine::saveEditorThemeFile(std::string* outError) {
         return false;
     }
 
-    const ImGuiStyle& style = ImGui::GetStyle();
+    const ImGuiStyle style = getEditorBaseStyle();
     file << "# Modularity editor theme. Edited while the editor is running and it reloads within a second.\n";
     file << "# Written from preset: " << uiStylePresetName << "\n\n";
+#if !MODULARITY_RUNTIME_ONLY
+    file << "# Optional local Matugen overlay. Blank palette uses $XDG_CONFIG_HOME/matugen/colors.css.\n";
+    file << "matugen.enabled=" << (editorMatugen.enabled ? "true" : "false") << "\n";
+    file << "matugen.palette=" << editorMatugen.palettePath << "\n";
+    file << "matugen.fadeSeconds=" << editorMatugen.fadeSeconds << "\n\n";
+#endif
     file << std::fixed << std::setprecision(4);
     for (int i = 0; i < ImGuiCol_COUNT; ++i) {
         const ImVec4& c = style.Colors[i];
@@ -22662,12 +22975,19 @@ bool Engine::saveEditorThemeFile(std::string* outError) {
 
 void Engine::pollEditorThemeFile() {
     const double now = glfwGetTime();
+#if !MODULARITY_RUNTIME_ONLY
+    editorMatugen.update(ImGui::GetStyle(), now);
+#endif
     if (now < editorThemeFileNextCheck) {
         return;
     }
     editorThemeFileNextCheck = now + 1.0;
 
     const fs::path themePath = getEditorThemeFilePath();
+    if (themePath != editorThemeFileTrackedPath) {
+        editorThemeFileTrackedPath = themePath;
+        editorThemeFileTracked = false;
+    }
     if (themePath.empty()) {
         return;
     }

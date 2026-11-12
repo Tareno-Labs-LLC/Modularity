@@ -1955,7 +1955,9 @@ elseif(NOT WIN32)
             Xcursor
         )
         # Export symbols so runtime-loaded scripts can resolve ImGui/engine symbols.
-        target_link_options(Modularity PRIVATE "-rdynamic")
+        # C scripts are the only callers of Modu_* functions, so force their API
+        # object out of the static archive before exporting the host symbols.
+        target_link_options(Modularity PRIVATE "-rdynamic" "-Wl,--undefined=Modu_GetObjectId")
     endif()
 
     target_include_directories(ModularityPlayer PRIVATE ${X11_INCLUDE_DIR})
@@ -1975,7 +1977,8 @@ elseif(NOT WIN32)
         Xinerama
         Xcursor
     )
-    target_link_options(ModularityPlayer PRIVATE "-rdynamic")
+    # Retain the C script API in standalone builds as well as the editor.
+    target_link_options(ModularityPlayer PRIVATE "-rdynamic" "-Wl,--undefined=Modu_GetObjectId")
 else()
     if(MODULARITY_BUILD_EDITOR)
         target_link_libraries(Modularity PRIVATE core glfw ${MODULARITY_OPENGL_LIBRARIES})
@@ -2204,13 +2207,26 @@ if(MODULARITY_BUILD_NEBULA_BINDINGS AND MODULARITY_BUILD_EDITOR)
             COMMAND ${CARGO_EXECUTABLE} build ${_nebula_cargo_profile_flag}
                     --manifest-path "${MODULARITY_NEBULA_MANIFEST}"
                     --target-dir "${_nebula_target_dir}"
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${_nebula_lib}" "$<TARGET_FILE_DIR:Modularity>/"
             BYPRODUCTS "${_nebula_lib}"
             COMMENT "Building Nebula bake bindings (cargo ${_nebula_cargo_profile_dir})"
             VERBATIM
         )
         add_dependencies(Modularity NebulaBindings)
+
+        # Stage after linking, and also on incremental default builds where
+        # cargo may update the library without the editor needing to relink.
+        add_custom_command(TARGET Modularity POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_nebula_lib}" "$<TARGET_FILE_DIR:Modularity>/"
+            VERBATIM
+        )
+        add_custom_target(StageNebulaBindings ALL
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_nebula_lib}" "$<TARGET_FILE_DIR:Modularity>/"
+            DEPENDS Modularity
+            COMMENT "Staging Nebula bake bindings"
+            VERBATIM
+        )
 
         install(FILES "${_nebula_lib}"
             DESTINATION ${MODULARITY_INSTALL_APPDIR}

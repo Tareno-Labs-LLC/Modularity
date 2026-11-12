@@ -5,7 +5,11 @@ in vec2 TexCoord;
 
 uniform sampler2D sceneTex;
 uniform sampler2D bloomTex;
-uniform sampler2D historyTex;
+uniform sampler2D sceneDepth;
+uniform sampler2D aoTex;
+uniform mat4 inverseProjection;
+uniform mat4 currentToPreviousClip;
+uniform float motionShutterScale = 1.0;
 uniform float effectBlendWeight = 1.0;
 
 // Set when a ModuVolume is scoped to a slice of the 2D draw order. The source
@@ -66,6 +70,7 @@ uniform float sharpenStrength = 0.15;
 uniform bool enableAO = false;
 uniform float aoRadius = 0.0035;
 uniform float aoStrength = 0.6;
+uniform vec2 aoActiveSize = vec2(0.0);
 
 uniform bool enableDither = false;
 uniform float ditherIntensity = 0.65;
@@ -726,19 +731,80 @@ vec3 computeLensFlare(vec2 uv) {
     return flare * sunEnergy * lensFlareIntensity * edgeFade;
 }
 
+float linearEyeDepth(vec2 uv) {
+    float depth = texture(sceneDepth, uv).r;
+    if (depth >= 0.999999) return 0.0;
+    vec4 p = inverseProjection * vec4(uv * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
+    return -p.z / p.w;
+}
+
 float computeAOFactor(vec2 uv) {
-    vec3 centerColor = sampleBase(uv);
-    float centerLum = luminance(centerColor);
-    float occlusion = 0.0;
-    vec2 directions[4] = vec2[](vec2(1.0, 0.0), vec2(-1.0, 0.0), vec2(0.0, 1.0), vec2(0.0, -1.0));
-    for (int i = 0; i < 4; ++i) {
-        vec2 sampleUv = uv + directions[i] * aoRadius;
-        vec3 sampleColor = sampleBase(sampleUv);
-        float sampleLum = luminance(sampleColor);
-        occlusion += max(0.0, centerLum - sampleLum);
+    float depth = linearEyeDepth(uv);
+    if (depth <= 0.0) return 1.0;
+    vec2 size = vec2(textureSize(aoTex, 0));
+    vec2 activeSize = aoActiveSize.x > 0.0 ? aoActiveSize : size;
+    vec2 grid = uv * activeSize - 0.5;
+    vec2 base = floor(grid);
+    vec2 fraction = fract(grid);
+    float visibility = 0.0;
+    float weightSum = 0.0;
+    float tolerance = max(aoRadius * 0.12, depth * 0.003);
+    for (int y = 0; y < 2; ++y) {
+        for (int x = 0; x < 2; ++x) {
+            vec2 pixel = clamp(base + vec2(x, y), vec2(0.0), activeSize - 1.0);
+            vec2 tap = texture(aoTex, (pixel + 0.5) / size).rg;
+            vec2 bilinear = mix(vec2(1.0) - fraction, fraction, vec2(x, y));
+            float weight = bilinear.x * bilinear.y * exp2(-abs(tap.y - depth) / tolerance);
+            weight *= step(0.00001, tap.y);
+            visibility += tap.x * weight;
+            weightSum += weight;
+        }
     }
-    occlusion /= 4.0;
-    return clamp(1.0 - occlusion * aoStrength, 0.0, 1.0);
+    visibility = weightSum > 0.0001 ? visibility / weightSum : 1.0;
+    return pow(clamp(visibility, 0.0, 1.0), max(aoStrength, 0.0));
+}
+
+vec3 applyMotionBlur(vec2 uv, vec3 centerColor) {
+    if (!enableMotionBlur || !hasHistory || motionBlurStrength <= 0.0) return centerColor;
+    // Derivatives must be evaluated before per-pixel early exits.
+    float depth = linearEyeDepth(uv);
+    vec2 depthGradient = vec2(dFdx(depth), dFdy(depth)) / texelSize;
+    float rawDepth = texture(sceneDepth, uv).r;
+    vec4 previous = currentToPreviousClip * vec4(uv * 2.0 - 1.0, rawDepth * 2.0 - 1.0, 1.0);
+    if (previous.w <= 0.00001) return centerColor;
+    vec2 velocity = (uv - (previous.xy / previous.w * 0.5 + 0.5)) * motionBlurStrength * motionShutterScale;
+    vec2 pixelVelocity = velocity / texelSize;
+    float pixelLength = length(pixelVelocity);
+    float minimumMotion = max(motionBlurThreshold * 10.0, 0.25);
+    if (pixelLength < minimumMotion) return centerColor;
+    float maxPixels = max(motionBlurClamp, 0.0) * 0.1 / texelSize.y;
+    pixelVelocity *= min(1.0, maxPixels / max(pixelLength, 0.001));
+    pixelLength = length(pixelVelocity);
+    if (pixelLength < 0.25) return centerColor;
+    velocity = pixelVelocity * texelSize;
+    int taps = int(clamp(ceil(pixelLength), 2.0, 12.0));
+    // A local depth slope permits sampling along slanted surfaces, while rejecting
+    // unrelated foreground/background colors at silhouettes.
+    vec3 sum = centerColor;
+    float weights = 1.0;
+    for (int i = 0; i < 12; ++i) {
+        if (i >= taps) break;
+        float t = (float(i) + 0.5) / float(taps) - 0.5;
+        vec2 offset = velocity * t;
+        vec2 sampleUv = uv + offset;
+        if (any(lessThan(sampleUv, vec2(0.0))) || any(greaterThan(sampleUv, vec2(1.0)))) continue;
+        float sampleDepth = linearEyeDepth(sampleUv);
+        float expectedDepth = depth + dot(depthGradient, offset);
+        float tolerance = max(0.02, depth * 0.015);
+        float weight = 1.0 - abs(t) * 0.5;
+        if (depth > 0.0) weight *= exp2(-abs(sampleDepth - expectedDepth) / tolerance) * step(0.00001, sampleDepth);
+        else weight *= 1.0 - step(0.00001, sampleDepth);
+        // The renderer gives depth the same bilinear footprint as color here.
+        // This preserves subpixel motion while rejecting blended depth edges.
+        sum += sampleBase(sampleUv) * weight;
+        weights += weight;
+    }
+    return sum / weights;
 }
 
 vec3 applySharpening(vec2 uv, vec3 color) {
@@ -927,6 +993,8 @@ void main() {
         color = applyChromatic(sampleUv);
     }
 
+    color = applyMotionBlur(sampleUv, color);
+
     // A band layer was drawn over a cleared transparent target, so it arrives
     // premultiplied. Every effect below expects straight color, and additive
     // ones (static, VHS, scanlines) would otherwise paint over fully
@@ -945,17 +1013,6 @@ void main() {
 
     if (enableVignette) {
         color *= computeVignette(sampleUv);
-    }
-
-    if (enableMotionBlur && hasHistory) {
-        vec3 history = texture(historyTex, sampleUv).rgb;
-        vec3 delta = clamp(history - color, vec3(-motionBlurClamp), vec3(motionBlurClamp));
-        float diff = max(max(abs(delta.r), abs(delta.g)), abs(delta.b));
-        float response = smoothstep(motionBlurThreshold,
-                                    max(motionBlurThreshold * 4.0, motionBlurThreshold + 0.0001),
-                                    diff);
-        float mixAmt = clamp(motionBlurStrength * response, 0.0, 0.92);
-        color += delta * mixAmt;
     }
 
     if (enableLensFlare) {

@@ -91,6 +91,20 @@ With the loader missing, Project Settings > OpenXR Manager > Runtime Diagnostics
 reports `Loader: Not found` and says what to do about it. Nothing else in the
 editor is affected.
 
+## Linux loader (PCVR)
+
+Not vendored, and not needed: Linux distributions ship the Khronos loader as a
+system package (`openxr` on Arch, `libopenxr-loader1` on Debian/Ubuntu), and
+`XRLoader` dlopens `libopenxr_loader.so.1` from the normal library path. The
+runtime is whatever `~/.config/openxr/1/active_runtime.json` (or
+`/etc/xdg/openxr/1/`, or `XR_RUNTIME_JSON`) points at - SteamVR or Monado.
+
+The session binds desktop OpenGL through `XrGraphicsBindingOpenGLXlibKHR`
+(`src/XR/XRDesktopGL.cpp`), which is the only desktop-GL binding OpenXR defines
+on Linux. It needs GLFW on its X11 platform, so on a Wayland desktop Modularity
+must run under XWayland. A GLFW built without Wayland support (the default here)
+always does.
+
 ### The AAR's manifest is NOT merged
 
 Gradle would merge the loader AAR's `AndroidManifest.xml` into the app manifest.
