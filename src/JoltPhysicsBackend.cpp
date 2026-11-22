@@ -570,6 +570,10 @@ JoltPhysicsBackend::BodyRecord JoltPhysicsBackend::createBodyFor(const SceneObje
 
     JPH::BodyCreationSettings settings(shape, pos, rot, motionType, layer);
     settings.mIsSensor = wantsCollider && obj.collider.isTrigger;
+    // Report contacts against static and kinematic bodies, including after a motion type change.
+    settings.mCollideKinematicVsNonDynamic = wantsDynamic;
+    // Jolt drops contacts against static bodies when a kinematic body goes to sleep.
+    settings.mAllowSleeping = motionType != JPH::EMotionType::Kinematic;
     settings.mUserData = static_cast<uint64_t>(obj.id) + 1u;
     settings.mFriction = ColliderFriction(obj);
     settings.mRestitution = ColliderRestitution(obj);
@@ -971,6 +975,8 @@ void JoltPhysicsBackend::simulate(float deltaTime, std::vector<SceneObject>& obj
                 bi.SetMotionType(rec.bodyId,
                     isKinematic ? JPH::EMotionType::Kinematic : JPH::EMotionType::Dynamic,
                     JPH::EActivation::Activate);
+                JPH::BodyLockWrite lock(mPhysicsSystem->GetBodyLockInterface(), rec.bodyId);
+                if (lock.Succeeded()) lock.GetBody().SetAllowSleeping(!isKinematic);
                 rec.isKinematic = isKinematic;
             }
             const bool gravityDisabled = !obj.rigidbody.useGravity;

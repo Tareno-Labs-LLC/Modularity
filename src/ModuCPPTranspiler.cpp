@@ -1442,7 +1442,11 @@ namespace {
             return false;
         }
         const std::string beforeParen = trimCopy(trimmed.substr(0, openParen));
-        if (!isCollisionMethodName(beforeParen)) {
+        const bool hasVoidReturn = beforeParen.size() > 4 && beforeParen.compare(0, 4, "void") == 0 &&
+            std::isspace(static_cast<unsigned char>(beforeParen[4])) != 0;
+        const std::string methodName = hasVoidReturn
+            ? trimCopy(beforeParen.substr(4)) : beforeParen;
+        if (!isCollisionMethodName(methodName)) {
             return false;
         }
         const size_t closeParen = findMatchingParen(trimmed, openParen);
@@ -1462,11 +1466,11 @@ namespace {
             }
             params = trimCopy(parts[0]);
         }
-        if (beforeParen == "OnCollideHold" && outHoldDuration.empty()) {
+        if (methodName == "OnCollideHold" && outHoldDuration.empty()) {
             outHoldDuration = "2.0f";
         }
 
-        signature = "void " + beforeParen + "(" + params + ")" + trimmed.substr(closeParen + 1);
+        signature = "void " + methodName + "(" + params + ")" + trimmed.substr(closeParen + 1);
         return true;
     }
 
