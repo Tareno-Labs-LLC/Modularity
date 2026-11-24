@@ -684,6 +684,8 @@ detect_package_manager() {
         pkg_manager="pacman"
     elif command -v zypper >/dev/null 2>&1; then
         pkg_manager="zypper"
+    elif command -v xbps-install >/dev/null 2>&1; then
+        pkg_manager="xbps"
     else
         pkg_manager=""
     fi
@@ -745,6 +747,11 @@ update_pkg_index_once() {
         pacman)
             admin_cmd pacman -Sy --noconfirm
             ;;
+        xbps)
+            admin_cmd xbps-install -S
+            # xbps refuses every install while xbps itself is outdated.
+            admin_cmd xbps-install -yu xbps || true
+            ;;
         dnf|zypper)
             ;;
     esac
@@ -779,6 +786,19 @@ install_packages() {
         zypper)
             admin_cmd zypper --non-interactive install --no-recommends "${packages[@]}"
             ;;
+        xbps)
+            # xbps-install exits non-zero when asked for an already-installed
+            # package, so only pass the ones that are actually missing.
+            local -a missing_pkgs=()
+            local pkg
+            for pkg in "${packages[@]}"; do
+                xbps-query "${pkg}" >/dev/null 2>&1 || missing_pkgs+=("${pkg}")
+            done
+            if [[ "${#missing_pkgs[@]}" -eq 0 ]]; then
+                return 0
+            fi
+            admin_cmd xbps-install -y "${missing_pkgs[@]}"
+            ;;
         *)
             return 1
             ;;
@@ -801,7 +821,7 @@ ensure_linux_dependencies() {
     detect_package_manager
 
     if [[ -z "${pkg_manager}" ]]; then
-        log_warn "No supported package manager detected (apt/dnf/pacman/zypper). Skipping auto-install."
+        log_warn "No supported package manager detected (apt/dnf/pacman/zypper/xbps). Skipping auto-install."
         return
     fi
 
@@ -894,6 +914,15 @@ ensure_linux_dependencies() {
             audio_pkgs=(libsndfile-devel libopusfile-devel)
             optional_pkgs=(ccache)
             glslc_candidates=(shaderc shaderc-devel)
+            ;;
+        xbps)
+            core_pkgs=(base-devel cmake pkg-config git git-lfs zlib-devel)
+            x11_pkgs=(libX11-devel libXrandr-devel libXinerama-devel libXcursor-devel libXi-devel)
+            graphics_pkgs=(MesaLib-devel wayland-devel)
+            vulkan_pkgs=(Vulkan-Headers vulkan-loader-devel Vulkan-Tools glslang)
+            audio_pkgs=(libsndfile-devel opusfile-devel)
+            optional_pkgs=(ccache)
+            glslc_candidates=(shaderc)
             ;;
     esac
     if [[ "${build_profile}" == "low" ]]; then
@@ -1079,7 +1108,29 @@ clean_player_cache() {
     fi
 }
 
+# A CMakeCache.txt copied in from another checkout (or another OS, e.g. a
+# build/ folder carried over from Windows) hard-fails configure with "source
+# does not match the source used to generate cache". Drop just the cache state
+# so CMake re-configures here; compiled objects are left alone.
+discard_foreign_cmake_cache() {
+    local dir="$1"
+    local cache="${dir}/CMakeCache.txt"
+    [[ -f "${cache}" ]] || return 0
+    local cached_src cached_bin
+    cached_src="$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' "${cache}" | head -n1)"
+    cached_bin="$(sed -n 's/^CMAKE_CACHEFILE_DIR:INTERNAL=//p' "${cache}" | head -n1)"
+    local here_src here_bin
+    here_src="$(cd "${script_dir}" && pwd -P)"
+    here_bin="$(cd "${dir}" && pwd -P)"
+    if [[ -n "${cached_src}" && "$(cd "${cached_src}" 2>/dev/null && pwd -P)" != "${here_src}" ]] ||
+       [[ -n "${cached_bin}" && "$(cd "${cached_bin}" 2>/dev/null && pwd -P)" != "${here_bin}" ]]; then
+        log_warn "${cache} was generated for another location (${cached_bin:-${cached_src}}); discarding stale CMake cache."
+        rm -rf "${cache}" "${dir}/CMakeFiles"
+    fi
+}
+
 configure_editor_build() {
+    discard_foreign_cmake_cache "${build_dir}"
     local -a generator_args=()
     if [[ ! -f "${build_dir}/CMakeCache.txt" && -n "${cmake_generator}" ]]; then
         generator_args=(-G "${cmake_generator}")
@@ -1123,6 +1174,7 @@ copy_engine_libraries() {
 }
 
 configure_player_build() {
+    discard_foreign_cmake_cache "${player_cache_dir}"
     local -a generator_args=()
     if [[ ! -f "${player_cache_dir}/CMakeCache.txt" && -n "${cmake_generator}" ]]; then
         generator_args=(-G "${cmake_generator}")
@@ -1454,6 +1506,8 @@ if [[ "${build_platform}" != "windows" && "$(uname -s)" == "Linux" ]]; then
 fi
 
 build_started=1
+discard_foreign_cmake_cache "${build_dir}"
+discard_foreign_cmake_cache "${player_cache_dir}"
 detect_cmake_generator
 printf "%s================================%s\n" "${C_BOLD}" "${C_RESET}"
 printf "%s   Modularity - %s%s\n" "${C_BOLD}" "${build_platform_label}" "${C_RESET}"
