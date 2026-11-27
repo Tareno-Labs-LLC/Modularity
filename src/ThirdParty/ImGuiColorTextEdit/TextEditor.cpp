@@ -6,7 +6,7 @@
 
 #include "TextEditor.h"
 
-#include "imgui.h"
+#include "imgui_internal.h"
 
 // TODO
 // - multiline comments vs single-line: latter is blocking start of a ML
@@ -941,7 +941,8 @@ void TextEditor::Render()
 
 	auto lineNo = std::max(0, (int)floor(scrollY / mCharAdvance.y));
 	auto globalLineMax = (int)mLines.size();
-	auto lineMax = std::max(0, std::min((int)mLines.size() - 1, lineNo + (int)floor((scrollY + contentSize.y) / mCharAdvance.y)));
+	const float visibleBottom = ImGui::GetCurrentWindowRead()->InnerClipRect.Max.y - cursorScreenPos.y;
+	auto lineMax = std::min(globalLineMax - 1, (int)floor(visibleBottom / mCharAdvance.y));
 
 	// Deduce mTextStart by evaluating mLines size (global lineMax) plus two spaces as text width
 	char buf[16];
@@ -1147,7 +1148,7 @@ void TextEditor::Render()
 		}
 
 		// Draw a tooltip on known identifiers/preprocessor symbols
-		if (ImGui::IsMousePosValid())
+		if (ImGui::IsMousePosValid() && ImGui::IsWindowHovered())
 		{
 			auto id = GetWordAt(ScreenPosToCoordinates(ImGui::GetMousePos()));
 			if (!id.empty())
@@ -1184,38 +1185,131 @@ void TextEditor::Render()
 	}
 }
 
-void TextEditor::Render(const char* aTitle, const ImVec2& aSize, bool aBorder)
+void TextEditor::RenderMinimap(ImGuiWindow* aEditorWindow, const ImVec2& aSize)
+{
+	if (mLines.empty() || aSize.x <= 8.0f || aSize.y <= 8.0f || mCharAdvance.y <= 0.0f)
+		return;
+
+	const ImVec2 topLeft = ImGui::GetCursorScreenPos();
+	const ImVec2 bottomRight(topLeft.x + aSize.x, topLeft.y + aSize.y);
+	ImGui::InvisibleButton("Minimap", aSize);
+	const float padding = 4.0f;
+	const float lineTop = topLeft.y + padding;
+	const float lineStep = std::min(2.0f, (aSize.y - 2.0f * padding) / mLines.size());
+	const float columnWidth = 1.25f;
+	const int maxColumns = static_cast<int>((aSize.x - 2.0f * padding) / columnWidth);
+	const int lineStride = std::max(1, static_cast<int>(std::ceil(1.0f / lineStep)));
+	const float viewportLines = aEditorWindow->InnerRect.GetHeight() / mCharAdvance.y;
+	const float maxScroll = aEditorWindow->ScrollMax.y;
+
+	if (ImGui::IsItemActive() && maxScroll > 0.0f)
+	{
+		const float targetLine = (ImGui::GetMousePos().y - lineTop) / lineStep - viewportLines * 0.5f;
+		ImGui::SetScrollY(aEditorWindow, std::clamp(targetLine * mCharAdvance.y, 0.0f, maxScroll));
+	}
+
+	ImDrawList* drawList = ImGui::GetWindowDrawList();
+	const float rounding = ImGui::GetStyle().ChildRounding;
+	drawList->AddRectFilled(topLeft, bottomRight, mPalette[(int)PaletteIndex::Background], rounding);
+	drawList->AddRect(topLeft, bottomRight, ImGui::GetColorU32(ImGuiCol_Border), rounding);
+
+	const float codeLeft = topLeft.x + padding;
+	for (int line = 0; line < static_cast<int>(mLines.size()); line += lineStride)
+	{
+		const float y = std::floor(lineTop + line * lineStep);
+		int column = 0;
+		int runStart = 0;
+		ImU32 runColor = 0;
+		auto drawRun = [&]() {
+			if (runColor != 0 && runStart < column)
+				drawList->AddRectFilled(ImVec2(codeLeft + runStart * columnWidth, y),
+					ImVec2(codeLeft + column * columnWidth, y + 1.0f), runColor);
+		};
+		for (const Glyph& glyph : mLines[line])
+		{
+			if (column >= maxColumns)
+				break;
+			const unsigned char ch = glyph.mChar;
+			if ((ch & 0xc0) == 0x80)
+				continue;
+			const ImU32 color = ch == ' ' || ch == '\t' ? 0 : GetGlyphColor(glyph);
+			if (color != runColor)
+			{
+				drawRun();
+				runStart = column;
+				runColor = color;
+			}
+			column += ch == '\t' ? mTabSize - column % mTabSize : 1;
+		}
+		drawRun();
+	}
+
+	const float viewTop = lineTop + aEditorWindow->Scroll.y / mCharAdvance.y * lineStep;
+	const float viewBottom = std::min(bottomRight.y, viewTop + std::max(6.0f, viewportLines * lineStep));
+	if (viewTop < viewBottom)
+	{
+		ImVec4 tint = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+		tint.w = ImGui::IsItemHovered() || ImGui::IsItemActive() ? 0.12f : 0.06f;
+		drawList->AddRectFilled(ImVec2(topLeft.x + 1.0f, viewTop),
+			ImVec2(bottomRight.x - 1.0f, viewBottom), ImGui::GetColorU32(tint), 2.0f);
+	}
+}
+
+void TextEditor::Render(const char* aTitle, const ImVec2& aSize, bool aBorder, float aMinimapWidth)
 {
 	mWithinRender = true;
 	mTextChanged = false;
 	mCursorPositionChanged = false;
 
-	ImGui::PushStyleColor(ImGuiCol_ChildBg, ImGui::ColorConvertU32ToFloat4(mPalette[(int)PaletteIndex::Background]));
+	const float minimapGap = 4.0f;
+	ImVec2 editorSize = aSize;
+	const ImVec2 available = ImGui::GetContentRegionAvail();
+	const float totalWidth = aSize.x > 0.0f ? aSize.x : available.x + aSize.x;
+	const bool showMinimap = !mIgnoreImGuiChild && aMinimapWidth > 8.0f && totalWidth >= aMinimapWidth + 120.0f;
+	if (showMinimap)
+		editorSize.x = totalWidth - aMinimapWidth - minimapGap;
+
+	ImGui::PushStyleColor(ImGuiCol_ChildBg, ImGui::ColorConvertU32ToFloat4(mPaletteBase[(int)PaletteIndex::Background]));
 	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 0.0f));
+	bool visible = true;
 	if (!mIgnoreImGuiChild)
-		ImGui::BeginChild(aTitle, aSize, aBorder,
+		visible = ImGui::BeginChild(aTitle, editorSize, aBorder,
 			ImGuiWindowFlags_HorizontalScrollbar |
 			ImGuiWindowFlags_AlwaysHorizontalScrollbar |
 			ImGuiWindowFlags_NoMove |
 			ImGuiWindowFlags_NoNavInputs);
 
-	if (mHandleKeyboardInputs)
+	ImGuiWindow* editorWindow = ImGui::GetCurrentWindow();
+	const float editorHeight = ImGui::GetWindowHeight();
+	mCursorScreenPosValid = false;
+	if (visible)
 	{
-		HandleKeyboardInputs();
-		ImGui::PushItemFlag(ImGuiItemFlags_NoTabStop, false);
+		if (mHandleKeyboardInputs)
+		{
+			HandleKeyboardInputs();
+			ImGui::PushItemFlag(ImGuiItemFlags_NoTabStop, false);
+		}
+
+		if (mHandleMouseInputs)
+			HandleMouseInputs();
+
+		ColorizeInternal();
+		Render();
+
+		if (mHandleKeyboardInputs)
+			ImGui::PopItemFlag();
 	}
-
-	if (mHandleMouseInputs)
-		HandleMouseInputs();
-
-	ColorizeInternal();
-	Render();
-
-	if (mHandleKeyboardInputs)
-		ImGui::PopItemFlag();
 
 	if (!mIgnoreImGuiChild)
 		ImGui::EndChild();
+
+	if (showMinimap && visible)
+	{
+		ImGui::SameLine(0.0f, minimapGap);
+		ImGui::PushID(aTitle);
+		RenderMinimap(editorWindow, ImVec2(aMinimapWidth, editorHeight));
+		ImGui::PopID();
+	}
 
 	ImGui::PopStyleVar();
 	ImGui::PopStyleColor();

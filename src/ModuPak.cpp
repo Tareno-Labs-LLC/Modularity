@@ -1,5 +1,6 @@
 #include "MaterialShaderProfile.h"
 #include "ModuPak.h"
+#include "TerrainRuntime.h"
 #include "ProjectManager.h"
 #include "../include/Platform/AssetSource.h"
 #include "ThirdParty/assimp/contrib/unzip/unzip.h"
@@ -757,6 +758,17 @@ bool ModuObjExporter::exportObject(const fs::path& projectRoot,
         collectDependency(deps, projectRoot, obj.occlusionMapPath);
         collectDependency(deps, projectRoot, obj.heightMapPath);
         collectDependency(deps, projectRoot, obj.shaderPackPath);
+        if (obj.hasTerrain) {
+            collectDependency(deps, projectRoot, obj.terrain.dataPath);
+            for (const TerrainLayer& layer : obj.terrain.layers) {
+                collectDependency(deps, projectRoot, layer.albedoPath);
+                collectDependency(deps, projectRoot, layer.normalPath);
+                // Roughness / ambient occlusion maps are picked up by name next to the normal map.
+                for (const char* suffix : {"Roughness", "AmbientOcclusion"}) {
+                    collectDependency(deps, projectRoot, TerrainRuntime::SiblingMapPath(layer.normalPath, suffix));
+                }
+            }
+        }
         collectDependency(deps, projectRoot, obj.material.shaderParameters.profilePath);
         const auto& profile=GetMaterialShaderProfile(obj.material.shaderParameters.profileId);
         for(const auto* stage : {&profile.vert,&profile.frag,&profile.gbufferFrag,&profile.shadowDirVert,&profile.shadowCubeVert}) {

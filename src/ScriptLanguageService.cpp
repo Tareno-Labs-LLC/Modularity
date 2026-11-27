@@ -306,7 +306,7 @@ namespace {
             "string", "vec2", "vec3", "Vector2", "Vector3", "ConsoleMessageType", "UISliderStyle",
             "UIButtonStyle", "UIElementType", "Header", "Slider", "ObjectRef", "ObjectList",
             "DialogueLines", "ClipGridPair", "Separator", "SoundSet", "range", "step",
-            "Begin", "TickUpdate", "Update", "Spec", "TestEditor", "RenderEditorWindow",
+            "Begin", "TickUpdate", "FixedUpdate", "Update", "Spec", "TestEditor", "RenderEditorWindow",
             "ExitRenderEditorWindow", "Script_OnInspector", "OnCollideEnter", "OnCollideHold",
             "OnCollideExit", "Config", "State", "BindSetting",
             "BindArray", "BindArray2D", "SerializeSubScript", "DeserializeSubScript",
@@ -362,6 +362,7 @@ namespace {
         return {
             {"Begin", "void Begin()"},
             {"TickUpdate", "void TickUpdate(float deltaTime)"},
+            {"FixedUpdate", "void FixedUpdate()  // implicit dt = physics fixed step"},
             {"Update", "void Update(float deltaTime)"},
             {"Spec", "void Spec()"},
             {"TestEditor", "void TestEditor()"},

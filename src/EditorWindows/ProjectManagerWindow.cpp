@@ -5987,6 +5987,11 @@ void Engine::renderOpenProjectDialog() {
 #pragma endregion
 
 #pragma region Project Browser Panel
+namespace ViewportRenderHelpers {
+// Defined in Panels/ViewportRenderHelpers.cpp.
+bool CanSkipHiddenPanelBody(bool beginVisible, double *railState);
+}
+
 void Engine::renderProjectBrowserPanel() {
     ImVec4 headerCol = ImVec4(0.20f, 0.27f, 0.36f, 1.0f);
     ImVec4 headerColActive = ImVec4(0.24f, 0.34f, 0.46f, 1.0f);
@@ -5997,7 +6002,8 @@ void Engine::renderProjectBrowserPanel() {
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.0f, 4.0f));
 
     const bool wasOpen = showProjectBrowser;
-    ImGui::Begin(Loc::Window("WINDOW_PROJECT_SETTINGS", "Project Settings"), &showProjectBrowser);
+    const bool settingsWindowVisible =
+        ImGui::Begin(Loc::Window("WINDOW_PROJECT_SETTINGS", "Project Settings"), &showProjectBrowser);
 
     if (!projectManager.currentProject.isLoaded) {
         ImGui::TextDisabled("No project loaded");
@@ -6150,6 +6156,21 @@ void Engine::renderProjectBrowserPanel() {
         const float speed = selectedTab == i ? 10.0f : 16.0f;
         const float blend = animateTabs ? 1.0f - std::exp(-tabDeltaTime * speed / tabMotionScale) : 1.0f;
         tabSelectionAnim[i] = ImLerp(tabSelectionAnim[i], target, blend);
+    }
+
+    // Hidden tab or folded drawer: the pending language reload and the tab animation above
+    // have run; everything below only lays out and draws the selected category.
+    {
+        static double settingsRailState[2] = { -1.0, -1.0 };
+        if (ViewportRenderHelpers::CanSkipHiddenPanelBody(settingsWindowVisible, settingsRailState)) {
+            ImGui::End();
+            if (wasOpen != showProjectBrowser) {
+                saveEditorUserSettings();
+            }
+            ImGui::PopStyleVar(2);
+            ImGui::PopStyleColor(3);
+            return;
+        }
     }
 
     auto drawProjectSettingsTab = [&](int index, bool iconsOnly) {
@@ -8550,7 +8571,7 @@ void Engine::renderProjectBrowserPanel() {
             DrawSettingSection("[C]", Loc::T("SETTINGS_COMPILATION_COMPILER_WORKFLOW", "Compiler Workflow"), Loc::T("SETTINGS_COMPILATION_COMPILER_WORKFLOW_DESC", "C++ script compiler workflow settings."))) {
             if (visible(ProjectSettingsVisibilityMode::Simple, "Compiler Workflow", "Auto-compile on Save", "scripts compile")) {
                 editorSettingsChanged |= DrawSettingRow(Loc::T("SETTINGS_COMPILATION_AUTO_COMPILE_ON_SAVE", "Auto-compile on Save"), Loc::T("SETTINGS_COMPILATION_AUTO_COMPILE_ON_SAVE_DESC", "Compile scripts automatically when a script file is saved."), [&]() {
-                    return ImGui::Checkbox("##ScriptAutoCompileOnSave", &scriptEditorState.autoCompileOnSave);
+                    return ImGui::Checkbox("##ScriptAutoCompileOnSave", &scriptEditorAutoCompileOnSave);
                 });
             }
             if (visible(ProjectSettingsVisibilityMode::Advanced, "Compiler Workflow", "Scan Interval", "auto compile scan seconds")) {

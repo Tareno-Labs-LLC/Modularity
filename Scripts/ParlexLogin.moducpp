@@ -1,0 +1,126 @@
+add ModuCPP;
+add Parlex;
+
+// ParlexLogin - email + password sign-in through Parlex.
+//
+// Wire up the UI objects of your Login Room:
+//   Email Field / Password Field  - input fields (the password one is masked),
+//   Login Button / Register Button / Guest Button - buttons (guest = device sign-in),
+//   Status Text                   - a text object for progress and errors.
+// On success the Enable On Login objects turn on and the Disable On Login objects turn
+// off (hide the login screen, show the lobby), and the player's email is remembered.
+//
+// Set ParlexBootstrap's "Auto Login" off when using this, so it does not also sign the
+// player in as a device guest. "Email and password" must be ticked in the console's
+// sign-in methods (it is). Passwords are only sent to Parlex over HTTPS.
+public class ParlexLogin : ModuNode
+{
+    [Header("UI")]
+    [ObjectRef] public SceneObj emailField;
+    [ObjectRef] public SceneObj passwordField;
+    [ObjectRef] public SceneObj loginButton;
+    [ObjectRef] public SceneObj registerButton;
+    [ObjectRef] public SceneObj guestButton;
+    [ObjectRef] public SceneObj statusText;
+
+    [Header("After sign-in")]
+    public SceneObj[] enableOnLogin;
+    public SceneObj[] disableOnLogin;
+
+    [Header("Behaviour")]
+    public bool rememberEmail = true;
+    public bool submitWithEnter = true;
+    [Slider(6.0f, 64.0f)] public float minPasswordLength = 8.0f;
+
+    private bool busy = false;
+    private bool done = false;
+
+    void Begin()
+    {
+        busy = false;
+        done = false;
+        SceneObject* password = SmartResolveRef(passwordField);
+        if (password) { password->ui.password = true; password->ui.inputText = ""; }
+        SceneObject* email = SmartResolveRef(emailField);
+        if (email && rememberEmail) email->ui.inputText = ParlexAnnouncements.RememberedEmail();
+        SetStatus("Sign in or create an account.");
+        if (Parlex.LoggedIn()) Finish();
+    }
+
+    void TickUpdate()
+    {
+        if (done || busy) return;
+        if (Parlex.LoggedIn()) { Finish(); return; }
+
+        SceneObject* login = SmartResolveRef(loginButton);
+        SceneObject* registration = SmartResolveRef(registerButton);
+        SceneObject* guest = SmartResolveRef(guestButton);
+        SceneObject* email = SmartResolveRef(emailField);
+        SceneObject* password = SmartResolveRef(passwordField);
+
+        bool enter = submitWithEnter && ((email && email->ui.inputSubmitted) || (password && password->ui.inputSubmitted));
+        if ((login && login->ui.buttonPressed) || enter) Submit(false);
+        else if (registration && registration->ui.buttonPressed) Submit(true);
+        else if (guest && guest->ui.buttonPressed) SignInGuest();
+    }
+
+    void Submit(bool create)
+    {
+        if (Parlex.TitleId().length() == 0) { SetStatus("Parlex is not configured yet (ParlexBootstrap needs a Title ID)."); return; }
+        SceneObject* email = SmartResolveRef(emailField);
+        SceneObject* password = SmartResolveRef(passwordField);
+        string address = email ? email->ui.inputText : "";
+        string secret = password ? password->ui.inputText : "";
+        if (address.find('@') == std::string::npos || address.length() < 5) { SetStatus("Enter a valid email address."); return; }
+        if (secret.length() < (size_t)minPasswordLength) { SetStatus("The password needs at least " + std::to_string((int)minPasswordLength) + " characters."); return; }
+
+        busy = true;
+        SetStatus(create ? "Creating your account..." : "Signing in...");
+        if (create) Parlex.RegisterWithEmail(address, secret, (const ParlexResult& r) => { OnResult(r); });
+        else Parlex.LoginWithEmail(address, secret, (const ParlexResult& r) => { OnResult(r); });
+    }
+
+    void SignInGuest()
+    {
+        if (Parlex.TitleId().length() == 0) { SetStatus("Parlex is not configured yet (ParlexBootstrap needs a Title ID)."); return; }
+        busy = true;
+        SetStatus("Signing in as a guest...");
+        Parlex.LoginWithDevice((const ParlexResult& r) => { OnResult(r); });
+    }
+
+    void OnResult(const ParlexResult& r)
+    {
+        busy = false;
+        // Never keep the password around once the request has gone out.
+        SceneObject* password = SmartResolveRef(passwordField);
+        if (password) password->ui.inputText = "";
+        if (r.Ok)
+        {
+            if (rememberEmail)
+            {
+                SceneObject* email = SmartResolveRef(emailField);
+                if (email) ParlexAnnouncements.RememberEmail(email->ui.inputText);
+            }
+            Finish();
+            return;
+        }
+        if (r.ErrorName == "AccountBanned") SetStatus("This account is banned. " + ParlexBan.Describe());
+        else if (r.ErrorName == "MaintenanceMode") SetStatus(r.Error);
+        else SetStatus(r.Error.length() > 0 ? r.Error : "Could not sign in.");
+    }
+
+    void Finish()
+    {
+        if (done) return;
+        done = true;
+        SetStatus("Signed in.");
+        each enableOnLogin.state(true);
+        each disableOnLogin.state(false);
+    }
+
+    void SetStatus(const string& message)
+    {
+        SceneObject* status = SmartResolveRef(statusText);
+        if (status) status->ui.label = message;
+    }
+}

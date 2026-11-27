@@ -10,6 +10,8 @@
 #include <regex>
 #include "imgui.h"
 
+struct ImGuiWindow;
+
 class TextEditor
 {
 public:
@@ -194,7 +196,7 @@ public:
 	void SetErrorMarkers(const ErrorMarkers& aMarkers) { mErrorMarkers = aMarkers; }
 	void SetBreakpoints(const Breakpoints& aMarkers) { mBreakpoints = aMarkers; }
 
-	void Render(const char* aTitle, const ImVec2& aSize = ImVec2(), bool aBorder = false);
+	void Render(const char* aTitle, const ImVec2& aSize = ImVec2(), bool aBorder = false, float aMinimapWidth = 0.0f);
 	void SetText(const std::string& aText);
 	std::string GetText() const;
 
@@ -361,6 +363,7 @@ private:
 	void HandleKeyboardInputs();
 	void HandleMouseInputs();
 	void Render();
+	void RenderMinimap(ImGuiWindow* aEditorWindow, const ImVec2& aSize);
 
 	float mLineSpacing;
 	Lines mLines;

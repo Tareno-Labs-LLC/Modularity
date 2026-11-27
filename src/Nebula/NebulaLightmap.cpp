@@ -56,7 +56,11 @@ void closeLibrary(void* handle) {
 }
 std::string libraryError() { return "LoadLibrary failed"; }
 #else
+#if defined(__APPLE__)
+constexpr const char* kLibraryName = "libnebula_modularity.dylib";
+#else
 constexpr const char* kLibraryName = "libnebula_modularity.so";
+#endif
 void* openLibrary(const std::string& path) {
     return dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
 }

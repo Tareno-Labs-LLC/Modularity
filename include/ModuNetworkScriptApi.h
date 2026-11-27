@@ -234,6 +234,30 @@ struct NetworkFacade {
         ScriptContext* c = ctxPtr();
         return c && c->NetworkJoinRandomRoom();
     }
+    bool JoinLobby() const {
+        ScriptContext* c = ctxPtr();
+        return c && c->NetworkJoinLobby();
+    }
+    bool RefreshRoomList() const {
+        ScriptContext* c = ctxPtr();
+        return c && c->NetworkRefreshRoomList();
+    }
+    int RoomCount() const {
+        ScriptContext* c = ctxPtr();
+        return c ? c->GetRoomCount() : 0;
+    }
+    std::string RoomName(int index) const {
+        ScriptContext* c = ctxPtr();
+        return c ? c->GetRoomName(index) : std::string();
+    }
+    int RoomPlayerCount(int index) const {
+        ScriptContext* c = ctxPtr();
+        return c ? c->GetRoomPlayerCount(index) : 0;
+    }
+    int RoomMaxPlayers(int index) const {
+        ScriptContext* c = ctxPtr();
+        return c ? c->GetRoomMaxPlayers(index) : 0;
+    }
     bool LeaveRoom() const {
         ScriptContext* c = ctxPtr();
         return c && c->NetworkLeaveRoom();

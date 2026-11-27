@@ -5,7 +5,6 @@
 #include <filesystem>
 #include <iostream>
 #include <string>
-#include <vector>
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -25,27 +24,13 @@ extern "C" {
 __declspec(dllexport) unsigned long NvOptimusEnablement = 0x00000001;
 __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 }
-#else
-#include <unistd.h>
 #endif
-static std::filesystem::path getExecutableDir() {
-  #if defined(_WIN32)
-    char pathBuf[MAX_PATH] = {};
-    DWORD len = GetModuleFileNameA(nullptr, pathBuf, MAX_PATH);
-    if (len == 0 || len == MAX_PATH) {return {};}
-    return std::filesystem::path(pathBuf).parent_path();
-  #else
-    std::vector<char> buf(4096, '\0');
-    ssize_t len = readlink("/proc/self/exe", buf.data(), buf.size() - 1);
-    if (len <= 0) {return {};}
-    buf[static_cast<size_t>(len)] = '\0';
-    return std::filesystem::path(buf.data()).parent_path();
-  #endif
-}
+#include "Platform/ExecutablePath.h"
+
 static int ModularityPlayerMain(int argc, char** argv) {
   ModularityRouteAsanReports();
   if (Modularity::CrashReporter::HandleCrashReporterMode(argc, argv)) return 0;
-  if (auto exeDir = getExecutableDir(); !exeDir.empty()) {
+  if (auto exeDir = Modularity::CurrentExecutablePath().parent_path(); !exeDir.empty()) {
     std::error_code ec;
     std::filesystem::current_path(exeDir, ec);
     if (ec) std::cerr << "[WARN] Failed to set working dir to executable: " << ec.message() << std::endl;

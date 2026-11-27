@@ -1,7 +1,10 @@
 #include "MaterialShaderProfile.h"
 #include "Rendering.h"
 #include "RenderOptimizationInternal.h"
+#include "RenderTerrainInternal.h"
+#include "TerrainRuntime.h"
 #include "Profiler.h"
+#include "InstancerRuntime.h"
 #include "ShaderFileWatcher.h"
 #include "Modu2DStats.h"
 #include "Camera.h"
@@ -537,6 +540,11 @@ uint64_t HashStringFNV1a(const std::string& value) {
     return hash;
 }
 
+// Skinned meshes flagged "Never Cull" (Skeletal Animation component) skip view culling.
+inline bool IsNeverCulled(const SceneObject& obj) {
+    return obj.hasSkeletalAnimation && obj.skeletal.enabled && obj.skeletal.alwaysRender;
+}
+
 bool TryGetObjectLocalBounds(const SceneObject& obj, glm::vec3& outCenter, glm::vec3& outExtents) {
     outCenter = glm::vec3(0.0f);
     switch (obj.renderType) {
@@ -570,6 +578,14 @@ bool TryGetObjectLocalBounds(const SceneObject& obj, glm::vec3& outCenter, glm::
             }
             break;
         case RenderType::Model:
+            // Skinned: the box around the current pose (Engine::updateSkinningMatrices), not the
+            // bind pose, which an animated or IK-driven limb can leave entirely.
+            if (obj.hasSkeletalAnimation && obj.skeletal.enabled && obj.skeletal.poseBoundsValid) {
+                outCenter = (obj.skeletal.poseBoundsMin + obj.skeletal.poseBoundsMax) * 0.5f;
+                outExtents = glm::max((obj.skeletal.poseBoundsMax - obj.skeletal.poseBoundsMin) * 0.5f,
+                                      glm::vec3(0.001f));
+                return true;
+            }
             if (obj.meshId >= 0) {
                 if (const auto* meshInfo = getModelLoader().getMeshInfo(obj.meshId)) {
                     if (IsFiniteVec3(meshInfo->boundsMin) && IsFiniteVec3(meshInfo->boundsMax)) {
@@ -752,6 +768,32 @@ ProjectModel ResolveProjectModel(const MaterialProperties& material,const std::s
 ProjectModel ResolveProjectModel(const SceneObject& obj) {
     return ResolveProjectModel(obj.material,obj.vertexShaderPath,obj.fragmentShaderPath,ObjectIsGpuSkinned(obj));
 }
+// Instancer LOD fade for project foliage (CTI leaves shrink toward their pivots before the
+// instancer LOD-switches or culls a tree, the port of CTI's unity_LODFade leaf scale). The
+// vertex stage rebuilds the exact cull sphere gather() tested, so the fade completes at the
+// same distance the CPU switches or drops the instance:
+//   ctiLodInvRel  inverse of the template part's matrix relative to the instance, so
+//                 model * ctiLodInvRel is the instance matrix gather() culled with
+//   ctiLodSphere  xyz cull-sphere centre in instance space, w its unscaled radius
+//                 (negative: the radius is wind-padded like ProjectWindPaddedRadius)
+//   ctiLodFade    x LOD-switch distance, y its fade band (0 = none; flagged leaves only),
+//                 z max draw distance, w its fade band (0 = none; every leaf)
+//   ctiLodCamera  the position gather() measured from (centre eye in stereo, the scene
+//                 camera in shadow passes, so shadows shrink with the visible leaves)
+// All zero means "off": regular scene objects and non-foliage project shaders.
+struct CtiLodFadeData {
+    glm::mat4 invRel{1.0f};
+    glm::vec4 sphere{0.0f};
+    glm::vec4 fade{0.0f};
+};
+void UploadCtiLodFade(Shader* program, const CtiLodFadeData* data, const glm::vec3& camera) {
+    static const CtiLodFadeData kOff{};
+    const CtiLodFadeData& d = data ? *data : kOff;
+    program->setMat4("ctiLodInvRel", d.invRel);
+    program->setVec4("ctiLodSphere", d.sphere);
+    program->setVec4("ctiLodFade", d.fade);
+    program->setVec3("ctiLodCamera", camera);
+}
 void UploadProjectMaterialUniforms(Shader* program,const MaterialShaderParameters& params,
                                   const MaterialShaderParameters* last) {
     for(const auto& f:GetMaterialShaderProfile(params.profileId).fields) {
@@ -876,6 +918,9 @@ bool IsStaticMergeCandidate(const SceneObject& obj) {
     if (obj.hasVideoPlayer) return false;
     if (obj.hasAnimation || obj.hasSkeletalAnimation) return false;
     if (!obj.scripts.empty()) return false;
+    // A child of a rigidbody/controller/scripted/animated object moves with it every frame;
+    // merging it into a world-space batch would render a frozen copy and force a rebuild per frame.
+    if (obj.hierarchyMovingAncestor) return false;
     if (obj.faceCamera) return false;
     // Merging bakes world-space vertices (8-float stream only), which drops the vertex
     // streams and per-tree pivot the project shader wind needs.
@@ -1705,6 +1750,98 @@ const OBJLoader::LoadedMesh* OBJLoader::getMeshInfo(int index) const {
     return &loadedMeshes[index];
 }
 
+// Instancer component runtime. One scene object owns a list of instances of "template" scene
+// objects; this state turns the visible part of that list into per-material matrix batches that
+// the existing InstanceState groups draw. Nothing here allocates per frame once the scratch
+// vectors have grown, and everything per-instance (world matrix, bounding sphere) is cached
+// until the component, the instancer transform or a template changes.
+const std::string kInstancerStandardVertPath = "Resources/Shaders/vert_mdi.glsl";
+struct Renderer::InstancerState {
+    struct Part {
+        int objectId = -1;
+        size_t objectIndex = 0;
+        int meshId = -1;
+        RenderType renderType = RenderType::None;
+        glm::mat4 rel{1.0f};                  // part world transform minus the template root translation
+        glm::vec3 center{0.0f};               // bounding sphere in the template root frame
+        float radius = 0.0f;
+        glm::vec3 pos{0.0f}, rot{0.0f}, scale{1.0f};   // part transform when rel was built
+        bool windPadded = false;
+    };
+    struct Template {
+        int rootId = -1;
+        size_t rootIndex = 0;
+        glm::vec3 rootPos{0.0f}, rootRot{0.0f}, rootScale{1.0f};
+        std::vector<Part> parts;
+        // Objects under the template that are not drawn right now (mesh still loading, or switched
+        // off): the cache is rebuilt as soon as one of them becomes drawable.
+        std::vector<std::pair<size_t, int>> watch;   // {object index, object id}
+        glm::vec3 center{0.0f};
+        float radius = 0.0f;
+        bool windPadded = false;
+    };
+    struct ProtoCache {
+        std::array<Template, 2> lod;          // [0] = main template, [1] = LOD1 template
+        glm::vec3 center{0.0f};               // union of both templates
+        float radius = 0.0f;
+        bool windPadded = false;
+    };
+    struct Cache {
+        bool valid = false;
+        uint64_t revision = 0;
+        const void* listPtr = nullptr;
+        size_t listSize = 0;
+        uint64_t protoHash = 0;
+        size_t sceneObjectCount = 0;
+        glm::mat4 world{1.0f};
+        uint64_t worldHash = 0;
+        std::vector<ProtoCache> protos;
+        std::vector<glm::mat4> instanceWorld;   // instancer world * instance local
+        std::vector<glm::vec4> bounds;          // world centre + radius, cull sphere
+        uint64_t lastUse = 0;
+        uint64_t buildSerial = 0;               // unique per rebuild: shadow-map reuse must see template edits
+    };
+    struct Batch {
+        int objectIndex = -1;                 // template part object (index into sceneObjects)
+        Mesh* mesh = nullptr;
+        size_t first = 0, count = 0;          // range in the pool the batch was gathered into
+        uint64_t key = 0;                     // InstanceState group key, hashed once per batch
+        uint8_t projectModel = 0;
+        uint64_t signature = 0;               // content hash for shadow reuse
+        CtiLodFadeData lodFade;               // project foliage LOD fade (all zero = off)
+        uint64_t lodFadeKey = 0;              // hash of lodFade; split groups that fade differently
+    };
+    struct ShadowQuery {
+        bool sphere = false;
+        glm::vec3 sphereCenter{0.0f};
+        float sphereRadius = 0.0f;
+    };
+    std::unordered_map<int, Cache> caches;
+    uint64_t epoch = 0;
+    std::vector<glm::mat4> viewPool, shadowPool;
+    std::vector<Batch> viewBatches, shadowBatches;
+    std::vector<std::vector<uint32_t>> buckets;
+    std::vector<uint64_t> bucketHash;
+    std::vector<int> shadowGroupIds;
+    bool shadowSignatureValid = true;
+    bool warnedUnsupported = false;
+
+    bool anyInstancer(const std::vector<SceneObject>& objects) const;
+    Cache* ensureCache(Renderer& renderer, const std::vector<SceneObject>& objects,
+                       const SceneObject& object);
+    // Fills `batches`/`pool` with this view's visible instances. `shadow` switches to the
+    // shadow rules (castShadows, shadowDistance, optional range sphere). Returns the batch
+    // count; `signature` (optional) receives a hash of everything the batches would draw.
+    size_t gather(Renderer& renderer, const std::vector<SceneObject>& objects,
+                  const glm::vec3& cameraPosition, const std::array<glm::vec4, 6>& planes,
+                  uint32_t cullingMask, const ShadowQuery* shadow,
+                  std::vector<glm::mat4>& pool, std::vector<Batch>& batches, uint64_t* signature);
+    // Appends one leader SceneRenderItem per view batch, in front of the transparent items.
+    size_t appendItems(Renderer& renderer, const std::vector<SceneObject>& objects,
+                       const glm::mat4& view, const glm::vec3& cameraPosition,
+                       std::vector<SceneRenderItem>& items);
+};
+
 // Renderer implementation
 // Reuse original mesh streams; only changed instance transforms are uploaded.
 struct Renderer::InstanceState {
@@ -1750,6 +1887,7 @@ struct Renderer::InstanceState {
         size_t capacity = 0;
         bool submitted = false;
         bool depthPrepassed = false;
+        bool forced = false;      // an Instancer part leads it: draw instanced even with one matrix
         uint64_t key = 0, lastUse = 0;
         Shader* program = nullptr;
         std::vector<glm::mat4> matrices, uploaded;
@@ -1762,7 +1900,7 @@ struct Renderer::InstanceState {
     void begin() {
         ++epoch;
         for (auto& g : groups) {
-            g.matrices.clear(); g.submitted=false; g.depthPrepassed=false;
+            g.matrices.clear(); g.submitted=false; g.depthPrepassed=false; g.forced=false;
             // Retire old material/scene keys instead of retaining transform arrays
             // and GPU buffers throughout a long editing session.
             if ((epoch & 63u)==0 && g.mesh && g.lastUse+32<epoch) {
@@ -1778,7 +1916,7 @@ struct Renderer::InstanceState {
         visitor.flag(glm::determinant(glm::mat3(model)) < 0.0f);
         return visitor.hash;
     }
-    int add(uint64_t key, Mesh* mesh, const glm::mat4& model) {
+    int acquire(uint64_t key, Mesh* mesh) {
         auto it=lookup.find(key);
         if (it==lookup.end()) {
             size_t index=groups.size();
@@ -1794,8 +1932,22 @@ struct Renderer::InstanceState {
             it=lookup.emplace(key,index).first;
         }
         groups[it->second].lastUse=epoch;
-        groups[it->second].matrices.push_back(model);
         return static_cast<int>(it->second);
+    }
+    int add(uint64_t key, Mesh* mesh, const glm::mat4& model) {
+        const int index=acquire(key,mesh);
+        if (index>=0) groups[static_cast<size_t>(index)].matrices.push_back(model);
+        return index;
+    }
+    // Instancer batches arrive as one contiguous run of final matrices.
+    int addBulk(uint64_t key, Mesh* mesh, const glm::mat4* matrices, size_t count) {
+        const int index=acquire(key,mesh);
+        if (index>=0) {
+            auto& g=groups[static_cast<size_t>(index)];
+            g.matrices.insert(g.matrices.end(),matrices,matrices+count);
+            g.forced=true;
+        }
+        return index;
     }
     void draw(int index) {
         auto& g=groups[static_cast<size_t>(index)];
@@ -1821,39 +1973,474 @@ struct Renderer::InstanceState {
     }
     void prepare(Renderer& renderer, std::vector<SceneRenderItem>& items) {
         begin();
+        const bool ssrOn = renderer.skybox && renderer.skybox->getSettings().ssrEnabled;
         for (auto& item : items) {
             item.instanceGroup=-1; item.instanceFollower=false;
+            if (item.instancerBatch>=0) {
+                // Instancer leader: one group key per batch, the whole culled matrix run at once.
+                const auto& ib=renderer.instancerState->viewBatches[static_cast<size_t>(item.instancerBatch)];
+                if (!item.obj || !item.mesh || item.mesh->isDynamic() || item.mesh->usesBones()) continue;
+                if (item.projectModel) {
+                    const auto& profile=GetMaterialShaderProfile(item.projectModel);
+                    if (!profile.instancing || (ssrOn && profile.gbufferFrag.empty())) continue;
+                }
+                // The LOD fade is one uniform per draw, so batches only share a group if they fade alike.
+                item.instanceGroup=addBulk(HashCombine64(ib.key,ib.lodFadeKey),item.mesh,
+                                           renderer.instancerState->viewPool.data()+ib.first,ib.count);
+                continue;
+            }
             if (!item.obj || !item.mesh || item.multiDrawBatch>=0 || !item.sortOpaque ||
                 item.isUiCanvas3D || item.mesh->isDynamic() || item.mesh->usesBones() ||
                 item.obj->hasSkeletalAnimation || item.obj->faceCamera ||
                 item.obj->renderType==RenderType::Sprite || item.obj->renderType==RenderType::Mirror ||
                 item.obj->runtimeHasAlbedoTextureOverride || !item.projectModel) continue;
             const auto& profile=GetMaterialShaderProfile(item.projectModel);
-            if (!profile.instancing || (renderer.skybox && renderer.skybox->getSettings().ssrEnabled && profile.gbufferFrag.empty())) continue;
+            if (!profile.instancing || (ssrOn && profile.gbufferFrag.empty())) continue;
             uint64_t batchKey=key(*item.obj,item.mesh,item.model);
             batchKey=HashCombine64(batchKey,item.reflectionCube);
             batchKey=HashCombine64(batchKey,HashFloat64(item.reflectionIntensity));
             item.instanceGroup=add(batchKey,item.mesh,item.model);
         }
+        bool droppedLeader=false;
         for (auto& item : items) {
-            if (item.instanceGroup<0) continue;
+            if (item.instanceGroup<0) { droppedLeader|=item.instancerBatch>=0; continue; }
             auto& g=groups[static_cast<size_t>(item.instanceGroup)];
-            if (g.matrices.size()<2) { item.instanceGroup=-1; continue; }
+            if (g.matrices.size()<2 && !g.forced) { item.instanceGroup=-1; continue; }
             if (!g.submitted) {
-                const auto& profile=GetMaterialShaderProfile(item.projectModel);
-                g.program=renderer.getShader(profile.instancedVert,profile.frag);
-                if (renderer.skybox && renderer.skybox->getSettings().ssrEnabled && !profile.gbufferFrag.empty()) {
-                    Shader* surface=renderer.getShader(profile.instancedVert,profile.gbufferFrag);
-                    if (!surface || surface==renderer.defaultShader || !surface->ID) g.program=nullptr;
+                if (item.projectModel) {
+                    const auto& profile=GetMaterialShaderProfile(item.projectModel);
+                    g.program=renderer.getShader(profile.instancedVert,profile.frag);
+                    if (ssrOn && !profile.gbufferFrag.empty()) {
+                        Shader* surface=renderer.getShader(profile.instancedVert,profile.gbufferFrag);
+                        if (!surface || surface==renderer.defaultShader || !surface->ID) g.program=nullptr;
+                    }
+                } else {
+                    // Standard material: the multi-draw vertex stage already reads a per-instance
+                    // matrix (attributes 5-8) and matches vert.glsl, so the same fragment stage runs.
+                    const std::string& frag=item.fragPath && !item.fragPath->empty() ? *item.fragPath : renderer.defaultFragPath;
+                    g.program=renderer.getShader(kInstancerStandardVertPath,frag);
+                    if (!g.program || g.program==renderer.defaultShader || !g.program->ID)
+                        g.program=renderer.getShader(kInstancerStandardVertPath,renderer.defaultFragPath);
                 }
             }
             if (!g.program || g.program==renderer.defaultShader || !g.program->ID) {
-                item.instanceGroup=-1; continue;
+                item.instanceGroup=-1; droppedLeader|=item.instancerBatch>=0; continue;
             }
             item.instanceFollower=g.submitted; g.submitted=true;
         }
+        if (droppedLeader) {
+            // A leader that cannot instance has no meaningful non-instanced draw (its model is
+            // only the first instance), so it must not stay in the list.
+            items.erase(std::remove_if(items.begin(),items.end(),[](const SceneRenderItem& it) {
+                return it.instancerBatch>=0 && it.instanceGroup<0; }),items.end());
+        }
     }
 };
+
+// ---- Instancer component runtime (see the declaration above InstanceState) -----------------
+namespace {
+
+bool InstancerPartUsable(const SceneObject& obj) {
+    if (!HasRendererComponent(obj)) return false;
+    switch (obj.renderType) {
+        case RenderType::None:
+        case RenderType::Mirror:
+        case RenderType::Sprite:
+            return false;
+        default:
+            break;
+    }
+    return !obj.faceCamera && !obj.hasSkeletalAnimation &&
+           !(obj.hasUI && obj.ui.type == UIElementType::Canvas && obj.ui.renderIn3D);
+}
+
+float TransformAxisScale(const glm::mat4& m, int axis) {
+    return glm::length(glm::vec3(m[axis]));
+}
+
+} // namespace
+
+bool Renderer::InstancerState::anyInstancer(const std::vector<SceneObject>& objects) const {
+    for (const SceneObject& obj : objects) {
+        if (obj.hasInstancer) return true;
+    }
+    return false;
+}
+
+Renderer::InstancerState::Cache* Renderer::InstancerState::ensureCache(
+        Renderer& renderer, const std::vector<SceneObject>& objects, const SceneObject& object) {
+    const InstancerComponent& comp = object.instancer;
+    Cache& c = caches[object.id];
+    c.lastUse = epoch;
+    const glm::mat4 world = BuildSceneObjectModelMatrix(object);
+    const uint64_t protoHash = InstancerRuntime::HashPrototypes(comp.prototypes);
+
+    const auto templateValid = [&](const Template& t) {
+        if (t.rootId < 0) return true;
+        if (t.rootIndex >= objects.size() || objects[t.rootIndex].id != t.rootId) return false;
+        const SceneObject& root = objects[t.rootIndex];
+        if (root.position != t.rootPos || root.rotation != t.rootRot || root.scale != t.rootScale) return false;
+        for (const Part& part : t.parts) {
+            if (part.objectIndex >= objects.size()) return false;
+            const SceneObject& o = objects[part.objectIndex];
+            if (o.id != part.objectId || o.meshId != part.meshId || o.renderType != part.renderType ||
+                !o.enabled || o.position != part.pos || o.rotation != part.rot || o.scale != part.scale) {
+                return false;
+            }
+        }
+        for (const std::pair<size_t, int>& watched : t.watch) {
+            if (watched.first >= objects.size()) return false;
+            const SceneObject& o = objects[watched.first];
+            if (o.id != watched.second) return false;
+            if (o.enabled && InstancerPartUsable(o) && OptimizationState::meshFor(renderer, o)) return false;
+        }
+        return true;
+    };
+    bool templatesOk = c.valid && c.protoHash == protoHash && c.sceneObjectCount == objects.size() &&
+                       c.protos.size() == comp.prototypes.size();
+    if (templatesOk) {
+        for (const ProtoCache& pc : c.protos) {
+            if (!templateValid(pc.lod[0]) || !templateValid(pc.lod[1])) { templatesOk = false; break; }
+        }
+    }
+    const bool listChanged = !c.valid || c.revision != comp.revision ||
+                             c.listPtr != comp.instances.get() || c.listSize != comp.instanceCount();
+    const bool worldChanged = !c.valid || std::memcmp(&c.world, &world, sizeof(world)) != 0;
+    if (templatesOk && !listChanged && !worldChanged) return &c;
+
+    if (!templatesOk) {
+        std::unordered_map<int, size_t> idToIndex;
+        idToIndex.reserve(objects.size());
+        for (size_t i = 0; i < objects.size(); ++i) idToIndex[objects[i].id] = i;
+
+        const auto buildTemplate = [&](int rootId, Template& t) {
+            t = Template{};
+            const auto rootIt = idToIndex.find(rootId);
+            if (rootId < 0 || rootIt == idToIndex.end()) return;
+            const SceneObject& root = objects[rootIt->second];
+            t.rootId = rootId;
+            t.rootIndex = rootIt->second;
+            t.rootPos = root.position;
+            t.rootRot = root.rotation;
+            t.rootScale = root.scale;
+            std::vector<size_t> stack{rootIt->second};
+            std::vector<char> visited(objects.size(), 0);
+            glm::vec3 boundsMin(std::numeric_limits<float>::max());
+            glm::vec3 boundsMax(std::numeric_limits<float>::lowest());
+            while (!stack.empty() && t.parts.size() < 256) {
+                const size_t index = stack.back();
+                stack.pop_back();
+                if (visited[index]) continue;
+                visited[index] = 1;
+                const SceneObject& o = objects[index];
+                if (o.hasInstancer) continue;   // never draw an instancer through a template
+                if (index != rootIt->second && !o.enabled) {
+                    // A part switched off inside the template (the root itself is normally the disabled one).
+                    t.watch.emplace_back(index, o.id);
+                    continue;
+                }
+                if (!InstancerPartUsable(o) || !OptimizationState::meshFor(renderer, o)) {
+                    if (InstancerPartUsable(o)) t.watch.emplace_back(index, o.id);
+                } else {
+                    Part part;
+                    part.objectId = o.id;
+                    part.objectIndex = index;
+                    part.meshId = o.meshId;
+                    part.renderType = o.renderType;
+                    part.pos = o.position;
+                    part.rot = o.rotation;
+                    part.scale = o.scale;
+                    part.rel = BuildSceneObjectModelMatrix(o);
+                    part.rel[3] -= glm::vec4(root.position, 0.0f);
+                    part.windPadded = o.material.usesProjectShader();
+                    glm::vec3 localCenter(0.0f), localExtents(0.0f);
+                    if (TryGetObjectLocalBounds(o, localCenter, localExtents)) {
+                        part.center = glm::vec3(part.rel * glm::vec4(localCenter, 1.0f));
+                        part.radius = glm::length(glm::vec3(localExtents.x * TransformAxisScale(part.rel, 0),
+                                                            localExtents.y * TransformAxisScale(part.rel, 1),
+                                                            localExtents.z * TransformAxisScale(part.rel, 2)));
+                    } else {
+                        part.center = glm::vec3(part.rel[3]);
+                        part.radius = 50.0f;
+                    }
+                    if (!std::isfinite(part.radius)) part.radius = 50.0f;
+                    boundsMin = glm::min(boundsMin, part.center - glm::vec3(part.radius));
+                    boundsMax = glm::max(boundsMax, part.center + glm::vec3(part.radius));
+                    t.windPadded = t.windPadded || part.windPadded;
+                    t.parts.push_back(part);
+                }
+                for (int childId : o.childIds) {
+                    const auto childIt = idToIndex.find(childId);
+                    if (childIt != idToIndex.end() && !visited[childIt->second]) stack.push_back(childIt->second);
+                }
+            }
+            if (!t.parts.empty()) {
+                t.center = (boundsMin + boundsMax) * 0.5f;
+                float radius = 0.0f;
+                for (const Part& part : t.parts) {
+                    radius = std::max(radius, glm::length(part.center - t.center) + part.radius);
+                }
+                t.radius = radius;
+            }
+        };
+
+        c.protos.assign(comp.prototypes.size(), ProtoCache{});
+        for (size_t p = 0; p < comp.prototypes.size(); ++p) {
+            const InstancerPrototype& proto = comp.prototypes[p];
+            ProtoCache& pc = c.protos[p];
+            buildTemplate(proto.sourceObjectId, pc.lod[0]);
+            if (proto.lodSourceObjectId >= 0 && proto.lodSourceObjectId != proto.sourceObjectId) {
+                buildTemplate(proto.lodSourceObjectId, pc.lod[1]);
+            }
+            const Template& a = pc.lod[0];
+            const Template& b = pc.lod[1];
+            if (!a.parts.empty() && !b.parts.empty()) {
+                const glm::vec3 lo = glm::min(a.center - glm::vec3(a.radius), b.center - glm::vec3(b.radius));
+                const glm::vec3 hi = glm::max(a.center + glm::vec3(a.radius), b.center + glm::vec3(b.radius));
+                pc.center = (lo + hi) * 0.5f;
+                pc.radius = std::max(glm::length(a.center - pc.center) + a.radius,
+                                     glm::length(b.center - pc.center) + b.radius);
+            } else if (!a.parts.empty()) {
+                pc.center = a.center;
+                pc.radius = a.radius;
+            } else {
+                pc.center = b.center;
+                pc.radius = b.radius;
+            }
+            pc.windPadded = a.windPadded || b.windPadded;
+        }
+        c.protoHash = protoHash;
+        c.sceneObjectCount = objects.size();
+    }
+
+    // Per-instance world matrix and cull sphere.
+    const size_t count = comp.instanceCount();
+    c.instanceWorld.resize(count);
+    c.bounds.resize(count);
+    for (size_t i = 0; i < count; ++i) {
+        const InstancerInstance& inst = (*comp.instances)[i];
+        const glm::mat4 m = world * InstancerRuntime::InstanceLocalMatrix(inst);
+        c.instanceWorld[i] = m;
+        if (inst.prototype >= c.protos.size() || c.protos[inst.prototype].radius <= 0.0f) {
+            c.bounds[i] = glm::vec4(glm::vec3(m[3]), -1.0f);   // nothing to draw
+            continue;
+        }
+        const ProtoCache& pc = c.protos[inst.prototype];
+        float radius = pc.radius * TransformAxisScale(m, 1);
+        if (pc.windPadded) radius = ProjectWindPaddedRadius(radius);
+        c.bounds[i] = glm::vec4(glm::vec3(m * glm::vec4(pc.center, 1.0f)), radius);
+    }
+    uint64_t worldHash = 1469598103934665603ull;
+    for (int col = 0; col < 4; ++col) {
+        for (int row = 0; row < 4; ++row) worldHash = HashCombine64(worldHash, HashFloat64(world[col][row]));
+    }
+    c.worldHash = worldHash;
+    c.world = world;
+    c.revision = comp.revision;
+    c.buildSerial = InstancerComponent::NextRevision();
+    c.listPtr = comp.instances.get();
+    c.listSize = count;
+    c.valid = true;
+    return &c;
+}
+
+size_t Renderer::InstancerState::gather(Renderer& renderer, const std::vector<SceneObject>& objects,
+                                        const glm::vec3& cameraPosition,
+                                        const std::array<glm::vec4, 6>& planes, uint32_t cullingMask,
+                                        const ShadowQuery* shadow, std::vector<glm::mat4>& pool,
+                                        std::vector<Batch>& batches, uint64_t* signature) {
+    pool.clear();
+    batches.clear();
+    if (signature) *signature = 0;
+    if (shadow) shadowSignatureValid = true;
+    for (size_t objectIndex = 0; objectIndex < objects.size(); ++objectIndex) {
+        const SceneObject& object = objects[objectIndex];
+        if (!object.hasInstancer || !object.instancer.enabled || object.instancer.instanceCount() == 0) continue;
+        if (!IsObjectEnabledInHierarchy(object)) continue;
+        if (!shadow && cullingMask != 0xFFFFFFFFu &&
+            (cullingMask & (1u << (static_cast<uint32_t>(object.layer) & 31u))) == 0u) continue;
+        Cache* cache = ensureCache(renderer, objects, object);
+        if (!cache) continue;
+        const InstancerComponent& comp = object.instancer;
+        const std::vector<InstancerInstance>& list = *comp.instances;
+        const size_t protoCount = cache->protos.size();
+        if (protoCount == 0) continue;
+
+        if (buckets.size() < protoCount * 2) {
+            buckets.resize(protoCount * 2);
+            bucketHash.resize(protoCount * 2);
+        }
+        for (size_t b = 0; b < protoCount * 2; ++b) {
+            buckets[b].clear();
+            bucketHash[b] = 1469598103934665603ull;
+        }
+
+        for (size_t i = 0; i < list.size(); ++i) {
+            const uint16_t p = list[i].prototype;
+            const glm::vec4& bound = cache->bounds[i];
+            if (p >= protoCount || bound.w < 0.0f) continue;
+            const InstancerPrototype& proto = comp.prototypes[p];
+            if (shadow && !proto.castShadows) continue;
+            const glm::vec3 center(bound);
+            const glm::vec3 toCamera = center - cameraPosition;
+            const float distance = std::sqrt(glm::dot(toCamera, toCamera));
+            if (proto.maxDrawDistance > 0.0f && distance - bound.w > proto.maxDrawDistance) continue;
+            if (shadow) {
+                if (proto.shadowDistance > 0.0f && distance - bound.w > proto.shadowDistance) continue;
+                if (shadow->sphere) {
+                    const glm::vec3 fromLight = center - shadow->sphereCenter;
+                    const float reach = shadow->sphereRadius + bound.w;
+                    if (glm::dot(fromLight, fromLight) > reach * reach) continue;
+                }
+            }
+            if (!RenderOpt::SphereInsidePlanes(planes, center, bound.w)) continue;
+            const bool useLod = proto.lodDistance > 0.0f && distance > proto.lodDistance &&
+                                !cache->protos[p].lod[1].parts.empty();
+            const size_t bucket = static_cast<size_t>(p) * 2 + (useLod ? 1u : 0u);
+            buckets[bucket].push_back(static_cast<uint32_t>(i));
+            bucketHash[bucket] = HashCombine64(bucketHash[bucket], i);
+        }
+
+        for (size_t p = 0; p < protoCount; ++p) {
+            for (size_t lod = 0; lod < 2; ++lod) {
+                const std::vector<uint32_t>& visible = buckets[p * 2 + lod];
+                if (visible.empty()) continue;
+                const Template& t = cache->protos[p].lod[lod];
+                for (const Part& part : t.parts) {
+                    const SceneObject& partObject = objects[part.objectIndex];
+                    Mesh* mesh = OptimizationState::meshFor(renderer, partObject);
+                    if (!mesh || mesh->isDynamic() || mesh->usesBones() ||
+                        partObject.runtimeHasAlbedoTextureOverride) {
+                        continue;
+                    }
+                    const ProjectModel project = ResolveProjectModel(partObject);
+                    if (project == ProjectModel::None && !partObject.vertexShaderPath.empty()) continue;
+                    Batch batch;
+                    batch.objectIndex = static_cast<int>(part.objectIndex);
+                    batch.mesh = mesh;
+                    batch.first = pool.size();
+                    batch.count = visible.size();
+                    batch.projectModel = static_cast<uint8_t>(project);
+                    pool.resize(batch.first + batch.count);
+                    glm::mat4* out = pool.data() + batch.first;
+                    for (size_t k = 0; k < visible.size(); ++k) {
+                        out[k] = cache->instanceWorld[visible[k]] * part.rel;
+                    }
+                    batch.key = InstanceState::key(partObject, mesh, out[0]);
+                    // buildSerial changes with every cache rebuild (instance list, instancer transform,
+                    // prototype settings or template edits), so edits can never reuse a stale shadow map.
+                    uint64_t sig = HashCombine64(static_cast<uint64_t>(partObject.id), cache->buildSerial);
+                    sig = HashCombine64(sig, cache->worldHash);
+                    sig = HashCombine64(sig, HashFloat64(partObject.material.alpha));
+                    sig = HashCombine64(sig, HashFloat64(partObject.material.alphaCutoff));
+                    sig = HashCombine64(sig, renderer.textureCacheGeneration);
+                    sig = HashCombine64(sig, bucketHash[p * 2 + lod]);
+                    sig = HashCombine64(sig, mesh->getSerial());
+                    sig = HashCombine64(sig, batch.key);
+                    batch.signature = sig;
+                    if (project != ProjectModel::None) {
+                        // Leaves shrink over a band that ends exactly where this loop switches
+                        // LOD (centre distance > lodDistance) or culls (distance - radius >
+                        // maxDrawDistance). Same values in shadow passes: casters are measured
+                        // from the scene camera too, so the shadows fade with the leaves.
+                        const ProtoCache& pc = cache->protos[p];
+                        const InstancerPrototype& proto = comp.prototypes[p];
+                        const bool switches = lod == 0 && proto.lodDistance > 0.0f && !pc.lod[1].parts.empty();
+                        const float lodSwitch = switches ? proto.lodDistance : 0.0f;
+                        const float maxDraw = std::max(proto.maxDrawDistance, 0.0f);
+                        CtiLodFadeData& fade = batch.lodFade;
+                        fade.fade = glm::vec4(lodSwitch, switches ? std::clamp(lodSwitch * 0.2f, 0.5f, 4.0f) : 0.0f,
+                                              maxDraw, maxDraw > 0.0f ? std::clamp(maxDraw * 0.15f, 1.0f, 6.0f) : 0.0f);
+                        if (fade.fade.y > 0.0f || fade.fade.w > 0.0f) {
+                            fade.invRel = glm::inverse(part.rel);
+                            fade.sphere = glm::vec4(pc.center, pc.windPadded ? -pc.radius : pc.radius);
+                            uint64_t fk = 1469598103934665603ull;
+                            for (int col = 0; col < 4; ++col) {
+                                fk = HashCombine64(fk, HashFloat64(fade.fade[col]));
+                                fk = HashCombine64(fk, HashFloat64(fade.sphere[col]));
+                                for (int row = 0; row < 4; ++row) fk = HashCombine64(fk, HashFloat64(fade.invRel[col][row]));
+                            }
+                            batch.lodFadeKey = fk;
+                        } else {
+                            fade = CtiLodFadeData{};
+                        }
+                    }
+                    if (shadow && project != ProjectModel::None) shadowSignatureValid = false;
+                    if (signature) *signature = HashCombine64(*signature, sig);
+                    batches.push_back(batch);
+                }
+            }
+        }
+    }
+    // Retire caches of instancers that no longer exist.
+    if (!shadow) {
+        ++epoch;
+        if ((epoch & 255u) == 0) {
+            for (auto it = caches.begin(); it != caches.end();) {
+                if (it->second.lastUse + 256 < epoch) it = caches.erase(it); else ++it;
+            }
+        }
+    }
+    return batches.size();
+}
+
+size_t Renderer::InstancerState::appendItems(Renderer& renderer, const std::vector<SceneObject>& objects,
+                                             const glm::mat4& view, const glm::vec3& cameraPosition,
+                                             std::vector<SceneRenderItem>& items) {
+    size_t appended = 0;
+    const size_t oldSize = items.size();
+    for (size_t batchIndex = 0; batchIndex < viewBatches.size(); ++batchIndex) {
+        const Batch& batch = viewBatches[batchIndex];
+        const SceneObject& obj = objects[static_cast<size_t>(batch.objectIndex)];
+        items.emplace_back();
+        SceneRenderItem& item = items.back();
+        item.obj = &obj;
+        item.mesh = batch.mesh;
+        item.model = viewPool[batch.first];
+        item.sortCenter = glm::vec3(item.model[3]);
+        item.depthSortCenter = item.sortCenter;
+        item.vertPath = &obj.vertexShaderPath;
+        item.fragPath = &obj.fragmentShaderPath;
+        item.material = obj.material;
+        item.materialPath = &obj.materialPath;
+        item.albedoTexturePath = &obj.albedoTexturePath;
+        item.overlayTexturePath = &obj.overlayTexturePath;
+        item.normalMapPath = &obj.normalMapPath;
+        item.metallicRoughnessMapPath = &obj.metallicRoughnessMapPath;
+        item.metallicMapPath = &obj.metallicMapPath;
+        item.roughnessMapPath = &obj.roughnessMapPath;
+        item.opacityMapPath = &obj.opacityMapPath;
+        item.emissiveMapPath = &obj.emissiveMapPath;
+        item.occlusionMapPath = &obj.occlusionMapPath;
+        item.heightMapPath = &obj.heightMapPath;
+        item.useOverlay = obj.useOverlay;
+        const ProjectModel projectModel = static_cast<ProjectModel>(batch.projectModel);
+        if (projectModel != ProjectModel::None) {
+            const ProjectPrograms& programs = GetProjectPrograms(projectModel);
+            item.vertPath = &programs.vert;
+            item.fragPath = &programs.frag;
+            item.projectModel = batch.projectModel;
+        }
+        item.doubleSided = ProfileTwoSided(projectModel);
+        item.requiresBlending = false;
+        item.sortOpaque = true;
+        item.reflectionResolved = true;   // instancer groups never use a reflection probe
+        item.instancerBatch = static_cast<int>(batchIndex);
+        const glm::vec3 viewSpaceCenter = glm::vec3(view * glm::vec4(item.depthSortCenter, 1.0f));
+        item.cameraDepth = -viewSpaceCenter.z;
+        const glm::vec3 toCamera = item.depthSortCenter - cameraPosition;
+        item.cameraDistanceSq = glm::dot(toCamera, toCamera);
+        ++appended;
+    }
+    if (appended > 0) {
+        // Opaque items come first in both queue builders; keep the leaders with them so the
+        // lazy skybox still draws before the first transparent item.
+        const auto firstTransparent = std::find_if(items.begin(), items.begin() + static_cast<std::ptrdiff_t>(oldSize),
+            [](const SceneRenderItem& it) { return !it.sortOpaque; });
+        std::rotate(firstTransparent, items.begin() + static_cast<std::ptrdiff_t>(oldSize), items.end());
+    }
+    return appended;
+}
 
 struct Renderer::StereoState {
 #if MODULARITY_OPENGL_ES
@@ -2127,6 +2714,8 @@ Renderer::~Renderer() {
     if (quadVBO) glDeleteBuffers(1, &quadVBO);
     if (quadVAO) glDeleteVertexArrays(1, &quadVAO);
     releaseParticleBuffers();
+    releaseRainResources();
+    if (terrainState) terrainState->release();
     releaseTextureArrays();
     if (debugWhiteTexture) glDeleteTextures(1, &debugWhiteTexture);
     if (missingMaterialFallbackTexture) glDeleteTextures(1, &missingMaterialFallbackTexture);
@@ -3545,10 +4134,63 @@ void Renderer::releaseSkyboxReflectionTarget(SkyboxReflectionTarget& target) {
     target = {};
 }
 
+// A cube's whole mip chain is what image-based lighting samples by roughness
+// (and its smallest levels as diffuse irradiance). Regenerated only when the cube
+// is recaptured, never per frame. GLES 3 cannot generate mips for an RGB16F
+// target without extensions, so ES keeps the single level and frag.glsl reads
+// maxLod 0 as "no chain".
+static float GenerateCubeMipChain(unsigned int cube, int resolution) {
+#if MODULARITY_OPENGL_ES
+    (void)cube; (void)resolution;
+    return 0.0f;
+#else
+    if (cube == 0 || resolution <= 1) return 0.0f;
+    glBindTexture(GL_TEXTURE_CUBE_MAP, cube);
+    glGenerateMipmap(GL_TEXTURE_CUBE_MAP);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
+    return std::floor(std::log2(static_cast<float>(resolution)));
+#endif
+}
+
+// Image-based lighting reads the captured sky cube on its own unit, so a
+// reflection probe can keep unit 11. 22 is the first unit nothing else claims
+// (20 and 21 hold the project shader texture arrays).
+constexpr int kEnvironmentCubeUnit = 22;
+static bool EnvironmentLightingSupported() {
+    // Also rules out the ES 2 profile (8 units), whose shader has no such sampler.
+    return Modularity::HardwareProfile::Static().maxTextureImageUnits > kEnvironmentCubeUnit;
+}
+
+void Renderer::updateSurfaceWetness() {
+    const double nowSec = glfwGetTime();
+    float dt = surfaceWetnessLastSec >= 0.0 ? static_cast<float>(nowSec - surfaceWetnessLastSec) : 0.0f;
+    surfaceWetnessLastSec = nowSec;
+    dt = std::clamp(dt, 0.0f, 0.25f);
+    // Rain soaks surfaces over ~20 s and they dry over ~60 s. The target follows
+    // the rain amount so a drizzle never reaches full puddles.
+    const float rain = weatherDrive.active ? std::clamp(weatherDrive.rainAmount, 0.0f, 1.0f) : 0.0f;
+    const float target = std::clamp(rain * 1.25f, 0.0f, 1.0f);
+    if (target > weatherWetness) {
+        weatherWetness = std::min(target, weatherWetness + dt / 20.0f);
+    } else {
+        weatherWetness = std::max(target, weatherWetness - dt / 60.0f);
+    }
+    float wet = weatherWetness;
+    if (skybox) {
+        const float manual = skybox->getSettings().wetness;
+        if (manual >= 0.0f) wet = std::min(manual, 1.0f);
+    }
+    surfaceWetness = std::isfinite(wet) ? std::clamp(wet, 0.0f, 1.0f) : 0.0f;
+}
+
 void Renderer::updateSkyboxReflectionTarget() {
     if (!skybox) return;
     const SkyboxSettings& settings = skybox->getSettings();
-    if (!settings.environmentReflections || settings.environmentReflectionIntensity <= 0.001f) {
+    const bool wantsEnvironmentLighting =
+        settings.environmentLightingIntensity > 0.001f && EnvironmentLightingSupported();
+    if ((!settings.environmentReflections || settings.environmentReflectionIntensity <= 0.001f) &&
+        !wantsEnvironmentLighting) {
         if (skyboxReflectionTarget.fbo || skyboxReflectionTarget.cube || skyboxReflectionTarget.depth) {
             releaseSkyboxReflectionTarget(skyboxReflectionTarget);
         }
@@ -3574,6 +4216,14 @@ void Renderer::updateSkyboxReflectionTarget() {
     for (char c : settings.sunTexturePath) mix(static_cast<unsigned char>(c));
     for (char c : settings.moonTexturePath) mix(static_cast<unsigned char>(c));
     for (char c : settings.scrollingTexturePath) mix(static_cast<unsigned char>(c));
+    // Weather changes what the sky looks like (overcast, rain darkening), and the
+    // cube now lights the scene, so a storm rolling in has to reach it. Quantised
+    // so the slow blend recaptures a handful of times rather than every 0.25 s.
+    if (weatherDrive.active) {
+        mix(static_cast<uint64_t>(std::lround(weatherDrive.cloudCoverage * 20.0f)));
+        mix(static_cast<uint64_t>(std::lround(weatherDrive.cloudDarkness * 20.0f)));
+        mix(static_cast<uint64_t>(std::lround(weatherDrive.rainAmount * 20.0f)));
+    }
 
     constexpr int resolution = 128;
     const bool targetMissing = skyboxReflectionTarget.fbo == 0 || skyboxReflectionTarget.cube == 0 || skyboxReflectionTarget.depth == 0;
@@ -3653,6 +4303,7 @@ void Renderer::updateSkyboxReflectionTarget() {
 
     glBindFramebuffer(GL_FRAMEBUFFER, prevFBO);
     glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
+    skyboxReflectionTarget.maxLod = GenerateCubeMipChain(skyboxReflectionTarget.cube, resolution);
     skyboxReflectionTarget.signature = signature;
     skyboxReflectionTarget.hasCapture = true;
     skyboxReflectionTarget.lastCaptureSec = nowSec;
@@ -3740,6 +4391,7 @@ void Renderer::updateReflectionCastTargets(const std::vector<SceneObject>& scene
             renderSceneInternal(captureCamera, sceneObjects, resolution, resolution, false, 90.0f, nearPlane, farPlane, false, true);
         }
         reflectionCapturePass = false;
+        target.maxLod = GenerateCubeMipChain(target.cube, resolution);
         target.hasCapture = true;
         const_cast<SceneObject&>(obj).reflectionCast.baked = true;
     }
@@ -4781,6 +5433,13 @@ void Renderer::renderObject(const SceneObject& obj) {
     shader->setVec4("uvTransform", BuildSurfaceUvTransform(&obj, obj.material));
     shader->setVec4("uvRect", BuildSpriteUvRect(obj));
     shader->setBool("unlit", obj.renderType == RenderType::Mirror || obj.renderType == RenderType::Sprite || missingMaterialAndShader);
+    // This single-object path binds no environment cube and no weather; clear
+    // what the scene pass may have left on the shared program.
+    shader->setFloat("clearcoat", obj.material.pbrEnabled ? std::clamp(obj.material.clearcoat, 0.0f, 1.0f) : 0.0f);
+    shader->setFloat("clearcoatRoughness", std::clamp(obj.material.clearcoatRoughness, 0.0f, 1.0f));
+    shader->setBool("hasEnvironmentCube", false);
+    shader->setInt("environmentCube", 11);
+    shader->setFloat("surfaceWetness", 0.0f);
 
     Texture* baseTex = texture1;
     if (missingMaterialAndShader && missingMaterialFallbackTexture != 0) {
@@ -4830,7 +5489,7 @@ void Renderer::renderObject(const SceneObject& obj) {
         shader->setFloat("reflectionFadeEnd", skySettings.reflectionDistanceFadeEnd);
         shader->setBool("fogEnabled", skySettings.fogEnabled);
         shader->setInt("fogMode", skySettings.fogMode);
-        shader->setVec3("fogColor", skySettings.fogColor);
+        shader->setVec3("fogColor", skybox->sceneFogColor());
         shader->setFloat("fogStart", skySettings.fogStart);
         shader->setFloat("fogEnd", skySettings.fogEnd);
         shader->setFloat("fogDensity", skySettings.fogDensity);
@@ -4920,6 +5579,41 @@ const std::string kMultiDrawVertPath = "Resources/Shaders/vert_mdi.glsl";
 const std::string kShadowDirectionalMultiDrawVertPath =
     "Resources/Shaders/shadow_directional_depth_mdi_vert.glsl";
 const std::string kShadowCubeMultiDrawVertPath = "Resources/Shaders/shadow_depth_mdi_vert.glsl";
+
+// Cross-frame shadow map reuse. MODULARITY_SHADOW_CACHE=0 turns it off (A/B validation).
+bool ShadowCacheEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("MODULARITY_SHADOW_CACHE");
+        return !(value && value[0] == '0');
+    }();
+    return enabled;
+}
+
+// FNV-1a over 64-bit words with an extra fold; raw bit patterns, so any change at all
+// (even -0.0 vs 0.0) reads as different and only costs a re-render.
+struct ShadowSignature {
+    uint64_t hash = 1469598103934665603ull;
+    // False once a caster's depth output cannot be derived from hashed inputs.
+    bool valid = true;
+    void u64(uint64_t value) {
+        hash ^= value;
+        hash *= 1099511628211ull;
+        hash ^= hash >> 32;
+    }
+    void f32(float value) { u64(HashFloat64(value)); }
+    void floats(const float* values, size_t count) {
+        size_t i = 0;
+        for (; i + 1 < count; i += 2) {
+            uint64_t word = 0;
+            std::memcpy(&word, values + i, sizeof(word));
+            u64(word);
+        }
+        if (i < count) f32(values[i]);
+    }
+    void mat4(const glm::mat4& m) { floats(&m[0][0], 16); }
+    void vec3(const glm::vec3& v) { floats(&v.x, 3); }
+    void vec4(const glm::vec4& v) { floats(&v.x, 4); }
+};
 
 uint64_t ShaderPairHash(const std::string& vert, const std::string& frag) {
     return HashCombine64(HashString64(vert), HashString64(frag));
@@ -5035,7 +5729,8 @@ void Renderer::OptimizationState::refreshTransforms(const std::vector<SceneObjec
         }
         glm::vec3 localCenter(0.0f);
         glm::vec3 localExtents(0.0f);
-        const bool hasLocalBounds = TryGetObjectLocalBounds(obj, localCenter, localExtents);
+        // "Never Cull" rigs report no bounds; passesCulling always draws an object without them.
+        const bool hasLocalBounds = !IsNeverCulled(obj) && TryGetObjectLocalBounds(obj, localCenter, localExtents);
         // A camera-facing sprite's matrix depends on the camera, so it never stays valid.
         const bool cameraDependent = obj.renderType == RenderType::Sprite && obj.faceCamera;
         const bool windPadded = obj.material.usesProjectShader();
@@ -6082,14 +6777,17 @@ void Renderer::OptimizationState::finishPass(Renderer& renderer, Pass& pass, Ren
             std::fprintf(stderr,
                          "[RenderOpt] %s%s: features 0x%02x | submitted %d culled %d lod %d visible %d | "
                          "multi-draw %d obj %d batches %d cmds | queue %.3f ms "
-                         "(cull %.3f, sort %.3f, batched cull %.3f) | gpu cull %.3f ms %d visible\n",
+                         "(cull %.3f, sort %.3f, batched cull %.3f) | gpu cull %.3f ms %d visible | "
+                         "shadow maps %d drawn %d reused\n",
                          logView == 0 ? "viewport" : "preview", plan.automatic ? " (auto)" : "",
                          features, passStats.objectsSubmitted, passStats.objectsCulled,
                          passStats.objectsLodCulled, passStats.visibleRenderables,
                          passStats.mdiObjects, passStats.mdiBatches, passStats.indirectDrawCommands,
                          passStats.queueBuildMs, passStats.cpuCullingMs,
                          passStats.sortingMs, pass.multiDrawCpuCullMs, passStats.gpuCullingMs,
-                         passStats.gpuVisible);
+                         passStats.gpuVisible,
+                         // Counted on the view's stats directly, so these are frame-to-date.
+                         renderer.activeStats->shadowMapUpdates, renderer.activeStats->shadowMapReuses);
         }
     }
 
@@ -6489,6 +7187,7 @@ void Renderer::renderSceneInternal(const Camera& inputCamera, const std::vector<
         map.fbo = 0;
         map.depthCube = 0;
         map.resolution = 0; map.renderedFrame=UINT64_MAX;
+        map.casterSignatureValid = false;
     };
     auto releaseDirectionalShadowMap = [](ShadowDirectionalMap& map) {
         if (map.fbo) glDeleteFramebuffers(1, &map.fbo);
@@ -6496,6 +7195,7 @@ void Renderer::renderSceneInternal(const Camera& inputCamera, const std::vector<
         map.fbo = 0;
         map.depthTexture = 0;
         map.resolution = 0; map.renderedFrame=UINT64_MAX;
+        map.casterSignatureValid = false;
     };
     const bool hasShadowCasters = std::any_of(lights.begin(), lights.end(), [](const LightUniform& light) {
         return light.castShadows && light.sourceId >= 0;
@@ -6567,6 +7267,25 @@ void Renderer::renderSceneInternal(const Camera& inputCamera, const std::vector<
             GLuint opacity = 0;
         };
         std::vector<ShadowTexBind> shadowTexBinds(sceneObjects.size());
+        // Also called by the caster signature, so a skipped render resolves the same ids
+        // the draw would have bound.
+        const auto resolveShadowTexBind = [&](size_t objectIndex, bool cutout) -> const ShadowTexBind& {
+            const SceneObject& obj = sceneObjects[objectIndex];
+            ShadowTexBind& binds = shadowTexBinds[objectIndex];
+            if (!binds.resolved) {
+                // project shader maps load at full precision, like the main pass (shared cache entry).
+                Texture* albedo = obj.albedoTexturePath.empty() ? texture1
+                    : getTexture(obj.albedoTexturePath, obj.material.textureFilter, cutout);
+                binds.albedo = albedo ? albedo->GetID() : 0;
+                if (obj.runtimeHasAlbedoTextureOverride && obj.runtimeAlbedoTextureOverrideId != 0)
+                    binds.albedo = obj.runtimeAlbedoTextureOverrideId;
+                Texture* opacity = obj.opacityMapPath.empty() ? nullptr
+                    : getTexture(obj.opacityMapPath, obj.material.textureFilter, cutout);
+                binds.opacity = opacity ? opacity->GetID() : 0;
+                binds.resolved = true;
+            }
+            return binds;
+        };
         const auto bindShadowMaterial = [&](Shader* program, size_t objectIndex, ShadowBind mode) {
             const SceneObject& obj = sceneObjects[objectIndex];
             if (mode == ShadowBind::Plain) {
@@ -6588,19 +7307,7 @@ void Renderer::renderSceneInternal(const Camera& inputCamera, const std::vector<
                 std::remove(shadowPlainPrograms.begin(), shadowPlainPrograms.end(), program),
                 shadowPlainPrograms.end());
             const bool cutout = mode == ShadowBind::ProjectCutout;
-            ShadowTexBind& binds = shadowTexBinds[objectIndex];
-            if (!binds.resolved) {
-                // project shader maps load at full precision, like the main pass (shared cache entry).
-                Texture* albedo = obj.albedoTexturePath.empty() ? texture1
-                    : getTexture(obj.albedoTexturePath, obj.material.textureFilter, cutout);
-                binds.albedo = albedo ? albedo->GetID() : 0;
-                if (obj.runtimeHasAlbedoTextureOverride && obj.runtimeAlbedoTextureOverrideId != 0)
-                    binds.albedo = obj.runtimeAlbedoTextureOverrideId;
-                Texture* opacity = obj.opacityMapPath.empty() ? nullptr
-                    : getTexture(obj.opacityMapPath, obj.material.textureFilter, cutout);
-                binds.opacity = opacity ? opacity->GetID() : 0;
-                binds.resolved = true;
-            }
+            const ShadowTexBind& binds = resolveShadowTexBind(objectIndex, cutout);
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, binds.albedo);
             glActiveTexture(GL_TEXTURE1);
@@ -6740,6 +7447,7 @@ void Renderer::renderSceneInternal(const Camera& inputCamera, const std::vector<
                     lastParams = &obj.material.shaderParameters;
                     program->setBool("meshHasAuxiliaryAxis", caster.mesh->getUV2Components() >= 3);
                     program->setBool("meshHasAuxiliaryStreams", caster.mesh->hasAuxiliaryStreams());
+                    UploadCtiLodFade(program, nullptr, glm::vec3(0.0f));   // scene objects never fade
                 }
                 const bool wantCulling = !ProfileTwoSided(caster.project);
                 if (wantCulling != cullingOn) {
@@ -6768,6 +7476,213 @@ void Renderer::renderSceneInternal(const Camera& inputCamera, const std::vector<
                                (kind & 1u) ? ShadowBind::Alpha : ShadowBind::Plain);
             plainProgram->setMat4("model", model);
             mesh->draw();
+        };
+
+        // Instancer casters: the instances of every Instancer component that reach this light,
+        // gathered per light (per cube face when drawing) and drawn as instance groups.
+        const std::array<glm::vec4, 6> instancerAllPlanes = {
+            glm::vec4(0.0f, 0.0f, 0.0f, 1e30f), glm::vec4(0.0f, 0.0f, 0.0f, 1e30f),
+            glm::vec4(0.0f, 0.0f, 0.0f, 1e30f), glm::vec4(0.0f, 0.0f, 0.0f, 1e30f),
+            glm::vec4(0.0f, 0.0f, 0.0f, 1e30f), glm::vec4(0.0f, 0.0f, 0.0f, 1e30f)};
+        const auto gatherInstancerShadowCasters = [&](const std::array<glm::vec4, 6>& planes, bool sphere,
+                                                      const glm::vec3& sphereCenter, float sphereRadius,
+                                                      uint64_t* signature) -> size_t {
+            if (!instancerState) {
+                bool anyInstancerObject = false;
+                for (const SceneObject& candidate : sceneObjects) {
+                    if (candidate.hasInstancer) { anyInstancerObject = true; break; }
+                }
+                if (!anyInstancerObject) return 0;
+                instancerState = std::make_unique<InstancerState>();
+            }
+            InstancerState::ShadowQuery query;
+            query.sphere = sphere;
+            query.sphereCenter = sphereCenter;
+            query.sphereRadius = sphereRadius;
+            return instancerState->gather(*this, sceneObjects, camera.position, planes, 0xFFFFFFFFu, &query,
+                                          instancerState->shadowPool, instancerState->shadowBatches, signature);
+        };
+        const auto drawInstancerShadowCasters = [&](bool cube, Shader* plainProgram, const glm::mat4& lightSpace,
+                                                    const glm::vec3& lightPosition, float farPlaneDistance) {
+            if (!instancerState || instancerState->shadowBatches.empty()) return;
+            ProfilerScope casterScope("Shadows::InstancerCasters", ProfilerSampleCategory::RenderDetail);
+            InstancerState& inst = *instancerState;
+            // Two phases: batches that share a material and mesh land in one group first.
+            instanceState->begin();
+            inst.shadowGroupIds.assign(inst.shadowBatches.size(), -1);
+            for (size_t i = 0; i < inst.shadowBatches.size(); ++i) {
+                const InstancerState::Batch& batch = inst.shadowBatches[i];
+                inst.shadowGroupIds[i] = instanceState->addBulk(
+                    HashCombine64(HashCombine64(batch.key, batch.lodFadeKey), cube ? 1u : 2u), batch.mesh,
+                    inst.shadowPool.data() + batch.first, batch.count);
+            }
+            Shader* current = nullptr;
+            const MaterialShaderParameters* lastParams = nullptr;
+            bool cullingOn = true;
+            Shader* standardProgram = nullptr;
+            bool standardResolved = false;
+            for (size_t i = 0; i < inst.shadowBatches.size(); ++i) {
+                const InstancerState::Batch& batch = inst.shadowBatches[i];
+                const int group = inst.shadowGroupIds[i];
+                if (group < 0) continue;
+                auto& groupState = instanceState->groups[static_cast<size_t>(group)];
+                if (groupState.submitted) continue;
+                const SceneObject& obj = sceneObjects[static_cast<size_t>(batch.objectIndex)];
+                const ProjectModel project = static_cast<ProjectModel>(batch.projectModel);
+                Shader* program = nullptr;
+                ShadowBind mode = ShadowBind::Plain;
+                bool twoSided = false;
+                if (project != ProjectModel::None) {
+                    const ProjectPrograms& programs = GetProjectPrograms(project);
+                    if (!programs.instancing) continue;
+                    program = projectShadowProgram(project, cube, true);
+                    if (programs.cutout) mode = ShadowBind::ProjectCutout;
+                    twoSided = programs.twoSided;
+                } else {
+                    if (!standardResolved) {
+                        standardResolved = true;
+                        Shader* candidate = getShader(cube ? kShadowCubeMultiDrawVertPath : kShadowDirectionalMultiDrawVertPath,
+                                                      cube ? shadowDepthFragPath : directionalShadowDepthFragPath);
+                        standardProgram = (candidate && candidate != defaultShader && candidate->ID != 0) ? candidate : nullptr;
+                    }
+                    program = standardProgram;
+                    if (!obj.opacityMapPath.empty() || obj.material.alpha < 0.999f ||
+                        OptimizationState::albedoNeedsShadowAlpha(*this, obj)) {
+                        mode = ShadowBind::Alpha;
+                    }
+                }
+                if (!program) continue;
+                groupState.submitted = true;
+                if (program != current) {
+                    program->use();
+                    current = program;
+                    lastParams = nullptr;
+                    program->setMat4("lightSpaceMatrix", lightSpace);
+                    if (cube) {
+                        program->setVec3("lightPos", lightPosition);
+                        program->setFloat("farPlane", farPlaneDistance);
+                    }
+                    if (project != ProjectModel::None) {
+                        program->setVec4("sceneWind", glm::vec4(sceneWind.direction, sceneWind.strength));
+                        program->setFloat("sceneWindTurbulence", sceneWind.turbulence);
+                        program->setFloat("sceneTime", sceneWind.time);
+                        program->setInt("albedoArray", kProjectArrayAlbedoUnit);
+                        program->setInt("normalArray", kProjectArrayNormalUnit);
+                    }
+                }
+                bindShadowMaterial(program, static_cast<size_t>(batch.objectIndex), mode);
+                if (project != ProjectModel::None) {
+                    UploadProjectMaterialUniforms(program, obj.material.shaderParameters, lastParams);
+                    lastParams = &obj.material.shaderParameters;
+                    program->setBool("meshHasAuxiliaryAxis", batch.mesh->getUV2Components() >= 3);
+                    program->setBool("meshHasAuxiliaryStreams", batch.mesh->hasAuxiliaryStreams());
+                    UploadCtiLodFade(program, &batch.lodFade, camera.position);
+                }
+                const bool wantCulling = !twoSided;
+                if (wantCulling != cullingOn) {
+                    if (wantCulling) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
+                    cullingOn = wantCulling;
+                }
+                recordMeshDraw();
+                instanceState->draw(group);
+            }
+            if (!cullingOn) glEnable(GL_CULL_FACE);
+            plainProgram->use();   // the caller's loop expects its own program bound
+        };
+
+        // Terrain casters: the chunk meshes of every Terrain object that reach this light, culled per
+        // light (per cube face when drawing) and drawn with the plain depth program.
+        const auto gatherTerrainShadowCasters = [&](const std::array<glm::vec4, 6>& planes, bool sphere,
+                                                    const glm::vec3& sphereCenter, float sphereRadius,
+                                                    uint64_t* signature) -> size_t {
+            if (!terrainState) {
+                bool anyTerrainObject = false;
+                for (const SceneObject& candidate : sceneObjects) {
+                    if (candidate.hasTerrain) { anyTerrainObject = true; break; }
+                }
+                if (!anyTerrainObject) return 0;
+                terrainState = std::make_unique<TerrainState>();
+            }
+            TerrainState::ShadowQuery query;
+            query.sphere = sphere;
+            query.sphereCenter = sphereCenter;
+            query.sphereRadius = sphereRadius;
+            return terrainState->gather(*this, sceneObjects, camera.position, planes, 0xFFFFFFFFu, &query,
+                                        terrainState->shadowPool, terrainState->shadowBatches, signature);
+        };
+        const auto drawTerrainShadowCasters = [&](bool cube, Shader* plainProgram, const glm::mat4& lightSpace,
+                                                  const glm::vec3& lightPosition, float farPlaneDistance) {
+            if (!terrainState || terrainState->shadowBatches.empty()) return;
+            ProfilerScope casterScope("Shadows::TerrainCasters", ProfilerSampleCategory::RenderDetail);
+            plainProgram->use();
+            plainProgram->setMat4("lightSpaceMatrix", lightSpace);
+            if (cube) {
+                plainProgram->setVec3("lightPos", lightPosition);
+                plainProgram->setFloat("farPlane", farPlaneDistance);
+            }
+            for (const TerrainState::Batch& batch : terrainState->shadowBatches) {
+                bindShadowMaterial(plainProgram, static_cast<size_t>(batch.objectIndex), ShadowBind::Plain);
+                plainProgram->setMat4("model", batch.model);
+                for (size_t chunk = 0; chunk < batch.count; ++chunk) {
+                    recordMeshDraw();
+                    terrainState->shadowPool[batch.first + chunk]->draw();
+                }
+            }
+        };
+
+        // Cross-frame reuse: a map is left untouched when the signature of everything its
+        // render would consume equals the one stored when it was last drawn. Casters whose
+        // depth output depends on state that is not hashed here (skinned or CPU-updated
+        // meshes, project shader vertex animation, runtime texture overrides) clear
+        // `valid`, which forces a render and leaves the map unreusable.
+        const bool shadowCacheEnabled = ShadowCacheEnabled();
+        bool shadowSignatureSampledTextures = false;
+        const auto hashShadowCaster = [&](ShadowSignature& sig, size_t objectIndex, const Mesh* mesh,
+                                          const glm::mat4& model) {
+            const SceneObject& obj = sceneObjects[objectIndex];
+            sig.u64((static_cast<uint64_t>(objectIndex) << 32) | static_cast<uint32_t>(obj.id));
+            sig.u64(mesh->getSerial());
+            sig.mat4(model);
+            if (mesh->isDynamic() || mesh->usesBones()) sig.valid = false;
+            const uint16_t kind = shadowKindOf(objectIndex);
+            sig.u64(kind);
+            if (kind & 0x1FEu) {
+                // Wind and time move these vertices in the depth pass.
+                sig.valid = false;
+            } else if (kind & 1u) {
+                if (obj.runtimeHasAlbedoTextureOverride) {
+                    // A render target or video frame: same id, different texels.
+                    sig.valid = false;
+                    return;
+                }
+                const ShadowTexBind& binds = resolveShadowTexBind(objectIndex, false);
+                shadowSignatureSampledTextures = true;
+                sig.u64((static_cast<uint64_t>(binds.albedo) << 32) | binds.opacity);
+                sig.f32(obj.material.alpha);
+                sig.f32(obj.material.alphaCutoff);
+                sig.vec4(BuildSurfaceUvTransform(&obj, obj.material));
+                sig.vec4(BuildSpriteUvRect(obj));
+            }
+        };
+        const auto beginShadowSignature = [&](const LightUniform& light, bool cube, int resolution,
+                                              const Shader* plainProgram, const Shader* batchProgram) {
+            ShadowSignature sig;
+            sig.valid = shadowCacheEnabled;
+            shadowSignatureSampledTextures = false;
+            sig.u64((cube ? 1u : 2u) | (static_cast<uint64_t>(static_cast<uint32_t>(resolution)) << 8));
+            sig.u64((static_cast<uint64_t>(plainProgram ? plainProgram->ID : 0u) << 32) |
+                    (batchProgram ? batchProgram->ID : 0u));
+            sig.u64(optPass ? (2u | (optPass->plan.cpuCulling ? 1u : 0u) | (optPass->plan.lod ? 4u : 0u)) : 0u);
+            sig.vec3(light.pos);
+            sig.f32(light.shadowFar);
+            if (!cube) sig.mat4(light.shadowMatrix);
+            return sig;
+        };
+        const auto finishShadowSignature = [&](ShadowSignature& sig, size_t casterCount) {
+            sig.u64(casterCount);
+            // Read after the lookups above: a texture that loaded, reloaded or was evicted
+            // bumped the generation, and its GL id may have been handed out again.
+            if (shadowSignatureSampledTextures) sig.u64(textureCacheGeneration);
         };
 
         int shadowSlot = 0;
@@ -6839,20 +7754,13 @@ void Renderer::renderSceneInternal(const Camera& inputCamera, const std::vector<
                     if (activeStats) ++activeStats->shadowMapReuses;
                     continue;
                 }
-                shadowMap.renderedFrame=frameSerial; shadowMap.contentKey=contentKey;
-                if (activeStats) ++activeStats->shadowMapUpdates;
 
-                directionalShadowDepthShader->use();
-                directionalShadowDepthShader->setMat4("lightSpaceMatrix", light.shadowMatrix);
-
-                glViewport(0, 0, shadowMap.resolution, shadowMap.resolution);
-                glBindFramebuffer(GL_FRAMEBUFFER, shadowMap.fbo);
-                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, shadowMap.depthTexture, 0);
-                SetDepthOnlyFramebufferDrawBuffer();
-                glReadBuffer(GL_NONE);
-                glClear(GL_DEPTH_BUFFER_BIT);
-
+                // Gather this light's casters once: the list feeds both the signature and
+                // the draw, so a skipped render costs one walk and no GL work.
                 const FrustumPlanes shadowFrustum = BuildFrustumPlanes(light.shadowMatrix);
+                ShadowSignature casterSignature = beginShadowSignature(
+                    light, false, shadowMap.resolution, directionalShadowDepthShader, directionalCasterBatch);
+                size_t casterCount = 0;
                 if (optPass) {
                     // Cached matrices and bounds instead of rebuilding every caster's matrix
                     // per light. LOD skips casters under one shadow texel across.
@@ -6861,7 +7769,7 @@ void Renderer::renderSceneInternal(const Camera& inputCamera, const std::vector<
                                              light.shadowMatrix[2][0]);
                     const float texelsPerUnit =
                         0.5f * static_cast<float>(shadowMap.resolution) * glm::length(lightRow);
-                    size_t queued = 0;
+                    shadowCasterOptScratch.clear();
                     for (const auto& caster : optPass->shadowCasters) {
                         if (sceneObjects[caster.first].id == light.sourceId) continue;
                         const RenderOpt::CullBounds& b = optState->bounds[caster.first];
@@ -6875,6 +7783,91 @@ void Renderer::renderSceneInternal(const Camera& inputCamera, const std::vector<
                                 continue;
                             }
                         }
+                        shadowCasterOptScratch.push_back(caster);
+                        hashShadowCaster(casterSignature, caster.first, caster.second,
+                                         optState->cache[caster.first].model);
+                        casterSignature.u64(
+                            batchedCasterSlot(caster.first, directionalCasterBatch) != UINT32_MAX ? 1u : 0u);
+                    }
+                    casterCount = shadowCasterOptScratch.size();
+                } else {
+                    shadowCasterScratch.clear();
+                    for (const auto& obj : sceneObjects) {
+                        if (!IsObjectEnabledInHierarchy(obj) || !HasRendererComponent(obj)) continue;
+                        if (obj.renderType == RenderType::Mirror) continue;
+                        if (obj.renderType == RenderType::Sprite) continue;
+                        if (obj.id == light.sourceId) continue;
+                        bool isUiCanvas3D = obj.hasUI && obj.ui.type == UIElementType::Canvas && obj.ui.renderIn3D;
+                        if (isUiCanvas3D) continue;
+                        if (obj.hasSkeletalAnimation && obj.skeletal.enabled) continue;
+
+                        Mesh* shadowMesh = selectMeshForObject(obj);
+                        if (!shadowMesh) continue;
+                        glm::mat4 model = buildModelMatrix(obj);
+                        glm::vec3 boundsCenter(0.0f);
+                        float boundsRadius = 0.0f;
+                        if (TryComputeObjectCullSphere(obj, model, boundsCenter, boundsRadius) &&
+                            !SphereInsideFrustum(shadowFrustum, boundsCenter, boundsRadius)) {
+                            continue;
+                        }
+                        ShadowCasterRef ref;
+                        ref.index = static_cast<uint32_t>(&obj - sceneObjects.data());
+                        ref.mesh = shadowMesh;
+                        ref.model = model;
+                        shadowCasterScratch.push_back(ref);
+                        hashShadowCaster(casterSignature, ref.index, shadowMesh, model);
+                    }
+                    casterCount = shadowCasterScratch.size();
+                }
+                {
+                    uint64_t instancerSignature = 0;
+                    const size_t instancerBatches = gatherInstancerShadowCasters(
+                        shadowFrustum.planes, false, glm::vec3(0.0f), 0.0f, &instancerSignature);
+                    if (instancerBatches > 0) {
+                        casterSignature.u64(instancerSignature);
+                        casterSignature.u64(instancerBatches);
+                        if (!instancerState->shadowSignatureValid) casterSignature.valid = false;
+                        casterCount += instancerBatches;
+                    }
+                }
+                {
+                    uint64_t terrainSignature = 0;
+                    const size_t terrainBatches = gatherTerrainShadowCasters(
+                        shadowFrustum.planes, false, glm::vec3(0.0f), 0.0f, &terrainSignature);
+                    if (terrainBatches > 0) {
+                        casterSignature.u64(terrainSignature);
+                        casterSignature.u64(terrainBatches);
+                        casterCount += terrainBatches;
+                    }
+                }
+                finishShadowSignature(casterSignature, casterCount);
+                if (casterSignature.valid && shadowMap.casterSignatureValid &&
+                    shadowMap.casterSignature == casterSignature.hash) {
+                    // Same texels a render would write, so later passes of this frame can
+                    // take the same-frame path above.
+                    shadowMap.renderedFrame=frameSerial; shadowMap.contentKey=contentKey;
+                    if (activeStats) ++activeStats->shadowMapReuses;
+                    continue;
+                }
+                shadowMap.renderedFrame=frameSerial; shadowMap.contentKey=contentKey;
+                shadowMap.casterSignature = casterSignature.hash;
+                shadowMap.casterSignatureValid = casterSignature.valid;
+                if (activeStats) ++activeStats->shadowMapUpdates;
+
+                directionalShadowDepthShader->use();
+                directionalShadowDepthShader->setMat4("lightSpaceMatrix", light.shadowMatrix);
+
+                glViewport(0, 0, shadowMap.resolution, shadowMap.resolution);
+                glBindFramebuffer(GL_FRAMEBUFFER, shadowMap.fbo);
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, shadowMap.depthTexture, 0);
+                SetDepthOnlyFramebufferDrawBuffer();
+                glReadBuffer(GL_NONE);
+                glClear(GL_DEPTH_BUFFER_BIT);
+
+                if (optPass) {
+                    // Already culled and LOD-tested by the gather above.
+                    size_t queued = 0;
+                    for (const auto& caster : shadowCasterOptScratch) {
                         const uint32_t batchSlot = batchedCasterSlot(caster.first, directionalCasterBatch);
                         if (batchSlot != UINT32_MAX) {
                             queueBatchedCaster(queued, batchSlot);
@@ -6891,31 +7884,25 @@ void Renderer::renderSceneInternal(const Camera& inputCamera, const std::vector<
                     }
                     flushProjectShadowCasters(false, directionalShadowDepthShader, light.shadowMatrix,
                                           glm::vec3(0.0f), 0.0f);
+                    drawInstancerShadowCasters(false, directionalShadowDepthShader, light.shadowMatrix,
+                                               glm::vec3(0.0f), 0.0f);
+                    if (gatherTerrainShadowCasters(shadowFrustum.planes, false, glm::vec3(0.0f), 0.0f, nullptr) > 0) {
+                        drawTerrainShadowCasters(false, directionalShadowDepthShader, light.shadowMatrix,
+                                                 glm::vec3(0.0f), 0.0f);
+                    }
                     continue;
                 }
-                for (const auto& obj : sceneObjects) {
-                    if (!IsObjectEnabledInHierarchy(obj) || !HasRendererComponent(obj)) continue;
-                    if (obj.renderType == RenderType::Mirror) continue;
-                    if (obj.renderType == RenderType::Sprite) continue;
-                    if (obj.id == light.sourceId) continue;
-                    bool isUiCanvas3D = obj.hasUI && obj.ui.type == UIElementType::Canvas && obj.ui.renderIn3D;
-                    if (isUiCanvas3D) continue;
-                    if (obj.hasSkeletalAnimation && obj.skeletal.enabled) continue;
-
-                    Mesh* shadowMesh = selectMeshForObject(obj);
-                    if (!shadowMesh) continue;
-                    glm::mat4 model = buildModelMatrix(obj);
-                    glm::vec3 boundsCenter(0.0f);
-                    float boundsRadius = 0.0f;
-                    if (TryComputeObjectCullSphere(obj, model, boundsCenter, boundsRadius) &&
-                        !SphereInsideFrustum(shadowFrustum, boundsCenter, boundsRadius)) {
-                        continue;
-                    }
-                    drawShadowCaster(directionalShadowDepthShader,
-                                     static_cast<size_t>(&obj - sceneObjects.data()), shadowMesh, model);
+                for (const ShadowCasterRef& caster : shadowCasterScratch) {
+                    drawShadowCaster(directionalShadowDepthShader, caster.index, caster.mesh, caster.model);
                 }
                 flushProjectShadowCasters(false, directionalShadowDepthShader, light.shadowMatrix,
                                       glm::vec3(0.0f), 0.0f);
+                drawInstancerShadowCasters(false, directionalShadowDepthShader, light.shadowMatrix,
+                                           glm::vec3(0.0f), 0.0f);
+                if (gatherTerrainShadowCasters(shadowFrustum.planes, false, glm::vec3(0.0f), 0.0f, nullptr) > 0) {
+                    drawTerrainShadowCasters(false, directionalShadowDepthShader, light.shadowMatrix,
+                                             glm::vec3(0.0f), 0.0f);
+                }
                 continue;
             }
 
@@ -6966,7 +7953,98 @@ void Renderer::renderSceneInternal(const Camera& inputCamera, const std::vector<
                 if (activeStats) ++activeStats->shadowMapReuses;
                 continue;
             }
+
+            // Gather the casters in range once instead of once per face. Range is the only
+            // test shared by all six faces; the optimized path's per-face frustum and LOD
+            // tests are functions of the bounds hashed here.
+            ShadowSignature casterSignature = beginShadowSignature(
+                light, true, shadowMap.resolution, shadowDepthShader, cubeCasterBatch);
+            size_t casterCount = 0;
+            if (optPass) {
+                OptimizationState::collectShadowCasters(*this, *optPass, sceneObjects);
+                shadowCasterOptScratch.clear();
+                for (const auto& caster : optPass->shadowCasters) {
+                    if (sceneObjects[caster.first].id == light.sourceId) continue;
+                    const RenderOpt::CullBounds& b = optState->bounds[caster.first];
+                    if (b.hasBounds) {
+                        const glm::vec3 lightDelta = b.center - light.pos;
+                        const float distanceSq = glm::dot(lightDelta, lightDelta);
+                        const float maxDistance = light.shadowFar + b.radius;
+                        if (distanceSq > maxDistance * maxDistance) continue;
+                    }
+                    shadowCasterOptScratch.push_back(caster);
+                    hashShadowCaster(casterSignature, caster.first, caster.second,
+                                     optState->cache[caster.first].model);
+                    casterSignature.vec3(b.center);
+                    casterSignature.f32(b.radius);
+                    casterSignature.vec3(b.extents);
+                    casterSignature.u64((static_cast<uint64_t>(b.hasBounds) << 1) |
+                        (batchedCasterSlot(caster.first, cubeCasterBatch) != UINT32_MAX ? 1u : 0u));
+                }
+                casterCount = shadowCasterOptScratch.size();
+            } else {
+                shadowCasterScratch.clear();
+                for (const auto& obj : sceneObjects) {
+                    if (!IsObjectEnabledInHierarchy(obj) || !HasRendererComponent(obj)) continue;
+                    if (obj.renderType == RenderType::Mirror) continue;
+                    if (obj.renderType == RenderType::Sprite) continue;
+                    if (obj.id == light.sourceId) continue;
+                    bool isUiCanvas3D = obj.hasUI && obj.ui.type == UIElementType::Canvas && obj.ui.renderIn3D;
+                    if (isUiCanvas3D) continue;
+                    if (obj.hasSkeletalAnimation && obj.skeletal.enabled) continue;
+
+                    Mesh* shadowMesh = selectMeshForObject(obj);
+                    if (!shadowMesh) continue;
+                    glm::mat4 model = buildModelMatrix(obj);
+                    glm::vec3 boundsCenter(0.0f);
+                    float boundsRadius = 0.0f;
+                    if (TryComputeObjectCullSphere(obj, model, boundsCenter, boundsRadius)) {
+                        glm::vec3 lightDelta = boundsCenter - light.pos;
+                        float maxDistance = light.shadowFar + boundsRadius;
+                        if (glm::dot(lightDelta, lightDelta) > maxDistance * maxDistance) {
+                            continue;
+                        }
+                    }
+                    ShadowCasterRef ref;
+                    ref.index = static_cast<uint32_t>(&obj - sceneObjects.data());
+                    ref.mesh = shadowMesh;
+                    ref.model = model;
+                    shadowCasterScratch.push_back(ref);
+                    hashShadowCaster(casterSignature, ref.index, shadowMesh, model);
+                }
+                casterCount = shadowCasterScratch.size();
+            }
+            {
+                uint64_t instancerSignature = 0;
+                const size_t instancerBatches = gatherInstancerShadowCasters(
+                    instancerAllPlanes, true, light.pos, light.shadowFar, &instancerSignature);
+                if (instancerBatches > 0) {
+                    casterSignature.u64(instancerSignature);
+                    casterSignature.u64(instancerBatches);
+                    if (!instancerState->shadowSignatureValid) casterSignature.valid = false;
+                    casterCount += instancerBatches;
+                }
+            }
+            {
+                uint64_t terrainSignature = 0;
+                const size_t terrainBatches = gatherTerrainShadowCasters(
+                    instancerAllPlanes, true, light.pos, light.shadowFar, &terrainSignature);
+                if (terrainBatches > 0) {
+                    casterSignature.u64(terrainSignature);
+                    casterSignature.u64(terrainBatches);
+                    casterCount += terrainBatches;
+                }
+            }
+            finishShadowSignature(casterSignature, casterCount);
+            if (casterSignature.valid && shadowMap.casterSignatureValid &&
+                shadowMap.casterSignature == casterSignature.hash) {
+                shadowMap.renderedFrame=frameSerial; shadowMap.contentKey=contentKey;
+                if (activeStats) ++activeStats->shadowMapReuses;
+                continue;
+            }
             shadowMap.renderedFrame=frameSerial; shadowMap.contentKey=contentKey;
+            shadowMap.casterSignature = casterSignature.hash;
+            shadowMap.casterSignatureValid = casterSignature.valid;
             if (activeStats) ++activeStats->shadowMapUpdates;
 
             const float shadowNearPlane = 0.1f;
@@ -6998,7 +8076,6 @@ void Renderer::renderSceneInternal(const Camera& inputCamera, const std::vector<
                 if (optPass) {
                     // The legacy loop only range-tests casters, so every caster in range is
                     // drawn into all six faces. CPU culling also tests each face's frustum.
-                    OptimizationState::collectShadowCasters(*this, *optPass, sceneObjects);
                     FrustumPlanes faceFrustum{};
                     if (optPass->plan.cpuCulling) {
                         faceFrustum = BuildFrustumPlanes(shadowProj * shadowViews[face]);
@@ -7006,8 +8083,7 @@ void Renderer::renderSceneInternal(const Camera& inputCamera, const std::vector<
                     // A 90 degree face: one texel spans 2 * distance / resolution.
                     const float texelsAtUnitDistance = 0.5f * static_cast<float>(shadowMap.resolution);
                     size_t queued = 0;
-                    for (const auto& caster : optPass->shadowCasters) {
-                        if (sceneObjects[caster.first].id == light.sourceId) continue;
+                    for (const auto& caster : shadowCasterOptScratch) {
                         const RenderOpt::CullBounds& b = optState->bounds[caster.first];
                         if (b.hasBounds) {
                             const glm::vec3 lightDelta = b.center - light.pos;
@@ -7047,36 +8123,34 @@ void Renderer::renderSceneInternal(const Camera& inputCamera, const std::vector<
                     // Leaves shadowDepthShader bound again, as the next face expects.
                     flushProjectShadowCasters(true, shadowDepthShader, shadowProj * shadowViews[face],
                                           light.pos, light.shadowFar);
+                    if (gatherInstancerShadowCasters(BuildFrustumPlanes(shadowProj * shadowViews[face]).planes,
+                                                     true, light.pos, light.shadowFar, nullptr) > 0) {
+                        drawInstancerShadowCasters(true, shadowDepthShader, shadowProj * shadowViews[face],
+                                                   light.pos, light.shadowFar);
+                    }
+                    if (gatherTerrainShadowCasters(BuildFrustumPlanes(shadowProj * shadowViews[face]).planes,
+                                                   true, light.pos, light.shadowFar, nullptr) > 0) {
+                        drawTerrainShadowCasters(true, shadowDepthShader, shadowProj * shadowViews[face],
+                                                 light.pos, light.shadowFar);
+                    }
                     continue;
                 }
 
-                for (const auto& obj : sceneObjects) {
-                    if (!IsObjectEnabledInHierarchy(obj) || !HasRendererComponent(obj)) continue;
-                    if (obj.renderType == RenderType::Mirror) continue;
-                    if (obj.renderType == RenderType::Sprite) continue;
-                    if (obj.id == light.sourceId) continue;
-                    bool isUiCanvas3D = obj.hasUI && obj.ui.type == UIElementType::Canvas && obj.ui.renderIn3D;
-                    if (isUiCanvas3D) continue;
-                    if (obj.hasSkeletalAnimation && obj.skeletal.enabled) continue;
-
-                    Mesh* shadowMesh = selectMeshForObject(obj);
-                    if (!shadowMesh) continue;
-                    glm::mat4 model = buildModelMatrix(obj);
-                    glm::vec3 boundsCenter(0.0f);
-                    float boundsRadius = 0.0f;
-                    if (TryComputeObjectCullSphere(obj, model, boundsCenter, boundsRadius)) {
-                        glm::vec3 lightDelta = boundsCenter - light.pos;
-                        float maxDistance = light.shadowFar + boundsRadius;
-                        if (glm::dot(lightDelta, lightDelta) > maxDistance * maxDistance) {
-                            continue;
-                        }
-                    }
-
-                    drawShadowCaster(shadowDepthShader,
-                                     static_cast<size_t>(&obj - sceneObjects.data()), shadowMesh, model);
+                for (const ShadowCasterRef& caster : shadowCasterScratch) {
+                    drawShadowCaster(shadowDepthShader, caster.index, caster.mesh, caster.model);
                 }
                 flushProjectShadowCasters(true, shadowDepthShader, shadowProj * shadowViews[face],
                                       light.pos, light.shadowFar);
+                if (gatherInstancerShadowCasters(BuildFrustumPlanes(shadowProj * shadowViews[face]).planes,
+                                                 true, light.pos, light.shadowFar, nullptr) > 0) {
+                    drawInstancerShadowCasters(true, shadowDepthShader, shadowProj * shadowViews[face],
+                                               light.pos, light.shadowFar);
+                }
+                if (gatherTerrainShadowCasters(BuildFrustumPlanes(shadowProj * shadowViews[face]).planes,
+                                               true, light.pos, light.shadowFar, nullptr) > 0) {
+                    drawTerrainShadowCasters(true, shadowDepthShader, shadowProj * shadowViews[face],
+                                             light.pos, light.shadowFar);
+                }
             }
         }
 
@@ -7203,7 +8277,8 @@ void Renderer::renderSceneInternal(const Camera& inputCamera, const std::vector<
                 glm::mat4 model = buildModelMatrix(obj);
                 glm::vec3 boundsCenter(0.0f);
                 float boundsRadius = 0.0f;
-                const bool hasBounds = TryComputeObjectCullSphere(obj, model, boundsCenter, boundsRadius);
+                const bool hasBounds = !IsNeverCulled(obj) &&
+                                       TryComputeObjectCullSphere(obj, model, boundsCenter, boundsRadius);
                 if (hasBounds && !SphereInsideFrustum(frustum, boundsCenter, boundsRadius)) {
                     continue;
                 }
@@ -7418,6 +8493,53 @@ void Renderer::renderSceneInternal(const Camera& inputCamera, const std::vector<
         }
         if (activeStats) {
             activeStats->visibleRenderables += static_cast<int>(drawItems.size());
+        }
+    }
+
+    // Instancer components: cull each instancer's instances for this view and add one leader
+    // item per template mesh. They join the instance groups in instanceState->prepare() below.
+    {
+        bool anyInstancerObject = false;
+        for (const SceneObject& candidate : sceneObjects) {
+            if (candidate.hasInstancer) { anyInstancerObject = true; break; }
+        }
+        if (anyInstancerObject) {
+            MODU_PROFILE_SCOPE("Renderer::InstancerGather", ProfilerSampleCategory::RenderDetail);
+            if (!instancerState) instancerState = std::make_unique<InstancerState>();
+            instancerState->gather(*this, sceneObjects, camera.position, frustum.planes, camera.cullingMask,
+                                   nullptr, instancerState->viewPool, instancerState->viewBatches, nullptr);
+            const size_t appended = instancerState->appendItems(*this, sceneObjects, view, camera.position, drawItems);
+            if (activeStats) activeStats->visibleRenderables += static_cast<int>(appended);
+        } else if (instancerState) {
+            instancerState->viewBatches.clear();
+            instancerState->viewPool.clear();
+        }
+    }
+
+    // Terrain components: cull + LOD their chunks for this view and add one leader item each.
+    {
+        bool anyTerrainObject = false;
+        for (const SceneObject& candidate : sceneObjects) {
+            if (candidate.hasTerrain) { anyTerrainObject = true; break; }
+        }
+        if (anyTerrainObject) {
+            MODU_PROFILE_SCOPE("Renderer::TerrainGather", ProfilerSampleCategory::RenderDetail);
+            if (!terrainState) terrainState = std::make_unique<TerrainState>();
+            terrainState->gather(*this, sceneObjects, camera.position, frustum.planes, camera.cullingMask,
+                                 nullptr, terrainState->viewPool, terrainState->viewBatches, nullptr);
+            terrainState->viewPlanes = frustum.planes;
+            terrainState->haveViewPlanes = true;
+            glActiveTexture(GL_TEXTURE0);
+            terrainState->prepareSurfaces(*this, sceneObjects, terrainState->viewBatches);
+            const size_t appended = terrainState->appendItems(*this, sceneObjects, view, camera.position, drawItems);
+            if (activeStats) activeStats->visibleRenderables += static_cast<int>(appended);
+            // Grass and pond water ride on the terrain's batches (RenderGrass.cpp).
+            terrainState->prepareVegetation(sceneObjects, terrainState->viewBatches);
+            glActiveTexture(GL_TEXTURE0);
+            terrainState->appendVegetationItems(sceneObjects, view, camera.position, !reflectionCapturePass, drawItems);
+        } else if (terrainState) {
+            terrainState->viewBatches.clear();
+            terrainState->viewPool.clear();
         }
     }
 
@@ -7721,6 +8843,7 @@ void Renderer::renderSceneInternal(const Camera& inputCamera, const std::vector<
                             mesh->draw();
                         };
                         for (const RenderItem& item : drawItems) {
+                            if (item.instancerBatch >= 0 || item.terrainBatch >= 0 || item.grassBatch >= 0 || item.waterBatch >= 0) continue;   // instanced parts / terrain are not voxelized
                             if (item.multiDrawBatch >= 0 && optState) {
                                 // The voxelizer has its own vertex stage, so batched objects
                                 // voxelize one at a time, limited to the view frustum the
@@ -7837,6 +8960,11 @@ void Renderer::renderSceneInternal(const Camera& inputCamera, const std::vector<
         bool parallaxInvertHeight = false;
         bool hasReflectionCast = false;
         float reflectionIntensity = 0.0f;
+        int reflectionIsProbe = -1;
+        float reflectionMaxLod = -1.0f;
+        float clearcoat = -1.0f;
+        float clearcoatRoughness = -1.0f;
+        int wetnessReceive = -1;
         float reflectionFadeStart = -1.0f;
         float reflectionFadeEnd = -1.0f;
         bool fogEnabled = false;
@@ -7917,6 +9045,10 @@ void Renderer::renderSceneInternal(const Camera& inputCamera, const std::vector<
         depthProgram->setFloat("sceneTime", sceneWind.time);
         depthProgram->setBool("meshHasAuxiliaryStreams", item.mesh->hasAuxiliaryStreams());
         depthProgram->setBool("meshHasAuxiliaryAxis", item.mesh->getUV2Components() >= 3);
+        // Same fade as the forward draw, or the GL_EQUAL depth test would reject its leaves.
+        UploadCtiLodFade(depthProgram, item.instancerBatch >= 0 && instancerState
+            ? &instancerState->viewBatches[static_cast<size_t>(item.instancerBatch)].lodFade : nullptr,
+            camera.position);
         const MaterialShaderParameters* lastParameters = nullptr;
         UploadProjectMaterialUniforms(depthProgram, item.material.shaderParameters, lastParameters);
         Texture* albedo = item.obj->albedoTexturePath.empty() ? texture1
@@ -7998,6 +9130,7 @@ void Renderer::renderSceneInternal(const Camera& inputCamera, const std::vector<
                 }
             }
             shader->setVec3("ambientColor", ambientColor);
+            shader->setFloat("ambientHemisphere", ambientHemisphere);
             shader->setBool("specularEnabled", specularEnabled);
             shader->setInt("texture1", 0);
             shader->setInt("overlayTex", 1);
@@ -8036,9 +9169,47 @@ void Renderer::renderSceneInternal(const Camera& inputCamera, const std::vector<
             const SkyboxSettings skySettings = skybox ? skybox->getSettings() : SkyboxSettings{};
             shader->setFloat("reflectionFadeStart", skySettings.reflectionDistanceFadeStart);
             shader->setFloat("reflectionFadeEnd", skySettings.reflectionDistanceFadeEnd);
+            {
+                // Sky image-based lighting and surface wetness: frame constants, so
+                // they ride on the program bind rather than the per-draw cache.
+                const bool envSupported = EnvironmentLightingSupported();
+                const bool envAvailable = skybox != nullptr && envSupported &&
+                    skyboxReflectionTarget.cube != 0 && skyboxReflectionTarget.hasCapture &&
+                    skySettings.environmentLightingIntensity > 0.001f;
+                // Always point the cube sampler at a cube unit: left on unit 0 it
+                // would alias texture1's 2D sampler and invalidate the draw.
+                shader->setInt("environmentCube", envSupported ? kEnvironmentCubeUnit : 11);
+                shader->setBool("hasEnvironmentCube", envAvailable);
+                shader->setBool("skyLightingReflections", skySettings.skyLightingReflections);
+                shader->setFloat("environmentIntensity",
+                                 envAvailable ? skySettings.environmentLightingIntensity : 0.0f);
+                shader->setFloat("environmentMaxLod", envAvailable ? skyboxReflectionTarget.maxLod : 0.0f);
+                glm::vec3 groundSun(0.0f);
+                for (size_t li = 0; li < lights.size() && li < kMaxLights; ++li) {
+                    if (lights[li].type != 0) continue;
+                    // Main directional light on flat ground, times a generic ground
+                    // albedo (0.12, matching kGroundAlbedo in frag.glsl).
+                    const float len = glm::length(lights[li].dir);
+                    const float elevation = len > 1e-4f ? std::max(-lights[li].dir.y / len, 0.0f) : 0.0f;
+                    groundSun = lights[li].color * (std::max(lights[li].intensity, 0.0f) * elevation * 0.12f);
+                    break;
+                }
+                shader->setVec3("environmentGroundSun", groundSun);
+                if (envAvailable) {
+                    glActiveTexture(GL_TEXTURE0 + kEnvironmentCubeUnit);
+                    glBindTexture(GL_TEXTURE_CUBE_MAP, skyboxReflectionTarget.cube);
+                    glActiveTexture(GL_TEXTURE0);
+                    currentActiveTexture = GL_TEXTURE0;
+                }
+                shader->setFloat("surfaceWetness", surfaceWetness);
+                shader->setFloat("rainAmount", weatherDrive.active
+                    ? std::clamp(weatherDrive.rainAmount, 0.0f, 1.0f) : 0.0f);
+                shader->setFloat("puddleAmount", std::clamp(skySettings.puddleAmount, 0.0f, 1.0f));
+                shader->setFloat("wetTime", static_cast<float>(std::fmod(glfwGetTime(), 3600.0)));
+            }
             shader->setBool("fogEnabled", skybox != nullptr && skySettings.fogEnabled);
             shader->setInt("fogMode", skySettings.fogMode);
-            shader->setVec3("fogColor", skySettings.fogColor);
+            shader->setVec3("fogColor", skybox ? skybox->sceneFogColor() : skySettings.fogColor);
             shader->setFloat("fogStart", skySettings.fogStart);
             shader->setFloat("fogEnd", skySettings.fogEnd);
             shader->setFloat("fogDensity", skySettings.fogDensity);
@@ -8091,9 +9262,10 @@ void Renderer::renderSceneInternal(const Camera& inputCamera, const std::vector<
             shader->setInt("fogMode", skySettings.fogMode);
             matCache.fogMode = skySettings.fogMode;
         }
-        if (!matCache.valid || matCache.fogColor != skySettings.fogColor) {
-            shader->setVec3("fogColor", skySettings.fogColor);
-            matCache.fogColor = skySettings.fogColor;
+        const glm::vec3 wantFogColor = skybox ? skybox->sceneFogColor() : skySettings.fogColor;
+        if (!matCache.valid || matCache.fogColor != wantFogColor) {
+            shader->setVec3("fogColor", wantFogColor);
+            matCache.fogColor = wantFogColor;
         }
         if (!matCache.valid || matCache.fogStart != skySettings.fogStart) {
             shader->setFloat("fogStart", skySettings.fogStart);
@@ -8377,6 +9549,49 @@ void Renderer::renderSceneInternal(const Camera& inputCamera, const std::vector<
             shader->setFloat("reflectionIntensity", reflectionIntensity);
             matCache.reflectionIntensity = reflectionIntensity;
         }
+        {
+            // A probe cube is a local capture; the sky fallback is the same cube
+            // image-based lighting already reads, so the shader must not add it twice.
+            const bool isProbe = reflectionUsed && reflectionCube != skyboxReflectionTarget.cube;
+            float wantMaxLod = 0.0f;
+            if (isProbe) {
+                for (const auto& probeEntry : reflectionCastTargets) {
+                    if (probeEntry.second.cube == reflectionCube) {
+                        wantMaxLod = probeEntry.second.maxLod;
+                        break;
+                    }
+                }
+            } else if (reflectionUsed) {
+                wantMaxLod = skyboxReflectionTarget.maxLod;
+            }
+            const int wantIsProbe = isProbe ? 1 : 0;
+            if (!matCache.valid || matCache.reflectionIsProbe != wantIsProbe) {
+                shader->setBool("reflectionIsProbe", isProbe);
+                matCache.reflectionIsProbe = wantIsProbe;
+            }
+            if (!matCache.valid || matCache.reflectionMaxLod != wantMaxLod) {
+                shader->setFloat("reflectionMaxLod", wantMaxLod);
+                matCache.reflectionMaxLod = wantMaxLod;
+            }
+            const float wantClearcoat = wantPbr ? std::clamp(item.material.clearcoat, 0.0f, 1.0f) : 0.0f;
+            if (!matCache.valid || matCache.clearcoat != wantClearcoat) {
+                shader->setFloat("clearcoat", wantClearcoat);
+                matCache.clearcoat = wantClearcoat;
+            }
+            const float wantClearcoatRoughness = std::clamp(item.material.clearcoatRoughness, 0.0f, 1.0f);
+            if (!matCache.valid || matCache.clearcoatRoughness != wantClearcoatRoughness) {
+                shader->setFloat("clearcoatRoughness", wantClearcoatRoughness);
+                matCache.clearcoatRoughness = wantClearcoatRoughness;
+            }
+            // Rain wets world surfaces, not UI canvases or camera-facing sprites.
+            const bool receivesWetness = !wantUnlit && !item.isUiCanvas3D &&
+                !(objPtr && objPtr->renderType == RenderType::Sprite);
+            const int wantWet = receivesWetness ? 1 : 0;
+            if (!matCache.valid || matCache.wetnessReceive != wantWet) {
+                shader->setBool("wetnessReceive", receivesWetness);
+                matCache.wetnessReceive = wantWet;
+            }
+        }
 
         bool normalUsed = false;
         if (projectTextureArrays) {
@@ -8539,9 +9754,49 @@ void Renderer::renderSceneInternal(const Camera& inputCamera, const std::vector<
                 shader->setBool("meshHasAuxiliaryAxis", wantBranchAxis != 0);
                 matCache.projectHasBranchAxis = wantBranchAxis;
             }
+            // Every project item sets it: a program keeps the last batch's value otherwise.
+            UploadCtiLodFade(shader, item.instancerBatch >= 0 && instancerState
+                ? &instancerState->viewBatches[static_cast<size_t>(item.instancerBatch)].lodFade : nullptr,
+                camera.position);
         }
 
         matCache.valid = true;
+
+        if (item.terrainBatch >= 0 && terrainState &&
+            static_cast<size_t>(item.terrainBatch) < terrainState->viewBatches.size()) {
+            // Terrain: unit 0 carries the splat map (texture1), units 20/21 the layer arrays.
+            const auto& terrainBatch = terrainState->viewBatches[static_cast<size_t>(item.terrainBatch)];
+            const TerrainState::Surface surf = terrainState->surface(sceneObjects[static_cast<size_t>(terrainBatch.objectIndex)]);
+            bindTexture2D(GL_TEXTURE0, surf.splat ? surf.splat : debugWhiteTexture);
+            glActiveTexture(GL_TEXTURE0 + kProjectArrayAlbedoUnit);
+            glBindTexture(GL_TEXTURE_2D_ARRAY, surf.albedoArray);
+            glActiveTexture(GL_TEXTURE0 + kProjectArrayNormalUnit);
+            glBindTexture(GL_TEXTURE_2D_ARRAY, surf.normalArray);
+            glActiveTexture(GL_TEXTURE0);
+            currentActiveTexture = GL_TEXTURE0;
+            shader->setInt("terrainAlbedo", kProjectArrayAlbedoUnit);
+            shader->setInt("terrainNormal", kProjectArrayNormalUnit);
+            shader->setVec4("terrainTiling", surf.tiling);
+            shader->setVec4("terrainNormalStrength", surf.normalStrength);
+            shader->setVec3("terrainTint0", surf.tint[0]);
+            shader->setVec3("terrainTint1", surf.tint[1]);
+            shader->setVec3("terrainTint2", surf.tint[2]);
+            shader->setVec3("terrainTint3", surf.tint[3]);
+            shader->setFloat("terrainSize", surf.size);
+            shader->setVec2("terrainGrassShade", surf.grassShade);
+        }
+        if ((item.grassBatch >= 0 || item.waterBatch >= 0) && terrainState) {
+            const int vegetationBatch = item.grassBatch >= 0 ? item.grassBatch : item.waterBatch;
+            if (static_cast<size_t>(vegetationBatch) < terrainState->viewBatches.size()) {
+                const auto& terrainBatch = terrainState->viewBatches[static_cast<size_t>(vegetationBatch)];
+                const SceneObject& terrainObject = sceneObjects[static_cast<size_t>(terrainBatch.objectIndex)];
+                const TerrainState::Surface surf = terrainState->surface(terrainObject);
+                bindTexture2D(GL_TEXTURE0, surf.splat ? surf.splat : debugWhiteTexture);
+                terrainState->bindVegetation(*this, terrainBatch, terrainObject, item.grassBatch >= 0, shader,
+                                             camera.position, proj, height);
+                currentActiveTexture = GL_TEXTURE0;
+            }
+        }
 
         if (objPtr && objPtr->renderType == RenderType::Model && objPtr->meshId != -1 &&
             objPtr->hasSkeletalAnimation && objPtr->skeletal.enabled && !item.wantsGpuSkinning) {
@@ -8643,6 +9898,28 @@ void Renderer::renderSceneInternal(const Camera& inputCamera, const std::vector<
             // Same program and vertices, so the colour pass lands on exactly that depth.
             glDepthFunc(GL_LEQUAL);
             Runtime2DCountStateBind();
+        }
+        if (item.terrainBatch >= 0 && terrainState &&
+            static_cast<size_t>(item.terrainBatch) < terrainState->viewBatches.size()) {
+            const auto& terrainBatch = terrainState->viewBatches[static_cast<size_t>(item.terrainBatch)];
+            for (size_t chunk = 0; chunk < terrainBatch.count; ++chunk) {
+                recordMeshDraw();
+                terrainState->viewPool[terrainBatch.first + chunk]->draw();
+            }
+            if (activeStats) activeStats->triangles += terrainBatch.triangles;
+            continue;
+        }
+        if ((item.grassBatch >= 0 || item.waterBatch >= 0) && terrainState) {
+            const int vegetationBatch = item.grassBatch >= 0 ? item.grassBatch : item.waterBatch;
+            if (static_cast<size_t>(vegetationBatch) < terrainState->viewBatches.size()) {
+                const auto& terrainBatch = terrainState->viewBatches[static_cast<size_t>(vegetationBatch)];
+                long long submitted = 0;
+                recordDrawCall();
+                terrainState->drawVegetation(terrainBatch, sceneObjects[static_cast<size_t>(terrainBatch.objectIndex)],
+                                             item.grassBatch >= 0, shader, camera.position, submitted);
+                if (activeStats) activeStats->triangles += submitted;
+            }
+            continue;
         }
         recordMeshDraw();
         const int instances = item.instanceGroup >= 0
@@ -8833,6 +10110,48 @@ void Renderer::renderSceneInternal(const Camera& inputCamera, const std::vector<
         renderParticleSystems(sceneObjects, view, proj);
     }
 
+    // 3D rain (RenderRain.cpp): after every blended surface, so it falls in front of glass and
+    // particles, depth-tested against the scene and fed through post FX. Main views only:
+    // mirrors, reflection captures and the multiview stereo pass skip it.
+    if (!reflectionCapturePass && !stereoPass && drawMirrorObjects && drawSkybox && isRain3DActive()) {
+        rainState.lightCount = 0;
+        rainState.sunColor = glm::vec3(0.0f);
+        bool rainSunFound = false;
+        for (const LightUniform& l : lights) {
+            if (l.intensity <= 0.0f) continue;
+            if (l.type == 0) {
+                if (!rainSunFound) {
+                    rainSunFound = true;
+                    rainState.sunDirection = glm::length(l.dir) > 1e-4f ? glm::normalize(l.dir)
+                                                                       : glm::vec3(0.0f, -1.0f, 0.0f);
+                    rainState.sunColor = l.color * l.intensity;
+                }
+                continue;
+            }
+            if ((l.type != 1 && l.type != 2) || rainState.lightCount >= kRainMaxLights) continue;
+            const int slot = rainState.lightCount++;
+            rainState.lightPosRange[slot] = glm::vec4(l.pos, l.range);
+            rainState.lightColorType[slot] = glm::vec4(l.color * l.intensity, static_cast<float>(l.type));
+            const glm::vec3 spotDir = glm::length(l.dir) > 1e-4f ? glm::normalize(l.dir) : glm::vec3(0.0f, -1.0f, 0.0f);
+            rainState.lightDirCone[slot] = glm::vec4(spotDir, l.inner);
+            rainState.lightOuterCos[slot] = l.outer;
+        }
+        struct RainResolveContext {
+            decltype(buildModelMatrix)* model;
+            decltype(selectMeshForObject)* mesh;
+        } rainResolve{&buildModelMatrix, &selectMeshForObject};
+        const RainMeshResolver resolver = [](void* context, const SceneObject& obj, glm::mat4& outModel,
+                                             glm::vec3& outCenter, float& outRadius) -> Mesh* {
+            auto* ctx = static_cast<RainResolveContext*>(context);
+            Mesh* mesh = (*ctx->mesh)(obj);
+            if (!mesh) return nullptr;
+            outModel = (*ctx->model)(obj);
+            if (!TryComputeObjectCullSphere(obj, outModel, outCenter, outRadius)) outRadius = 0.0f;
+            return mesh;
+        };
+        renderWeatherRain(camera, sceneObjects, view, proj, width, height, resolver, &rainResolve);
+    }
+
     if (currentBlendEnabled != (blendEnabled == GL_TRUE)) {
         if (blendEnabled) glEnable(GL_BLEND);
         else glDisable(GL_BLEND);
@@ -8917,6 +10236,15 @@ void Renderer::renderSceneInternal(const Camera& inputCamera, const std::vector<
                         gbufferMultiDraw = nullptr;
                     }
                 }
+                // Instancer parts with a Standard material write through the instanced vertex stage.
+                Shader* gbufferInstancedStandard = nullptr;
+                if (instancerState && !instancerState->viewBatches.empty()) {
+                    gbufferInstancedStandard = getShader(kInstancerStandardVertPath, gbufferFragPath);
+                    if (!gbufferInstancedStandard || gbufferInstancedStandard == defaultShader ||
+                        gbufferInstancedStandard->ID == 0) {
+                        gbufferInstancedStandard = nullptr;
+                    }
+                }
                 // as the main pass (identical positions, or the LEQUAL test would reject it).
                 Shader* gbufferProjectPrograms[2][256] = {};
                 bool gbufferProjectResolved[2][256] = {};
@@ -8935,6 +10263,7 @@ void Renderer::renderSceneInternal(const Camera& inputCamera, const std::vector<
                 Shader* active = nullptr;
                 for (const RenderItem& item : drawItems) {
                     if (item.instanceFollower) continue;
+                    if (item.grassBatch >= 0 || item.waterBatch >= 0) continue;   // generated in the vertex shader; not in the G-buffer
                     const bool drawsBatch = item.multiDrawBatch >= 0 && gbufferMultiDraw != nullptr;
                     if ((item.mesh == nullptr && !drawsBatch) || !item.sortOpaque || item.unlit ||
                         item.isUiCanvas3D) {
@@ -8943,12 +10272,21 @@ void Renderer::renderSceneInternal(const Camera& inputCamera, const std::vector<
                     // Null when the item is not project shader or its project shader variant did not build (it then
                     // writes through the plain G-buffer program, unanimated).
                     Shader* const projectProgram = drawsBatch ? nullptr : gbufferProjectProgram(item.projectModel, item.instanceGroup >= 0);
+                    const bool standardInstanced = item.instancerBatch >= 0 && item.projectModel == 0 &&
+                                                   item.instanceGroup >= 0;
+                    // An instancer leader has no meaningful non-instanced draw (its model is just
+                    // the first instance), so without its instanced program it writes nothing.
+                    if (item.instancerBatch >= 0 && !projectProgram &&
+                        !(standardInstanced && gbufferInstancedStandard)) {
+                        continue;
+                    }
                     const bool projectCutoutItem =
                         projectProgram && GetProjectPrograms(static_cast<ProjectModel>(item.projectModel)).cutout;
                     const bool projectArrayItem =
                         projectProgram && ProfileUsesArrays(static_cast<ProjectModel>(item.projectModel));
                     Shader* want = drawsBatch ? gbufferMultiDraw
                                  : projectProgram ? projectProgram
+                                 : standardInstanced ? gbufferInstancedStandard
                                  : (item.wantsGpuSkinning && gbufferSkinned &&
                                     gbufferSkinned->ID != 0) ? gbufferSkinned : gbufferStatic;
                     if (want != active) {
@@ -8965,6 +10303,13 @@ void Renderer::renderSceneInternal(const Camera& inputCamera, const std::vector<
                             active->setInt("metallicMap", 17);
                             active->setInt("roughnessMap", 18);
                         }
+                        // Same wetness inputs as the forward pass, so SSR sees the
+                        // glossy wet roughness and the puddle normals it shades with.
+                        active->setFloat("surfaceWetness", surfaceWetness);
+                        active->setFloat("rainAmount", weatherDrive.active
+                            ? std::clamp(weatherDrive.rainAmount, 0.0f, 1.0f) : 0.0f);
+                        active->setFloat("puddleAmount", std::clamp(ssrSky.puddleAmount, 0.0f, 1.0f));
+                        active->setFloat("wetTime", static_cast<float>(std::fmod(glfwGetTime(), 3600.0)));
                         if (projectProgram) {
                             gbufferProjectLast = nullptr;
                             active->setInt("texture1", 0);
@@ -9007,6 +10352,10 @@ void Renderer::renderSceneInternal(const Camera& inputCamera, const std::vector<
                     active->setFloat("heightScale", item.material.heightScale);
                     active->setInt("parallaxSteps", item.material.parallaxSteps);
                     active->setBool("parallaxInvertHeight", item.material.parallaxInvertHeight);
+                    active->setFloat("clearcoat", item.material.pbrEnabled
+                        ? std::clamp(item.material.clearcoat, 0.0f, 1.0f) : 0.0f);
+                    active->setFloat("clearcoatRoughness", std::clamp(item.material.clearcoatRoughness, 0.0f, 1.0f));
+                    active->setBool("wetnessReceive", !(objPtr && objPtr->renderType == RenderType::Sprite));
 
                     // A Bark Array item's normal slot names a Texture2DArray, not a 2D image.
                     const std::string& nPath =
@@ -9054,6 +10403,9 @@ void Renderer::renderSceneInternal(const Camera& inputCamera, const std::vector<
                         gbufferProjectLast = &item.material.shaderParameters;
                         active->setBool("meshHasAuxiliaryAxis", item.mesh && item.mesh->getUV2Components() >= 3);
                         active->setBool("meshHasAuxiliaryStreams", item.mesh && item.mesh->hasAuxiliaryStreams());
+                        UploadCtiLodFade(active, item.instancerBatch >= 0 && instancerState
+                            ? &instancerState->viewBatches[static_cast<size_t>(item.instancerBatch)].lodFade : nullptr,
+                            camera.position);
                         float cutoff = std::clamp(item.material.alphaCutoff, 0.0f, 1.0f);
                         cutoff = projectCutoutItem ? (cutoff > 0.0f ? cutoff : 0.5f) : 0.0f;
                         active->setFloat("alphaCutoff", cutoff);
@@ -9142,8 +10494,17 @@ void Renderer::renderSceneInternal(const Camera& inputCamera, const std::vector<
                             *optPass, optState->multiDraw.batches[static_cast<size_t>(item.multiDrawBatch)]);
                         continue;
                     }
+                    if (item.terrainBatch >= 0 && terrainState &&
+                        static_cast<size_t>(item.terrainBatch) < terrainState->viewBatches.size()) {
+                        const auto& terrainBatch = terrainState->viewBatches[static_cast<size_t>(item.terrainBatch)];
+                        for (size_t chunk = 0; chunk < terrainBatch.count; ++chunk) {
+                            recordMeshDraw();
+                            terrainState->viewPool[terrainBatch.first + chunk]->draw();
+                        }
+                        continue;
+                    }
                     recordMeshDraw();
-                    if (item.instanceGroup >= 0 && projectProgram) instanceState->draw(item.instanceGroup);
+                    if (item.instanceGroup >= 0 && (projectProgram || standardInstanced)) instanceState->draw(item.instanceGroup);
                     else item.mesh->draw();
                 }
                 glFrontFace(GL_CCW);
@@ -9222,9 +10583,12 @@ void Renderer::renderSceneInternal(const Camera& inputCamera, const std::vector<
                     glActiveTexture(GL_TEXTURE12);
                     glBindTexture(GL_TEXTURE_2D, surfaceTexture);
 
+                    // Image-based lighting reflects the same cube on every PBR
+                    // surface, which counts as the forward pass reflecting the sky.
                     const bool forwardAlreadyReflectsSky =
-                        ssrSky.environmentReflections &&
-                        ssrSky.environmentReflectionIntensity > 0.001f;
+                        (ssrSky.environmentReflections &&
+                         ssrSky.environmentReflectionIntensity > 0.001f) ||
+                        (ssrSky.environmentLightingIntensity > 0.001f && EnvironmentLightingSupported());
                     const bool hasCube = !forwardAlreadyReflectsSky &&
                                          skyboxReflectionTarget.cube != 0 &&
                                          skyboxReflectionTarget.hasCapture;
@@ -10188,7 +11552,8 @@ unsigned int Renderer::applyPostProcessing(const Camera& camera, const std::vect
         postShader->setFloat("autoExposure",
                              updateEyeAdaptation(sourceTexture, width, height, settings));
         const SkyboxSettings& weatherSky = skybox ? skybox->getSettings() : SkyboxSettings{};
-        postShader->setFloat("rainAmount", weatherDrive.active ? weatherDrive.rainAmount : 0.0f);
+        // With 3D rain on, the world-space streaks replace these; lightning still applies.
+        postShader->setFloat("rainAmount", (weatherDrive.active && !isRain3DActive()) ? weatherDrive.rainAmount : 0.0f);
         postShader->setFloat("rainOpacity", weatherSky.weather.rainOpacity);
         postShader->setFloat("rainSpeed", weatherSky.weather.rainSpeed);
         postShader->setFloat("rainScale", weatherSky.weather.rainScale);

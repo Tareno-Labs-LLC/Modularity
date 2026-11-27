@@ -395,6 +395,17 @@ int EditorScenePicking::PickRay(const std::vector<SceneObject>& sceneObjects,
          obj.type == ObjectType::AreaLight))
       continue;
 
+    if (obj.hasTerrain && obj.terrain.enabled) {
+      // Heightfield objects are Empties with no mesh: pick them by marching the ray over the heights.
+      float terrainT = 0.0f;
+      if (TerrainRuntime::Raycast(obj, ray.first, ray.second, closest < FLT_MAX ? closest : 100000.0f, terrainT) &&
+          terrainT >= 0.0f && terrainT < closest) {
+        closest = terrainT;
+        hitId = obj.id;
+      }
+      continue;
+    }
+
     glm::vec3 aabbMin(-0.5f);
     glm::vec3 aabbMax(0.5f);
 
@@ -3486,8 +3497,10 @@ void Engine::renderViewport() {
     if (mouseOverRMeshModeToolbar || mouseOverRMeshActionsPopup) {
       blockSelection = true;
     }
+    // While the terrain brush is armed the left button belongs to it, so the transform gizmo steps aside.
+    const bool terrainBrushArmed = terrainBrushTarget() != nullptr;
     const bool sceneGizmoEligible =
-        !worldUiEditing && selectedObj && IsObjectEnabledInHierarchy(*selectedObj) &&
+        !terrainBrushArmed && !worldUiEditing && selectedObj && IsObjectEnabledInHierarchy(*selectedObj) &&
         !selectedObj->IsInvariable &&
         !selectedObj->hasPostFX &&
         (!HasUIComponent(*selectedObj) || selectedIsUiCanvas3D ||
@@ -9568,10 +9581,13 @@ void Engine::renderViewport() {
 
     // Viewport object picking (left click select, RMB click-release for context
     // selection)
+    bool terrainBrushOwnsClick = false;
+    updateTerrainBrush(view, proj, imageMin, imageMax,
+                       mouseOverViewportImage && !blockSelection, terrainBrushOwnsClick);
     const bool leftPickClick = mouseOverViewportImage &&
                                ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
                                !ImGuizmo::IsUsing() && !ImGuizmo::IsOver() &&
-                               !blockSelection;
+                               !blockSelection && !terrainBrushOwnsClick;
     bool rightPickHitObject = false;
     std::vector<int> rig25DSelectionBeforeContext;
     if (project25DPipeline) {

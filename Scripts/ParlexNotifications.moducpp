@@ -1,0 +1,176 @@
+add ModuCPP;
+add Parlex;
+
+// ParlexNotifications - the popup notification system.
+//
+// Drives the "Notification Popout" object: shows a queued notification, holds it,
+// hides it, then shows the next one. Anything can queue a popup with
+//     ParlexNotify.Push("Title", "Body", "info", 5.0f);
+// and this script queues the built-in ones itself:
+//   - sign-in success (and "new player"),
+//   - friends coming online,
+//   - the console's announcement / "the game was updated" after an update,
+//   - "Moderator tools unlocked" when the player owns a moderator item.
+//
+// Assign Popup Root (the whole popout), Popup Text (the Notification Text object) and
+// optionally Popup Icon (tinted per kind). Needs ParlexBootstrap in the scene.
+public class ParlexNotifications : ModuNode
+{
+    [Header("Popup objects")]
+    [ObjectRef] public SceneObj popupRoot;
+    [ObjectRef] public SceneObj popupText;
+    [ObjectRef] public SceneObj popupIcon;
+
+    [Header("Timing")]
+    [Slider(1.0f, 15.0f)] public float defaultSeconds = 5.0f;
+    [Slider(0.0f, 2.0f)] public float gapSeconds = 0.4f;
+
+    [Header("Built-in notifications")]
+    public bool notifyLogin = true;
+    public bool notifyFriendsOnline = true;
+    public bool notifyAnnouncements = true;
+    public bool notifyUpdates = true;
+    [Slider(5.0f, 120.0f)] public float friendPollSeconds = 15.0f;
+
+    [Header("Moderator")]
+    public string moderatorItemIds = "moderator";
+
+    private float showTimer = 0.0f;
+    private float gapTimer = 0.0f;
+    private bool showing = false;
+    private bool welcomed = false;
+    private bool friendsPrimed = false;
+    private string knownOnline = "|";
+    private int gateRevision = -1;
+    private bool wasModerator = false;
+    private int modRevision = -1;
+
+    void Begin()
+    {
+        showTimer = 0.0f;
+        gapTimer = 0.0f;
+        showing = false;
+        welcomed = false;
+        friendsPrimed = false;
+        knownOnline = "|";
+        gateRevision = -1;
+        wasModerator = false;
+        modRevision = -1;
+        Hide();
+    }
+
+    void TickUpdate()
+    {
+        if (Parlex.LoggedIn()) WatchSession();
+        Present(dt);
+    }
+
+    void WatchSession()
+    {
+        if (!welcomed)
+        {
+            welcomed = true;
+            ParlexModerator.SetItemIds(moderatorItemIds);
+            ParlexModerator.Refresh();
+            if (notifyLogin) ParlexNotify.Push("Signed in", "Welcome back! (" + Parlex.PlayerId() + ")", "success", defaultSeconds);
+            string before = ParlexAnnouncements.CheckUpdated();
+            if (notifyUpdates && before.length() > 0)
+                ParlexNotify.Push("Game updated", "Updated from " + before + " to " + Parlex.ClientVersion(), "update", defaultSeconds + 2.0f);
+            ParlexFriends.Refresh();
+        }
+
+        // Announcement (the latest one the console schedule has put out), once per id.
+        if ((int)ParlexServerGate.Revision() != gateRevision)
+        {
+            gateRevision = (int)ParlexServerGate.Revision();
+            if (notifyAnnouncements && ParlexAnnouncements.Active() && ParlexAnnouncements.IsNew())
+            {
+                string from = ParlexAnnouncements.From();
+                ParlexNotify.Push(from.length() > 0 ? "Announcement from " + from : "Announcement", ParlexAnnouncements.Text(), "announcement", defaultSeconds + 4.0f);
+                ParlexAnnouncements.MarkSeen();
+            }
+        }
+
+        // Moderator item.
+        if ((int)ParlexModerator.Revision() != modRevision)
+        {
+            modRevision = (int)ParlexModerator.Revision();
+            bool isMod = ParlexModerator.IsModerator();
+            if (isMod && !wasModerator) ParlexNotify.Push("Moderator tools unlocked", "You have a moderator item.", "success", defaultSeconds);
+            wasModerator = isMod;
+        }
+
+        // Friends coming online.
+        if (notifyFriendsOnline)
+        {
+            if (ParlexFriends.Due(friendPollSeconds)) ParlexFriends.Refresh();
+            if (ParlexFriends.Loaded()) CheckFriends();
+        }
+    }
+
+    void CheckFriends()
+    {
+        string now = "|";
+        for (const string& id : ParlexFriends.Online()) now += id + "|";
+        if (now == knownOnline) return;
+        if (friendsPrimed)
+        {
+            for (const string& id : ParlexFriends.Online())
+            {
+                if (knownOnline.find("|" + id + "|") != std::string::npos) continue;
+                string name = ParlexFriends.NameOf(id);
+                ParlexNotify.Push(name.length() > 0 ? name : "A friend", "is online now", "friend", defaultSeconds);
+            }
+        }
+        friendsPrimed = true;
+        knownOnline = now;
+    }
+
+    void Present(float step)
+    {
+        if (showing)
+        {
+            showTimer -= step;
+            if (showTimer <= 0.0f)
+            {
+                showing = false;
+                gapTimer = gapSeconds;
+                Hide();
+            }
+            return;
+        }
+        if (gapTimer > 0.0f) { gapTimer -= step; return; }
+
+        Json item;
+        if (!ParlexNotify.Pop(item)) return;
+        string title = item["Title"].AsString();
+        string body = item["Body"].AsString();
+        string kind = item["Kind"].AsString();
+        float seconds = item["Seconds"].AsFloat(defaultSeconds);
+        Show(title.length() > 0 && body.length() > 0 ? title + "\n" + body : title + body, kind);
+        showing = true;
+        showTimer = seconds > 0.5f ? seconds : defaultSeconds;
+    }
+
+    void Show(const string& message, const string& kind)
+    {
+        SceneObject* text = SmartResolveRef(popupText);
+        if (text) text->ui.label = message;
+        SceneObject* icon = SmartResolveRef(popupIcon);
+        if (icon)
+        {
+            glm::vec4 tint(1.0f, 1.0f, 1.0f, 1.0f);
+            if (kind == "success") tint = glm::vec4(0.55f, 1.0f, 0.65f, 1.0f);
+            else if (kind == "friend") tint = glm::vec4(0.6f, 0.8f, 1.0f, 1.0f);
+            else if (kind == "announcement" || kind == "update") tint = glm::vec4(1.0f, 0.85f, 0.4f, 1.0f);
+            else if (kind == "warning") tint = glm::vec4(1.0f, 0.5f, 0.45f, 1.0f);
+            icon->ui.color = tint;
+        }
+        SetActive(SmartResolveRef(popupRoot), true);
+    }
+
+    void Hide()
+    {
+        SetActive(SmartResolveRef(popupRoot), false);
+    }
+}

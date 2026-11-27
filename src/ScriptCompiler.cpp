@@ -1,4 +1,5 @@
 #include "ScriptCompiler.h"
+#include "Platform/ExecutablePath.h"
 #include "ModuCPPTranspiler.h"
 #include "ScriptRuntime.h"
 #include "DevBuildDir.h"
@@ -26,7 +27,52 @@
     #define NOMINMAX
     #endif
     #include <windows.h>
+#elif defined(__linux__)
+    #include <sys/resource.h>
+    #include <cerrno>
 #endif
+
+namespace {
+    // Set while a ScriptBackgroundBuildScope is alive on this thread.
+    thread_local bool gBackgroundBuildThread = false;
+    constexpr int kBackgroundBuildNice = 10;
+}
+
+ScriptBackgroundBuildScope::ScriptBackgroundBuildScope() {
+#if defined(_WIN32)
+    // Thread priority covers in-process work; spawned compilers get a priority class in
+    // runWindowsShellCommand because children do not inherit a thread's priority.
+    HANDLE thread = GetCurrentThread();
+    previousPriority = GetThreadPriority(thread);
+    if (previousPriority != THREAD_PRIORITY_ERROR_RETURN &&
+        SetThreadPriority(thread, THREAD_PRIORITY_BELOW_NORMAL)) {
+        applied = true;
+    }
+    gBackgroundBuildThread = true;
+#elif defined(__linux__)
+    // On Linux a nice value belongs to the thread (who == 0 is the caller, not the process),
+    // and the compilers this thread spawns inherit it. Elsewhere this would renice the whole
+    // editor, so other POSIX systems are left alone.
+    errno = 0;
+    previousPriority = getpriority(PRIO_PROCESS, 0);
+    if (errno == 0 && previousPriority < kBackgroundBuildNice &&
+        setpriority(PRIO_PROCESS, 0, kBackgroundBuildNice) == 0) {
+        applied = true;
+    }
+    gBackgroundBuildThread = true;
+#endif
+}
+
+ScriptBackgroundBuildScope::~ScriptBackgroundBuildScope() {
+    gBackgroundBuildThread = false;
+    if (!applied) return;
+#if defined(_WIN32)
+    SetThreadPriority(GetCurrentThread(), previousPriority);
+#elif defined(__linux__)
+    // Usually refused without CAP_SYS_NICE; harmless, each compile job runs on its own thread.
+    (void)setpriority(PRIO_PROCESS, 0, previousPriority);
+#endif
+}
 
 namespace {
     // An unresolved symbol, reduced from the linker's mangled wall of text to the bit a
@@ -615,7 +661,14 @@ namespace {
     }
 
     std::string posixCompileDriver(bool cxx) {
-#if !defined(_WIN32)
+#if defined(__APPLE__)
+    #if defined(__aarch64__)
+        constexpr const char* arch = " -arch arm64";
+    #else
+        constexpr const char* arch = " -arch x86_64";
+    #endif
+        return std::string(cxx ? "xcrun --sdk macosx clang++" : "xcrun --sdk macosx clang") + arch;
+#elif !defined(_WIN32)
         static std::mutex ccacheMutex;
         static int ccacheAvailable = -1;
         std::lock_guard<std::mutex> lock(ccacheMutex);
@@ -643,10 +696,26 @@ namespace {
         if (!config.crossCompilerDriver.empty()) {
             return "\"" + config.crossCompilerDriver + "\"";
         }
+#if defined(__APPLE__)
+        return posixCompileDriver(true);
+#else
         return "g++";
+#endif
     }
+
+    const char* posixScriptModuleLinkFlags(const ScriptBuildConfig& config) {
+#if defined(__APPLE__)
+        if (config.crossCompilerDriver.empty() && !config.embeddedCompiler) {
+            return " -dynamiclib -Wl,-undefined,dynamic_lookup";
+        }
+#else
+        (void)config;
+#endif
+        return " -shared";
+    }
+
     bool posixScriptCompilerSupportsNoGnuUnique() {
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
         return false;
 #else
         static std::mutex probeMutex;
@@ -762,7 +831,7 @@ namespace {
             nullptr,
             nullptr,
             TRUE,
-            CREATE_NO_WINDOW,
+            CREATE_NO_WINDOW | (gBackgroundBuildThread ? BELOW_NORMAL_PRIORITY_CLASS : 0),
             nullptr,
             nullptr,
             &si,
@@ -1279,30 +1348,12 @@ bool ScriptCompiler::loadConfig(const fs::path& configPath, ScriptBuildConfig& o
     addBundledScriptSdkIncludeRoots(configPath.parent_path(), outConfig);
     addBundledScriptSdkIncludeRoots(fs::current_path(), outConfig);
     addBundledScriptSdkIncludeRoots(fs::current_path().parent_path(), outConfig);
-#if defined(__linux__)
-    {
-        std::error_code ec;
-        fs::path exe = fs::read_symlink("/proc/self/exe", ec);
-        if (!ec) {
-            tryAddEngineRoot(exe.parent_path());
-            tryAddEngineRoot(exe.parent_path().parent_path());
-            addBundledScriptSdkIncludeRoots(exe.parent_path(), outConfig);
-            addBundledScriptSdkIncludeRoots(exe.parent_path().parent_path(), outConfig);
-        }
+    if (auto exe = Modularity::CurrentExecutablePath(); !exe.empty()) {
+        tryAddEngineRoot(exe.parent_path());
+        tryAddEngineRoot(exe.parent_path().parent_path());
+        addBundledScriptSdkIncludeRoots(exe.parent_path(), outConfig);
+        addBundledScriptSdkIncludeRoots(exe.parent_path().parent_path(), outConfig);
     }
-#elif defined(_WIN32)
-    {
-        wchar_t buffer[MAX_PATH];
-        DWORD len = GetModuleFileNameW(nullptr, buffer, MAX_PATH);
-        if (len > 0) {
-            fs::path exe(buffer);
-            tryAddEngineRoot(exe.parent_path());
-            tryAddEngineRoot(exe.parent_path().parent_path());
-            addBundledScriptSdkIncludeRoots(exe.parent_path(), outConfig);
-            addBundledScriptSdkIncludeRoots(exe.parent_path().parent_path(), outConfig);
-        }
-    }
-#endif
 
     return true;
 }
@@ -1368,8 +1419,14 @@ bool ScriptCompiler::makeCommands(const ScriptBuildConfig& config, const fs::pat
         binaryPath /= baseName + ".dll";
         outCommands.linkBinaryPath = config.outDir / ".staging" / relativeParent / (baseName + ".dll");
     } else {
-        binaryPath /= baseName + ".so";
-        outCommands.linkBinaryPath = config.outDir / ".staging" / relativeParent / (baseName + ".so");
+#if defined(__APPLE__)
+        const char* extension = config.crossCompilerDriver.empty() && !config.embeddedCompiler
+            ? NativeScriptArtifactExtension() : ".so";
+#else
+        const char* extension = ".so";
+#endif
+        binaryPath /= baseName + extension;
+        outCommands.linkBinaryPath = config.outDir / ".staging" / relativeParent / (baseName + extension);
         dependencyPath = config.outDir / relativeParent / (baseName + ".d");
     }
 
@@ -1818,7 +1875,7 @@ bool ScriptCompiler::makeCommands(const ScriptBuildConfig& config, const fs::pat
         compileCmd << " -MMD -MF \"" << dependencyPath.string() << "\"";
         compileCmd << " -c \"" << wrapperPath.string() << "\" -o \"" << objectPath.string() << "\"";
         const fs::path producedBinaryPath = outCommands.linkBinaryPath.empty() ? binaryPath : outCommands.linkBinaryPath;
-        linkCmd << posixScriptLinkDriver(config) << " -shared \"" << objectPath.string()
+        linkCmd << posixScriptLinkDriver(config) << posixScriptModuleLinkFlags(config) << " \"" << objectPath.string()
                 << "\" -o \"" << producedBinaryPath.string() << "\"";
         for (const auto& lib : config.linuxLinkLibs) {
             linkCmd << " " << formatLinkFlag(lib);
@@ -2392,7 +2449,7 @@ bool ScriptCompiler::makeCommands(const ScriptBuildConfig& config, const fs::pat
         compileCmd << " -MMD -MF \"" << secondaryDependencyPath.string() << "\"";
         compileCmd << " -c \"" << wrapperPath.string() << "\" -o \"" << secondaryObjectPath.string() << "\"";
         const fs::path producedBinaryPath = outCommands.linkBinaryPath.empty() ? binaryPath : outCommands.linkBinaryPath;
-        linkCmd << posixScriptLinkDriver(config) << " -shared \"" << objectPath.string() << "\" \"" << secondaryObjectPath.string()
+        linkCmd << posixScriptLinkDriver(config) << posixScriptModuleLinkFlags(config) << " \"" << objectPath.string() << "\" \"" << secondaryObjectPath.string()
                 << "\" -o \"" << producedBinaryPath.string() << "\"";
         for (const auto& lib : config.linuxLinkLibs) {
             linkCmd << " " << formatLinkFlag(lib);
@@ -2406,6 +2463,7 @@ bool ScriptCompiler::makeCommands(const ScriptBuildConfig& config, const fs::pat
         FunctionSpec testEditorSpec = detectFunction(scriptSource, "TestEditor", cppContextPattern);
         FunctionSpec updateSpec = detectFunction(scriptSource, "Update", cppContextPattern);
         FunctionSpec tickUpdateSpec = detectFunction(scriptSource, "TickUpdate", cppContextPattern);
+        FunctionSpec fixedUpdateSpec = detectFunction(scriptSource, "FixedUpdate", cppContextPattern);
         FunctionSpec inspectorSpec = detectFunction(scriptSource, "Script_OnInspector", cppContextPattern);
         FunctionSpec editorRenderSpec = detectFunction(scriptSource, "RenderEditorWindow", cppContextPattern);
         FunctionSpec editorExitSpec = detectFunction(scriptSource, "ExitRenderEditorWindow", cppContextPattern);
@@ -2414,7 +2472,7 @@ bool ScriptCompiler::makeCommands(const ScriptBuildConfig& config, const fs::pat
         bool needsRenderWrap = editorRenderSpec.present;
         bool needsExitWrap = editorExitSpec.present;
         useWrapper = transpiledModuCpp || beginSpec.present || specSpec.present || testEditorSpec.present ||
-                     updateSpec.present || tickUpdateSpec.present ||
+                     updateSpec.present || tickUpdateSpec.present || fixedUpdateSpec.present ||
                      needsInspectorWrap || needsRenderWrap || needsExitWrap;
 
         fs::path sourceToCompile = compileSourcePath;
@@ -2500,6 +2558,7 @@ bool ScriptCompiler::makeCommands(const ScriptBuildConfig& config, const fs::pat
             emitTickBridge("Script_TestEditor", "TestEditor", testEditorSpec);
             emitTickBridge("Script_Update", "Update", updateSpec);
             emitTickBridge("Script_TickUpdate", "TickUpdate", tickUpdateSpec);
+            emitTickBridge("Script_FixedUpdate", "FixedUpdate", fixedUpdateSpec);
             if (needsInspectorWrap) {
                 emitEditorBridge("Script_OnInspector", "Script_OnInspector_Impl", inspectorSpec);
             }
@@ -2573,7 +2632,7 @@ bool ScriptCompiler::makeCommands(const ScriptBuildConfig& config, const fs::pat
         compileCmd << " -MMD -MF \"" << dependencyPath.string() << "\"";
         compileCmd << " -c \"" << sourceToCompile.string() << "\" -o \"" << objectPath.string() << "\"";
         const fs::path producedBinaryPath = outCommands.linkBinaryPath.empty() ? binaryPath : outCommands.linkBinaryPath;
-        linkCmd << posixScriptLinkDriver(config) << " -shared \"" << objectPath.string() << "\" -o \"" << producedBinaryPath.string() << "\"";
+        linkCmd << posixScriptLinkDriver(config) << posixScriptModuleLinkFlags(config) << " \"" << objectPath.string() << "\" -o \"" << producedBinaryPath.string() << "\"";
         for (const auto& lib : config.linuxLinkLibs) {
             linkCmd << " " << formatLinkFlag(lib);
         }

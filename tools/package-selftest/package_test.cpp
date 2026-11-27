@@ -94,7 +94,7 @@ static void TestLiveRegistryDiscovery(const fsys::path& registryRoot) {
         { "moduengine.sprite-editor",   "1.2.0"    },
         { "moduengine.spritesheet",     "1.1.0"    },
         { "moduengine.mesh-builder",    "1.1.0"    },
-        { "moduengine.scripting-window","1.1.0"    },
+        { "moduengine.scripting-window","1.2.0"    },
         { "moduengine.vulkan-pipeline", "1.1.0"    },
         { "moduengine.networking",      "1.0.0"    },
         { "photon.realtime-sdk",        "5.0.14.3" },

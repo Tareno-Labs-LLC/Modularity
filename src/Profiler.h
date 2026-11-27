@@ -31,11 +31,20 @@ struct ProfilerSampleRecord {
     int64_t memoryDeltaBytes = 0;
     uint64_t memoryTotalBytes = 0;
     bool synthetic = false;
+    // Heap allocations made on this thread inside the scope (MODULARITY_PROFILE_ALLOCS builds).
+    uint64_t allocCount = 0;
 };
 
 struct ProfilerFrameRecord {
     uint64_t frameId = 0;
     double cpuMs = 0.0;
+    // Main-thread CPU time actually burned this frame (CLOCK_THREAD_CPUTIME_ID). Unlike cpuMs,
+    // which is wall time, this excludes time blocked in swap/vsync/sleep, so on a GPU-bound or
+    // paced frame the gap between the two is the wait. 0 where the platform has no cheap clock.
+    double threadCpuMs = 0.0;
+    // Wall time spent inside the known wait scopes (Swap Buffers / Frame Pacing / Idle Throttle).
+    double waitMs = 0.0;
+    uint64_t allocCount = 0;
     double gpuMs = 0.0;
     double gcMs = 0.0;
     double renderMs = 0.0;
@@ -114,12 +123,18 @@ public:
     const ProfilerFrameRecord* getFrameById(uint64_t frameId) const;
     uint64_t getLatestFrameId() const;
 
+    // Heap allocations made by the calling thread so far. Always 0 unless the build defines
+    // MODULARITY_PROFILE_ALLOCS=1 (CMake -DMODULARITY_PROFILE_ALLOCS=ON), which replaces the
+    // global operator new with a counting one.
+    static uint64_t threadAllocationCount();
+
 private:
     Profiler() = default;
 
     struct ActiveSample {
         int sampleIndex = -1;
         std::chrono::steady_clock::time_point startTime{};
+        uint64_t startAllocCount = 0;
     };
 
     struct PendingGpuQuery {
@@ -134,6 +149,7 @@ private:
     void releaseGpuQuery(GLuint query);
     ProfilerFrameRecord* findFrameMutable(uint64_t frameId);
     void attachGpuTimeToFrame(uint64_t frameId, double gpuMs, bool partial);
+    void noteGpuTimeForDump(double gpuMs);
 
     bool recording = true;
     bool frameActive = false;
@@ -143,6 +159,8 @@ private:
     size_t historyWriteIndex = 0;
     size_t historyCount = 0;
     uint64_t latestFrameId = 0;
+    double frameStartThreadCpuMs = 0.0;
+    uint64_t frameStartAllocCount = 0;
 
     std::vector<GLuint> gpuQueryPool;
     std::deque<PendingGpuQuery> pendingGpuQueries;

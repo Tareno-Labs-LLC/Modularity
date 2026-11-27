@@ -772,6 +772,7 @@ namespace {
         static const std::unordered_set<std::string> kNames = {
             "Begin",
             "TickUpdate",
+            "FixedUpdate",
             "Update",
             "Spec",
             "TestEditor",
@@ -1915,6 +1916,8 @@ namespace {
             {"ModuInput", "ModuInputScriptApi.h"},
             {"ModuInput.XR", "ModuInputXRScriptApi.h"},
             {"ModuNetwork", "ModuNetworkScriptApi.h"},
+            {"ModuHttp", "ModuHttpScriptApi.h"},
+            {"Parlex", "ParlexScriptApi.h"},
             {"RMeshBuilder", "RMeshBuilderScriptApi.h"},
             {"ModuCPP.Experimental", "ModuCPPExperimentalScriptApi.h"},
         };
@@ -2278,6 +2281,8 @@ namespace {
             "ModuInput",
             "ModuInput.XR",
             "ModuNetwork",
+            "ModuHttp",
+            "Parlex",
             "RMeshBuilder",
             "ModuCPP.Experimental",
         };
@@ -2737,7 +2742,7 @@ namespace {
         return out;
     }
 
-    std::string rewriteSurfaceSyntax(const std::string& sourceText) {
+    std::string rewriteSurfaceSyntax(const std::string& sourceText, bool httpFacades = false) {
         std::string out = rewriteThenSyntax(sourceText);
 
         replaceRegexAll(out, std::regex(R"(\bMath\s*\.)"), "Math::");
@@ -2764,6 +2769,16 @@ namespace {
         // because \bNet:: requires "Net" immediately followed by "::".
         replaceRegexAll(out, std::regex(R"(\bNet::([A-Za-z_][A-Za-z0-9_]*)\b)"),
                         "::ModuCPP::Net.$1");
+        // Same for the ModuHttp / Parlex facade objects, only in scripts that import
+        // them so a project's own `Http` or `Parlex` namespace keeps working. Json,
+        // ParlexResult and ParlexFriendState are real types and keep `::`.
+        if (httpFacades) {
+            replaceRegexAll(out, std::regex(R"(\b(Http|SharedValues)::([A-Za-z_][A-Za-z0-9_]*)\b)"),
+                            "::ModuCPP::$1.$2");
+            replaceRegexAll(out,
+                            std::regex(R"(\b(Parlex|ParlexBan|ParlexServerGate|ParlexFriends|ParlexSavedMutes|ParlexIntegrity|ParlexErrorReporter|ParlexServerAgent|ParlexNotify|ParlexModerator|ParlexAnnouncements)::([A-Za-z_][A-Za-z0-9_]*)\b)"),
+                            "::ModuCPP::$1.$2");
+        }
         // Fully qualify 'time.' to avoid ambiguity with the C standard library ::time() function
         // when 'using namespace ::ModuCPP' is in scope.
         replaceRegexAll(out, std::regex(R"(\btime\s*\.)"), "::ModuCPP::time.");
@@ -3322,12 +3337,19 @@ namespace {
         std::unordered_map<std::string, std::string> rewrittenSyntaxCache;
         std::unordered_map<std::string, std::string> mappedTypeCache;
 
+        // `add ModuHttp;` / `add Parlex;` turn on their facade-object rewrites.
+        bool httpFacades = false;
+        for (const std::string& directive : spec.includeDirectives) {
+            if (directive.find("ModuHttp") != std::string::npos || directive.find("Parlex") != std::string::npos) {
+                httpFacades = true;
+            }
+        }
         auto cachedRewriteSurfaceSyntax = [&](const std::string& text) -> const std::string& {
             const auto it = rewrittenSyntaxCache.find(text);
             if (it != rewrittenSyntaxCache.end()) {
                 return it->second;
             }
-            return rewrittenSyntaxCache.emplace(text, rewriteSurfaceSyntax(text)).first->second;
+            return rewrittenSyntaxCache.emplace(text, rewriteSurfaceSyntax(text, httpFacades)).first->second;
         };
 
         auto cachedMapScriptTypeToCpp = [&](const std::string& typeName) -> const std::string& {

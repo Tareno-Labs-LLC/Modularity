@@ -46,6 +46,16 @@ public:
     bool getContactNormal(int objectId, glm::vec3& outNormal) const override;
     void noteContactNormal(int objectAId, int objectBId, const glm::vec3& lowToHighNormal);
     bool setObjectsCollisionIgnored(int objectAId, int objectBId, bool ignored) override;
+    bool addForceAtPosition(int id, const glm::vec3& force, const glm::vec3& worldPoint) override;
+    bool addImpulseAtPosition(int id, const glm::vec3& impulse, const glm::vec3& worldPoint) override;
+    bool getPointVelocity(int id, const glm::vec3& worldPoint, glm::vec3& outVelocity) const override;
+    bool getCenterOfMassPosition(int id, glm::vec3& outWorldCenterOfMass) const override;
+    bool getActorPoseQuat(int id, glm::vec3& outPosition, glm::quat& outRotation) const override;
+    bool getMass(int id, float& outMassKg) const override;
+    bool raycastClosestFiltered(const glm::vec3& origin, const glm::vec3& dir, float distance,
+                                int ignoreId, bool skipSensors,
+                                glm::vec3* hitPos, glm::vec3* hitNormal, float* hitDistance,
+                                int* hitActorId, float* hitFriction) const override;
 private:
     friend class JoltContactEvents;
     // A per-body authoring/cache state stuff
@@ -73,6 +83,10 @@ private:
     };
     struct JoltFilters;
     BodyRecord createBodyFor(const SceneObject& obj);
+    // Static capsule trunks for an Instancer component's colliderMode == Capsule prototypes.
+    void createInstancerBodies(const SceneObject& obj);
+    // Static heightfield for a Terrain component (collision enabled, data loaded).
+    void createTerrainBody(const SceneObject& obj);
     void clearBodies();
     void applySceneGravity();
     bool mReady = false;
@@ -85,6 +99,7 @@ private:
     std::unique_ptr<JoltContactEvents> mContactEvents;
 
     std::unordered_map<int, BodyRecord> mBodies;
+    std::vector<JPH::BodyID> mInstancerBodies;   // static instance colliders, no per-object record
     std::unordered_map<uint32_t, int> mIdsByBody;
     mutable std::mutex mCollisionEventMutex;
     std::vector<PhysicsCollisionEvent> mPendingCollisionEvents;

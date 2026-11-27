@@ -1,0 +1,16 @@
+add ModuCPP;
+add Parlex;
+#include "ParlexEditorWindow.h"
+
+// ParlexEditorWindow - the Parlex console inside the editor (Scripting > editor windows).
+// Port of Parlex for Unity's Window > CSVRStudios > Parlex: overview, players (ban /
+// unban), servers, errors, title data, and moderator tools. See ParlexEditorWindow.h.
+public class ParlexEditorWindow : ModuBehaviour
+{
+    void RenderEditorWindow()
+    {
+        ParlexEditor::Draw();
+    }
+
+    void ExitRenderEditorWindow() {}
+}

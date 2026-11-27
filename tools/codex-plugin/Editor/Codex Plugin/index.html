@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Codex Plugin · Modularity</title>
+<style>
+:root {
+  color-scheme: dark;
+  font: 14px/1.55 system-ui, sans-serif;
+  color: #e4e2ea;
+  background: #1c1c23;
+  --panel: #25252f;
+  --border: #3a3947;
+  --muted: #a5a1b0;
+  --accent: #c7b2f0;
+}
+* { box-sizing: border-box; }
+body { margin: 0; }
+[hidden] { display: none !important; }
+main { height: 100dvh; min-height: 0; display: flex; flex-direction: column; }
+header {
+  min-height: 50px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+}
+header strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-mark {
+  display: inline-grid; place-items: center; width: 27px; height: 27px;
+  border: 1px solid #514765; border-radius: 8px; color: var(--accent);
+  font: 700 15px ui-monospace, monospace; flex: none;
+}
+.toolbar { display: flex; gap: 3px; align-items: center; margin-left: auto; flex: none; }
+button, a.action {
+  font: inherit; cursor: pointer; border: 1px solid var(--border); border-radius: 8px;
+  color: inherit; background: var(--panel); padding: 6px 10px; text-decoration: none;
+}
+button:disabled { opacity: .44; cursor: default; }
+button:hover:not(:disabled), a.action:hover { background: #343141; }
+.icon-button { display: inline-grid; place-items: center; width: 32px; height: 32px; padding: 0; background: transparent; border-color: transparent; }
+.icon { display: inline-block; width: 15px; height: 15px; position: relative; color: currentColor; }
+.icon-new { border: 1.4px solid; border-radius: 4px; width: 13px; height: 13px; }
+.icon-new::before, .icon-new::after { content: ""; position: absolute; background: currentColor; inset: 5px 2px auto; height: 1px; }
+.icon-new::after { transform: rotate(90deg); }
+.icon-account::before { content: ""; position: absolute; width: 5px; height: 5px; border-radius: 50%; border: 1.4px solid; left: 5px; top: 0; }
+.icon-account::after { content: ""; position: absolute; left: 2px; right: 2px; bottom: 0; height: 6px; border: 1.4px solid; border-radius: 6px 6px 2px 2px; }
+.icon-send::before { content: ""; position: absolute; width: 6px; height: 6px; border-top: 1.6px solid; border-left: 1.6px solid; top: 2px; left: 4px; transform: rotate(45deg); }
+.icon-send::after { content: ""; position: absolute; width: 1.6px; height: 10px; top: 3px; left: 7px; background: currentColor; }
+.icon-stop::before { content: ""; position: absolute; inset: 4px; border-radius: 1px; background: currentColor; }
+.icon-local { width: 13px; height: 9px; border: 1px solid; border-radius: 2px; margin-right: 5px; }
+.icon-local::after { content: ""; position: absolute; bottom: -3px; inset-inline: -2px; border-bottom: 1px solid; }
+.account { position: relative; }
+.account summary { list-style: none; cursor: pointer; color: var(--muted); }
+.account summary::-webkit-details-marker { display: none; }
+.account[open] summary { color: var(--accent); background: #343141; }
+.account-card {
+  position: absolute; z-index: 3; right: 0; top: calc(100% + 7px);
+  width: min(285px, calc(100vw - 28px)); padding: 13px; overflow-wrap: anywhere;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+  box-shadow: 0 8px 26px #0006;
+}
+.account-card h2 { margin: 0; font-size: 13px; }
+.account-card section { border-top: 1px solid var(--border); padding-top: 10px; margin-top: 10px; }
+.account-card button, .account-card a { display: inline-block; margin-top: 7px; }
+.muted, small { color: var(--muted); }
+#conversation { flex: 1; overflow: auto; min-height: 0; padding: 20px 16px 6px; }
+.flow, .composer-area { width: min(100%, 760px); margin-inline: auto; }
+#welcome { min-height: 34vh; display: grid; align-content: end; padding: 22px 10px; }
+#welcome h1 { font-size: clamp(23px, 4vw, 34px); line-height: 1.2; font-weight: 620; margin: 0; letter-spacing: -.035em; }
+#welcome p { margin: 7px 0 0; }
+.message { margin: 0 0 21px; }
+.message strong { display: block; font-size: 12px; color: var(--accent); margin-bottom: 4px; font-weight: 620; }
+.message pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
+.message.you { width: fit-content; max-width: min(90%, 540px); margin-left: auto; border: 1px solid #3f374e; background: #2b2935; padding: 9px 13px; border-radius: 14px 14px 3px 14px; }
+.message.you strong { color: var(--muted); }
+.activity { margin: 8px 0 0; color: var(--muted); font-size: 12px; }
+.activity summary { cursor: pointer; }
+.activity div { padding: 3px 9px; border-left: 1px solid var(--border); }
+footer { padding: 0 12px 12px; }
+.context { display: flex; gap: 10px; align-items: center; padding: 4px 4px 8px; flex-wrap: wrap; }
+.context small { display: inline-flex; align-items: baseline; }
+#permissions { margin-left: auto; color: var(--accent); }
+form { display: grid; grid-template-columns: 1fr auto; gap: 5px; border: 1px solid var(--border); border-radius: 15px; padding: 8px; background: var(--panel); }
+form:focus-within { border-color: #74658d; }
+textarea {
+  grid-column: 1/-1; resize: vertical; min-height: 53px; max-height: 28vh;
+  background: transparent; color: inherit; font: inherit; border: 0; padding: 4px 5px;
+}
+textarea::placeholder { color: var(--muted); }
+textarea:focus-visible { outline: none; }
+form small { align-self: center; padding-left: 5px; }
+.send { border: 0; border-radius: 50%; background: var(--accent); color: #251d35; }
+.send:hover:not(:disabled) { background: #dfcdf7; }
+#error { color: #ffb9be; margin: 0 4px 5px; overflow-wrap: anywhere; }
+#error:empty { display: none; }
+#usage div { margin-top: 6px; }
+meter { width: 100%; height: 12px; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+@media (min-width: 820px) { #conversation { padding-inline: 26px; } footer { padding-inline: 24px; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <span class="workspace-mark" title="Modularity Codex Plugin" aria-hidden="true">›_</span>
+    <strong id="project">Modularity project</strong>
+    <div class="toolbar">
+      <details class="account" id="accountMenu">
+        <summary class="icon-button" title="Account and usage" aria-label="Account and usage"><span class="icon icon-account" aria-hidden="true"></span></summary>
+        <div class="account-card">
+          <h2>Account</h2>
+          <div id="account" class="muted">Checking account…</div>
+          <button id="login" type="button" hidden>Sign in with ChatGPT</button>
+          <a id="loginLink" class="action" target="_blank" rel="noopener noreferrer" hidden>Open ChatGPT sign-in</a>
+          <section><h2>Subscription usage</h2><div id="usage" class="muted">Sign in to see available limits.</div></section>
+        </div>
+      </details>
+      <button id="new" class="icon-button" type="button" aria-label="New conversation" title="New conversation"><span class="icon icon-new" aria-hidden="true"></span></button>
+    </div>
+  </header>
+  <section id="conversation" aria-label="Conversation">
+    <div class="flow" id="messages">
+      <div id="welcome"><h1>Work on your project</h1><p class="muted">Ask Codex about scripts, scenes, assets, or build errors.</p></div>
+    </div>
+  </section>
+  <footer>
+    <div class="composer-area">
+      <div id="error" role="status"></div>
+      <div class="context"><small><span class="icon icon-local" aria-hidden="true"></span>Local workspace</small><small id="permissions"></small></div>
+      <form id="composer">
+        <textarea id="prompt" aria-label="Prompt" placeholder="Message Codex" required></textarea>
+        <small id="turnUsage">Saved project files</small>
+        <div>
+          <button type="button" id="stop" class="icon-button" aria-label="Stop turn" title="Stop turn" hidden><span class="icon icon-stop" aria-hidden="true"></span></button>
+          <button type="submit" id="send" class="icon-button send" aria-label="Send prompt" title="Send prompt" disabled><span class="icon icon-send" aria-hidden="true"></span></button>
+        </div>
+      </form>
+    </div>
+  </footer>
+</main>
+<script>
+const el = id => document.getElementById(id);
+const token = location.hash.slice(1);
+const headers = {"X-Modularity-Session": token, "Content-Type":"application/json"};
+let active = false, signedIn = false, checking = false, accountChecked = false;
+function status() {
+  el("send").disabled = active || !signedIn;
+  el("new").disabled = active;
+  el("stop").hidden = !active;
+}
+async function api(path, options = {}) {
+  const response = await fetch(path, {...options, headers});
+  if (!response.ok) throw Error((await response.json()).error);
+  return response;
+}
+function error(message) { el("error").textContent = message; }
+async function refresh() {
+  if (!token || checking) return;
+  checking = true;
+  try {
+    const info = await (await api("/account")).json();
+    signedIn = info.signedIn;
+    if (!accountChecked && !signedIn) el("accountMenu").open = true;
+    accountChecked = true;
+    el("account").textContent = signedIn ? "ChatGPT" + (info.plan ? " · " + info.plan : "") : "Signed out";
+    el("login").hidden = signedIn || !el("loginLink").hidden;
+    if (signedIn) el("loginLink").hidden = true;
+    el("project").textContent = info.project;
+    el("permissions").textContent = (info.edits ? "Project edits" : "Read only") + (info.network ? " · Live network" : "");
+    status();
+    const usage = el("usage");
+    if (!signedIn) {
+      usage.textContent = "Sign in to see available limits.";
+      return;
+    }
+    if (!usage.dataset.loaded) usage.textContent = "Checking subscription limits…";
+    try {
+      const limits = Object.values(await (await api("/limits")).json());
+      usage.dataset.loaded = "true";
+      usage.replaceChildren();
+      for (const window of limits) {
+        const row = document.createElement("div");
+        const used = Number(window.usedPercent || 0);
+        const duration = Number(window.windowDurationMins || 0);
+        const label = duration ? (duration >= 60 ? (duration / 60) + "h" : duration + "m") + " window" : "Usage window";
+        row.append(label + " · " + Math.round(used) + "% used");
+        const meter = document.createElement("meter");
+        meter.min = 0;
+        meter.max = 100;
+        meter.value = used;
+        meter.setAttribute("aria-label", label);
+        row.append(meter);
+        if (window.resetsAt) {
+          const reset = document.createElement("small");
+          reset.textContent = "Resets " + new Date(window.resetsAt * 1000).toLocaleString();
+          row.append(reset);
+        }
+        usage.append(row);
+      }
+      if (!limits.length) usage.textContent = "No limit windows reported.";
+    } catch {
+      usage.textContent = "Limits are currently unavailable.";
+    }
+  } catch (failure) { error(failure.message); }
+  finally { checking = false; }
+}
+el("login").onclick = async () => {
+  try {
+    const {url} = await (await api("/login", {method:"POST"})).json();
+    const link = new URL(url);
+    if (link.protocol !== "https:" || !["auth.openai.com", "chatgpt.com"].includes(link.hostname)) throw Error("Unexpected sign-in address.");
+    el("loginLink").href = link.href;
+    el("loginLink").hidden = false;
+    el("login").hidden = true;
+  } catch (failure) { error(failure.message); }
+};
+el("new").onclick = async () => {
+  try {
+    await api("/new", {method:"POST"});
+    el("messages").replaceChildren(el("welcome"));
+    el("welcome").hidden = false;
+    el("turnUsage").textContent = "Saved project files";
+    error("");
+  } catch (failure) { error(failure.message); }
+};
+el("stop").onclick = async () => {
+  try { await api("/stop", {method:"POST"}); }
+  catch (failure) { error(failure.message); }
+};
+function message(author, text) {
+  const item = document.createElement("article");
+  item.className = "message" + (author === "You" ? " you" : "");
+  const name = document.createElement("strong");
+  name.textContent = author;
+  const body = document.createElement("pre");
+  body.textContent = text;
+  item.append(name, body);
+  el("messages").append(item);
+  return {item, body};
+}
+const tools = {commandExecution:"›_ Command",fileChange:"✎ File change",mcpToolCall:"◇ MCP tool",dynamicToolCall:"◇ Tool",webSearch:"⌕ Web search"};
+el("composer").onsubmit = async event => {
+  event.preventDefault();
+  const prompt = el("prompt").value.trim();
+  if (active || !signedIn || !prompt) return;
+  error("");
+  active = true;
+  status();
+  el("welcome").hidden = true;
+  message("You", prompt);
+  el("prompt").value = "";
+  const {item, body} = message("Codex", "");
+  const activity = document.createElement("details");
+  activity.className = "activity";
+  activity.hidden = true;
+  const activityLabel = document.createElement("summary");
+  activityLabel.textContent = "Tool activity";
+  activity.append(activityLabel);
+  item.append(activity);
+  const rows = new Map();
+  try {
+    const response = await api("/run", {method:"POST",body:JSON.stringify({prompt})});
+    const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+    let buffer = "";
+    function event(line) {
+      const {kind,value} = JSON.parse(line);
+      if (kind === "text") body.append(document.createTextNode(value));
+      if (kind === "tool") {
+        activity.hidden = false;
+        if (!rows.has(value.id)) {
+          const row = document.createElement("div");
+          rows.set(value.id, row);
+          activity.append(row);
+        }
+        rows.get(value.id).textContent = tools[value.kind] + (value.name ? " · " + value.name : "") + " · " + value.status;
+      }
+      if (kind === "error") error(value);
+      if (kind === "usage" && Number.isFinite(value.totalTokens)) el("turnUsage").textContent = value.totalTokens.toLocaleString() + " tokens in latest update";
+      if (kind === "done" && value === "interrupted") el("turnUsage").textContent = "Turn stopped";
+    }
+    while (true) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buffer += value;
+      let newline;
+      while ((newline = buffer.indexOf("\n")) >= 0) {
+        event(buffer.slice(0, newline));
+        buffer = buffer.slice(newline + 1);
+      }
+      const conversation = el("conversation");
+      conversation.scrollTop = conversation.scrollHeight;
+    }
+  } catch (failure) { error(failure.message); }
+  finally { active = false; status(); refresh(); }
+};
+if (!token) error("Open the session URL printed by the plugin.");
+refresh();
+setInterval(refresh, 30000);
+</script>
+</body>
+</html>

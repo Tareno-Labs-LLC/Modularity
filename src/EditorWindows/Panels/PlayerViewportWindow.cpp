@@ -1327,6 +1327,10 @@ void Engine::renderPlayerViewport() {
                 projectManager.currentProject.hasUnsavedChanges = true;
               }
             }
+          } else {
+            // Read-only slider (e.g. a HUD gauge): still submit an item after the SetCursorPos
+            // above, or ImGui reports "SetCursorPos() to extend window boundaries" every frame.
+            ImGui::Dummy(drawSize);
           }
           float t = (obj.ui.sliderValue - minValue) / range;
           t = std::clamp(t, 0.0f, 1.0f);

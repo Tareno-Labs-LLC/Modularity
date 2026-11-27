@@ -1770,10 +1770,17 @@ void AudioSystem::updateSourceFX(const SceneObject& obj, ActiveSound& snd) {
     const bool localFX = obj.hasAudioFX && obj.audioFX.enabled && !obj.audioFX.global;
     const AudioFXChain& chain = localFX ? obj.audioFX.chain : kEmptyChain;
     const bool chainActive = chain.active();
-    if (!chainActive && snd.fxSignature.empty() && !snd.fxNodeReady) return;
+    // Source pitch (AudioSourceComponent::pitch) multiplies with the AudioFX pitch effect.
+    const float sourcePitch = std::isfinite(obj.audioSource.pitch)
+        ? std::clamp(obj.audioSource.pitch, 0.05f, 4.0f)
+        : 1.0f;
+    if (!chainActive && snd.fxSignature.empty() && !snd.fxNodeReady) {
+        ma_sound_set_pitch(&snd.sound, sourcePitch);
+        return;
+    }
 
     float semis = chainActive ? chain.pitchSemitones() : 0.0f;
-    ma_sound_set_pitch(&snd.sound, std::pow(2.0f, std::clamp(semis, -24.0f, 24.0f) / 12.0f));
+    ma_sound_set_pitch(&snd.sound, sourcePitch * std::pow(2.0f, std::clamp(semis, -24.0f, 24.0f) / 12.0f));
 
     const std::string signature = chainActive ? AudioFXSerialize(chain) : std::string();
     if (signature == snd.fxSignature) return;

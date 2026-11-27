@@ -2,10 +2,72 @@
 
 #include <array>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <new>
 #include <unordered_map>
+#if !defined(_WIN32)
+#include <ctime>
+#endif
+
+#ifndef MODULARITY_PROFILE_ALLOCS
+#define MODULARITY_PROFILE_ALLOCS 0
+#endif
+
+#if MODULARITY_PROFILE_ALLOCS
+// Counting replacement for the global allocator, compiled only into profiling builds. The counter
+// is thread-local so the per-frame figure is the main thread's own allocations and the hot path
+// stays a single non-atomic increment.
+namespace { thread_local uint64_t tlsModuAllocCount = 0; }
+void* operator new(std::size_t size) {
+    ++tlsModuAllocCount;
+    if (void* p = std::malloc(size ? size : 1)) return p;
+    throw std::bad_alloc();
+}
+void* operator new[](std::size_t size) {
+    ++tlsModuAllocCount;
+    if (void* p = std::malloc(size ? size : 1)) return p;
+    throw std::bad_alloc();
+}
+void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
+    ++tlsModuAllocCount;
+    return std::malloc(size ? size : 1);
+}
+void* operator new[](std::size_t size, const std::nothrow_t&) noexcept {
+    ++tlsModuAllocCount;
+    return std::malloc(size ? size : 1);
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+void operator delete(void* p, const std::nothrow_t&) noexcept { std::free(p); }
+void operator delete[](void* p, const std::nothrow_t&) noexcept { std::free(p); }
+#endif
 
 namespace {
 using ProfilerClock = std::chrono::steady_clock;
+
+double threadCpuNowMs() {
+#if !defined(_WIN32) && defined(CLOCK_THREAD_CPUTIME_ID)
+    timespec ts{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0) {
+        return double(ts.tv_sec) * 1000.0 + double(ts.tv_nsec) * 1e-6;
+    }
+#endif
+    return 0.0;
+}
+
+bool isWaitSampleName(const std::string& name) {
+    return name == "Swap Buffers" || name == "Frame Pacing" || name == "Idle Throttle";
+}
+
+double percentileOfSorted(const std::vector<double>& sorted, double fraction) {
+    if (sorted.empty()) return 0.0;
+    const size_t index = std::min(sorted.size() - 1,
+        static_cast<size_t>(fraction * static_cast<double>(sorted.size() - 1) + 0.5));
+    return sorted[index];
+}
 
 struct ProfileDumpState {
     bool enabled = false;
@@ -15,9 +77,21 @@ struct ProfileDumpState {
     int frameCount = 0;
     double frameMsSum = 0.0;
     std::unordered_map<std::string, std::pair<double, uint64_t>> sampleTotals;
+    std::unordered_map<std::string, uint64_t> sampleAllocTotals;
     double worstFrameMs = 0.0;
     std::vector<std::pair<std::string, double>> worstFrameSamples;
     std::vector<double> frameMsSamples;
+    // Per-frame wall time minus the wait scopes: what the engine itself cost.
+    std::vector<double> workMsSamples;
+    double threadCpuMsSum = 0.0;
+    double waitMsSum = 0.0;
+    double gpuMsSum = 0.0;
+    uint64_t gpuMsCount = 0;
+    uint64_t drawCallSum = 0;
+    uint64_t textureBindSum = 0;
+    uint64_t stateBindSum = 0;
+    uint64_t allocSum = 0;
+    size_t topCount = 12;
 };
 
 ProfileDumpState& profileDumpState() {
@@ -29,6 +103,10 @@ ProfileDumpState& profileDumpState() {
             if (parsed > 0.0) {
                 s.intervalSec = std::max(0.5, parsed);
             }
+        }
+        if (const char* env = std::getenv("MODULARITY_PROFILE_DUMP_TOP")) {
+            const int parsed = std::atoi(env);
+            if (parsed > 0) s.topCount = static_cast<size_t>(parsed);
         }
         return s;
     }();
@@ -50,11 +128,21 @@ void accumulateProfileDump(const ProfilerFrameRecord& frame) {
     state.frameCount += 1;
     state.frameMsSum += frame.cpuMs;
     state.frameMsSamples.push_back(frame.cpuMs);
+    state.workMsSamples.push_back(std::max(0.0, frame.cpuMs - frame.waitMs));
+    state.threadCpuMsSum += frame.threadCpuMs;
+    state.waitMsSum += frame.waitMs;
+    state.drawCallSum += frame.drawCalls;
+    state.textureBindSum += frame.textureBinds;
+    state.stateBindSum += frame.stateBinds;
+    state.allocSum += frame.allocCount;
     for (const ProfilerSampleRecord& sample : frame.samples) {
         if (sample.parentIndex < 0) continue;
         auto& total = state.sampleTotals[sample.name];
         total.first += sample.cpuMs;
         total.second += sample.callCount;
+        if (sample.allocCount > 0) {
+            state.sampleAllocTotals[sample.name] += sample.allocCount;
+        }
     }
     if (frame.cpuMs > state.worstFrameMs) {
         state.worstFrameMs = frame.cpuMs;
@@ -87,6 +175,35 @@ void accumulateProfileDump(const ProfilerFrameRecord& frame) {
                  state.frameCount, avgFrameMs, fps,
                  onePercentLowMs, onePercentLowMs > 0.0 ? 1000.0 / onePercentLowMs : 0.0,
                  state.worstFrameMs);
+    {
+        // One machine-readable line per window. "work" is wall time outside the wait scopes,
+        // "cpu" is main-thread CPU time; a frame whose work is far above its cpu was blocked
+        // somewhere the wait scopes do not cover (driver, page faults, a contended lock).
+        std::sort(state.workMsSamples.begin(), state.workMsSamples.end());
+        const double frames = static_cast<double>(state.frameCount);
+        double workSum = 0.0;
+        for (double v : state.workMsSamples) workSum += v;
+        std::fprintf(stdout,
+                     "[ProfileStats] frames=%d frame_avg=%.3f frame_p50=%.3f frame_p95=%.3f frame_p99=%.3f "
+                     "work_avg=%.3f work_p50=%.3f work_p95=%.3f work_p99=%.3f cpu_avg=%.3f wait_avg=%.3f "
+                     "gpu_avg=%.3f gpu_samples=%llu draws=%.1f texbinds=%.1f statebinds=%.1f allocs=%.1f\n",
+                     state.frameCount, avgFrameMs,
+                     percentileOfSorted(state.frameMsSamples, 0.50),
+                     percentileOfSorted(state.frameMsSamples, 0.95),
+                     percentileOfSorted(state.frameMsSamples, 0.99),
+                     workSum / frames,
+                     percentileOfSorted(state.workMsSamples, 0.50),
+                     percentileOfSorted(state.workMsSamples, 0.95),
+                     percentileOfSorted(state.workMsSamples, 0.99),
+                     state.threadCpuMsSum / frames,
+                     state.waitMsSum / frames,
+                     state.gpuMsCount > 0 ? state.gpuMsSum / static_cast<double>(state.gpuMsCount) : 0.0,
+                     static_cast<unsigned long long>(state.gpuMsCount),
+                     static_cast<double>(state.drawCallSum) / frames,
+                     static_cast<double>(state.textureBindSum) / frames,
+                     static_cast<double>(state.stateBindSum) / frames,
+                     static_cast<double>(state.allocSum) / frames);
+    }
     for (const auto& sample : state.worstFrameSamples) {
         std::fprintf(stdout, "[ProfileDump]   worst> %-26s %8.3fms\n",
                      sample.first.c_str(), sample.second);
@@ -97,8 +214,17 @@ void accumulateProfileDump(const ProfilerFrameRecord& frame) {
     std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
         return a.second.first > b.second.first;
     });
-    const size_t topCount = std::min<size_t>(sorted.size(), 12);
+    const size_t topCount = std::min<size_t>(sorted.size(), state.topCount);
     for (size_t i = 0; i < topCount; ++i) {
+        const auto allocIt = state.sampleAllocTotals.find(sorted[i].first);
+        if (allocIt != state.sampleAllocTotals.end()) {
+            std::fprintf(stdout, "[ProfileDump]   %-32s %8.3fms/frame  (%.1f calls/frame, %.1f allocs/frame)\n",
+                         sorted[i].first.c_str(),
+                         sorted[i].second.first / state.frameCount,
+                         static_cast<double>(sorted[i].second.second) / state.frameCount,
+                         static_cast<double>(allocIt->second) / state.frameCount);
+            continue;
+        }
         std::fprintf(stdout, "[ProfileDump]   %-32s %8.3fms/frame  (%.1f calls/frame)\n",
                      sorted[i].first.c_str(),
                      sorted[i].second.first / state.frameCount,
@@ -109,11 +235,29 @@ void accumulateProfileDump(const ProfilerFrameRecord& frame) {
     state.frameCount = 0;
     state.frameMsSum = 0.0;
     state.sampleTotals.clear();
+    state.sampleAllocTotals.clear();
     state.worstFrameMs = 0.0;
     state.worstFrameSamples.clear();
     state.frameMsSamples.clear();
+    state.workMsSamples.clear();
+    state.threadCpuMsSum = 0.0;
+    state.waitMsSum = 0.0;
+    state.gpuMsSum = 0.0;
+    state.gpuMsCount = 0;
+    state.drawCallSum = 0;
+    state.textureBindSum = 0;
+    state.stateBindSum = 0;
+    state.allocSum = 0;
     state.windowStart = now;
 }
+}
+
+uint64_t Profiler::threadAllocationCount() {
+#if MODULARITY_PROFILE_ALLOCS
+    return tlsModuAllocCount;
+#else
+    return 0;
+#endif
 }
 
 Profiler& Profiler::instance() {
@@ -151,6 +295,8 @@ void Profiler::beginFrame(uint64_t frameId) {
     }
 
     currentFrame.frameId = frameId;
+    frameStartThreadCpuMs = threadCpuNowMs();
+    frameStartAllocCount = threadAllocationCount();
     currentFrame.samples.reserve(64);
     currentFrame.samples.push_back({
         "Frame",
@@ -164,7 +310,7 @@ void Profiler::beginFrame(uint64_t frameId) {
         0,
         false
     });
-    sampleStack.push_back({ 0, ProfilerClock::now() });
+    sampleStack.push_back({ 0, ProfilerClock::now(), threadAllocationCount() });
 }
 
 void Profiler::endFrame() {
@@ -187,10 +333,17 @@ void Profiler::endFrame() {
         currentFrame.cpuMs = currentFrame.samples[root.sampleIndex].cpuMs;
     }
 
+    currentFrame.threadCpuMs = std::max(0.0, threadCpuNowMs() - frameStartThreadCpuMs);
+    currentFrame.allocCount = threadAllocationCount() - frameStartAllocCount;
+
     currentFrame.renderMs = 0.0;
+    currentFrame.waitMs = 0.0;
     for (const ProfilerSampleRecord& sample : currentFrame.samples) {
         if (sample.category == ProfilerSampleCategory::Render) {
             currentFrame.renderMs += sample.cpuMs;
+        }
+        if (isWaitSampleName(sample.name)) {
+            currentFrame.waitMs += sample.cpuMs;
         }
     }
 
@@ -238,7 +391,7 @@ bool Profiler::beginSample(std::string_view name, ProfilerSampleCategory categor
         0,
         false
     });
-    sampleStack.push_back({ sampleIndex, ProfilerClock::now() });
+    sampleStack.push_back({ sampleIndex, ProfilerClock::now(), threadAllocationCount() });
     return true;
 }
 
@@ -252,6 +405,8 @@ void Profiler::endSample() {
     sampleStack.pop_back();
     currentFrame.samples[active.sampleIndex].cpuMs =
         std::chrono::duration<double, std::milli>(now - active.startTime).count();
+    currentFrame.samples[active.sampleIndex].allocCount =
+        threadAllocationCount() - active.startAllocCount;
 }
 
 void Profiler::addSyntheticSample(std::string_view name,
@@ -492,7 +647,16 @@ ProfilerFrameRecord* Profiler::findFrameMutable(uint64_t frameId) {
     return nullptr;
 }
 
+void Profiler::noteGpuTimeForDump(double gpuMs) {
+    ProfileDumpState& state = profileDumpState();
+    if (state.enabled) {
+        state.gpuMsSum += gpuMs;
+        state.gpuMsCount += 1;
+    }
+}
+
 void Profiler::attachGpuTimeToFrame(uint64_t frameId, double gpuMs, bool partial) {
+    noteGpuTimeForDump(gpuMs);
     ProfilerFrameRecord* frame = findFrameMutable(frameId);
     if (!frame) {
         return;

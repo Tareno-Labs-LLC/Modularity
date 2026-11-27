@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "PhysicsSystem.h"
 #ifdef MODULARITY_ENABLE_PHYSX
 #include "PxPhysicsAPI.h"
@@ -290,6 +291,19 @@ namespace {
         PxQueryHitType::Enum preFilter(const PxFilterData&, const PxShape* shape, const PxRigidActor* actor, PxHitFlags&) override {
             if (actor == ignore) return PxQueryHitType::eNONE;
             if (shape && shape->getFlags().isSet(PxShapeFlag::eTRIGGER_SHAPE)) return PxQueryHitType::eNONE;
+            return PxQueryHitType::eBLOCK;
+        }
+        PxQueryHitType::Enum postFilter(const PxFilterData&, const PxQueryHit&, const PxShape*, const PxRigidActor*) override {
+            return PxQueryHitType::eBLOCK;
+        }
+    };
+
+    struct IgnoreActorSensorFilter : PxQueryFilterCallback {
+        const PxRigidActor* ignore = nullptr;
+        bool skipSensors = true;
+        PxQueryHitType::Enum preFilter(const PxFilterData&, const PxShape* shape, const PxRigidActor* actor, PxHitFlags&) override {
+            if (ignore && actor == ignore) return PxQueryHitType::eNONE;
+            if (skipSensors && shape && shape->getFlags().isSet(PxShapeFlag::eTRIGGER_SHAPE)) return PxQueryHitType::eNONE;
             return PxQueryHitType::eBLOCK;
         }
         PxQueryHitType::Enum postFilter(const PxFilterData&, const PxQueryHit&, const PxShape*, const PxRigidActor*) override {
@@ -680,8 +694,21 @@ void PhysicsSystem::onPlayStart(const std::vector<SceneObject>& objects) {
     clearActors();
     mActors.reserve(objects.size());
     mActorIdsByPtr.reserve(objects.size());
+    bool warnedJoltOnly = false;
     for (const auto& obj : objects) {
         if (!IsObjectEnabledInHierarchy(obj)) continue;
+        if (!warnedJoltOnly && ((obj.hasTerrain && obj.terrain.collision) || obj.hasInstancer)) {
+            // Instancer trunk capsules and the Terrain heightfield are Jolt bodies (JoltPhysicsBackend).
+            bool wantsCollision = obj.hasTerrain && obj.terrain.collision;
+            for (const InstancerPrototype& proto : obj.instancer.prototypes) {
+                wantsCollision = wantsCollision || (obj.hasInstancer && proto.colliderMode == InstancerColliderMode::Capsule);
+            }
+            if (wantsCollision) {
+                warnedJoltOnly = true;
+                std::fprintf(stderr, "[Physics] '%s': Instancer / Terrain colliders need the Jolt physics backend; "
+                                     "the PhysX backend does not create them.\n", obj.name.c_str());
+            }
+        }
         ActorRecord rec = createActorFor(obj);
         if (!rec.actor) continue;
         mScene->addActor(*rec.actor);
@@ -1096,6 +1123,8 @@ void PhysicsSystem::simulate(float deltaTime, std::vector<SceneObject>& objects)
             }
         }
     }
+    // PhysX steps once per frame with the frame dt, so FixedUpdate runs once with that dt.
+    invokePreStepCallback(deltaTime);
     mScene->simulate(deltaTime);
     mScene->fetchResults(true);
     for (auto& [id, rec] : mActors) {
@@ -1255,6 +1284,111 @@ void PhysicsSystem::drainCollisionEvents(std::vector<PhysicsCollisionEvent>& out
                              PhysicsCollisionPhase::Stay});
     }
     mPendingCollisionEvents.clear();
+}
+
+bool PhysicsSystem::addForceAtPosition(int id, const glm::vec3& force, const glm::vec3& worldPoint) {
+    auto it = mActors.find(id);
+    if (it == mActors.end()) return false;
+    ActorRecord& rec = it->second;
+    if (!rec.actor || !rec.isDynamic || rec.isKinematic) return false;
+    PxRigidDynamic* dyn = rec.actor->is<PxRigidDynamic>();
+    if (!dyn) return false;
+    PxRigidBodyExt::addForceAtPos(*dyn, ToPxVec3(force), ToPxVec3(worldPoint), PxForceMode::eFORCE, true);
+    return true;
+}
+
+bool PhysicsSystem::addImpulseAtPosition(int id, const glm::vec3& impulse, const glm::vec3& worldPoint) {
+    auto it = mActors.find(id);
+    if (it == mActors.end()) return false;
+    ActorRecord& rec = it->second;
+    if (!rec.actor || !rec.isDynamic || rec.isKinematic) return false;
+    PxRigidDynamic* dyn = rec.actor->is<PxRigidDynamic>();
+    if (!dyn) return false;
+    PxRigidBodyExt::addForceAtPos(*dyn, ToPxVec3(impulse), ToPxVec3(worldPoint), PxForceMode::eIMPULSE, true);
+    return true;
+}
+
+bool PhysicsSystem::getPointVelocity(int id, const glm::vec3& worldPoint, glm::vec3& outVelocity) const {
+    auto it = mActors.find(id);
+    if (it == mActors.end()) return false;
+    const ActorRecord& rec = it->second;
+    if (!rec.actor || !rec.isDynamic) return false;
+    const PxRigidDynamic* dyn = rec.actor->is<PxRigidDynamic>();
+    if (!dyn) return false;
+    outVelocity = ToGlmVec3(PxRigidBodyExt::getVelocityAtPos(*dyn, ToPxVec3(worldPoint)));
+    return true;
+}
+
+bool PhysicsSystem::getCenterOfMassPosition(int id, glm::vec3& outWorldCenterOfMass) const {
+    auto it = mActors.find(id);
+    if (it == mActors.end()) return false;
+    const ActorRecord& rec = it->second;
+    if (!rec.actor) return false;
+    const PxTransform pose = rec.actor->getGlobalPose();
+    if (const PxRigidDynamic* dyn = rec.actor->is<PxRigidDynamic>()) {
+        outWorldCenterOfMass = ToGlmVec3(pose.transform(dyn->getCMassLocalPose().p));
+    } else {
+        outWorldCenterOfMass = ToGlmVec3(pose.p);
+    }
+    return true;
+}
+
+bool PhysicsSystem::getActorPoseQuat(int id, glm::vec3& outPosition, glm::quat& outRotation) const {
+    auto it = mActors.find(id);
+    if (it == mActors.end()) return false;
+    const ActorRecord& rec = it->second;
+    if (!rec.actor) return false;
+    const PxTransform pose = rec.actor->getGlobalPose();
+    outPosition = ToGlmVec3(pose.p);
+    outRotation = glm::quat(pose.q.w, pose.q.x, pose.q.y, pose.q.z);
+    return true;
+}
+
+bool PhysicsSystem::getMass(int id, float& outMassKg) const {
+    auto it = mActors.find(id);
+    if (it == mActors.end()) return false;
+    const ActorRecord& rec = it->second;
+    if (!rec.actor || !rec.isDynamic || rec.isKinematic) return false;
+    const PxRigidDynamic* dyn = rec.actor->is<PxRigidDynamic>();
+    if (!dyn) return false;
+    outMassKg = dyn->getMass();
+    return true;
+}
+
+bool PhysicsSystem::raycastClosestFiltered(const glm::vec3& origin, const glm::vec3& dir, float distance,
+                                           int ignoreId, bool skipSensors,
+                                           glm::vec3* hitPos, glm::vec3* hitNormal, float* hitDistance,
+                                           int* hitActorId, float* hitFriction) const {
+    if (hitActorId) *hitActorId = -1;
+    if (hitFriction) *hitFriction = 0.9f;
+    if (!isReady() || distance <= 0.0f || !mScene) return false;
+    PxVec3 unitDir = ToPxVec3(glm::normalize(dir));
+    if (!unitDir.isFinite()) return false;
+    PxRaycastBuffer hit;
+    PxQueryFilterData fd(PxQueryFlag::eSTATIC | PxQueryFlag::eDYNAMIC | PxQueryFlag::ePREFILTER);
+    IgnoreActorSensorFilter cb;
+    cb.skipSensors = skipSensors;
+    if (ignoreId >= 0) {
+        auto it = mActors.find(ignoreId);
+        if (it != mActors.end()) cb.ignore = it->second.actor;
+    }
+    const bool result = mScene->raycast(ToPxVec3(origin), unitDir, distance, hit,
+                                        PxHitFlag::ePOSITION | PxHitFlag::eNORMAL, fd, &cb);
+    if (!result || !hit.hasBlock) return false;
+    if (hitPos) *hitPos = ToGlmVec3(hit.block.position);
+    if (hitNormal) *hitNormal = ToGlmVec3(hit.block.normal);
+    if (hitDistance) *hitDistance = hit.block.distance;
+    if (hitFriction && hit.block.shape) {
+        PxMaterial* materials[1] = {nullptr};
+        if (hit.block.shape->getMaterials(materials, 1) > 0 && materials[0]) {
+            *hitFriction = 0.5f * (materials[0]->getStaticFriction() + materials[0]->getDynamicFriction());
+        }
+    }
+    if (hitActorId && hit.block.actor) {
+        auto idIt = mActorIdsByPtr.find(hit.block.actor);
+        if (idIt != mActorIdsByPtr.end()) *hitActorId = idIt->second;
+    }
+    return true;
 }
 
 void PhysicsSystem::shutdown() {

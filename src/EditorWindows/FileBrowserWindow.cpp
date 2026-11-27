@@ -1,3 +1,6 @@
+#if defined(__APPLE__)
+#include "Platform/MacFileDialogs.h"
+#endif
 #include "Engine.h"
 #include "HardwareProfile.h"
 #include "ModelLoader.h"
@@ -1619,6 +1622,8 @@ namespace {
         #elif defined(__ANDROID__)
         (void)path;
         return false;
+        #elif defined(__APPLE__)
+        return Modularity::OpenMacPath(path);
         #elif __linux__
         std::string cmd = "xdg-open \"" + PathToUtf8(path) + "\"";
         return std::system(cmd.c_str()) == 0;
@@ -1638,6 +1643,8 @@ namespace {
         }
         #elif defined(__ANDROID__)
         (void)path;
+        #elif defined(__APPLE__)
+        Modularity::RevealMacPath(path);
         #elif __linux__
         fs::path folder = fs::is_directory(path) ? path : path.parent_path();
         std::string cmd = "xdg-open \"" + PathToUtf8(folder) + "\"";
@@ -1763,6 +1770,8 @@ namespace {
         #elif defined(__ANDROID__)
         (void)initialDir;
         return std::nullopt;
+        #elif defined(__APPLE__)
+        return Modularity::ChooseMacPath(initialDir, false);
         #elif __linux__
         const fs::path initial = initialDir.empty() ? fs::current_path() : initialDir;
         const std::string initialString = PathToUtf8(initial);
@@ -1814,6 +1823,8 @@ namespace {
         #elif defined(__ANDROID__)
         (void)initialDir;
         return std::nullopt;
+        #elif defined(__APPLE__)
+        return Modularity::ChooseMacPath(initialDir, true);
         #elif __linux__
         const fs::path initial = initialDir.empty() ? fs::current_path() : initialDir;
         const std::string initialString = PathToUtf8(initial);
@@ -1844,6 +1855,8 @@ namespace {
         return true;
         #elif defined(__ANDROID__)
         return Modularity::AndroidRuntime::SupportsFilePicker();
+        #elif defined(__APPLE__)
+        return true;
         #elif __linux__
         return commandExists("zenity") || commandExists("kdialog");
         #else
@@ -1854,11 +1867,21 @@ namespace {
 #pragma endregion
 
 #pragma region File Browser Panel
+namespace ViewportRenderHelpers {
+// Defined in Panels/ViewportRenderHelpers.cpp.
+bool CanSkipHiddenPanelBody(bool beginVisible, double *railState);
+}
+
 // Uses FileBrowser state for navigation, selection, and drag-drop.
 void Engine::renderFileBrowserPanel() {
     const auto __fbStart = std::chrono::steady_clock::now();
     ResetFileBrowserPreviewBudget();
-    ImGui::Begin(Loc::Window("WINDOW_PROJECT", "Project"), &showFileBrowser);
+    const bool fileBrowserVisible =
+        ImGui::Begin(Loc::Window("WINDOW_PROJECT", "Project"), &showFileBrowser);
+    // Hidden tab, or folded into the drawer rail: nothing the body submits can be seen or used.
+    static double fileBrowserRailState[2] = { -1.0, -1.0 };
+    const bool fileBrowserBodyHidden =
+        ViewportRenderHelpers::CanSkipHiddenPanelBody(fileBrowserVisible, fileBrowserRailState);
 
     if (fileBrowser.needsRefresh) {
         const auto __fbRefStart = std::chrono::steady_clock::now();
@@ -1869,7 +1892,12 @@ void Engine::renderFileBrowserPanel() {
             std::fprintf(stderr, "[ModuTimer] fileBrowser.refresh %.1f ms\n", __fbRefMs);
         }
     }
-    fileBrowser.pollExternalChanges(ImGui::GetTime());
+    // While hidden, only collect a scan that is already running; starting a directory scan
+    // thread every 1.25 s for a listing nobody can see is wasted work on a 2-core machine.
+    // The first visible frame polls again.
+    if (!fileBrowserBodyHidden || fileBrowser.externalPollInFlight) {
+        fileBrowser.pollExternalChanges(ImGui::GetTime());
+    }
 
     static bool showDeletePopup = false;
     static bool showRenamePopup = false;
@@ -1908,6 +1936,20 @@ void Engine::renderFileBrowserPanel() {
     static bool androidImportPickerPending = false;
     static fs::path androidImportPickerTargetPath;
 #endif
+    // Everything that must keep running while hidden is above (refresh requests, focus state,
+    // finished polls). OS file drops and the Android picker result are consumed further down,
+    // so the body still runs for those; so does it while the dock layout is being rebuilt,
+    // when the drawer rail is not submitted.
+    if (fileBrowserBodyHidden && pendingExternalFileDrops.empty() &&
+        !pendingWorkspaceReload && !workspaceLayoutDirty &&
+        glfwGetTime() >= workspaceLayoutStabilizeUntil
+#ifdef __ANDROID__
+        && !androidImportPickerPending
+#endif
+        ) {
+        ImGui::End();
+        return;
+    }
     bool settingsDirty = false;
 
     auto openEntry = [&](const fs::directory_entry& entry) {

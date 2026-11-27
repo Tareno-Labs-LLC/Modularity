@@ -443,7 +443,7 @@ const std::vector<ComponentSchema>& GetComponentSchemas() {
                 "materialCloudSoftness", "materialCloudDetail", "materialCloudSpeed", "materialCloudWarp",
                 "materialCloudHighlight", "materialCloudStars", "materialCloudHorizon",
                 "materialPbrEnabled", "materialMetallic", "materialRoughness",
-                "materialOcclusionStrength", "materialEmissionColor", "materialEmissionStrength",
+                "materialOcclusionStrength", "materialClearcoat", "materialClearcoatRoughness", "materialEmissionColor", "materialEmissionStrength",
                 "materialAlphaCutoff",
                 "materialHeightScale", "materialParallaxSteps", "materialParallaxInvertHeight",
                 "materialshaderProfile",
@@ -484,6 +484,8 @@ const std::vector<ComponentSchema>& GetComponentSchemas() {
                 {"materialMetallic", "metallic"},
                 {"materialRoughness", "roughness"},
                 {"materialOcclusionStrength", "occlusionStrength"},
+                {"materialClearcoat", "clearcoat"},
+                {"materialClearcoatRoughness", "clearcoatRoughness"},
                 {"materialEmissionColor", "emissionColor"},
                 {"materialEmissionStrength", "emissionStrength"},
                 {"materialHeightScale", "heightScale"},
@@ -536,6 +538,8 @@ const std::vector<ComponentSchema>& GetComponentSchemas() {
                 {"metallic", "materialMetallic"},
                 {"roughness", "materialRoughness"},
                 {"occlusionStrength", "materialOcclusionStrength"},
+                {"clearcoat", "materialClearcoat"},
+                {"clearcoatRoughness", "materialClearcoatRoughness"},
                 {"emissionColor", "materialEmissionColor"},
                 {"emissionStrength", "materialEmissionStrength"},
                 {"heightScale", "materialHeightScale"},
@@ -1054,6 +1058,26 @@ const std::vector<ComponentSchema>& GetComponentSchemas() {
             }
         },
         {
+            "Instancer",
+            "hasInstancer",
+            "instancerEnabled",
+            {},
+            {"instancer"},
+            {},
+            {},
+            {}
+        },
+        {
+            "Terrain",
+            "hasTerrain",
+            "terrainEnabled",
+            {},
+            {"terrain"},
+            {},
+            {},
+            {}
+        },
+        {
             "ShadowCaster2D",
             "hasShadowCaster2D",
             "shadowCaster2dEnabled",
@@ -1266,6 +1290,11 @@ bool WriteModularScene(std::ostream& out,
     WriteField(out, 4, "skyboxMode", doc.settings.count("skyboxMode") ? doc.settings["skyboxMode"] : "0");
     WriteField(out, 4, "skyboxCachedSky", doc.settings.count("skyboxCachedSky") ? doc.settings["skyboxCachedSky"] : "1");
     WriteField(out, 4, "skyboxSunFollowsLight", doc.settings.count("skyboxSunFollowsLight") ? doc.settings["skyboxSunFollowsLight"] : "0");
+    WriteField(out, 4, "skyboxAtmosphereModel", doc.settings.count("skyboxAtmosphereModel") ? doc.settings["skyboxAtmosphereModel"] : "1");
+    WriteField(out, 4, "skyboxTurbidity", doc.settings.count("skyboxTurbidity") ? doc.settings["skyboxTurbidity"] : "2.5");
+    WriteField(out, 4, "skyboxSunSize", doc.settings.count("skyboxSunSize") ? doc.settings["skyboxSunSize"] : "0.8");
+    WriteField(out, 4, "skyboxSunIntensity", doc.settings.count("skyboxSunIntensity") ? doc.settings["skyboxSunIntensity"] : "1");
+    WriteField(out, 4, "skyboxFogMatchSky", doc.settings.count("skyboxFogMatchSky") ? doc.settings["skyboxFogMatchSky"] : "1");
     WriteField(out, 4, "skyboxVolumetric", doc.settings.count("skyboxVolumetric") ? doc.settings["skyboxVolumetric"] : "0");
     WriteField(out, 4, "skyboxVolumetricIntensity", doc.settings.count("skyboxVolumetricIntensity") ? doc.settings["skyboxVolumetricIntensity"] : "1");
     WriteField(out, 4, "skyboxVolumetricSteps", doc.settings.count("skyboxVolumetricSteps") ? doc.settings["skyboxVolumetricSteps"] : "32");
@@ -1280,6 +1309,8 @@ bool WriteModularScene(std::ostream& out,
     WriteField(out, 4, "skyboxWeatherRainOpacity", doc.settings.count("skyboxWeatherRainOpacity") ? doc.settings["skyboxWeatherRainOpacity"] : "0.55");
     WriteField(out, 4, "skyboxWeatherRainSpeed", doc.settings.count("skyboxWeatherRainSpeed") ? doc.settings["skyboxWeatherRainSpeed"] : "1.6");
     WriteField(out, 4, "skyboxWeatherRainScale", doc.settings.count("skyboxWeatherRainScale") ? doc.settings["skyboxWeatherRainScale"] : "1");
+    WriteField(out, 4, "skyboxRain3D", doc.settings.count("skyboxRain3D") ? doc.settings["skyboxRain3D"] : "1");
+    WriteField(out, 4, "skyboxRainDensity", doc.settings.count("skyboxRainDensity") ? doc.settings["skyboxRainDensity"] : "1");
     WriteField(out, 4, "skyboxWeatherLightningInterval", doc.settings.count("skyboxWeatherLightningInterval") ? doc.settings["skyboxWeatherLightningInterval"] : "11");
     WriteField(out, 4, "skyboxWeatherLightningIntensity", doc.settings.count("skyboxWeatherLightningIntensity") ? doc.settings["skyboxWeatherLightningIntensity"] : "2.5");
     WriteField(out, 4, "skyboxWeatherAmbienceVolume", doc.settings.count("skyboxWeatherAmbienceVolume") ? doc.settings["skyboxWeatherAmbienceVolume"] : "0.7");
@@ -1337,6 +1368,9 @@ bool WriteModularScene(std::ostream& out,
     WriteField(out, 4, "skyboxEnvironmentReflectionIntensity", doc.settings.count("skyboxEnvironmentReflectionIntensity") ? doc.settings["skyboxEnvironmentReflectionIntensity"] : "0.5");
     WriteField(out, 4, "skyboxReflectionDistanceFadeStart", doc.settings.count("skyboxReflectionDistanceFadeStart") ? doc.settings["skyboxReflectionDistanceFadeStart"] : "4");
     WriteField(out, 4, "skyboxReflectionDistanceFadeEnd", doc.settings.count("skyboxReflectionDistanceFadeEnd") ? doc.settings["skyboxReflectionDistanceFadeEnd"] : "24");
+    WriteField(out, 4, "skyboxEnvironmentLighting", doc.settings.count("skyboxEnvironmentLighting") ? doc.settings["skyboxEnvironmentLighting"] : "1");
+    WriteField(out, 4, "skyboxWetness", doc.settings.count("skyboxWetness") ? doc.settings["skyboxWetness"] : "-1");
+    WriteField(out, 4, "skyboxPuddleAmount", doc.settings.count("skyboxPuddleAmount") ? doc.settings["skyboxPuddleAmount"] : "0.5");
     WriteField(out, 4, "fogEnabled", doc.settings.count("fogEnabled") ? doc.settings["fogEnabled"] : "0");
     WriteField(out, 4, "fogMode", doc.settings.count("fogMode") ? doc.settings["fogMode"] : "0");
     WriteField(out, 4, "fogColor", doc.settings.count("fogColor") ? doc.settings["fogColor"] : "0.65,0.72,0.78");
@@ -1608,6 +1642,11 @@ void EmitFlatSceneDocument(std::ostream& out, const FlatSceneDocument& doc) {
             "skyboxMode",
             "skyboxCachedSky",
             "skyboxSunFollowsLight",
+            "skyboxAtmosphereModel",
+            "skyboxTurbidity",
+            "skyboxSunSize",
+            "skyboxSunIntensity",
+            "skyboxFogMatchSky",
             "skyboxVolumetric",
             "skyboxVolumetricIntensity",
             "skyboxVolumetricSteps",
@@ -1622,6 +1661,8 @@ void EmitFlatSceneDocument(std::ostream& out, const FlatSceneDocument& doc) {
             "skyboxWeatherRainOpacity",
             "skyboxWeatherRainSpeed",
             "skyboxWeatherRainScale",
+            "skyboxRain3D",
+            "skyboxRainDensity",
             "skyboxWeatherLightningInterval",
             "skyboxWeatherLightningIntensity",
             "skyboxWeatherAmbienceVolume",
@@ -1679,6 +1720,9 @@ void EmitFlatSceneDocument(std::ostream& out, const FlatSceneDocument& doc) {
             "skyboxEnvironmentReflectionIntensity",
             "skyboxReflectionDistanceFadeStart",
             "skyboxReflectionDistanceFadeEnd",
+            "skyboxEnvironmentLighting",
+            "skyboxWetness",
+            "skyboxPuddleAmount",
             "fogEnabled",
             "fogMode",
             "fogColor",
@@ -1731,7 +1775,7 @@ void EmitFlatSceneDocument(std::ostream& out, const FlatSceneDocument& doc) {
             "pcVmJumpCrouchDip", "pcFeelLookSmoothing", "pcFeelChargedJump", "pcFeelJumpChargeTime", "pcFeelJumpMinScale",
             "pcVmGaitBlend", "pcVmRunLean", "pcVmIdleBlend",
             "pcAudioEnabled", "pcAudioJumpClip", "pcAudioLandClip", "pcAudioVolume", "pcAudioRunVolumeScale", "pcAudioLandVolumeScale", "pcAudioPitchVariance", "pcAudioStepCount",
-            "hasAudioSource", "audioEnabled", "audioClip", "audioVolume", "audioLoop", "audioPlayOnStart", "audioSpatial",
+            "hasAudioSource", "audioEnabled", "audioClip", "audioVolume", "audioPitch", "audioLoop", "audioPlayOnStart", "audioSpatial",
             "audioSpatialBlend", "audioMinDistance", "audioMaxDistance", "audioRolloffMode", "audioRolloff", "audioCustomMidDistance",
             "audioCustomMidGain", "audioCustomEndGain",
             "hasAudioFX", "afxEnabled", "afxGlobal", "afxChain",
@@ -1831,7 +1875,7 @@ void EmitFlatSceneDocument(std::ostream& out, const FlatSceneDocument& doc) {
 
         const std::vector<std::string> postAnimationKeys = {
             "hasSkeletalAnimation", "skelEnabled", "skelUseGpu", "skelAllowCpuFallback", "skelUseAnimation",
-            "skelClipIndex", "skelPlaySpeed", "skelLoop", "skelMaxBones",
+            "skelClipIndex", "skelPlaySpeed", "skelLoop", "skelMaxBones", "skelAlwaysRender",
             "materialColor", "materialAlpha", "materialAmbient", "materialSpecular", "materialShininess", "materialNormalMapIntensity", "materialTextureMix",
             "materialUvTiling", "materialUvOffset", "materialScrollSpeed", "materialScrollDirection",
             "materialTextureFilter",

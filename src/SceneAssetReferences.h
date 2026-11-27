@@ -1,6 +1,7 @@
 #pragma once
 
 #include "SceneObject.h"
+#include "TerrainRuntime.h"
 #include "../include/Platform/AssetSource.h"
 
 #include <filesystem>
@@ -40,6 +41,19 @@ bool ForEachSceneObjectAssetReference(Object& obj, Visitor&& visit) {
         if (!visit(obj.animation.clipAssetPath, SceneAssetRefKind::File, "Animations", "animation clip")) return false;
         for (auto& clip : obj.animation.clips) {
             if (!visit(clip.assetPath, SceneAssetRefKind::File, "Animations", "animation clip")) return false;
+        }
+    }
+    if (obj.hasTerrain) {
+        if (!visit(obj.terrain.dataPath, SceneAssetRefKind::File, "Terrain", "terrain data")) return false;
+        for (auto& layer : obj.terrain.layers) {
+            if (!visit(layer.albedoPath, SceneAssetRefKind::File, "Textures", "terrain albedo")) return false;
+            if (!visit(layer.normalPath, SceneAssetRefKind::File, "Textures", "terrain normal")) return false;
+            // Roughness / ambient occlusion maps are found by name next to the normal map.
+            for (const char* suffix : {"Roughness", "AmbientOcclusion"}) {
+                std::string sibling = TerrainRuntime::SiblingMapPath(layer.normalPath, suffix);
+                if (sibling.empty() || !Modularity::Platform::GetAssetSource().Exists(sibling)) continue;
+                if (!visit(sibling, SceneAssetRefKind::File, "Textures", "terrain map")) return false;
+            }
         }
     }
     for (auto& materialRef : obj.additionalMaterialPaths) {

@@ -11,6 +11,10 @@ namespace Loc = Modularity::Loc;
 #include <windows.h>
 #endif
 #include "Engine.h"
+#include "Platform/ExecutablePath.h"
+#include "InstancerTools.h"
+#include "InstancerRuntime.h"
+#include "TerrainRuntime.h"
 #include "AndroidToolchain.h"
 #include "DevBuildDir.h"
 #include "ScriptContextBinding.h"
@@ -3716,19 +3720,9 @@ bool packageAndroidApk(const fs::path& apkStageRoot,
 }
 
 fs::path resolveCurrentExecutablePath() {
-#if defined(__linux__)
-    std::error_code ec;
-    fs::path exe = fs::read_symlink("/proc/self/exe", ec);
-    if (!ec && !exe.empty()) {
+    if (auto exe = Modularity::CurrentExecutablePath(); !exe.empty()) {
         return exe.lexically_normal();
     }
-#elif defined(_WIN32)
-    wchar_t buffer[MAX_PATH];
-    DWORD len = GetModuleFileNameW(nullptr, buffer, MAX_PATH);
-    if (len > 0) {
-        return fs::path(buffer).lexically_normal();
-    }
-#endif
 
     std::error_code cwdEc;
 #if defined(_WIN32)
@@ -5373,26 +5367,10 @@ fs::path findEngineManagedRoot() {
     std::vector<fs::path> candidates;
     candidates.push_back(fs::current_path());
     candidates.push_back(fs::current_path().parent_path());
-#if defined(__linux__)
-    {
-        std::error_code ec;
-        fs::path exe = fs::read_symlink("/proc/self/exe", ec);
-        if (!ec) {
-            candidates.push_back(exe.parent_path());
-            candidates.push_back(exe.parent_path().parent_path());
-        }
+    if (auto exe = Modularity::CurrentExecutablePath(); !exe.empty()) {
+        candidates.push_back(exe.parent_path());
+        candidates.push_back(exe.parent_path().parent_path());
     }
-#elif defined(_WIN32)
-    {
-        wchar_t buffer[MAX_PATH];
-        DWORD len = GetModuleFileNameW(nullptr, buffer, MAX_PATH);
-        if (len > 0) {
-            fs::path exe(buffer);
-            candidates.push_back(exe.parent_path());
-            candidates.push_back(exe.parent_path().parent_path());
-        }
-    }
-#endif
 
     std::error_code ec;
     for (const auto& root : candidates) {
@@ -5718,7 +5696,22 @@ Engine::SceneSnapshot Engine::captureSceneSnapshot() const {
 }
 
 void Engine::restoreSceneSnapshot(SceneSnapshot snap) {
+    // Terrain buffers are copy-on-write, so a snapshot that holds different buffers than the live
+    // scene is a heightmap / splat edit being undone (or redone): bump the revisions so the renderer
+    // rebuilds, physics rebuilds, and the sidecar is rewritten (its on-disk copy may be the edited one).
+    std::unordered_map<int, std::pair<const void*, const void*>> liveTerrainBuffers;
+    for (const SceneObject& live : sceneObjects) {
+        if (live.hasTerrain) liveTerrainBuffers[live.id] = {live.terrain.heights.get(), live.terrain.splat.get()};
+    }
     sceneObjects = std::move(snap.objects);
+    for (SceneObject& restored : sceneObjects) {
+        if (!restored.hasTerrain) continue;
+        const auto live = liveTerrainBuffers.find(restored.id);
+        if (live == liveTerrainBuffers.end() || live->second.first != restored.terrain.heights.get() ||
+            live->second.second != restored.terrain.splat.get()) {
+            restored.terrain.markAllChanged();
+        }
+    }
     selectedObjectIds = std::move(snap.selectedIds);
     selectedObjectId = selectedObjectIds.empty() ? -1 : selectedObjectIds.back();
     nextObjectId = snap.nextId;
@@ -6046,6 +6039,31 @@ void Engine::applySceneSkyboxSettings(const SkyboxSettings& settings) {
     }
 }
 
+bool Engine::setRuntimeWeather(int mode, float intensity) {
+    if (mode < static_cast<int>(WeatherMode::Clear) || mode > static_cast<int>(WeatherMode::Thunderstorm)) {
+        return false;
+    }
+    if (!std::isfinite(intensity)) return false;
+    SkyboxSettings settings = sceneSkyboxSettings;
+    settings.weather.enabled = true;
+    settings.weather.mode = static_cast<WeatherMode>(mode);
+    settings.weather.intensity = std::clamp(intensity, 0.0f, 1.0f);
+    // Deliberately not recordState()/markProjectDirty(): gameplay weather is runtime state.
+    applySceneSkyboxSettings(settings);
+    return true;
+}
+
+bool Engine::getRuntimeWeather(int& mode, float& intensity) const {
+    if (!sceneSkyboxSettings.weather.enabled) {
+        mode = -1;
+        intensity = 0.0f;
+        return true;
+    }
+    mode = static_cast<int>(sceneSkyboxSettings.weather.mode);
+    intensity = sceneSkyboxSettings.weather.intensity;
+    return true;
+}
+
 SkyboxSettings Engine::getSceneSkyboxSettings() const {
     return sceneSkyboxSettings;
 }
@@ -6308,6 +6326,7 @@ void Engine::onWindowResized(int width, int height) {
 }
 
 bool Engine::init() {
+    TerrainRuntime::RegisterGroundQuery();
 #if !MODULARITY_RUNTIME_ONLY
     // Read preview mode before any OpenXR initialization (including --vr-editor).
     if(const char* value=std::getenv("MODULARITY_VR_EDITOR");value && *value && *value!='0')vrEditor.requested=true;
@@ -6418,6 +6437,11 @@ bool Engine::init() {
         autoStartRequested = true;
         autoStartPlayerMode = false;
     }
+#if !MODULARITY_RUNTIME_ONLY
+    if (autoShot_.enabled && !autoShot_.sceneName.empty() && autoStartRequested) {
+        autoStartSceneName = autoShot_.sceneName;
+    }
+#endif
 #ifdef MODULARITY_PLAYER
     playerMode = true;
     autoStartPlayerMode = true;
@@ -6830,6 +6854,7 @@ void Engine::run() {
         float currentFrame = glfwGetTime();
         deltaTime = currentFrame - lastFrame;
         lastFrame = currentFrame;
+        lastFrameWallMs = std::max(0.0f, deltaTime) * 1000.0f;
         deltaTime = std::min(deltaTime, 1.0f / 30.0f);
         gameTimeScale = std::clamp(gameTimeScale, kMinGameTimeScale, kMaxGameTimeScale);
         gameDeltaTime = deltaTime * gameTimeScale;
@@ -6946,16 +6971,30 @@ void Engine::run() {
         // Run scripts only in play/spec/test modes to avoid edit-time side effects (e.g., cursor grabs)
         if (projectManager.currentProject.isLoaded) {
             bool runScripts = isPlaying || specMode || testMode;
+            if (runScripts != scriptServicesLastRunning) {
+                // Entering or leaving play starts script services fresh (sessions, tokens),
+                // and callbacks for requests still in flight must not reach the instances
+                // that are about to be destroyed.
+                scriptServicesLastRunning = runScripts;
+                Net::Http::CancelCallbacks();
+                ScriptSharedValues::Clear();
+            }
             if (runScripts) {
                 updateScripts(gameDeltaTime);
             }
             updateNetworking(deltaTime);
         }
+        Net::Http::Pump();
 
         // Scripts consume the previous frame's UI events. Clear transient state
         // once before rendering, including controls that are now hidden or clipped.
         for (SceneObject& obj : sceneObjects) {
             if (!obj.hasUI || !IsExtendedUIType(obj.ui.type)) continue;
+            // Already clear on almost every control: skip the stores so the lines stay clean.
+            if (!(obj.ui.buttonPressed || obj.ui.inputSubmitted || obj.ui.valueChanged ||
+                  obj.ui.uiHovered || obj.ui.uiActive || obj.ui.uiFocused)) {
+                continue;
+            }
             obj.ui.buttonPressed = obj.ui.inputSubmitted = obj.ui.valueChanged = false;
             obj.ui.uiHovered = obj.ui.uiActive = obj.ui.uiFocused = false;
         }
@@ -7043,6 +7082,9 @@ void Engine::run() {
                                hasRuntime3DPhysics;
         if (simulatePhysics) {
             MODU_PROFILE_SCOPE("Physics 3D", ProfilerSampleCategory::Physics);
+            // Re-set every frame (two pointer stores) so a backend recreated on project load
+            // always has it; simulate() calls it before each fixed step to run FixedUpdate.
+            physics->setPreStepCallback(&Engine::PhysicsPreStepThunk, this);
             physics->simulate(gameDeltaTime, sceneObjects);
             dispatchPhysicsCollisionEvents(gameDeltaTime);
         }
@@ -7731,6 +7773,7 @@ void Engine::run() {
             const bool editorBusy =
                 playerMode || isPlaying || specMode || testMode || showLauncher ||
                 projectLoadInProgress || sceneLoadInProgress || xrSystem.isRunning() ||
+                autoShot_.enabled ||
                 cursorLocked || gameViewCursorLocked || EditorFrameHadUserInput();
             if (editorBusy) {
                 lastEditorActivityTime = now;
@@ -7776,10 +7819,12 @@ void Engine::run() {
         uint64_t profilerTextureBinds = 0;
         uint64_t profilerStateBinds = 0;
         if (rendererInitialized && (playerMode || showGameViewport)) {
-            const SceneObject* profiledCameraObject = findPlayerCameraObject();
-            const bool pure2DFrame =
-                isProject2DPipeline() ||
-                (profiledCameraObject && profiledCameraObject->camera.use2D);
+            // The camera scan only decides the answer when the project is not already 2D.
+            bool pure2DFrame = isProject2DPipeline();
+            if (!pure2DFrame) {
+                const SceneObject* profiledCameraObject = findPlayerCameraObject();
+                pure2DFrame = profiledCameraObject && profiledCameraObject->camera.use2D;
+            }
             if (!pure2DFrame) {
                 const Renderer::RenderStats& stats = playerMode
                     ? renderer.getLastViewportStats()
@@ -7806,6 +7851,9 @@ void Engine::run() {
         if (usingVulkan()) {
             profiler.setCurrentFrameGpuCapability(false, false);
         }
+#if !MODULARITY_RUNTIME_ONLY
+        if (autoShot_.enabled) updateAutoShot();
+#endif
         profiler.endFrame();
         const double __frameMs = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - __frameWall).count();
@@ -7868,6 +7916,7 @@ void Engine::waitForBackgroundJobs() {
 
 void Engine::shutdown() {
     waitForBackgroundJobs();
+    Net::Http::Shutdown();
     if (editorWindow && !usingVulkan()) glfwMakeContextCurrent(editorWindow);
     Modularity::DiscordPresence::Shutdown();
     shutdownXRSystem();
@@ -9513,9 +9562,11 @@ void Engine::updateNetworking(float delta) {
     }
 
     if (!networkSessionActive) {
-        const int managerId = FindActiveNetworkManager(sceneObjects);
+        // One scan gives both the count and the first id (FindActiveNetworkManager is this test).
+        int firstManagerId = -1;
+        const int managerCount = CountNetworkManagers(sceneObjects, &firstManagerId);
+        const int managerId = (managerCount == 1) ? firstManagerId : -1;
         if (managerId < 0) {
-            const int managerCount = CountNetworkManagers(sceneObjects);
             if (managerCount > 1) {
                 addConsoleMessage("[Network] " + std::to_string(managerCount) +
                                       " active Network Managers in the scene; networking disabled. "
@@ -9583,6 +9634,10 @@ void Engine::updateNetworking(float delta) {
             sceneObjectIndexData = nullptr;
             sceneObjectIndexCount = 0;
             updateHierarchyWorldTransforms();
+            // Spawning remaps every object id in the prefab, but skinned meshes keep
+            // runtime bone/armature ids resolved against the original ids. Rebuild
+            // them now or the newly spawned model renders with no valid bones.
+            rebuildSkeletalBindings();
         };
         networkSession.onObjectSpawned = [refreshAfterSceneMutation](Net::NetworkId) {
             refreshAfterSceneMutation();
@@ -9801,30 +9856,47 @@ void Engine::updateScripts(float delta) {
                 }
             }
         } else {
-            fs::path binary;
-            const bool attachedBinaryDirectly = IsNativeBinaryPath(fs::path(sc.path));
-            if (!attachedBinaryDirectly && (!sc.lastBinaryVerified || sc.lastBinaryPath.empty())) {
-                fs::path resolvedBinary = resolveScriptBinary(sc.path);
-                if (!resolvedBinary.empty()) {
-                    binary = resolvedBinary;
-                    sc.lastBinaryPath = resolvedBinary.string();
+            // Steady state (binary already resolved and verified): the slow path below would
+            // just rebuild fs::path(sc.lastBinaryPath) and skip every check, so take the parsed
+            // path from a string-keyed memo instead of allocating one per script per frame.
+            const fs::path* verifiedBinary = nullptr;
+            if (sc.lastBinaryVerified && !sc.lastBinaryPath.empty()) {
+                auto cachedPathIt = nativeScriptBinaryPathMemo.find(sc.lastBinaryPath);
+                if (cachedPathIt == nativeScriptBinaryPathMemo.end()) {
+                    cachedPathIt = nativeScriptBinaryPathMemo
+                        .emplace(sc.lastBinaryPath, fs::path(sc.lastBinaryPath)).first;
                 }
+                verifiedBinary = &cachedPathIt->second;
             }
-            if (binary.empty() && !sc.lastBinaryPath.empty()) {
-                if (sc.lastBinaryVerified) {
-                    binary = fs::path(sc.lastBinaryPath);
-                } else {
-                    fs::path cachedBinary = sc.lastBinaryPath;
-                    if (fs::exists(cachedBinary)) {
-                        binary = std::move(cachedBinary);
-                        sc.lastBinaryVerified = true;
+            fs::path resolvedBinaryStorage;
+            if (!verifiedBinary) {
+                fs::path& binary = resolvedBinaryStorage;
+                const bool attachedBinaryDirectly = IsNativeBinaryPath(fs::path(sc.path));
+                if (!attachedBinaryDirectly && (!sc.lastBinaryVerified || sc.lastBinaryPath.empty())) {
+                    fs::path resolvedBinary = resolveScriptBinary(sc.path);
+                    if (!resolvedBinary.empty()) {
+                        binary = resolvedBinary;
+                        sc.lastBinaryPath = resolvedBinary.string();
                     }
                 }
+                if (binary.empty() && !sc.lastBinaryPath.empty()) {
+                    if (sc.lastBinaryVerified) {
+                        binary = fs::path(sc.lastBinaryPath);
+                    } else {
+                        fs::path cachedBinary = sc.lastBinaryPath;
+                        if (fs::exists(cachedBinary)) {
+                            binary = std::move(cachedBinary);
+                            sc.lastBinaryVerified = true;
+                        }
+                    }
+                }
+                if (binary.empty()) {
+                    binary = resolveScriptBinary(sc.path);
+                    sc.lastBinaryPath = binary.string();
+                }
             }
-            if (binary.empty()) {
-                binary = resolveScriptBinary(sc.path);
-                sc.lastBinaryPath = binary.string();
-            }
+            // Memo entries are never erased, and unordered_map keeps references across inserts.
+            const fs::path& binary = verifiedBinary ? *verifiedBinary : resolvedBinaryStorage;
             bool hasBinary = !binary.empty();
             if (!hasBinary || !sc.lastBinaryVerified) {
                 std::error_code ec;
@@ -9845,8 +9917,10 @@ void Engine::updateScripts(float delta) {
                 continue;
             }
 
-            std::string binaryKey = binary.lexically_normal().string();
-            nativeScriptMissingLogged.erase(fs::path(sc.path).lexically_normal().string());
+            // The key is only needed to forget an earlier "missing" warning.
+            if (!nativeScriptMissingLogged.empty()) {
+                nativeScriptMissingLogged.erase(fs::path(sc.path).lexically_normal().string());
+            }
             if (traceScripts) {
                 std::cerr << "[RuntimeTrace] script start obj=\"" << obj.name
                           << "\" id=" << obj.id
@@ -9856,7 +9930,16 @@ void Engine::updateScripts(float delta) {
                           << "\" binary=\"" << binary.string() << "\""
                           << std::endl;
             }
-            scriptRuntime.tickModule(binary, ctx, delta, specMode, testMode);
+            {
+                // Per-script attribution for the profiler. The name is only built while a
+                // recording is running, so a normal frame pays one bool test per script.
+                std::string scriptSampleName;
+                if (Profiler::instance().isRecording()) {
+                    scriptSampleName = "script:" + binary.stem().string();
+                }
+                ProfilerScope scriptSample(scriptSampleName, ProfilerSampleCategory::Script);
+                scriptRuntime.tickModule(binary, ctx, delta, specMode, testMode);
+            }
             if (traceScripts) {
                 std::cerr << "[RuntimeTrace] script end obj=\"" << (ctx.object ? ctx.object->name : "<deleted>")
                           << "\" id=" << binding.objectId
@@ -9864,7 +9947,7 @@ void Engine::updateScripts(float delta) {
             }
             const std::string& runtimeError = scriptRuntime.getLastError();
             if (!runtimeError.empty()) {
-                std::string errorKey = binaryKey + "|" + runtimeError;
+                std::string errorKey = binary.lexically_normal().string() + "|" + runtimeError;
                 if (nativeScriptLoadErrorLogged.insert(errorKey).second) {
                     std::cerr << "[Script] Failed to load native script '" << binary.string()
                               << "': " << runtimeError << "\n";
@@ -9915,6 +9998,48 @@ void Engine::updateScripts(float delta) {
                                                     heapDeltaBytes,
                                                     gcEndStats.usedBytes);
         }
+    }
+}
+
+void Engine::PhysicsPreStepThunk(void* user, float stepDeltaTime) {
+    if (Engine* engine = static_cast<Engine*>(user)) {
+        engine->runFixedUpdateScripts(stepDeltaTime);
+    }
+}
+
+void Engine::runFixedUpdateScripts(float fixedDeltaTime) {
+    // Same gate as the 3D physics step: only while play (unpaused) or spec is simulating.
+    if (!((isPlaying && !isPaused) || (!isPlaying && specMode))) return;
+    if (sceneObjects.empty() || runtimeScriptBindings.empty()) return;
+    // Bindings are rebuilt by updateScripts (which runs earlier in the frame); a binding list
+    // invalidated during this frame is picked up by the next frame's updateScripts.
+    if (runtimeScriptBindingsCachedVersion != runtimeScriptBindingsVersion) return;
+    MODU_PROFILE_SCOPE("Script FixedUpdate", ProfilerSampleCategory::Script);
+    refreshSceneObjectIndexCache();
+
+    for (const RuntimeScriptBinding binding : runtimeScriptBindings) {
+        SceneObject* currentObject = findObjectById(binding.objectId);
+        if (!currentObject) continue;
+        SceneObject& obj = *currentObject;
+        if (!IsObjectEnabledInHierarchy(obj)) continue;
+        if (binding.scriptIndex >= obj.scripts.size()) continue;
+        ScriptComponent& sc = obj.scripts[binding.scriptIndex];
+        if (!sc.enabled || sc.path.empty()) continue;
+        if (sc.language == ScriptLanguage::CSharp) continue;  // managed scripts have no FixedUpdate hook
+        // updateScripts resolves and verifies the binary (and runs Begin) before the first
+        // physics step, so an unverified binary simply skips this step.
+        if (!sc.lastBinaryVerified || sc.lastBinaryPath.empty()) continue;
+        auto cachedPathIt = nativeScriptBinaryPathMemo.find(sc.lastBinaryPath);
+        if (cachedPathIt == nativeScriptBinaryPathMemo.end()) {
+            cachedPathIt = nativeScriptBinaryPathMemo
+                .emplace(sc.lastBinaryPath, fs::path(sc.lastBinaryPath)).first;
+        }
+
+        ScriptContext ctx;
+        ctx.engine = this;
+        ctx.object = &obj;
+        ctx.script = &sc;
+        scriptRuntime.fixedUpdateModule(cachedPathIt->second, ctx, fixedDeltaTime);
     }
 }
 
@@ -10367,11 +10492,7 @@ Engine::runScriptAutoCompileScan(ScriptAutoCompileScanRequest request) {
         fs::path relativeParent = relToScripts.has_parent_path() ? relToScripts.parent_path() : fs::path();
         std::string baseName = NativeScriptArtifactStem(scriptAbs);
         fs::path binaryPath = request.outDir / relativeParent;
-#ifdef _WIN32
-        binaryPath /= baseName + ".dll";
-#else
-        binaryPath /= baseName + ".so";
-#endif
+        binaryPath /= baseName + NativeScriptArtifactExtension();
         return binaryPath;
     };
 
@@ -11990,32 +12111,43 @@ void Engine::updateCameraFollow2D(float delta) {
 }
 
 void Engine::syncVideoPlayers(float delta) {
-    for (SceneObject& obj : sceneObjects) {
-        obj.runtimeHasAlbedoTextureOverride = false;
-        obj.runtimeAlbedoTextureOverrideId = 0;
-        obj.runtimeAlbedoTextureFlipX = false;
-        obj.runtimeAlbedoTextureFlipY = false;
-    }
+    // Reset last frame's override. Almost no object has one, so test before storing: an
+    // unconditional store dirties a cache line on every object every frame.
+    auto resetAlbedoOverride = [](SceneObject& obj) {
+        if (obj.runtimeHasAlbedoTextureOverride || obj.runtimeAlbedoTextureOverrideId != 0 ||
+            obj.runtimeAlbedoTextureFlipX || obj.runtimeAlbedoTextureFlipY) {
+            obj.runtimeHasAlbedoTextureOverride = false;
+            obj.runtimeAlbedoTextureOverrideId = 0;
+            obj.runtimeAlbedoTextureFlipX = false;
+            obj.runtimeAlbedoTextureFlipY = false;
+        }
+    };
 
     const bool runtimeVideoActive = isPlaying || specMode || testMode || playerMode;
     if (!runtimeVideoActive) {
+        for (SceneObject& obj : sceneObjects) {
+            resetAlbedoOverride(obj);
+        }
         if (!videoPlayers.empty()) {
             clearVideoPlayers();
         }
         return;
     }
 
-    std::unordered_set<int> activeVideoIds;
-    activeVideoIds.reserve(sceneObjects.size());
+    // Member scratch: no per-frame bucket allocation.
+    std::unordered_set<int>& activeVideoIds = videoActiveIdsScratch;
+    activeVideoIds.clear();
 
     for (SceneObject& obj : sceneObjects) {
+        // Folded into this pass: nothing below reads another object's override fields.
+        resetAlbedoOverride(obj);
 
         if (!obj.hasVideoPlayer ||
             !obj.videoPlayer.enabled ||
             !HasRendererComponent(obj) ||
             obj.videoPlayer.videoPath.empty()) {
-            videoPlayers.erase(obj.id);
-            videoLoadFailedPaths.erase(obj.id);
+            if (!videoPlayers.empty()) videoPlayers.erase(obj.id);
+            if (!videoLoadFailedPaths.empty()) videoLoadFailedPaths.erase(obj.id);
             continue;
         }
 
@@ -12472,10 +12604,10 @@ void Engine::updateSkeletalAnimations(float delta) {
         }
         float time = static_cast<float>(timeTicks);
 
-        std::vector<int> animatedNodeIds = obj.skeletal.armatureNodeIds;
-        if (animatedNodeIds.empty()) {
-            animatedNodeIds = obj.skeletal.boneNodeIds;
-        }
+        // By reference: the bone loop writes transforms only, never these id lists.
+        const std::vector<int>& animatedNodeIds = obj.skeletal.armatureNodeIds.empty()
+            ? obj.skeletal.boneNodeIds
+            : obj.skeletal.armatureNodeIds;
 
         for (int boneId : animatedNodeIds) {
             if (boneId < 0) continue;
@@ -12526,6 +12658,37 @@ void Engine::updateSkinningMatrices() {
             if (!boneObj) continue;
             glm::mat4 boneWorld = ComposeTransform(boneObj->position, boneObj->rotation, boneObj->scale);
             obj.skeletal.finalMatrices[b] = invMesh * boneWorld * obj.skeletal.inverseBindMatrices[b];
+        }
+
+        // Cull bounds for the current pose. A skinned vertex is a weighted average of its bind
+        // position under each bone's matrix, so it always lies inside the union of the bind box
+        // transformed by every bone matrix. Without this the renderer culls with the bind-pose
+        // box, which IK can pull a limb far away from (a VR hand vanishing in front of the face).
+        obj.skeletal.poseBoundsValid = false;
+        const auto* meshInfo = (obj.renderType == RenderType::Model && obj.meshId >= 0)
+            ? getModelLoader().getMeshInfo(obj.meshId) : nullptr;
+        if (meshInfo && meshInfo->boundsMin.x <= meshInfo->boundsMax.x) {
+            const glm::vec3 bindMin = meshInfo->boundsMin;
+            const glm::vec3 bindMax = meshInfo->boundsMax;
+            glm::vec3 lo(std::numeric_limits<float>::max());
+            glm::vec3 hi(-std::numeric_limits<float>::max());
+            for (const glm::mat4& m : obj.skeletal.finalMatrices) {
+                for (int corner = 0; corner < 8; ++corner) {
+                    const glm::vec3 p((corner & 1) ? bindMax.x : bindMin.x,
+                                      (corner & 2) ? bindMax.y : bindMin.y,
+                                      (corner & 4) ? bindMax.z : bindMin.z);
+                    const glm::vec3 q = glm::vec3(m * glm::vec4(p, 1.0f));
+                    lo = glm::min(lo, q);
+                    hi = glm::max(hi, q);
+                }
+            }
+            const bool finite = std::isfinite(lo.x) && std::isfinite(lo.y) && std::isfinite(lo.z) &&
+                                std::isfinite(hi.x) && std::isfinite(hi.y) && std::isfinite(hi.z);
+            if (finite && lo.x <= hi.x) {
+                obj.skeletal.poseBoundsMin = lo;
+                obj.skeletal.poseBoundsMax = hi;
+                obj.skeletal.poseBoundsValid = true;
+            }
         }
     }
 }
@@ -12734,6 +12897,7 @@ void Engine::refreshSceneObjectIndexCache() {
     sceneObjectIndexData = currentData;
     sceneObjectIndexCount = sceneObjects.size();
     sceneObjectIndexVerifiedFrame = renderFrameSerial;
+    ++sceneObjectIndexGeneration;
 
     std::vector<int> validSelectedIds;
     validSelectedIds.reserve(selectedObjectIds.size());
@@ -12763,12 +12927,324 @@ void Engine::rebuildRuntimeScriptBindings() {
     runtimeScriptBindingsCachedVersion = runtimeScriptBindingsVersion;
 }
 
+// Rebuilds the cached traversal order when ids, parent links, child lists or the index map
+// changed. Returns whether any object has hierarchy links.
+bool Engine::refreshHierarchyTransformTopology() {
+    const size_t count = sceneObjects.size();
+    bool topoMatches = hierarchyTopoValid &&
+                       hierarchyTopoIndexGeneration == sceneObjectIndexGeneration &&
+                       hierarchyTopoIds.size() == count;
+    if (topoMatches) {
+        const int* cachedIds = hierarchyTopoIds.data();
+        const int* cachedParentIds = hierarchyTopoParentIds.data();
+        const uint32_t* cachedOffsets = hierarchyTopoChildOffsets.data();
+        const int* cachedChildIds = hierarchyTopoChildIds.data();
+        for (size_t i = 0; i < count; ++i) {
+            const SceneObject& obj = sceneObjects[i];
+            const size_t childCount = obj.childIds.size();
+            const uint32_t offset = cachedOffsets[i];
+            if (cachedIds[i] != obj.id ||
+                cachedParentIds[i] != obj.parentId ||
+                static_cast<size_t>(cachedOffsets[i + 1] - offset) != childCount ||
+                (childCount > 0 &&
+                 std::memcmp(cachedChildIds + offset, obj.childIds.data(), childCount * sizeof(int)) != 0)) {
+                topoMatches = false;
+                break;
+            }
+        }
+    }
+    if (topoMatches) return hierarchyTopoHasLinks;
+
+    MODU_PROFILE_SCOPE("Hierarchy Topology Rebuild", ProfilerSampleCategory::Engine);
+    hierarchyTopoIds.clear();
+    hierarchyTopoParentIds.clear();
+    hierarchyTopoChildIds.clear();
+    hierarchyTopoChildOffsets.clear();
+    hierarchyTopoIds.reserve(count);
+    hierarchyTopoParentIds.reserve(count);
+    hierarchyTopoChildOffsets.reserve(count + 1);
+    hierarchyTopoHasLinks = false;
+    for (size_t i = 0; i < count; ++i) {
+        const SceneObject& obj = sceneObjects[i];
+        hierarchyTopoIds.push_back(obj.id);
+        hierarchyTopoParentIds.push_back(obj.parentId);
+        hierarchyTopoChildOffsets.push_back(static_cast<uint32_t>(hierarchyTopoChildIds.size()));
+        hierarchyTopoChildIds.insert(hierarchyTopoChildIds.end(), obj.childIds.begin(), obj.childIds.end());
+        if (obj.parentId != -1 || !obj.childIds.empty()) {
+            hierarchyTopoHasLinks = true;
+        }
+    }
+    hierarchyTopoChildOffsets.push_back(static_cast<uint32_t>(hierarchyTopoChildIds.size()));
+
+    // Same walk the recursive pass did: roots in object order, children in childIds order, every
+    // id resolved through the index map, and a node already entered is never entered again
+    // (which also covers cycles and duplicate child entries).
+    hierarchyTransformOrder.clear();
+    hierarchyTransformBuildStack.clear();
+    hierarchyTransformVisitState.assign(count, 0);
+    if (hierarchyTopoHasLinks) {
+        auto enterNode = [&](int id, int32_t parentSlot) {
+            auto itIndex = sceneObjectIndexById.find(id);
+            if (itIndex == sceneObjectIndexById.end()) return;
+            const size_t index = itIndex->second;
+            if (index >= count) return;
+            if (hierarchyTransformVisitState[index]) return;
+            hierarchyTransformVisitState[index] = 1;
+            HierarchyTransformSlot slot;
+            slot.objIndex = static_cast<uint32_t>(index);
+            slot.parentSlot = parentSlot;
+            HierarchyTransformBuildFrame frame;
+            frame.objIndex = slot.objIndex;
+            frame.cursor = 0;
+            frame.slot = static_cast<int32_t>(hierarchyTransformOrder.size());
+            hierarchyTransformOrder.push_back(slot);
+            hierarchyTransformBuildStack.push_back(frame);
+        };
+        for (size_t i = 0; i < count; ++i) {
+            const SceneObject& root = sceneObjects[i];
+            if (root.parentId != -1 &&
+                sceneObjectIndexById.find(root.parentId) != sceneObjectIndexById.end()) {
+                continue;
+            }
+            enterNode(root.id, -1);
+            while (!hierarchyTransformBuildStack.empty()) {
+                HierarchyTransformBuildFrame& top = hierarchyTransformBuildStack.back();
+                const std::vector<int>& childIds = sceneObjects[top.objIndex].childIds;
+                if (top.cursor >= childIds.size()) {
+                    hierarchyTransformBuildStack.pop_back();
+                    continue;
+                }
+                const int childId = childIds[top.cursor++];
+                const int32_t parentSlot = top.slot;
+                enterNode(childId, parentSlot);
+            }
+        }
+    }
+    hierarchyTransformWorld.resize(hierarchyTransformOrder.size());
+    hierarchyTransformMemo.resize(hierarchyTransformOrder.size());
+
+    hierarchyTopoIndexGeneration = sceneObjectIndexGeneration;
+    hierarchyTopoValid = true;
+    return hierarchyTopoHasLinks;
+}
+
 void Engine::updateHierarchyWorldTransforms(bool rebuildWorldFromLocal) {
     if (sceneObjects.empty()) return;
     refreshSceneObjectIndexCache();
+#if MODULARITY_VERIFY_TRANSFORM_CACHE
+    static std::vector<SceneObject> verifyObjects;
+    verifyObjects = sceneObjects;
+#endif
+    updateHierarchyWorldTransformsCached(rebuildWorldFromLocal);
+#if MODULARITY_VERIFY_TRANSFORM_CACHE
+    updateHierarchyWorldTransformsReference(verifyObjects, rebuildWorldFromLocal);
+    static unsigned long long verifyMismatchCount = 0;
+    for (size_t i = 0; i < sceneObjects.size() && i < verifyObjects.size(); ++i) {
+        const SceneObject& got = sceneObjects[i];
+        const SceneObject& want = verifyObjects[i];
+        const char* field = nullptr;
+        if (got.hierarchyEnabled != want.hierarchyEnabled) field = "hierarchyEnabled";
+        else if (got.localInitialized != want.localInitialized) field = "localInitialized";
+        else if (std::memcmp(&got.position, &want.position, sizeof(glm::vec3)) != 0) field = "position";
+        else if (std::memcmp(&got.rotation, &want.rotation, sizeof(glm::vec3)) != 0) field = "rotation";
+        else if (std::memcmp(&got.scale, &want.scale, sizeof(glm::vec3)) != 0) field = "scale";
+        else if (std::memcmp(&got.localPosition, &want.localPosition, sizeof(glm::vec3)) != 0) field = "localPosition";
+        else if (std::memcmp(&got.localRotation, &want.localRotation, sizeof(glm::vec3)) != 0) field = "localRotation";
+        else if (std::memcmp(&got.localScale, &want.localScale, sizeof(glm::vec3)) != 0) field = "localScale";
+        if (!field) continue;
+        if (++verifyMismatchCount <= 64) {
+            std::fprintf(stderr,
+                         "[TransformCacheVerify] frame %llu object index %zu id %d: %s differs from the reference pass "
+                         "(force=%d, got pos %.9g %.9g %.9g rot %.9g %.9g %.9g, want pos %.9g %.9g %.9g rot %.9g %.9g %.9g)\n",
+                         (unsigned long long)renderFrameSerial, i, got.id, field, rebuildWorldFromLocal ? 1 : 0,
+                         got.position.x, got.position.y, got.position.z,
+                         got.rotation.x, got.rotation.y, got.rotation.z,
+                         want.position.x, want.position.y, want.position.z,
+                         want.rotation.x, want.rotation.y, want.rotation.z);
+        }
+    }
+#endif
+}
+
+void Engine::updateHierarchyWorldTransformsCached(bool rebuildWorldFromLocal) {
+    const bool hasHierarchyLinks = refreshHierarchyTransformTopology();
+
+    if (!hasHierarchyLinks) {
+        const glm::vec3 rootPos(0.0f);
+        const glm::quat rootRot(1.0f, 0.0f, 0.0f, 0.0f);
+        const glm::vec3 rootScale(1.0f);
+        for (auto& obj : sceneObjects) {
+            obj.hierarchyEnabled = true;
+            obj.hierarchyMovingAncestor = false;
+            if (!obj.localInitialized) {
+                obj.localPosition = obj.position;
+                obj.localRotation = NormalizeEulerDegrees(obj.rotation);
+                obj.localScale = obj.scale;
+                obj.localInitialized = true;
+            }
+
+            bool useWorldAuthoritative = !rebuildWorldFromLocal &&
+                obj.hasRigidbody && obj.rigidbody.enabled && !obj.rigidbody.isKinematic &&
+                !obj.IsInvariable;
+            if (useWorldAuthoritative) {
+                updateLocalFromWorld(obj, rootPos, rootRot, rootScale);
+                continue;
+            }
+
+            obj.position = obj.localPosition;
+            obj.rotation = NormalizeEulerDegrees(obj.localRotation);
+            obj.scale = obj.localScale;
+        }
+        return;
+    }
+
+    auto unwrapNear = [](float angle, float reference) {
+        float result = angle;
+        while (result - reference > 180.0f) result -= 360.0f;
+        while (reference - result > 180.0f) result += 360.0f;
+        return result;
+    };
+
+    // Components that let an object move its whole subtree at runtime. Children of such an
+    // object get hierarchyMovingAncestor, which keeps them out of world-space static merging.
+    auto drivesSubtreeMotion = [](const SceneObject& o) {
+        return o.hasRigidbody || o.hasRigidbody2D || o.hasPlayerController ||
+               !o.scripts.empty() || o.hasAnimation || o.hasSkeletalAnimation;
+    };
+
+    // The memo keys below are raw float images of these types.
+    static_assert(sizeof(glm::vec3) == 3 * sizeof(float), "vec3 must be 3 packed floats");
+    static_assert(sizeof(glm::quat) == 4 * sizeof(float), "quat must be 4 packed floats");
+    enum : uint8_t { MemoNone = 0, MemoChild = 1, MemoWorldAuthoritative = 2 };
+
+    HierarchyTransformWorld rootWorld;
+    rootWorld.pos = glm::vec3(0.0f);
+    rootWorld.rot = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+    rootWorld.scale = glm::vec3(1.0f);
+    rootWorld.childEnabled = true;
+    rootWorld.childMoving = false;
+
+    // QuatFromEulerXYZ is pure, so reuse the last result while the angles are bit-identical.
+    auto memoQuatFromEuler = [](HierarchyTransformMemo& memo, const glm::vec3& deg) -> glm::quat {
+        if (memo.eulerValid && std::memcmp(memo.eulerKey, &deg, sizeof(memo.eulerKey)) == 0) {
+            return memo.eulerQuat;
+        }
+        const glm::quat result = QuatFromEulerXYZ(deg);
+        std::memcpy(memo.eulerKey, &deg, sizeof(memo.eulerKey));
+        memo.eulerQuat = result;
+        memo.eulerValid = true;
+        return result;
+    };
+
+    const size_t slotCount = hierarchyTransformOrder.size();
+    const HierarchyTransformSlot* order = hierarchyTransformOrder.data();
+    HierarchyTransformWorld* worlds = hierarchyTransformWorld.data();
+    HierarchyTransformMemo* memos = hierarchyTransformMemo.data();
+    for (size_t slotIndex = 0; slotIndex < slotCount; ++slotIndex) {
+        const HierarchyTransformSlot& slot = order[slotIndex];
+        // Parents always precede their children in the order, so the parent world is final here.
+        const HierarchyTransformWorld& parent = (slot.parentSlot < 0) ? rootWorld : worlds[slot.parentSlot];
+        HierarchyTransformWorld& world = worlds[slotIndex];
+        HierarchyTransformMemo& memo = memos[slotIndex];
+        SceneObject& obj = sceneObjects[slot.objIndex];
+
+        obj.hierarchyEnabled = parent.childEnabled;
+        obj.hierarchyMovingAncestor = parent.childMoving;
+        if (!obj.localInitialized) {
+            obj.localPosition = obj.position;
+            obj.localRotation = NormalizeEulerDegrees(obj.rotation);
+            obj.localScale = obj.scale;
+            obj.localInitialized = true;
+        }
+
+        bool useWorldAuthoritative = !rebuildWorldFromLocal &&
+            obj.hasRigidbody && obj.rigidbody.enabled && !obj.rigidbody.isKinematic &&
+            !obj.IsInvariable;
+        if (useWorldAuthoritative) {
+            // Inputs of updateLocalFromWorld: parent TRS, world TRS and the local rotation it
+            // uses as the euler continuity reference (localInitialized is always true here).
+            float key[22];
+            std::memcpy(key + 0, &parent.pos, sizeof(glm::vec3));
+            std::memcpy(key + 3, &parent.rot, sizeof(glm::quat));
+            std::memcpy(key + 7, &parent.scale, sizeof(glm::vec3));
+            std::memcpy(key + 10, &obj.position, sizeof(glm::vec3));
+            std::memcpy(key + 13, &obj.rotation, sizeof(glm::vec3));
+            std::memcpy(key + 16, &obj.scale, sizeof(glm::vec3));
+            std::memcpy(key + 19, &obj.localRotation, sizeof(glm::vec3));
+            if (memo.kind == MemoWorldAuthoritative && std::memcmp(memo.key, key, sizeof(key)) == 0) {
+                std::memcpy(&obj.localPosition, memo.out + 0, sizeof(glm::vec3));
+                std::memcpy(&obj.localRotation, memo.out + 3, sizeof(glm::vec3));
+                std::memcpy(&obj.localScale, memo.out + 6, sizeof(glm::vec3));
+            } else {
+                updateLocalFromWorld(obj, parent.pos, parent.rot, parent.scale);
+                std::memcpy(memo.key, key, sizeof(key));
+                std::memcpy(memo.out + 0, &obj.localPosition, sizeof(glm::vec3));
+                std::memcpy(memo.out + 3, &obj.localRotation, sizeof(glm::vec3));
+                std::memcpy(memo.out + 6, &obj.localScale, sizeof(glm::vec3));
+                memo.kind = MemoWorldAuthoritative;
+            }
+            world.pos = obj.position;
+            world.rot = memoQuatFromEuler(memo, obj.rotation);
+            world.scale = obj.scale;
+        } else if (obj.parentId == -1) {
+            obj.position = obj.localPosition;
+            obj.rotation = NormalizeEulerDegrees(obj.localRotation);
+            obj.scale = obj.localScale;
+            world.pos = obj.position;
+            world.rot = memoQuatFromEuler(memo, obj.rotation);
+            world.scale = obj.scale;
+        } else {
+            // Inputs of the child branch: parent TRS, local TRS and the previous world rotation
+            // (the euler continuity reference). Everything it writes is a function of these.
+            float key[22];
+            std::memcpy(key + 0, &parent.pos, sizeof(glm::vec3));
+            std::memcpy(key + 3, &parent.rot, sizeof(glm::quat));
+            std::memcpy(key + 7, &parent.scale, sizeof(glm::vec3));
+            std::memcpy(key + 10, &obj.localPosition, sizeof(glm::vec3));
+            std::memcpy(key + 13, &obj.localRotation, sizeof(glm::vec3));
+            std::memcpy(key + 16, &obj.localScale, sizeof(glm::vec3));
+            std::memcpy(key + 19, &obj.rotation, sizeof(glm::vec3));
+            if (memo.kind == MemoChild && std::memcmp(memo.key, key, sizeof(key)) == 0) {
+                std::memcpy(&obj.position, memo.out + 0, sizeof(glm::vec3));
+                std::memcpy(&obj.rotation, memo.out + 3, sizeof(glm::vec3));
+                std::memcpy(&obj.scale, memo.out + 6, sizeof(glm::vec3));
+                std::memcpy(&world.rot, memo.out + 9, sizeof(glm::quat));
+            } else {
+                glm::quat localRot = QuatFromEulerXYZ(obj.localRotation);
+                glm::quat worldRot = parent.rot * localRot;
+                glm::vec3 worldScale = parent.scale * obj.localScale;
+                glm::vec3 worldPos = parent.pos + parent.rot * (parent.scale * obj.localPosition);
+                glm::vec3 worldRotDeg = ChooseContinuousEulerDegrees(
+                    glm::degrees(ExtractEulerXYZ(glm::mat3_cast(worldRot), &obj.rotation)), obj.rotation);
+                worldRotDeg.x = unwrapNear(worldRotDeg.x, obj.rotation.x);
+                worldRotDeg.y = unwrapNear(worldRotDeg.y, obj.rotation.y);
+                worldRotDeg.z = unwrapNear(worldRotDeg.z, obj.rotation.z);
+                obj.position = worldPos;
+                obj.rotation = worldRotDeg;
+                obj.scale = worldScale;
+                world.rot = worldRot;
+                std::memcpy(memo.key, key, sizeof(key));
+                std::memcpy(memo.out + 0, &obj.position, sizeof(glm::vec3));
+                std::memcpy(memo.out + 3, &obj.rotation, sizeof(glm::vec3));
+                std::memcpy(memo.out + 6, &obj.scale, sizeof(glm::vec3));
+                std::memcpy(memo.out + 9, &world.rot, sizeof(glm::quat));
+                memo.kind = MemoChild;
+            }
+            world.pos = obj.position;
+            world.scale = obj.scale;
+        }
+
+        world.childEnabled = IsObjectEnabledInHierarchy(obj);
+        world.childMoving = parent.childMoving || drivesSubtreeMotion(obj);
+    }
+}
+
+#if MODULARITY_VERIFY_TRANSFORM_CACHE
+// The original recursive pass, kept verbatim as the oracle for the self-check above.
+void Engine::updateHierarchyWorldTransformsReference(std::vector<SceneObject>& objects, bool rebuildWorldFromLocal) {
 
     bool hasHierarchyLinks = false;
-    for (const auto& obj : sceneObjects) {
+    for (const auto& obj : objects) {
         if (obj.parentId != -1 || !obj.childIds.empty()) {
             hasHierarchyLinks = true;
             break;
@@ -12779,7 +13255,7 @@ void Engine::updateHierarchyWorldTransforms(bool rebuildWorldFromLocal) {
         const glm::vec3 rootPos(0.0f);
         const glm::quat rootRot(1.0f, 0.0f, 0.0f, 0.0f);
         const glm::vec3 rootScale(1.0f);
-        for (auto& obj : sceneObjects) {
+        for (auto& obj : objects) {
             obj.hierarchyEnabled = true;
             if (!obj.localInitialized) {
                 obj.localPosition = obj.position;
@@ -12812,8 +13288,8 @@ void Engine::updateHierarchyWorldTransforms(bool rebuildWorldFromLocal) {
 
     std::unordered_set<int> visiting;
     std::unordered_set<int> visited;
-    visiting.reserve(sceneObjects.size());
-    visited.reserve(sceneObjects.size());
+    visiting.reserve(objects.size());
+    visited.reserve(objects.size());
 
     std::function<void(int, const glm::vec3&, const glm::quat&, const glm::vec3&, bool)> processNode =
         [&](int id,
@@ -12827,7 +13303,7 @@ void Engine::updateHierarchyWorldTransforms(bool rebuildWorldFromLocal) {
         if (itIndex == sceneObjectIndexById.end()) return;
 
         visiting.insert(id);
-        SceneObject& obj = sceneObjects[itIndex->second];
+        SceneObject& obj = objects[itIndex->second];
         obj.hierarchyEnabled = parentHierarchyEnabled;
         if (!obj.localInitialized) {
             obj.localPosition = obj.position;
@@ -12878,7 +13354,7 @@ void Engine::updateHierarchyWorldTransforms(bool rebuildWorldFromLocal) {
         visited.insert(id);
     };
 
-    for (const auto& obj : sceneObjects) {
+    for (const auto& obj : objects) {
         if (obj.parentId == -1 || sceneObjectIndexById.find(obj.parentId) == sceneObjectIndexById.end()) {
             processNode(obj.id,
                         glm::vec3(0.0f),
@@ -12888,12 +13364,385 @@ void Engine::updateHierarchyWorldTransforms(bool rebuildWorldFromLocal) {
         }
     }
 }
+#endif
 #pragma endregion
 
 #pragma region Project Lifecycle
 void Engine::setStartupProjectPath(const std::string& path) {
     startupProjectPath = path;
 }
+
+#if !MODULARITY_RUNTIME_ONLY
+// ---- --autoshot tooling -------------------------------------------------------------------------
+// Runs once per frame after the swap. Waits for project + scene to finish loading, lets the engine
+// render for autoShot_.delaySeconds (streaming textures/meshes, shader compiles, eye adaptation),
+// then renders the requested view offscreen, saves a PNG, prints the 2 s average frame time and asks
+// the run loop to exit. Nothing here runs unless --autoshot was passed.
+void Engine::updateAutoShot() {
+    if (!autoShot_.enabled) return;
+    const double now = glfwGetTime();
+    if (autoShotWaitStart_ < 0.0) autoShotWaitStart_ = now;
+
+    const bool ready = projectManager.currentProject.isLoaded && !showLauncher &&
+                       !projectLoadInProgress && !sceneLoadInProgress &&
+                       rendererInitialized && !sceneObjects.empty();
+    if (!ready) {
+        autoShotReadySince_ = -1.0;
+        autoShotFrames_.clear();
+        // A project that never opens (bad path, missing project, modal stuck) must not hang a script.
+        if (now - autoShotWaitStart_ > 240.0) {
+            std::fprintf(stderr, "AUTOSHOT error: project/scene did not finish loading within 240 s\n");
+            std::fflush(stderr);
+            autoShotExitCode_ = 2;
+            autoShot_.enabled = false;
+            glfwSetWindowShouldClose(editorWindow, GLFW_TRUE);
+        }
+        return;
+    }
+
+    if (autoShotReadySince_ < 0.0) {
+        autoShotReadySince_ = now;
+        // MODU_AUTOSHOT_SELECT=<object id> selects it so the live Inspector draws its sections during the
+        // delay frames; MODU_AUTOSHOT_BRUSH=<mode 0..5> also arms the terrain brush (Raise..Grass density).
+        if (const char* selectId = std::getenv("MODU_AUTOSHOT_SELECT")) {
+            setPrimarySelection(std::atoi(selectId));
+        }
+        if (const char* brushMode = std::getenv("MODU_AUTOSHOT_BRUSH")) {
+            terrainBrushEnabled = true;
+            terrainBrush.mode = static_cast<TerrainRuntime::BrushMode>(std::clamp(std::atoi(brushMode), 0, 5));
+        }
+        if (autoShot_.hasCamera || autoShot_.sceneView) {
+            // Park the editor camera too so the live Scene Viewport shows the same view.
+            if (autoShot_.hasCamera) {
+                glm::vec3 dir = autoShot_.cameraTarget - autoShot_.cameraPosition;
+                if (glm::length(dir) < 1e-5f) dir = glm::vec3(0.0f, 0.0f, -1.0f);
+                dir = glm::normalize(dir);
+                camera.position = autoShot_.cameraPosition;
+                camera.front = dir;
+                camera.pitch = glm::clamp(glm::degrees(std::asin(glm::clamp(dir.y, -1.0f, 1.0f))), -89.0f, 89.0f);
+                camera.yaw = glm::degrees(std::atan2(dir.z, dir.x));
+                camera.velocity = glm::vec3(0.0f);
+                camera.firstMouse = true;
+                viewportFocusActive = false;
+            }
+        }
+    }
+
+    autoShotFrames_.emplace_back(now, lastFrameWallMs);
+    while (!autoShotFrames_.empty() && now - autoShotFrames_.front().first > 2.0) {
+        autoShotFrames_.pop_front();
+    }
+    if (now - autoShotReadySince_ < std::max(0.0, autoShot_.delaySeconds)) return;
+
+    // Average frame time over the last 2 s of rendering, taken before the capture's own cost.
+    double sumMs = 0.0;
+    for (const auto& f : autoShotFrames_) sumMs += f.second;
+    const double avgMs = autoShotFrames_.empty() ? 0.0 : sumMs / static_cast<double>(autoShotFrames_.size());
+
+    std::string error;
+    const bool ok = captureAutoShot(error);
+    if (!ok) {
+        std::fprintf(stderr, "AUTOSHOT error: %s\n", error.c_str());
+        autoShotExitCode_ = 1;
+    } else {
+        std::printf("AUTOSHOT saved=%s size=%dx%d\n", autoShot_.outPath.c_str(), autoShot_.width, autoShot_.height);
+    }
+    std::printf("AUTOSHOT frame_ms=%.3f\n", avgMs);
+    std::fflush(stdout);
+    std::fflush(stderr);
+    // The debug hooks (and a simulated brush stroke) edit the loaded scene. An autoshot run must leave
+    // the project untouched: drop the unsaved-changes flag so closing never writes the scene (or its
+    // terrain sidecars), and put back the project's own lastScene so the project file keeps it.
+    projectManager.currentProject.hasUnsavedChanges = false;
+    {
+        std::ifstream projectFile(projectManager.currentProject.projectPath / "project.modu");
+        std::string line;
+        while (projectFile && std::getline(projectFile, line)) {
+            if (line.compare(0, 10, "lastScene=") == 0) {
+                while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+                projectManager.currentProject.currentSceneName = line.substr(10);
+                break;
+            }
+        }
+    }
+    autoShot_.enabled = false;
+    glfwSetWindowShouldClose(editorWindow, GLFW_TRUE);
+}
+
+bool Engine::captureAutoShot(std::string& error) {
+    if (!rendererInitialized || usingVulkan()) {
+        error = "autoshot needs the OpenGL renderer";
+        return false;
+    }
+    // Round-trip check for scene serialization work: MODU_AUTOSHOT_SAVE_SCENE=<path> also writes the
+    // loaded scene to that path (modular format) before the screenshot. Never touches the project.
+    if (const char* saveScenePath = std::getenv("MODU_AUTOSHOT_SAVE_SCENE")) {
+        if (*saveScenePath) {
+            const bool saved = SceneSerializer::saveScene(saveScenePath, sceneObjects, nextObjectId,
+                                                          getSceneTimeOfDay(), getSceneSkyboxSettings());
+            std::fprintf(stderr, "AUTOSHOT scene %s -> %s\n", saved ? "saved" : "SAVE FAILED", saveScenePath);
+        }
+    }
+    static constexpr int kAutoShotPreviewSlot = 5099;
+    // MODU_AUTOSHOT_INSTANCER_CONVERT=<template object id>: wraps the template's parent in a new Instancer
+    // with that template as prototype 0 and runs "Convert Children (nested)", to check conversion
+    // fidelity against the original scene. Debug aid for the autoshot run only; nothing is saved.
+    if (const char* convertTemplate = std::getenv("MODU_AUTOSHOT_INSTANCER_CONVERT")) {
+        const int templateId = std::atoi(convertTemplate);
+        SceneObject* templateObject = findObjectById(templateId);
+        SceneObject* forest = templateObject ? findObjectById(templateObject->parentId) : nullptr;
+        if (forest) {
+            const int forestId = forest->id;
+            const int oldParentId = forest->parentId;
+            const int instancerId = nextObjectId++;
+            SceneObject instancer("Instancer (autoshot)", ObjectType::Empty, instancerId);
+            instancer.hasInstancer = true;
+            instancer.instancer.prototypes.emplace_back();
+            instancer.instancer.prototypes.back().sourceObjectId = templateId;
+            instancer.instancer.prototypes.back().maxDrawDistance = 0.0f;
+            instancer.instancer.prototypes.back().shadowDistance = 0.0f;
+            instancer.childIds.push_back(forestId);
+            instancer.position = glm::vec3(0.0f);
+            instancer.rotation = glm::vec3(0.0f);
+            instancer.scale = glm::vec3(1.0f);
+            instancer.localPosition = instancer.position;
+            instancer.localRotation = instancer.rotation;
+            instancer.localScale = instancer.scale;
+            instancer.localInitialized = true;
+            if (SceneObject* oldParent = findObjectById(oldParentId)) {
+                oldParent->childIds.erase(std::remove(oldParent->childIds.begin(), oldParent->childIds.end(), forestId),
+                                          oldParent->childIds.end());
+            }
+            if (SceneObject* movedForest = findObjectById(forestId)) movedForest->parentId = instancerId;
+            sceneObjects.push_back(instancer);
+            updateHierarchyWorldTransforms();
+            const size_t before = sceneObjects.size();
+            const auto started = std::chrono::steady_clock::now();
+            const InstancerTools::ConvertResult converted = InstancerTools::ConvertChildren(sceneObjects, instancerId, true);
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+            updateHierarchyWorldTransforms();
+            std::fprintf(stderr, "AUTOSHOT instancer convert: converted=%d unmatched=%d removed=%d objects %zu -> %zu in %.1f ms\n",
+                         converted.converted, converted.unmatched, converted.removedObjects, before, sceneObjects.size(), ms);
+        } else {
+            std::fprintf(stderr, "AUTOSHOT instancer convert: template %d or its parent not found\n", templateId);
+        }
+    }
+    // MODU_AUTOSHOT_PHYSICS_SMOKE=1: start and stop physics once, shooting a ray at the first few
+    // Instancer capsule colliders (expects a hit about `radius` short of the trunk centre).
+    if (std::getenv("MODU_AUTOSHOT_PHYSICS_SMOKE")) {
+        updateHierarchyWorldTransforms();
+        physics->onPlayStart(sceneObjects);
+        for (const SceneObject& holder : sceneObjects) {
+            if (!holder.hasInstancer || !holder.instancer.instances) continue;
+            int shot = 0;
+            for (const InstancerInstance& instance : *holder.instancer.instances) {
+                if (instance.prototype >= holder.instancer.prototypes.size() ||
+                    holder.instancer.prototypes[instance.prototype].colliderMode != InstancerColliderMode::Capsule) continue;
+                const glm::vec3 centre = holder.position + instance.position + glm::vec3(0.0f, 1.5f, 0.0f);
+                glm::vec3 hitPos(0.0f);
+                float hitDistance = -1.0f;
+                int hitId = -2;
+                const bool hit = physics->raycastClosest(centre + glm::vec3(4.0f, 0.0f, 0.0f), glm::vec3(-1.0f, 0.0f, 0.0f),
+                                                         10.0f, -1, &hitPos, nullptr, &hitDistance, &hitId);
+                std::fprintf(stderr, "AUTOSHOT physics ray instance at (%.1f,%.1f,%.1f): hit=%d dist=%.2f actor=%d\n",
+                             centre.x, centre.y, centre.z, hit ? 1 : 0, hitDistance, hitId);
+                if (++shot >= 3) break;
+            }
+        }
+        physics->onPlayStop();
+    }
+    // MODU_AUTOSHOT_TERRAIN_SMOKE=1: checks the Terrain component without a window interaction:
+    // sidecar encode/decode round trip, world queries against the Jolt heightfield (rays straight
+    // down from above), the viewport picking ray-march, and one brush stroke + undo-safe COW.
+    if (std::getenv("MODU_AUTOSHOT_TERRAIN_SMOKE")) {
+        updateHierarchyWorldTransforms();
+        for (SceneObject& holder : sceneObjects) {
+            if (!holder.hasTerrain) continue;
+            const TerrainComponent& t = holder.terrain;
+            std::fprintf(stderr, "AUTOSHOT terrain '%s': active=%d res=%d splat=%d size=%.1f hs=%.1f off=%.1f path=%s ponds=%zu clearings=%zu\n",
+                         holder.name.c_str(), TerrainRuntime::IsActive(holder) ? 1 : 0, t.resolution, t.splatResolution,
+                         t.size, t.heightScale, t.heightOffset, t.dataPath.c_str(), t.ponds.size(), t.clearings.size());
+            if (!t.hasData()) continue;
+            const std::vector<uint8_t> bytes = TerrainRuntime::EncodeSidecar(t);
+            TerrainComponent copy;
+            std::string decodeError;
+            const bool decoded = TerrainRuntime::DecodeSidecar(bytes.data(), bytes.size(), copy, &decodeError);
+            const bool same = decoded && copy.resolution == t.resolution && *copy.heights == *t.heights && *copy.splat == *t.splat;
+            std::fprintf(stderr, "AUTOSHOT terrain sidecar: %zu bytes, round trip %s %s\n", bytes.size(), same ? "OK" : "MISMATCH", decodeError.c_str());
+        }
+        physics->onPlayStart(sceneObjects);
+        int bad = 0;
+        int total = 0;
+        for (const SceneObject& holder : sceneObjects) {
+            if (!holder.hasTerrain || !TerrainRuntime::IsActive(holder)) continue;
+            const float half = holder.terrain.size * 0.5f * std::max(holder.scale.x, 0.01f);
+            for (int i = 0; i < 24; ++i) {
+                const float fx = holder.position.x + (((i * 37) % 23) / 23.0f * 2.0f - 1.0f) * half * 0.9f;
+                const float fz = holder.position.z + (((i * 53) % 29) / 29.0f * 2.0f - 1.0f) * half * 0.9f;
+                TerrainRuntime::SurfaceSample sample;
+                if (!TerrainRuntime::SampleObject(holder, fx, fz, sample)) continue;
+                glm::vec3 hitPos(0.0f);
+                float hitDistance = -1.0f;
+                int hitId = -2;
+                const bool hit = physics->raycastClosest(glm::vec3(fx, sample.height + 50.0f, fz), glm::vec3(0.0f, -1.0f, 0.0f),
+                                                         200.0f, -1, &hitPos, nullptr, &hitDistance, &hitId);
+                const float diff = hit ? std::fabs(hitPos.y - sample.height) : 999.0f;
+                float pickT = 0.0f;
+                const bool pick = TerrainRuntime::Raycast(holder, glm::vec3(fx, sample.height + 50.0f, fz), glm::vec3(0.0f, -1.0f, 0.0f), 200.0f, pickT);
+                const float pickDiff = pick ? std::fabs((sample.height + 50.0f - pickT) - sample.height) : 999.0f;
+                ++total;
+                if (!hit || diff > 0.06f || hitId != holder.id || pickDiff > 0.02f) {
+                    ++bad;
+                    std::fprintf(stderr, "AUTOSHOT terrain query MISMATCH at (%.2f,%.2f): height=%.3f jolt=%.3f (hit=%d actor=%d) pick=%.3f\n",
+                                 fx, fz, sample.height, hit ? hitPos.y : -999.0f, hit ? 1 : 0, hitId, pick ? sample.height + 50.0f - pickT : -999.0f);
+                }
+            }
+        }
+        physics->onPlayStop();
+        std::fprintf(stderr, "AUTOSHOT terrain physics/query check: %d of %d samples off\n", bad, total);
+    }
+    // MODU_AUTOSHOT_SCATTER=<instancer id>: runs the Inspector's Scatter once (circle, 60 m radius,
+    // 250 instances) through the registered ground query, to check height snapping and keep-out.
+    if (const char* scatterId = std::getenv("MODU_AUTOSHOT_SCATTER")) {
+        InstancerTools::ScatterParams params;
+        params.shape = InstancerTools::ScatterParams::Shape::Circle;
+        params.radius = 60.0f;
+        params.count = 250;
+        params.minSpacing = 3.0f;
+        updateHierarchyWorldTransforms();
+        const InstancerTools::ScatterResult result = InstancerTools::Scatter(sceneObjects, std::atoi(scatterId), params);
+        std::fprintf(stderr, "AUTOSHOT scatter: placed=%d spacing=%d keepOut=%d noGround=%d\n",
+                     result.placed, result.rejectedSpacing, result.rejectedKeepOut, result.rejectedNoGround);
+        if (std::getenv("MODU_AUTOSHOT_SNAP")) {
+            // Shift every instance up 5 m first, so the snap has something to undo.
+            if (SceneObject* holder = findObjectById(std::atoi(scatterId))) {
+                std::vector<InstancerInstance>& list = holder->instancer.mutableInstances();
+                for (InstancerInstance& instance : list) instance.position.y += 5.0f;
+            }
+            const InstancerTools::SnapResult snap = InstancerTools::SnapToGround(sceneObjects, std::atoi(scatterId), true);
+            std::fprintf(stderr, "AUTOSHOT snap: snapped=%d removedKeepOut=%d noGround=%d\n", snap.snapped, snap.removedKeepOut, snap.noGround);
+        }
+    }
+    // MODU_AUTOSHOT_TERRAIN_BRUSH=<terrain id>: one raise stroke and one path-paint stroke at the centre.
+    if (const char* brushId = std::getenv("MODU_AUTOSHOT_TERRAIN_BRUSH")) {
+        if (SceneObject* brushTarget = findObjectById(std::atoi(brushId))) {
+            if (brushTarget->hasTerrain && brushTarget->terrain.hasData()) {
+                TerrainRuntime::BrushParams brush;
+                brush.radius = 10.0f;
+                brush.strength = 1.0f;
+                brush.mode = TerrainRuntime::BrushMode::Raise;
+                for (int i = 0; i < 40; ++i) TerrainRuntime::ApplyBrush(brushTarget->terrain, 20.0f, -20.0f, brush, i == 0);
+                brush.mode = TerrainRuntime::BrushMode::PaintLayer;
+                brush.layer = 3;
+                brush.radius = 8.0f;
+                for (int i = 0; i < 12; ++i) TerrainRuntime::ApplyBrush(brushTarget->terrain, 20.0f, -20.0f, brush, i == 0);
+                std::fprintf(stderr, "AUTOSHOT terrain brush applied, dirty=%d\n", brushTarget->terrain.dataDirty() ? 1 : 0);
+            }
+        }
+    }
+    const int width = std::clamp(autoShot_.width, 16, 4096);
+    const int height = std::clamp(autoShot_.height, 16, 4096);
+    const float aspect = static_cast<float>(width) / static_cast<float>(height);
+
+    const bool wantScene = autoShot_.sceneView || autoShot_.hasCamera;
+    const SceneObject* playerCam = wantScene ? nullptr : findPlayerCameraObject();
+    if (!wantScene && !playerCam) {
+        std::fprintf(stderr, "AUTOSHOT warning: no enabled Player camera in the scene; using the scene camera\n");
+    }
+
+    Camera shotCamera = camera;
+    float fov = buildSettings.editorCameraFov;
+    float nearPlane = buildSettings.editorCameraNear;
+    float farPlane = buildSettings.editorCameraFar;
+    if (playerCam) {
+        shotCamera = makeCameraFromObject(*playerCam);
+        fov = ResolveCameraVerticalFovDeg(playerCam->camera, aspect);
+        nearPlane = std::max(0.01f, playerCam->camera.nearClip);
+        farPlane = std::max(nearPlane + 0.01f, playerCam->camera.farClip);
+    } else if (autoShot_.hasCamera) {
+        glm::vec3 dir = autoShot_.cameraTarget - autoShot_.cameraPosition;
+        if (glm::length(dir) < 1e-5f) dir = glm::vec3(0.0f, 0.0f, -1.0f);
+        dir = glm::normalize(dir);
+        shotCamera.position = autoShot_.cameraPosition;
+        shotCamera.front = dir;
+        shotCamera.pitch = glm::clamp(glm::degrees(std::asin(glm::clamp(dir.y, -1.0f, 1.0f))), -89.0f, 89.0f);
+        shotCamera.yaw = glm::degrees(std::atan2(dir.z, dir.x));
+    }
+
+    std::fprintf(stderr, "AUTOSHOT camera pos=(%.1f,%.1f,%.1f) front=(%.2f,%.2f,%.2f) fov=%.1f near=%.2f far=%.0f\n",
+                 shotCamera.position.x, shotCamera.position.y, shotCamera.position.z,
+                 shotCamera.front.x, shotCamera.front.y, shotCamera.front.z, fov, nearPlane, farPlane);
+    unsigned int tex = 0;
+    int texW = width;
+    int texH = height;
+    const bool pure2D = isProject2DPipeline() || isProject25DPipeline() ||
+                        (playerCam && playerCam->camera.use2D);
+    if (!pure2D) {
+        tex = renderer.renderScenePreview(shotCamera, sceneObjects, width, height, fov, nearPlane,
+                                          farPlane, true, kAutoShotPreviewSlot);
+    } else {
+        // 2D / 2.5D pipelines have their own passes; fall back to whatever the Scene Viewport shows.
+        tex = renderer.getViewportTexture();
+        texW = std::max(1, viewportWidth);
+        texH = std::max(1, viewportHeight);
+        std::fprintf(stderr, "AUTOSHOT warning: 2D/2.5D pipeline, capturing the scene viewport texture (%dx%d)\n", texW, texH);
+    }
+    if (tex == 0) {
+        error = "renderer returned no texture";
+        return false;
+    }
+
+    std::vector<unsigned char> pixels(static_cast<size_t>(texW) * texH * 4);
+#if MODULARITY_OPENGL_ES
+    GLint prevFbo = 0;
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
+    GLuint readFbo = 0;
+    glGenFramebuffers(1, &readFbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, readFbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    const bool readOk = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    if (readOk) {
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadPixels(0, 0, texW, texH, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+        glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(prevFbo));
+    glDeleteFramebuffers(1, &readFbo);
+    if (!readOk) {
+        error = "readback framebuffer incomplete";
+        return false;
+    }
+#else
+    GLint prevTex = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(prevTex));
+#endif
+
+    // GL rows run bottom to top; PNG wants top to bottom. The framebuffer is opaque in the viewer.
+    const size_t rowBytes = static_cast<size_t>(texW) * 4;
+    std::vector<unsigned char> flipped(pixels.size());
+    for (int y = 0; y < texH; ++y) {
+        std::memcpy(flipped.data() + static_cast<size_t>(y) * rowBytes,
+                    pixels.data() + static_cast<size_t>(texH - 1 - y) * rowBytes, rowBytes);
+    }
+    for (size_t i = 3; i < flipped.size(); i += 4) flipped[i] = 255;
+
+    std::error_code ec;
+    const fs::path outPath(autoShot_.outPath);
+    if (outPath.has_parent_path()) fs::create_directories(outPath.parent_path(), ec);
+    if (!stbi_write_png(outPath.string().c_str(), texW, texH, 4, flipped.data(), static_cast<int>(rowBytes))) {
+        error = "failed to write " + outPath.string();
+        return false;
+    }
+    autoShot_.width = texW;
+    autoShot_.height = texH;
+    return true;
+}
+#endif
 
 void Engine::OpenProjectPath(const std::string& path) {
     startProjectLoad(path);
@@ -13134,6 +13983,10 @@ void Engine::finalizeDeferredSceneLoad() {
 
     projectManager.currentProject.currentSceneName = sceneLoadSceneName;
     projectManager.currentProject.hasUnsavedChanges = false;
+#if !MODULARITY_RUNTIME_ONLY
+    // An --autoshot run must leave the project untouched (its --autoshot-scene is not the new lastScene).
+    if (!autoShot_.enabled)
+#endif
     projectManager.currentProject.saveProjectFile();
     clearSelection();
 
@@ -16741,6 +17594,17 @@ bool Engine::executeSceneSave(const std::string& destinationSceneName,
         return false;
     }
 
+    {
+        // Terrain heightmaps and splat maps live in `.modterrain` sidecars next to the scene; write
+        // the changed ones (and give new terrains a path) before the scene text names them.
+        const TerrainRuntime::SaveReport terrainReport =
+            TerrainRuntime::SaveDirtySidecars(sceneObjects, projectManager.currentProject.projectPath.string());
+        for (const std::string& terrainError : terrainReport.errors) {
+            addConsoleMessage("Error: " + terrainError, ConsoleMessageType::Error);
+        }
+        if (!terrainReport.errors.empty()) return false;
+    }
+
     const float timeOfDay = getSceneTimeOfDay();
     if (!SceneSerializer::saveScene(scenePath,
                                     sceneObjects,
@@ -17119,6 +17983,13 @@ void Engine::duplicateSelected() {
         newObj.videoPlayer = it->videoPlayer;
         newObj.hasReverbZone = it->hasReverbZone;
         newObj.reverbZone = it->reverbZone;
+        newObj.hasInstancer = it->hasInstancer;
+        newObj.instancer = it->instancer;   // shares the copy-on-write instance list
+        newObj.hasTerrain = it->hasTerrain;
+        newObj.terrain = it->terrain;       // shares the copy-on-write height/splat buffers
+        newObj.terrain.dataPath.clear();    // the copy gets its own .modterrain on the next save
+        newObj.terrain.savedHeightRevision = 0;
+        newObj.terrain.savedSplatRevision = 0;
         newObj.hasGroundBakedType = it->hasGroundBakedType;
         newObj.groundBakedType = it->groundBakedType;
         newObj.hasObsticleObject = it->hasObsticleObject;
@@ -17960,8 +18831,10 @@ void Engine::refreshParticleAssets(SceneObject& obj, double now) {
             ClearParticleMaterial(ps);
         }
     } else {
-        const fs::path resolved = resolveMaterialAssetPath(ps.materialPath);
         const bool keyChanged = ps.runtimeMaterialKey != ps.materialPath;
+        // Resolving stats the disk; the path is only read when the file is (re)stamped.
+        const fs::path resolved =
+            (keyChanged || restamp) ? resolveMaterialAssetPath(ps.materialPath) : fs::path();
         const long long stamp =
             (keyChanged || restamp) ? ParticleAssetStamp(resolved) : ps.runtimeMaterialStamp;
         if (keyChanged || stamp != ps.runtimeMaterialStamp) {
@@ -17999,9 +18872,11 @@ void Engine::refreshParticleAssets(SceneObject& obj, double now) {
         return;
     }
     // The same sidecar a UI Image reads its clips from: "<texture>.spritesheet".
+    const bool keyChanged = ps.runtimeSheetKey != texture;
+    // Steady state needs neither the sidecar name nor its resolved path.
+    if (!keyChanged && !restamp) return;
     const std::string sidecar = texture + ".spritesheet";
     const fs::path resolvedSidecar(Modularity::Platform::ResolveAssetPath(sidecar));
-    const bool keyChanged = ps.runtimeSheetKey != texture;
     const long long stamp =
         (keyChanged || restamp) ? ParticleAssetStamp(resolvedSidecar) : ps.runtimeSheetStamp;
     if (keyChanged || stamp != ps.runtimeSheetStamp) {
@@ -18200,11 +19075,7 @@ fs::path Engine::resolveScriptBinary(const fs::path& sourcePath) {
                 fs::path relativeParent = relToScripts.has_parent_path() ? relToScripts.parent_path() : fs::path();
                 fs::path binaryPath = config.outDir / relativeParent;
                 const std::string artifactStem = NativeScriptArtifactStem(sourceAbs);
-#ifdef _WIN32
-                binaryPath /= artifactStem + ".dll";
-#else
-                binaryPath /= artifactStem + ".so";
-#endif
+                binaryPath /= artifactStem + NativeScriptArtifactExtension();
                 std::error_code binEc;
                 if (!binaryPath.empty() && fs::exists(binaryPath, binEc) && !binEc) {
                     ScriptBinaryResolveCacheEntry entry;
@@ -18252,11 +19123,7 @@ fs::path Engine::resolveScriptBinary(const fs::path& sourcePath) {
                     continue;
                 }
                 fs::path p = it->path();
-#ifdef _WIN32
-                if (p.stem() == stem && p.extension() == ".dll") return p;
-#else
-                if (p.stem() == stem && p.extension() == ".so") return p;
-#endif
+                if (p.stem() == stem && p.extension() == NativeScriptArtifactExtension()) return p;
             }
         }
     }
@@ -18287,11 +19154,9 @@ fs::path Engine::getManagedProjectPath() const {
     if (root.empty()) {
         root = findManagedProjectRoot(fs::current_path());
     }
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
     if (root.empty()) {
-        std::error_code ec;
-        fs::path exe = fs::read_symlink("/proc/self/exe", ec);
-        if (!ec) {
+        if (auto exe = Modularity::CurrentExecutablePath(); !exe.empty()) {
             root = findManagedProjectRoot(exe.parent_path());
         }
     }
@@ -18380,23 +19245,11 @@ bool Engine::createScriptAsset(ScriptScaffoldKind kind,
         if (engineRoot.empty()) {
             engineRoot = findManagedProjectRoot(fs::current_path());
         }
-#if defined(__linux__)
         if (engineRoot.empty()) {
-            std::error_code exeEc;
-            fs::path exe = fs::read_symlink("/proc/self/exe", exeEc);
-            if (!exeEc) {
+            if (auto exe = Modularity::CurrentExecutablePath(); !exe.empty()) {
                 engineRoot = findManagedProjectRoot(exe.parent_path());
             }
         }
-#elif defined(_WIN32)
-        if (engineRoot.empty()) {
-            wchar_t buffer[MAX_PATH];
-            DWORD len = GetModuleFileNameW(nullptr, buffer, MAX_PATH);
-            if (len > 0) {
-                engineRoot = findManagedProjectRoot(fs::path(buffer).parent_path());
-            }
-        }
-#endif
         if (!ensureProjectManagedCsproj(projectRoot, engineRoot, error)) {
             return false;
         }
@@ -19848,6 +20701,68 @@ bool Engine::raycastClosestFromScript(const glm::vec3& origin, const glm::vec3& 
                                   hitActorId, hitActorVelocity, hitStaticFriction, hitDynamicFriction);
 }
 
+bool Engine::addRigidbodyForceAtPositionFromScript(int id, const glm::vec3& force, const glm::vec3& worldPoint) {
+    return physics && physics->addForceAtPosition(id, force, worldPoint);
+}
+
+bool Engine::addRigidbodyImpulseAtPositionFromScript(int id, const glm::vec3& impulse, const glm::vec3& worldPoint) {
+    return physics && physics->addImpulseAtPosition(id, impulse, worldPoint);
+}
+
+bool Engine::getRigidbodyPointVelocityFromScript(int id, const glm::vec3& worldPoint, glm::vec3& outVelocity) const {
+    return physics && physics->getPointVelocity(id, worldPoint, outVelocity);
+}
+
+bool Engine::getRigidbodyCenterOfMassFromScript(int id, glm::vec3& outWorldCenterOfMass) const {
+    return physics && physics->getCenterOfMassPosition(id, outWorldCenterOfMass);
+}
+
+bool Engine::getRigidbodyPhysicsPoseFromScript(int id, glm::vec3& outPosition, glm::quat& outRotation) const {
+    return physics && physics->getActorPoseQuat(id, outPosition, outRotation);
+}
+
+bool Engine::getRigidbodyMassFromScript(int id, float& outMassKg) const {
+    return physics && physics->getMass(id, outMassKg);
+}
+
+bool Engine::raycastClosestIgnoringFromScript(const glm::vec3& origin, const glm::vec3& dir, float distance,
+                                              int ignoreId, bool skipSensors,
+                                              glm::vec3* hitPos, glm::vec3* hitNormal, float* hitDistance,
+                                              int* hitObjectId, float* hitFriction) const {
+    if (!physics) return false;
+    return physics->raycastClosestFiltered(origin, dir, distance, ignoreId, skipSensors,
+                                           hitPos, hitNormal, hitDistance, hitObjectId, hitFriction);
+}
+
+void Engine::getRenderStatsFromScript(int& drawCalls, int& triangles, float& cpuFrameMs, float& gpuFrameMs) const {
+    drawCalls = 0;
+    triangles = 0;
+    cpuFrameMs = lastFrameWallMs;
+    gpuFrameMs = -1.0f;
+    if (rendererInitialized) {
+        // Same pass selection the profiler uses: the player renders the game into the
+        // viewport target, the editor's Game view renders through the preview target.
+        const Renderer::RenderStats& stats = playerMode
+            ? renderer.getLastViewportStats()
+            : renderer.getLastPreviewStats();
+        drawCalls = std::max(0, stats.drawCalls);
+        triangles = static_cast<int>(std::clamp<long long>(stats.triangles, 0LL,
+                                                            static_cast<long long>(std::numeric_limits<int>::max())));
+    }
+    // GPU timer queries resolve a few frames late and only while the profiler records, so
+    // look back over the last handful of frames for the newest whole-frame result.
+    const Profiler& profiler = Profiler::instance();
+    const size_t historyCount = profiler.getHistoryCount();
+    const size_t lookBack = std::min<size_t>(historyCount, 8);
+    for (size_t i = 0; i < lookBack; ++i) {
+        const ProfilerFrameRecord* frame = profiler.getHistoryFrame(historyCount - 1 - i);
+        if (frame && frame->gpuTimingSupported && !frame->gpuTimingPartial && frame->gpuMs > 0.0) {
+            gpuFrameMs = static_cast<float>(frame->gpuMs);
+            break;
+        }
+    }
+}
+
 void Engine::syncLocalTransform(SceneObject& obj) {
     if (obj.parentId == -1) {
         obj.localPosition = obj.position;
@@ -19892,12 +20807,20 @@ bool Engine::setAudioLoopFromScript(int id, bool loop) {
     return audio.setObjectLoop(*obj, loop);
 }
 
-bool Engine::setAudioVolumeFromScript(int id, float volume) {
+bool Engine::setAudioVolumeFromScript(int id, float volume, bool markDirty) {
     SceneObject* obj = findObjectById(id);
     if (!obj || !obj->hasAudioSource) return false;
     obj->audioSource.volume = std::clamp(volume, 0.0f, 2.0f);
-    markProjectDirty();
+    if (markDirty) markProjectDirty();
     return audio.setObjectVolume(*obj, obj->audioSource.volume);
+}
+
+bool Engine::setAudioPitchFromScript(int id, float pitch) {
+    SceneObject* obj = findObjectById(id);
+    if (!obj || !obj->hasAudioSource) return false;
+    // Runtime-only (no dirty mark): AudioSystem re-applies pitch from the component every frame.
+    obj->audioSource.pitch = std::isfinite(pitch) ? std::clamp(pitch, 0.05f, 4.0f) : 1.0f;
+    return true;
 }
 
 bool Engine::setAudioClipFromScript(int id, const std::string& path) {
@@ -20351,6 +21274,8 @@ void Engine::compileScriptFile(const fs::path& scriptPath) {
     compileInProgress = true;
     compileWorkers.push_back(std::async(std::launch::async,
                                          [this, scriptPath, configPath, projectRoot]() -> ScriptCompileJobResult {
+        // Editor-initiated script builds are background work: keep them below the UI thread.
+        ScriptBackgroundBuildScope backgroundPriority;
         auto setProgress = [this](float value, const char* stage) {
             std::lock_guard<std::mutex> lock(compileMutex);
             compileProgress = value;
@@ -20550,6 +21475,7 @@ void Engine::compileManagedScripts() {
 
     compileInProgress = true;
     compileWorkers.push_back(std::async(std::launch::async, [this, managedProject]() -> ScriptCompileJobResult {
+        ScriptBackgroundBuildScope backgroundPriority;
         auto setProgress = [this](float value, const char* stage) {
             std::lock_guard<std::mutex> lock(compileMutex);
             compileProgress = value;
@@ -22237,7 +23163,7 @@ void Engine::loadEditorUserSettings() {
         } else if (key == "scriptAutoCompileInterval") {
             try { scriptAutoCompileInterval = std::clamp(std::stod(value), 0.1, 10.0); } catch (...) {}
         } else if (key == "scriptAutoCompileOnSave") {
-            scriptEditorState.autoCompileOnSave = (value == "1" || value == "true" || value == "yes");
+            scriptEditorAutoCompileOnSave = (value == "1" || value == "true" || value == "yes");
         } else if (key == "audioPreviewVolume") {
             try { audioPreviewVolume = std::stof(value); } catch (...) {}
         } else if (key == "feedbackSoundsEnabled") {
@@ -22654,7 +23580,7 @@ void Engine::saveEditorUserSettings() const {
     }
     file << "sceneViewportToolbarCorner=" << toolbarCornerName << "\n";
     file << "scriptAutoCompileInterval=" << scriptAutoCompileInterval << "\n";
-    file << "scriptAutoCompileOnSave=" << (scriptEditorState.autoCompileOnSave ? "1" : "0") << "\n";
+    file << "scriptAutoCompileOnSave=" << (scriptEditorAutoCompileOnSave ? "1" : "0") << "\n";
     file << "audioPreviewVolume=" << std::clamp(audioPreviewVolume, 0.0f, 2.0f) << "\n";
     file << "feedbackSoundsEnabled=" << (feedbackSoundsEnabled ? "1" : "0") << "\n";
     file << "feedbackClickSoundsEnabled=" << (feedbackClickSoundsEnabled ? "1" : "0") << "\n";

@@ -1,0 +1,11 @@
+ManifestInfo()
+{
+    PackageID = "moduengine.codex-plugin";
+    Name = "Codex Plugin";
+    Author = "Modularity Core";
+    Description = "Project-aware local Codex SDK companion for Modularity.";
+    PackageType = "Editor Tool";
+    Subsystem = "Scripting";
+    Version = "1.0.0";
+    CompatibleModuEngineVersion = "6.8+";
+}

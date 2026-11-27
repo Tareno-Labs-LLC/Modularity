@@ -35,6 +35,8 @@ bool envWeatherDiffers(const WeatherSettings& a, const WeatherSettings& b) {
         envFloatDiffers(a.rainOpacity, b.rainOpacity) ||
         envFloatDiffers(a.rainSpeed, b.rainSpeed) ||
         envFloatDiffers(a.rainScale, b.rainScale) ||
+        a.rain3D != b.rain3D ||
+        envFloatDiffers(a.rainDensity, b.rainDensity) ||
         envFloatDiffers(a.lightningInterval, b.lightningInterval) ||
         envFloatDiffers(a.lightningIntensity, b.lightningIntensity) ||
         a.clearSoundPath != b.clearSoundPath ||
@@ -76,6 +78,10 @@ bool envSkySettingsDiffer(const SkyboxSettings& a, const SkyboxSettings& b) {
         envFloatDiffers(a.environmentReflectionIntensity, b.environmentReflectionIntensity) ||
         envFloatDiffers(a.reflectionDistanceFadeStart, b.reflectionDistanceFadeStart) ||
         envFloatDiffers(a.reflectionDistanceFadeEnd, b.reflectionDistanceFadeEnd) ||
+        envFloatDiffers(a.environmentLightingIntensity, b.environmentLightingIntensity) ||
+        a.skyLightingReflections != b.skyLightingReflections ||
+        envFloatDiffers(a.wetness, b.wetness) ||
+        envFloatDiffers(a.puddleAmount, b.puddleAmount) ||
         a.fogEnabled != b.fogEnabled ||
         a.fogMode != b.fogMode ||
         envFloatDiffers(a.fogStart, b.fogStart) ||
@@ -85,6 +91,11 @@ bool envSkySettingsDiffer(const SkyboxSettings& a, const SkyboxSettings& b) {
         envFloatDiffers(a.fogHeightFalloff, b.fogHeightFalloff) ||
         glm::length(a.fogColor - b.fogColor) > 0.0001f ||
         a.sunFollowsDirectionalLight != b.sunFollowsDirectionalLight ||
+        a.atmosphereModel != b.atmosphereModel ||
+        envFloatDiffers(a.turbidity, b.turbidity) ||
+        envFloatDiffers(a.sunSize, b.sunSize) ||
+        envFloatDiffers(a.sunIntensity, b.sunIntensity) ||
+        a.fogMatchSky != b.fogMatchSky ||
         a.cloudMode != b.cloudMode ||
         envFloatDiffers(a.cloudCoverage, b.cloudCoverage) ||
         envFloatDiffers(a.cloudDensity, b.cloudDensity) ||
@@ -128,9 +139,24 @@ bool envSkySettingsDiffer(const SkyboxSettings& a, const SkyboxSettings& b) {
 } // namespace
 
 #pragma region Environment Window
+namespace ViewportRenderHelpers {
+// Defined in Panels/ViewportRenderHelpers.cpp.
+bool CanSkipHiddenPanelBody(bool beginVisible, double *railState);
+}
+
 void Engine::renderEnvironmentWindow() {
     if (!showEnvironmentWindow) return;
-    ImGui::Begin(Loc::Window("WINDOW_ENVIRONMENT", "Environment"), &showEnvironmentWindow);
+    const bool environmentVisible =
+        ImGui::Begin(Loc::Window("WINDOW_ENVIRONMENT", "Environment"), &showEnvironmentWindow);
+    // The body only mirrors scene sky settings into widget state and draws; it re-syncs from
+    // the scene on its next visible frame (lastUiSkySettings), so a hidden tab can skip it.
+    {
+        static double environmentRailState[2] = { -1.0, -1.0 };
+        if (ViewportRenderHelpers::CanSkipHiddenPanelBody(environmentVisible, environmentRailState)) {
+            ImGui::End();
+            return;
+        }
+    }
 
     const bool vulkanPreviewMode = usingVulkan();
 
@@ -148,9 +174,19 @@ void Engine::renderEnvironmentWindow() {
     static float uiScrollVerticalInfluence = 0.18f;
     static bool uiCachedSky = true;
     static bool uiSunFollowsLight = false;
+    static int uiAtmosphereModel = 1;
+    static float uiTurbidity = 2.5f;
+    static float uiSunSize = 0.8f;
+    static float uiSunIntensity = 1.0f;
+    static bool uiFogMatchSky = true;
     static bool uiEnvironmentReflections = false;
     static float uiEnvironmentReflectionIntensity = 0.5f;
     static float uiReflectionDistanceFade[2] = { 4.0f, 24.0f };
+    static float uiEnvironmentLighting = 1.0f;
+    static bool uiSkyLightingReflections = true;
+    static bool uiWetnessAuto = true;
+    static float uiWetness = 0.0f;
+    static float uiPuddleAmount = 0.5f;
     static bool uiFogEnabled = false;
     static int uiFogMode = 0;
     static glm::vec3 uiFogColor = glm::vec3(0.65f, 0.72f, 0.78f);
@@ -180,6 +216,8 @@ void Engine::renderEnvironmentWindow() {
     static float uiWeatherRainOpacity = 0.55f;
     static float uiWeatherRainSpeed = 1.6f;
     static float uiWeatherRainScale = 1.0f;
+    static bool uiWeatherRain3D = true;
+    static float uiWeatherRainDensity = 1.0f;
     static float uiWeatherLightningInterval = 11.0f;
     static float uiWeatherLightningIntensity = 2.5f;
     static float uiWeatherAmbienceVolume = 0.7f;
@@ -231,6 +269,11 @@ void Engine::renderEnvironmentWindow() {
         uiScrollVerticalInfluence = skySettings.scrollingVerticalInfluence;
         uiCachedSky = skySettings.cachedSky;
         uiSunFollowsLight = skySettings.sunFollowsDirectionalLight;
+        uiAtmosphereModel = skySettings.atmosphereModel;
+        uiTurbidity = skySettings.turbidity;
+        uiSunSize = skySettings.sunSize;
+        uiSunIntensity = skySettings.sunIntensity;
+        uiFogMatchSky = skySettings.fogMatchSky;
         uiVolumetricMaxIntensity = skySettings.volumetricMaxIntensity;
         uiVolumetricDenoise = skySettings.volumetricDenoise;
         uiVolumetricDenoiseRadius = skySettings.volumetricDenoiseRadius;
@@ -252,6 +295,8 @@ void Engine::renderEnvironmentWindow() {
         uiWeatherRainOpacity = skySettings.weather.rainOpacity;
         uiWeatherRainSpeed = skySettings.weather.rainSpeed;
         uiWeatherRainScale = skySettings.weather.rainScale;
+        uiWeatherRain3D = skySettings.weather.rain3D;
+        uiWeatherRainDensity = skySettings.weather.rainDensity;
         uiWeatherLightningInterval = skySettings.weather.lightningInterval;
         uiWeatherLightningIntensity = skySettings.weather.lightningIntensity;
         uiWeatherAmbienceVolume = skySettings.weather.ambienceVolume;
@@ -295,6 +340,11 @@ void Engine::renderEnvironmentWindow() {
         uiEnvironmentReflectionIntensity = skySettings.environmentReflectionIntensity;
         uiReflectionDistanceFade[0] = skySettings.reflectionDistanceFadeStart;
         uiReflectionDistanceFade[1] = skySettings.reflectionDistanceFadeEnd;
+        uiEnvironmentLighting = skySettings.environmentLightingIntensity;
+        uiSkyLightingReflections = skySettings.skyLightingReflections;
+        uiWetnessAuto = skySettings.wetness < 0.0f;
+        uiWetness = std::clamp(skySettings.wetness, 0.0f, 1.0f);
+        uiPuddleAmount = skySettings.puddleAmount;
         uiFogEnabled = skySettings.fogEnabled;
         uiFogMode = skySettings.fogMode;
         uiFogColor = skySettings.fogColor;
@@ -350,10 +400,19 @@ void Engine::renderEnvironmentWindow() {
         updated.scrollingVerticalInfluence = uiScrollVerticalInfluence;
         updated.cachedSky = uiCachedSky;
         updated.sunFollowsDirectionalLight = uiSunFollowsLight;
+        updated.atmosphereModel = std::clamp(uiAtmosphereModel, 0, 1);
+        updated.turbidity = std::clamp(uiTurbidity, 1.0f, 10.0f);
+        updated.sunSize = std::clamp(uiSunSize, 0.05f, 20.0f);
+        updated.sunIntensity = std::clamp(uiSunIntensity, 0.0f, 10.0f);
+        updated.fogMatchSky = uiFogMatchSky;
         updated.environmentReflections = uiEnvironmentReflections;
         updated.environmentReflectionIntensity = std::clamp(uiEnvironmentReflectionIntensity, 0.0f, 2.0f);
         updated.reflectionDistanceFadeStart = std::max(0.0f, uiReflectionDistanceFade[0]);
         updated.reflectionDistanceFadeEnd = std::max(updated.reflectionDistanceFadeStart + 0.01f, uiReflectionDistanceFade[1]);
+        updated.environmentLightingIntensity = std::clamp(uiEnvironmentLighting, 0.0f, 4.0f);
+        updated.skyLightingReflections = uiSkyLightingReflections;
+        updated.wetness = uiWetnessAuto ? -1.0f : std::clamp(uiWetness, 0.0f, 1.0f);
+        updated.puddleAmount = std::clamp(uiPuddleAmount, 0.0f, 1.0f);
         updated.fogEnabled = uiFogEnabled;
         updated.fogMode = std::clamp(uiFogMode, 0, 2);
         updated.fogColor = uiFogColor;
@@ -383,6 +442,8 @@ void Engine::renderEnvironmentWindow() {
         updated.weather.rainOpacity = std::clamp(uiWeatherRainOpacity, 0.0f, 2.0f);
         updated.weather.rainSpeed = std::max(0.0f, uiWeatherRainSpeed);
         updated.weather.rainScale = std::max(0.05f, uiWeatherRainScale);
+        updated.weather.rain3D = uiWeatherRain3D;
+        updated.weather.rainDensity = std::clamp(uiWeatherRainDensity, 0.0f, 4.0f);
         updated.weather.lightningInterval = std::max(0.5f, uiWeatherLightningInterval);
         updated.weather.lightningIntensity = std::max(0.0f, uiWeatherLightningIntensity);
         updated.weather.ambienceVolume = std::clamp(uiWeatherAmbienceVolume, 0.0f, 1.0f);
@@ -491,6 +552,38 @@ void Engine::renderEnvironmentWindow() {
                                           "sky and the shading always agree. Day / Night still drives sky colour.");
                     }
                 });
+                drawSettingRow("Atmosphere", [&] {
+                    const char* atmosphereLabels[] = { "Legacy Gradient", "Physical (Rayleigh + Mie)" };
+                    if (ImGui::Combo("##AtmosphereModel", &uiAtmosphereModel, atmosphereLabels, IM_ARRAYSIZE(atmosphereLabels))) {
+                        applySkySettings();
+                    }
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                        ImGui::SetTooltip("Physical integrates sunlight scattering through the air: deep blue zenith,\n"
+                                          "hazy horizon, golden low sun, a real sun disk and glow. Its Day / Night arc\n"
+                                          "runs 0.25 sunrise, 0.5 noon, 0.75 sunset. Legacy is the original look.");
+                    }
+                });
+                ImGui::BeginDisabled(uiAtmosphereModel != 1);
+                drawSettingRow("Turbidity", [&] {
+                    if (ImGui::SliderFloat("##SkyTurbidity", &uiTurbidity, 1.0f, 10.0f, "%.2f")) {
+                        applySkySettings();
+                    }
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                        ImGui::SetTooltip("Haze in the air. 2.5 is a clear day; higher whitens the horizon\n"
+                                          "and widens the glow around the sun.");
+                    }
+                });
+                drawSettingRow("Sun Size", [&] {
+                    if (ImGui::SliderFloat("##SkySunSize", &uiSunSize, 0.1f, 5.0f, "%.2f deg")) {
+                        applySkySettings();
+                    }
+                });
+                drawSettingRow("Sun Intensity", [&] {
+                    if (ImGui::SliderFloat("##SkySunIntensity", &uiSunIntensity, 0.0f, 4.0f, "%.2f")) {
+                        applySkySettings();
+                    }
+                });
+                ImGui::EndDisabled();
                 drawSettingRow("Repeat", [&] {
                     ImGui::DragFloat2("##ScrollRepeat", uiScrollRepeat, 0.05f, 0.01f, 32.0f, "%.2f");
                 });
@@ -592,7 +685,42 @@ void Engine::renderEnvironmentWindow() {
         }
 
         if (ImGui::BeginTabItem("Environment")) {
-            ImGui::TextDisabled("Reflections");
+            ImGui::TextDisabled("Environment Lighting");
+            if (beginSettingsTable("##EnvironmentLightingTable")) {
+                drawSettingRow("Sky Light", [&] {
+                    ImGui::SliderFloat("##EnvironmentLighting", &uiEnvironmentLighting, 0.0f, 4.0f, "%.2f");
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Image-based lighting from the sky: diffuse sky light on\n"
+                                          "every lit surface and roughness-filtered reflections on\n"
+                                          "PBR materials. 0 restores the flat ambient colour.");
+                    }
+                });
+                drawSettingRow("Sky Reflections", [&] {
+                    ImGui::Checkbox("##SkyLightingReflections", &uiSkyLightingReflections);
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Reflect the sky on PBR materials and water.\n"
+                                          "Diffuse sky lighting remains enabled.");
+                    }
+                });
+                drawSettingRow("Auto Wetness", [&] {
+                    ImGui::Checkbox("##WetnessAuto", &uiWetnessAuto);
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Follow the weather: rain wets surfaces over ~20 s,\n"
+                                          "they dry over ~60 s once it stops.");
+                    }
+                });
+                ImGui::BeginDisabled(uiWetnessAuto);
+                drawSettingRow("Wetness", [&] {
+                    ImGui::SliderFloat("##Wetness", &uiWetness, 0.0f, 1.0f, "%.2f");
+                });
+                ImGui::EndDisabled();
+                drawSettingRow("Puddles", [&] {
+                    ImGui::SliderFloat("##PuddleAmount", &uiPuddleAmount, 0.0f, 1.0f, "%.2f");
+                });
+                ImGui::EndTable();
+            }
+
+            drawSection("Reflections");
             if (beginSettingsTable("##EnvironmentReflectionTable")) {
                 drawSettingRow("Enabled", [&] {
                     ImGui::Checkbox("##EnvironmentReflections", &uiEnvironmentReflections);
@@ -619,6 +747,16 @@ void Engine::renderEnvironmentWindow() {
                 ImGui::BeginDisabled(!uiFogEnabled);
                 drawSettingRow("Mode", [&] {
                     ImGui::Combo("##FogMode", &uiFogMode, fogModeLabels, IM_ARRAYSIZE(fogModeLabels));
+                });
+                drawSettingRow("Match Sky", [&] {
+                    if (ImGui::Checkbox("##FogMatchSky", &uiFogMatchSky)) {
+                        applySkySettings();
+                    }
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                        ImGui::SetTooltip("Use the procedural sky's horizon colour for the fog, updated with the\n"
+                                          "sun and weather, so distant geometry fades into the sky. Color below is\n"
+                                          "used when this is off or a scrolling background is showing.");
+                    }
                 });
                 drawSettingRow("Color", [&] {
                     ImGui::ColorEdit3("##FogColor", &uiFogColor.x, ImGuiColorEditFlags_DisplayRGB);
@@ -961,6 +1099,26 @@ void Engine::renderEnvironmentWindow() {
                         applySkySettings();
                     }
                 });
+                drawSettingRow("3D Rain", [&] {
+                    if (ImGui::Checkbox("##WeatherRain3D", &uiWeatherRain3D)) {
+                        applySkySettings();
+                    }
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                        ImGui::SetTooltip("World-space rain streaks and splashes, stopped by roofs and\n"
+                                          "overhangs. Replaces the screen-space streaks when on.");
+                    }
+                });
+                if (uiWeatherRain3D) {
+                    drawSettingRow("Rain Density", [&] {
+                        if (ImGui::SliderFloat("##WeatherRainDensity", &uiWeatherRainDensity, 0.0f, 4.0f, "%.2f")) {
+                            applySkySettings();
+                        }
+                        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+                            ImGui::SetTooltip("Scales how many streaks and splashes 3D rain draws.\n"
+                                              "Cost grows roughly linearly with it.");
+                        }
+                    });
+                }
                 drawSettingRow("Lightning Interval", [&] {
                     if (ImGui::SliderFloat("##WeatherLightningInterval", &uiWeatherLightningInterval, 0.5f, 60.0f, "%.1f s")) {
                         applySkySettings();
@@ -1286,7 +1444,15 @@ void Engine::renderEnvironmentWindow() {
 #pragma region Camera Window
 void Engine::renderCameraWindow() {
     if (!showCameraWindow) return;
-    ImGui::Begin(Loc::Window("WINDOW_CAMERA", "Camera"), &showCameraWindow);
+    const bool cameraVisible =
+        ImGui::Begin(Loc::Window("WINDOW_CAMERA", "Camera"), &showCameraWindow);
+    {
+        static double cameraRailState[2] = { -1.0, -1.0 };
+        if (ViewportRenderHelpers::CanSkipHiddenPanelBody(cameraVisible, cameraRailState)) {
+            ImGui::End();
+            return;
+        }
+    }
 
     ImGui::TextDisabled("Movement");
     ImGui::SetNextItemWidth(-1);

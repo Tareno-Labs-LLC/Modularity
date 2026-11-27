@@ -1,5 +1,8 @@
 #include "../EditorLocalization.h"
 #include "Engine.h"
+#include "CodexPluginSetup.h"
+#include "CodexPluginWebView.h"
+#include "imgui_internal.h"
 
 #include <array>
 #include <cstdint>
@@ -715,6 +718,13 @@ void Engine::renderRegistryPackagesWindow() {
         }
     }
     if (selectedState.inProject) {
+#if defined(__linux__) && !defined(__ANDROID__) && !MODULARITY_RUNTIME_ONLY
+        if (selectedPackage->id == CodexPluginSetup::PackageId &&
+            drawActionButton("Open Codex Plugin", projectLoaded, ImVec4(0.20f, 0.46f, 0.30f, 1.0f))) {
+            CodexPluginSetup::Open(projectManager.currentProject.projectPath,
+                                   packageManager.installedPackageRoot(selectedPackage->id), !usingVulkan());
+        }
+#endif
         if (drawActionButton(Loc::T("MODUPAK_RE_UNPACK", "Re-Unpack ModuPAK"), canReUnpack, ImVec4(0.20f, 0.31f, 0.46f, 1.0f))) {
             triggerUnpack(true, false);
         }
@@ -904,6 +914,10 @@ void Engine::renderRegistryPackagesWindow() {
         const char* confirmLabel = gUnpackPreview.isUpdate ? "Confirm Update"
                                   : gUnpackPreview.reUnpack ? "Confirm Re-Unpack"
                                                             : "Confirm Unpack";
+#if defined(__linux__) && !defined(__ANDROID__) && !MODULARITY_RUNTIME_ONLY
+        const bool openCodex = gUnpackPreview.packageId == CodexPluginSetup::PackageId;
+        if (openCodex) confirmLabel = "Unpack and Open";
+#endif
         if (ImGui::Button(confirmLabel, ImVec2(btnW, 0.0f))) {
             const std::string id = gUnpackPreview.packageId;
             bool ok = true;
@@ -922,6 +936,12 @@ void Engine::renderRegistryPackagesWindow() {
                     registryPackageLastActionSucceeded = true;
                     playEditorSound(EditorSoundCue::PackageInstalled, 0.95f);
                     addConsoleMessage(registryPackageFeedback, ConsoleMessageType::Success);
+#if defined(__linux__) && !defined(__ANDROID__) && !MODULARITY_RUNTIME_ONLY
+                    if (openCodex) {
+                        CodexPluginSetup::Open(projectManager.currentProject.projectPath,
+                                               packageManager.installedPackageRoot(id), !usingVulkan());
+                    }
+#endif
                 } else {
                     registryPackageFeedback = packageManager.getLastError();
                     registryPackageLastActionSucceeded = false;
@@ -942,3 +962,234 @@ void Engine::renderRegistryPackagesWindow() {
         saveEditorUserSettings();
     }
 }
+
+#if defined(__linux__) && !defined(__ANDROID__) && !MODULARITY_RUNTIME_ONLY
+#include <cerrno>
+#include <csignal>
+#include <cstring>
+#include <fcntl.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+namespace CodexPluginSetup {
+namespace {
+constexpr std::string_view StatusPrefix = "MODU_CODEX_STATUS ";
+constexpr size_t LogLimit = 12000;
+
+struct SetupProcess {
+    ~SetupProcess() {
+        if (pid > 0) kill(-pid, SIGTERM);
+        if (output >= 0) close(output);
+    }
+
+    pid_t pid = -1;
+    int output = -1;
+    bool visible = false;
+    bool ready = false;
+    bool focus = false;
+    bool embedded = false;
+    pid_t browser = -1;
+    std::string url;
+    bool stopping = false;
+    std::string stage;
+    std::string log;
+    std::string pending;
+    fs::path project;
+};
+
+SetupProcess setup;
+#if defined(MODULARITY_HAS_WPE_WEBKIT)
+CodexWebView webView;
+#endif
+
+void readProgress() {
+    char chunk[2048];
+    for (int reads = 0; reads < 16; ++reads) {
+        const ssize_t count = read(setup.output, chunk, sizeof(chunk));
+        if (count <= 0) break;
+        setup.pending.append(chunk, static_cast<size_t>(count));
+        size_t begin = 0;
+        for (size_t end = setup.pending.find('\n'); end != std::string::npos;
+             end = setup.pending.find('\n', begin)) {
+            std::string_view line(setup.pending.data() + begin, end - begin);
+            if (line.starts_with(StatusPrefix)) {
+                setup.stage = line.substr(StatusPrefix.size());
+                setup.ready = setup.stage == "Browser opened";
+            } else if (line.starts_with("MODU_CODEX_URL ")) {
+                setup.url = line.substr(15);
+                setup.ready = true;
+#if defined(MODULARITY_HAS_WPE_WEBKIT)
+                if (setup.embedded && !webView.Open(setup.url)) {
+                    setup.stage = "Could not initialize the embedded webview.";
+                }
+#endif
+            } else {
+                setup.log.append(line);
+                setup.log.push_back('\n');
+            }
+            begin = end + 1;
+        }
+        setup.pending.erase(0, begin);
+        if (setup.pending.size() > LogLimit) setup.pending.erase(0, setup.pending.size() - LogLimit);
+        if (setup.log.size() > LogLimit) setup.log.erase(0, setup.log.size() - LogLimit);
+    }
+}
+
+void pollProcess() {
+    readProgress();
+    int result = 0;
+    const pid_t child = waitpid(setup.pid, &result, WNOHANG);
+    if (child == 0 || (child < 0 && errno == EINTR)) return;
+    readProgress();
+    close(setup.output);
+    setup.output = -1;
+    setup.pid = -1;
+#if defined(MODULARITY_HAS_WPE_WEBKIT)
+    webView.Close();
+#endif
+    setup.stage = setup.stopping ? "Codex Plugin stopped"
+        : child > 0 && WIFEXITED(result) && WEXITSTATUS(result) == 0 ? "Codex Plugin closed"
+        : "Setup or launch failed";
+    setup.ready = false;
+    setup.url.clear();
+    setup.stopping = false;
+}
+}
+
+void Open(const fs::path& project, const fs::path& package, bool embedded) {
+    setup.visible = true;
+    setup.focus = true;
+    if (setup.pid > 0) {
+        if (setup.project != project) {
+            setup.log = "Codex Plugin is open for another project. Stop it before opening this project.\n";
+        }
+        return;
+    }
+    setup.stage = "Starting Linux setup";
+    setup.log.clear();
+    setup.pending.clear();
+    setup.project = project;
+    setup.url.clear();
+    setup.embedded = false;
+    if (!embedded) {
+        setup.log = "The embedded webview requires OpenGL.\n";
+    } else {
+#if defined(MODULARITY_HAS_WPE_WEBKIT)
+        setup.embedded = api.Load();
+        if (!setup.embedded) setup.log = api.error + "\n";
+#else
+        setup.log = "This editor was built without WPE WebKit support.\n";
+#endif
+    }
+
+    const fs::path launcher = fs::current_path() / "Resources/EditorTools/CodexPluginLinuxSetup.py";
+    if (!fs::is_regular_file(launcher)) {
+        setup.stage = "Setup files unavailable";
+        setup.log = "Install Codex Plugin and run an editor build that includes Linux setup.";
+        return;
+    }
+
+    int pipeEnds[2];
+    if (pipe2(pipeEnds, O_CLOEXEC) != 0) {
+        setup.stage = "Could not open setup output";
+        setup.log = std::strerror(errno);
+        return;
+    }
+    const int readFlags = fcntl(pipeEnds[0], F_GETFL);
+    if (readFlags == -1 || fcntl(pipeEnds[0], F_SETFL, readFlags | O_NONBLOCK) == -1) {
+        setup.stage = "Could not configure setup output";
+        setup.log = std::strerror(errno);
+        close(pipeEnds[0]);
+        close(pipeEnds[1]);
+        return;
+    }
+
+    posix_spawn_file_actions_t actions;
+    posix_spawnattr_t attributes;
+    int error = posix_spawn_file_actions_init(&actions);
+    const bool actionsReady = error == 0;
+    if (!error) error = posix_spawnattr_init(&attributes);
+    const bool attributesReady = error == 0;
+    if (!error) error = posix_spawn_file_actions_adddup2(&actions, pipeEnds[1], STDOUT_FILENO);
+    if (!error) error = posix_spawn_file_actions_adddup2(&actions, pipeEnds[1], STDERR_FILENO);
+    if (!error) error = posix_spawnattr_setpgroup(&attributes, 0);
+    if (!error) error = posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETPGROUP);
+    std::string executable = "python3";
+    std::string script = launcher.string();
+    std::string projectPath = project.string();
+    std::string packagePath = (package.empty() ? project : package).string();
+    std::string mode = "embedded";
+    char* args[] = {executable.data(), script.data(), projectPath.data(), packagePath.data(), mode.data(), nullptr};
+    if (!error) error = posix_spawnp(&setup.pid, executable.c_str(), &actions, &attributes, args, environ);
+
+    if (attributesReady) posix_spawnattr_destroy(&attributes);
+    if (actionsReady) posix_spawn_file_actions_destroy(&actions);
+    close(pipeEnds[1]);
+    if (error) {
+        close(pipeEnds[0]);
+        setup.pid = -1;
+        setup.stage = "Could not start Python 3";
+        setup.log = std::string(std::strerror(error)) + "\nInstall Python 3.10 or newer with venv support.";
+        return;
+    }
+    setup.output = pipeEnds[0];
+}
+
+void Draw() {
+    if (setup.pid > 0) pollProcess();
+    if (setup.browser > 0 && waitpid(setup.browser, nullptr, WNOHANG) != 0) setup.browser = -1;
+    if (!setup.visible) return;
+
+    if (setup.focus) {
+        if (ImGuiWindow* viewport = ImGui::FindWindowByName(Loc::WindowRef("Viewport"));
+            viewport && viewport->DockId != 0) {
+            ImGui::SetNextWindowDockID(viewport->DockId, ImGuiCond_FirstUseEver);
+        }
+        ImGui::SetNextWindowFocus();
+        setup.focus = false;
+    }
+    ImGui::SetNextWindowSize(ImVec2(960, 680), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Codex Plugin", &setup.visible)) {
+#if defined(MODULARITY_HAS_WPE_WEBKIT)
+        if (webView.page) {
+            if (ImGui::SmallButton("Stop Codex Plugin")) {
+                kill(-setup.pid, SIGTERM);
+                setup.stopping = true;
+            }
+            webView.Draw();
+            ImGui::End();
+            return;
+        }
+#endif
+        ImGui::TextUnformatted(setup.ready ? "Companion ready" : setup.stage.c_str());
+        if (setup.pid > 0 && !setup.ready) ImGui::ProgressBar(-static_cast<float>(ImGui::GetTime()));
+        if (setup.ready && !setup.url.empty() && setup.browser < 0 && ImGui::Button("Open in System Browser")) {
+            char executable[] = "xdg-open";
+            char* args[] = {executable, setup.url.data(), nullptr};
+            const int error = posix_spawnp(&setup.browser, executable, nullptr, nullptr, args, environ);
+            if (error) {
+                setup.browser = -1;
+                setup.log += std::strerror(error);
+            }
+        }
+        if (ImGui::BeginChild("Setup Output", ImVec2(0.0f, -ImGui::GetFrameHeightWithSpacing()),
+                              ImGuiChildFlags_Borders, ImGuiWindowFlags_HorizontalScrollbar)) {
+            ImGui::TextUnformatted(setup.log.c_str());
+            if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) ImGui::SetScrollHereY(1.0f);
+        }
+        ImGui::EndChild();
+        if (setup.pid > 0) {
+            ImGui::BeginDisabled(setup.stopping);
+            if (ImGui::Button(setup.ready ? "Stop Companion" : "Cancel Setup")) {
+                kill(-setup.pid, SIGTERM);
+                setup.stopping = true;
+                setup.stage = "Stopping Codex Plugin";
+            }
+            ImGui::EndDisabled();
+        }
+    }
+    ImGui::End();
+}
+}
+#endif

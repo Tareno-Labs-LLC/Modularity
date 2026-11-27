@@ -1,5 +1,7 @@
 #include "NetworkSession.h"
 
+#include "SceneAssetBinding.h"
+
 #include <algorithm>
 #include <cmath>
 
@@ -723,6 +725,17 @@ void NetworkSession::applySpawn(const SpawnRequest& request, bool local) {
     if (!result.success) {
         fail(ErrorCode::OperationFailed, "ModuOBJ spawn failed: " + result.error);
         return;
+    }
+
+    // Instantiate copies the prefab's meshPath/meshSourceIndex but leaves meshId at
+    // -1, so a spawned model would render nothing until the user pressed Reload in
+    // the Inspector. Bind the assets here, the same way a deferred scene load does.
+    std::string meshError;
+    SceneAssetBinding::ResolveMeshes(result.objects, &meshError);
+    if (!meshError.empty()) {
+        log(LogLevel::Warning,
+            "[Network] Spawned object " + request.assetId +
+                " has an unresolved mesh: " + meshError);
     }
 
     NetworkObject object;

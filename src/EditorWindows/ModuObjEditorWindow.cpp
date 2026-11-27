@@ -15,6 +15,7 @@
 
 #include "../Engine.h"
 #include "../ModuObj.h"
+#include "../SceneAssetBinding.h"
 
 #include <algorithm>
 
@@ -87,12 +88,18 @@ bool Engine::openModuObjEditor(const fs::path& assetPath) {
         obj.moduObjInstance = ModuObjInstanceRef{};
     }
 
+    // Assets store meshPath/meshSourceIndex, not the runtime meshId. Bind them now
+    // so opening a packaged object shows its models without pressing Reload.
+    SceneAssetBinding::ResolveMeshes(placed.objects);
+
     sceneObjects = std::move(placed.objects);
     sceneObjectIndexById.clear();
     sceneObjectIndexData = nullptr;
     sceneObjectIndexCount = 0;
     markRuntimeScriptBindingsDirty();
     updateHierarchyWorldTransforms();
+    // Instantiate remaps ids but not the runtime bone bindings of skinned meshes.
+    rebuildSkeletalBindings();
 
     moduObjEditMode = true;
     moduObjEditPath = assetPath;

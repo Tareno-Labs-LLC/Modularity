@@ -42,6 +42,7 @@ inline const std::string& SceneObjectComponentIconPath(const SceneObject& obj) {
     }
     if (obj.hasVideoPlayer) return kIconVideoPlayer;
     if (obj.hasParticleSystem2D) return kIconParticleSystemAnyType;
+    if (obj.hasTerrain) return kIconComponentMesh;
     if (obj.hasRenderer) {
         switch (obj.renderType) {
             case RenderType::Sprite:

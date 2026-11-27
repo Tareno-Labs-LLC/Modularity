@@ -1,0 +1,67 @@
+add ModuCPP;
+add Parlex;
+
+// ParlexAnnouncementTicker - scrolls the console's current announcement in a loop on a
+// text object (the in-world computer screen).
+//
+// Assign Ticker Text (the text object that reads "Announcement: ..."). The line is
+// "<Prefix><scrolling announcement>"; the announcement is padded with a gap and wraps
+// around, showing Visible Characters at a time. With no announcement it shows Idle Text.
+// Needs ParlexBootstrap in the scene (it polls the server status).
+public class ParlexAnnouncementTicker : ModuNode
+{
+    [ObjectRef] public SceneObj tickerText;
+    public string prefix = "Announcement: ";
+    public string idleText = "No announcements";
+    [Slider(8.0f, 120.0f)] public float visibleCharacters = 38.0f;
+    [Slider(1.0f, 30.0f)] public float charactersPerSecond = 6.0f;
+    [Slider(1.0f, 20.0f)] public float loopGap = 6.0f;
+
+    private float cursor = 0.0f;
+    private string lastText = "";
+    private string lastShown = "";
+
+    void Begin()
+    {
+        cursor = 0.0f;
+        lastText = "";
+        lastShown = "";
+    }
+
+    void TickUpdate()
+    {
+        SceneObject* target = SmartResolveRef(tickerText);
+        if (!target) return;
+
+        string text = ParlexAnnouncements.Text();
+        string shown;
+        if (text.length() == 0)
+        {
+            shown = idleText;
+        }
+        else
+        {
+            if (text != lastText) { lastText = text; cursor = 0.0f; }
+            shown = prefix + Window(text);
+            cursor += charactersPerSecond * dt;
+        }
+        if (shown != lastShown)
+        {
+            lastShown = shown;
+            target->ui.label = shown;
+        }
+    }
+
+    // A window onto "<text><gap>" that wraps around. Short text that already fits is
+    // shown still.
+    string Window(const string& text)
+    {
+        int width = (int)visibleCharacters;
+        if ((int)text.length() <= width) return text;
+        string loop = text + string((size_t)loopGap, ' ');
+        int length = (int)loop.length();
+        int start = ((int)cursor) % length;
+        string doubled = loop + loop;
+        return doubled.substr((size_t)start, (size_t)width);
+    }
+}

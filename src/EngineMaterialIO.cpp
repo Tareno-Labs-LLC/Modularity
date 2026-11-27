@@ -90,6 +90,8 @@ static bool readMaterialStream(std::istream& f, const std::string& path, Materia
         else if (key == "metallic")         {outData.props.metallic = std::clamp(std::stof(val), 0.0f, 1.0f);}
         else if (key == "roughness")        {outData.props.roughness = std::clamp(std::stof(val), 0.0f, 1.0f);}
         else if (key == "occlusionStrength"){outData.props.occlusionStrength = std::clamp(std::stof(val), 0.0f, 1.0f);}
+        else if (key == "clearcoat")        {outData.props.clearcoat = std::clamp(std::stof(val), 0.0f, 1.0f);}
+        else if (key == "clearcoatRoughness"){outData.props.clearcoatRoughness = std::clamp(std::stof(val), 0.0f, 1.0f);}
         else if (key == "emissionColor")    {sscanf(val.c_str(), "%f,%f,%f", &outData.props.emissionColor.r, &outData.props.emissionColor.g, &outData.props.emissionColor.b);}
         else if (key == "emissionStrength") {outData.props.emissionStrength = std::max(0.0f, std::stof(val));}
         else if (key == "metallicRoughness"){outData.metallicRoughness = val;}
@@ -170,6 +172,8 @@ bool writeMaterialFile(const MaterialFileData& data, const std::string& path) {
     f << "metallic=" << data.props.metallic << "\n";
     f << "roughness=" << data.props.roughness << "\n";
     f << "occlusionStrength=" << data.props.occlusionStrength << "\n";
+    f << "clearcoat=" << data.props.clearcoat << "\n";
+    f << "clearcoatRoughness=" << data.props.clearcoatRoughness << "\n";
     f << "emissionColor=" << data.props.emissionColor.r << "," << data.props.emissionColor.g << "," << data.props.emissionColor.b << "\n";
     f << "emissionStrength=" << data.props.emissionStrength << "\n";
     f << "heightScale=" << data.props.heightScale << "\n";

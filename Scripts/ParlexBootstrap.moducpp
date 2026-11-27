@@ -1,0 +1,125 @@
+add ModuCPP;
+add ModuNetwork;
+add Parlex;
+
+// ParlexBootstrap - signs the player in to Parlex and keeps the session healthy.
+//
+// Port of ParlexBootstrap + ParlexServerGate from Parlex for Unity 1.13.0. Put it on
+// one object in your first scene and fill in the Title ID (Settings page of your
+// game in the Parlex console). The Title secret is never needed in a game build.
+//
+// Every other script can then use the API directly once Parlex.LoggedIn() is true:
+//
+//     add Parlex;
+//     Parlex.GetBalances((const ParlexResult& r) => { OnBalances(r); });
+public class ParlexBootstrap : ModuNode
+{
+    [Header("Title")]
+    public string host = "https://parlex.csvrstudios.com";
+    public string titleId = "";
+    public string clientVersion = "1.0";
+
+    [Header("Session")]
+    public bool autoLogin = false;   // leave off when ParlexLogin handles sign-in
+    public bool reportIntegrity = true;
+    public bool reportErrors = true;
+    [Slider(3.0f, 120.0f)] public float statusPollSeconds = 10.0f;
+
+    [Header("When banned or kicked")]
+    public SceneObj bannedScreen;
+    public bool leaveNetworkOnBan = true;
+    public bool leaveNetworkOnKick = true;
+
+    [Header("Debug")]
+    public bool logStatusBanner = true;
+
+    private float integrityTimer = 5.0f;
+    private string lastBanner = "";
+    private bool configured = false;
+
+    void Begin()
+    {
+        integrityTimer = 5.0f;
+        lastBanner = "";
+        configured = false;
+
+        if (titleId.length() == 0)
+        {
+            AddLog("[Parlex] Set the Title ID on ParlexBootstrap (Settings page of your game in the Parlex console).", Type.Warning);
+            return;
+        }
+        if (!Http.Available())
+        {
+            AddLog("[Parlex] HTTP is unavailable: " + Http.UnavailableReason(), Type.Error);
+            return;
+        }
+
+        Parlex.Configure(host, titleId);
+        Parlex.SetClientVersion(clientVersion);
+        configured = true;
+
+        // Callbacks run on a later frame with this object's context restored. Keep
+        // them to their parameters and named methods: the locals of Begin are gone
+        // by then, and a method re-reads this object's fields when it runs.
+        ParlexBan.OnBanned((const string& reason, bool hasExpiry, double expiresUnix) => { HandleBan(reason); });
+        ParlexServerGate.OnKicked((const string& reason) => { HandleKick(reason); });
+
+        if (!autoLogin || Parlex.LoggedIn()) return;
+        Parlex.LoginWithDevice((const ParlexResult& r) => { HandleLogin(r); });
+    }
+
+    void TickUpdate()
+    {
+        if (!configured) return;
+
+        ParlexServerGate.Poll(dt, statusPollSeconds);
+
+        if (logStatusBanner)
+        {
+            string banner = ParlexServerGate.BannerText();
+            if (banner != lastBanner)
+            {
+                lastBanner = banner;
+                if (banner.length() > 0) AddLog("[Parlex] " + banner, Type.Warning);
+            }
+        }
+
+        if (reportIntegrity && Parlex.LoggedIn())
+        {
+            integrityTimer -= dt;
+            if (integrityTimer <= 0.0f)
+            {
+                integrityTimer = 1200.0f;
+                ParlexIntegrity.Report();
+            }
+        }
+
+        if (reportErrors) ParlexErrorReporter.Flush();
+    }
+
+    void HandleLogin(const ParlexResult& r)
+    {
+        if (r.Ok)
+        {
+            string suffix = r.GetBool("NewlyCreated") ? " (new player)" : "";
+            AddLog("[Parlex] signed in as " + Parlex.PlayerId() + suffix, Type.Success);
+        }
+        else if (r.ErrorName != "AccountBanned")
+        {
+            AddLog("[Parlex] sign-in failed: " + r.Error, Type.Warning);
+        }
+    }
+
+    void HandleKick(const string& reason)
+    {
+        AddLog("[Parlex] " + reason, Type.Warning);
+        if (leaveNetworkOnKick) Net.Disconnect();
+    }
+
+    void HandleBan(const string& reason)
+    {
+        AddLog("[Parlex] " + ParlexBan.LengthText() + " (" + reason + "). " + ParlexBan.Describe(), Type.Warning);
+        if (leaveNetworkOnBan) Net.Disconnect();
+        if (bannedScreen) SetActive(SmartResolveRef(bannedScreen), true);
+    }
+}

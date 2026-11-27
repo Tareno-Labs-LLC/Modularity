@@ -2,6 +2,7 @@
 #include <functional>
 #include "Common.h"
 #include "SceneObject.h"
+#include "TerrainRuntime.h"
 #include "Camera.h"
 #include "Rendering.h"
 #include "Render25D/TMOpenGLRenderer.h"
@@ -23,10 +24,15 @@
 #include "AudioSystem.h"
 #include "EditorSoundThemes.h"
 #include "Network/NetworkSession.h"
+#include "Network/HttpClient.h"
 #include "PackageManager.h"
 #include "ModuPak.h"
 #include "ManagedScriptRuntime.h"
 #include "Profiler.h"
+// Set to 1 to re-run the original hierarchy transform pass on a copy every call and report mismatches.
+#ifndef MODULARITY_VERIFY_TRANSFORM_CACHE
+#define MODULARITY_VERIFY_TRANSFORM_CACHE 0
+#endif
 #include "SpritesheetFormat.h"
 #include "VideoPlayer.h"
 #if !MODULARITY_RUNTIME_ONLY
@@ -133,6 +139,8 @@ private:
     static constexpr float kMinGameTimeScale = 0.0f;
     static constexpr float kMaxGameTimeScale = 8.0f;
     float lastFrame = 0.0f;
+    // Unclamped wall-clock interval of the last frame in ms (deltaTime is clamped to 1/30 s).
+    float lastFrameWallMs = 0.0f;
     bool renderSuspended = false;
     bool renderResumeLogPending = false;
     void logWindowLifecycle(const char* event, bool iconified, int fbWidth, int fbHeight) const;
@@ -149,6 +157,26 @@ private:
     int viewportWidth = 800;
     int viewportHeight = 600;
     bool gizmoHistoryCaptured = false;
+    // Terrain sculpt / paint tool (EditorWindows/TerrainEditorTools.cpp). Live while a Terrain object
+    // is selected and terrainBrushEnabled is on; the Inspector's Terrain section edits the settings.
+    // Declared in every build because InspectorWindow.cpp / ViewportWindows.cpp compile into the player
+    // too; there the functions are inert stubs (the editor tool is compiled out).
+    bool terrainBrushEnabled = false;
+    TerrainRuntime::BrushParams terrainBrush;
+    bool terrainFlattenFixed = false;            // Flatten to terrainBrush.flattenHeight instead of the stroke's first height
+    bool terrainStrokeActive = false;
+    int terrainStrokeObjectId = -1;
+    bool terrainStrokeFirstStamp = true;
+    double terrainStrokeNextStamp = 0.0;
+    bool terrainBrushHasHit = false;             // the cursor is over the selected terrain
+    glm::vec3 terrainBrushHitWorld = glm::vec3(0.0f);
+    // The selected terrain when the brush is armed (edit mode, enabled terrain with data), else null.
+    SceneObject* terrainBrushTarget();
+    // Per-frame viewport half of the brush: ring cursor, stroke start/continue/end, hotkeys.
+    // `leftClickConsumed` is set while the brush owns the left mouse button (no picking, no gizmo).
+    void updateTerrainBrush(const glm::mat4& view, const glm::mat4& proj, const ImVec2& imageMin,
+                            const ImVec2& imageMax, bool mouseOverImage, bool& leftClickConsumed);
+    void endTerrainStroke();
     struct GizmoDragTransform {
         glm::vec3 position = glm::vec3(0.0f);
         glm::vec3 rotation = glm::vec3(0.0f);
@@ -249,10 +277,53 @@ private:
     std::vector<SceneObject> sceneObjects;
     std::unordered_map<int, std::unique_ptr<VideoPlayer>> videoPlayers;
     std::unordered_map<int, std::string> videoLoadFailedPaths;
+    std::unordered_set<int> videoActiveIdsScratch; // syncVideoPlayers per-frame scratch
     std::unordered_map<int, size_t> sceneObjectIndexById;
     const SceneObject* sceneObjectIndexData = nullptr;
     size_t sceneObjectIndexCount = 0;
     uint64_t sceneObjectIndexVerifiedFrame = std::numeric_limits<uint64_t>::max();
+    // Bumped whenever sceneObjectIndexById is rebuilt; keys the hierarchy traversal cache.
+    uint64_t sceneObjectIndexGeneration = 0;
+    // updateHierarchyWorldTransforms scratch. The traversal order depends only on ids, parent
+    // links, child lists and the index map, so it is rebuilt only when one of those changes.
+    struct HierarchyTransformSlot {
+        uint32_t objIndex = 0;
+        int32_t parentSlot = -1;
+    };
+    struct HierarchyTransformWorld {
+        glm::vec3 pos;
+        glm::quat rot;
+        glm::vec3 scale;
+        bool childEnabled = true;
+        // This node or an ancestor can move its subtree at runtime (see hierarchyMovingAncestor).
+        bool childMoving = false;
+    };
+    // Pure-function memo: exact input bits -> exact output bits, so it never needs invalidating.
+    struct HierarchyTransformMemo {
+        float key[22];
+        float out[13];
+        float eulerKey[3];
+        glm::quat eulerQuat;
+        uint8_t kind = 0;
+        bool eulerValid = false;
+    };
+    struct HierarchyTransformBuildFrame {
+        uint32_t objIndex = 0;
+        uint32_t cursor = 0;
+        int32_t slot = -1;
+    };
+    std::vector<int> hierarchyTopoIds;
+    std::vector<int> hierarchyTopoParentIds;
+    std::vector<int> hierarchyTopoChildIds;
+    std::vector<uint32_t> hierarchyTopoChildOffsets;
+    std::vector<HierarchyTransformSlot> hierarchyTransformOrder;
+    std::vector<HierarchyTransformWorld> hierarchyTransformWorld;
+    std::vector<HierarchyTransformMemo> hierarchyTransformMemo;
+    std::vector<uint8_t> hierarchyTransformVisitState;
+    std::vector<HierarchyTransformBuildFrame> hierarchyTransformBuildStack;
+    uint64_t hierarchyTopoIndexGeneration = std::numeric_limits<uint64_t>::max();
+    bool hierarchyTopoValid = false;
+    bool hierarchyTopoHasLinks = false;
     struct RuntimeScriptBinding {
         int objectId = -1;
         size_t scriptIndex = 0;
@@ -725,6 +796,7 @@ private:
     bool runtimeCursorOwnsImGuiFlag = false;
     // Play enter/exit restarts every Particle System (main loop, just before the scripts run).
     bool particlesLastPlaying = false;
+    bool scriptServicesLastRunning = false;
     bool showGameProfiler = true;
     bool revealDebugSectionsAndMenus = false;
     bool uiCanvasPreviewEnabled = true;
@@ -1354,6 +1426,8 @@ private:
     std::unordered_set<std::string> autoCompileQueued;
     std::unordered_set<std::string> nativeScriptMissingLogged;
     std::unordered_set<std::string> nativeScriptLoadErrorLogged;
+    // lastBinaryPath string -> parsed fs::path, a pure memo (never erased) for updateScripts.
+    std::unordered_map<std::string, fs::path> nativeScriptBinaryPathMemo;
     struct ScriptHttpRequestState {
         int id = 0;
         std::mutex mutex;
@@ -1520,22 +1594,38 @@ private:
     std::unordered_map<ImGuiContext*, UIFontContextState> uiFontContexts;
     int uiStylePresetIndex = 0;
     std::string uiEditorFontAsset = "builtin:imgui-default";
-    struct ScriptEditorState {
+#if !MODULARITY_RUNTIME_ONLY
+    struct ScriptEditorDocument {
         fs::path filePath;
+        std::string key;
+        std::string name;
+        std::string tabLabel;
         std::string buffer;
+        TextEditor editor;
+        ScriptLanguageServiceDocumentData language;
+        bool completionPoolDirty = true;
+        std::unique_ptr<TextEditor> transpiledEditor;
+        std::string transpiledError;
+        bool transpiledPreviewDirty = true;
+        bool showTranspiled = false;
         bool dirty = false;
-        bool autoCompileOnSave = true;
         bool hasWriteTime = false;
         fs::file_time_type lastWriteTime;
     };
-    ScriptEditorState scriptEditorState;
+    std::vector<std::unique_ptr<ScriptEditorDocument>> scriptEditorDocuments;
+    ScriptEditorDocument* activeScriptEditor = nullptr;
+    ScriptEditorDocument* scriptEditorPendingClose = nullptr;
+    fs::path scriptingProjectPath;
+    fs::path scriptingDirectory;
+    bool selectScriptEditorTab = false;
+    void syncScriptEditorProject();
+    bool loadScriptEditorDocument(ScriptEditorDocument& document);
+    void renderScriptEditorDocument(ScriptEditorDocument& document, float minimapWidth);
+    void renderScriptDiagnostics();
+#endif
+    bool scriptEditorAutoCompileOnSave = true;
     std::vector<fs::path> scriptingFileList;
     std::vector<std::string> scriptingCompletions;
-    ScriptLanguageServiceDocumentData scriptLanguageDocument;
-#if !MODULARITY_RUNTIME_ONLY
-    TextEditor scriptTextEditor;
-    bool scriptTextEditorReady = false;
-#endif
     char scriptingFilter[128] = "";
     bool scriptingFilesDirty = true;
     struct RuntimeAnimKey {
@@ -1581,6 +1671,11 @@ private:
     void markRuntimeScriptBindingsDirty() { runtimeScriptBindingsVersion++; }
     void rebuildRuntimeScriptBindings();
     void updateHierarchyWorldTransforms(bool rebuildWorldFromLocal = false);
+    void updateHierarchyWorldTransformsCached(bool rebuildWorldFromLocal);
+    bool refreshHierarchyTransformTopology();
+#if MODULARITY_VERIFY_TRANSFORM_CACHE
+    void updateHierarchyWorldTransformsReference(std::vector<SceneObject>& objects, bool rebuildWorldFromLocal);
+#endif
     void updateLocalFromWorld(SceneObject& obj, const glm::vec3& parentPos, const glm::quat& parentRot, const glm::vec3& parentScale);
     void initializeLocalTransformsFromWorld(int sceneVersion);
     static bool isScriptScanExcludedDir(const std::string& name, bool atScanRoot);
@@ -1736,6 +1831,32 @@ private:
     bool updateAndroidTouchScroll(float px, float py, bool active);
     float uiDpiScale = 1.0f;
     bool autoPlayOnLoad_ = false;
+#if !MODULARITY_RUNTIME_ONLY
+public:
+    // Headless-style screenshot tooling (--autoshot ...). Once the project and scene are loaded and
+    // delaySeconds of rendering have passed, the chosen view is rendered offscreen at width x height,
+    // written to outPath as a PNG, the average frame time is printed, and the editor exits cleanly.
+    struct AutoShotConfig {
+        bool enabled = false;
+        std::string outPath;
+        double delaySeconds = 20.0;
+        bool sceneView = false;      // false = game (main/player camera), true = editor scene camera
+        bool hasCamera = false;      // --autoshot-camera given: place the editor camera, implies scene view
+        glm::vec3 cameraPosition = glm::vec3(0.0f);
+        glm::vec3 cameraTarget = glm::vec3(0.0f, 0.0f, -1.0f);
+        int width = 1280;
+        int height = 720;
+        std::string sceneName;       // scene to open instead of the project's lastScene (empty = default)
+    };
+private:
+    AutoShotConfig autoShot_;
+    int autoShotExitCode_ = 0;
+    double autoShotWaitStart_ = -1.0;   // first frame the autoshot logic ran
+    double autoShotReadySince_ = -1.0;  // time the project + scene became ready to render
+    std::deque<std::pair<double, float>> autoShotFrames_;
+    void updateAutoShot();
+    bool captureAutoShot(std::string& error);
+#endif
 
 public:
     void setAutoPlayDevMode(bool on) { autoPlayOnLoad_ = on; }
@@ -1817,6 +1938,10 @@ private:
     void finalizeDeferredSceneLoad();
     void syncPlayerCamera();
     void updateScripts(float delta);
+    // Runs every enabled native script's FixedUpdate(ctx, fixedDt). Called by the physics
+    // backend before each fixed step (IPhysicsBackend pre-step callback) while simulating.
+    void runFixedUpdateScripts(float fixedDeltaTime);
+    static void PhysicsPreStepThunk(void* user, float stepDeltaTime);
     void dispatchPhysicsCollisionEvents(float delta);
     void updatePlayerController(float delta);
     int updatePlayerGait(SceneObject& player,
@@ -2206,6 +2331,9 @@ public:
     ~Engine();
 #if !MODULARITY_RUNTIME_ONLY
     void setVREditorMode(bool enabled) { vrEditor.requested = enabled; }
+
+    void setAutoShotConfig(const AutoShotConfig& config) { autoShot_ = config; }
+    int autoShotExitCode() const { return autoShotExitCode_; }
 #endif
 
     void setStartupProjectPath(const std::string& path);
@@ -2225,6 +2353,11 @@ public:
     fs::path getManagedOutputDll() const;
     void compileManagedScripts();
     void markProjectDirty();
+    // Runtime weather control for scripts: changes the live scene weather only. No undo
+    // record, no dirty flag, nothing saved; mode is a WeatherMode value (0 Clear .. 4
+    // Thunderstorm), intensity 0..1. Setting a mode also turns weather on.
+    bool setRuntimeWeather(int mode, float intensity);
+    bool getRuntimeWeather(int& mode, float& intensity) const;
     // Script-accessible logging wrapper
     void addConsoleMessageFromScript(const std::string& message, ConsoleMessageType type);
     fs::path resolveProjectPathFromScript(const std::string& rawPath) const;
@@ -2307,6 +2440,19 @@ public:
     bool addRigidbodyTorqueFromScript(int id, const glm::vec3& torque);
     bool addRigidbodyAngularImpulseFromScript(int id, const glm::vec3& impulse);
     bool setRigidbodyYawFromScript(int id, float yawDegrees);
+    bool addRigidbodyForceAtPositionFromScript(int id, const glm::vec3& force, const glm::vec3& worldPoint);
+    bool addRigidbodyImpulseAtPositionFromScript(int id, const glm::vec3& impulse, const glm::vec3& worldPoint);
+    bool getRigidbodyPointVelocityFromScript(int id, const glm::vec3& worldPoint, glm::vec3& outVelocity) const;
+    bool getRigidbodyCenterOfMassFromScript(int id, glm::vec3& outWorldCenterOfMass) const;
+    bool getRigidbodyPhysicsPoseFromScript(int id, glm::vec3& outPosition, glm::quat& outRotation) const;
+    bool getRigidbodyMassFromScript(int id, float& outMassKg) const;
+    bool raycastClosestIgnoringFromScript(const glm::vec3& origin, const glm::vec3& dir, float distance,
+                                          int ignoreId, bool skipSensors,
+                                          glm::vec3* hitPos, glm::vec3* hitNormal, float* hitDistance,
+                                          int* hitObjectId, float* hitFriction) const;
+    // Last rendered game frame: draw calls/triangles of the game view pass, wall frame time,
+    // and GPU frame time from the profiler's timer query (-1 when none is available).
+    void getRenderStatsFromScript(int& drawCalls, int& triangles, float& cpuFrameMs, float& gpuFrameMs) const;
     bool raycastClosestFromScript(const glm::vec3& origin, const glm::vec3& dir, float distance,
                                   int ignoreId, glm::vec3* hitPos, glm::vec3* hitNormal,
                                   float* hitDistance, int* hitActorId = nullptr,
@@ -2317,7 +2463,9 @@ public:
     bool playAudioFromScript(int id);
     bool stopAudioFromScript(int id);
     bool setAudioLoopFromScript(int id, bool loop);
-    bool setAudioVolumeFromScript(int id, float volume);
+    // markDirty=false is the per-frame runtime path (ScriptContext::SetObjectAudioVolume).
+    bool setAudioVolumeFromScript(int id, float volume, bool markDirty = true);
+    bool setAudioPitchFromScript(int id, float pitch);
     bool setAudioClipFromScript(int id, const std::string& path);
     bool playAudioOneShotFromScript(int id, const std::string& clipPath, float volumeScale = 1.0f);
     // Microphone capture lives on AudioSystem (requestMicrophone / getMicrophoneLevel ...).

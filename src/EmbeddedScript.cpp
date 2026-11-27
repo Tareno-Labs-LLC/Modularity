@@ -99,7 +99,7 @@ auto& modules() {
 constexpr const char* kExports[] = {
     "Modularity_ScriptAbiVersion", "Modularity_ScriptLayoutSignature",
     "Script_OnInspector", "Script_Begin", "Script_Spec", "Script_TestEditor",
-    "Script_Update", "Script_TickUpdate", "RenderEditorWindow", "ExitRenderEditorWindow",
+    "Script_Update", "Script_TickUpdate", "Script_FixedUpdate", "RenderEditorWindow", "ExitRenderEditorWindow",
     "Script_ResetState", "Script_OnCollideEnter", "Script_OnCollideHold",
     "Script_OnCollideExit", "Script_OnCollideHoldDuration"
 };

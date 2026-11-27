@@ -1,3 +1,6 @@
+#include "../InstancerRuntime.h"
+#include "../InstancerTools.h"
+#include "../TerrainRuntime.h"
 #include "MaterialShaderProfileSelection.h"
 #include "../ScriptContextBinding.h"
 #include "UIInspector.h"
@@ -1137,7 +1140,29 @@ int Engine::activeAssetDropHover() const {
 #pragma endregion
 
 #pragma region Inspector Panel
+namespace {
+// Converting children deletes scene objects, which would leave the inspector's `obj` reference
+// dangling mid-frame, so the button only posts the request and the next frame runs it first.
+int s_pendingInstancerConvert = -1;
+bool s_pendingInstancerConvertNested = false;
+}
+
 void Engine::renderInspectorPanel() {
+    if (s_pendingInstancerConvert >= 0) {
+        const int instancerId = s_pendingInstancerConvert;
+        s_pendingInstancerConvert = -1;
+        recordState("instancerConvert");
+        const InstancerTools::ConvertResult converted = InstancerTools::ConvertChildren(sceneObjects, instancerId, s_pendingInstancerConvertNested);
+        if (converted.converted > 0) {
+            markRuntimeScriptBindingsDirty();
+            updateHierarchyWorldTransforms();
+            if (projectManager.currentProject.isLoaded) projectManager.currentProject.hasUnsavedChanges = true;
+        }
+        addConsoleMessage("Instancer: converted " + std::to_string(converted.converted) + " children into instances (" +
+                          std::to_string(converted.removedObjects) + " objects removed, " +
+                          std::to_string(converted.unmatched) + " children did not match a prototype)",
+                          ConsoleMessageType::Info);
+    }
     const auto __ipStart = std::chrono::steady_clock::now();
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.0f, 6.0f));
     const bool inspectorOpen = ImGui::Begin(Loc::Window("WINDOW_INSPECTOR", "Inspector"), &showInspector);
@@ -3388,6 +3413,27 @@ void Engine::renderInspectorPanel() {
                 changed = true;
             }
             if (materialValue.pbrEnabled) {
+                drawMaterialInlineLabel("Clearcoat");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(-1.0f);
+                if (ImGui::SliderFloat("##Clearcoat", &materialValue.clearcoat, 0.0f, 1.0f, "%.2f")) {
+                    materialValue.clearcoat = std::clamp(materialValue.clearcoat, 0.0f, 1.0f);
+                    changed = true;
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Clear lacquer over the base layer (car paint, varnish).\n"
+                                      "Adds a sharp second reflection with a fixed 4%% Fresnel.\n"
+                                      "0 leaves the material exactly as it was.");
+                }
+                ImGui::BeginDisabled(materialValue.clearcoat <= 0.0f);
+                drawMaterialInlineLabel("Clearcoat Roughness");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(-1.0f);
+                if (ImGui::SliderFloat("##ClearcoatRoughness", &materialValue.clearcoatRoughness, 0.0f, 1.0f, "%.2f")) {
+                    materialValue.clearcoatRoughness = std::clamp(materialValue.clearcoatRoughness, 0.0f, 1.0f);
+                    changed = true;
+                }
+                ImGui::EndDisabled();
                 changed |= drawMaterialTextureField("Height Map", (std::string(idPrefix) + "Height").c_str(), heightPath);
                 drawMaterialInlineLabel("Height Scale");
                 ImGui::SameLine();
@@ -4220,6 +4266,8 @@ void Engine::renderInspectorPanel() {
     const bool sharedLight = allSelected([](const SceneObject& candidate) { return candidate.hasLight; });
     const bool sharedLight2D = allSelected([](const SceneObject& candidate) { return candidate.hasLight2D; });
     const bool sharedReflectionCast = allSelected([](const SceneObject& candidate) { return candidate.hasReflectionCast; });
+    const bool sharedInstancer = allSelected([](const SceneObject& candidate) { return candidate.hasInstancer; });
+    const bool sharedTerrain = allSelected([](const SceneObject& candidate) { return candidate.hasTerrain; });
     const bool sharedShadowCaster2D = allSelected([](const SceneObject& candidate) { return candidate.hasShadowCaster2D; });
 
     auto scriptSignature = [](const ScriptComponent& script) {
@@ -4287,6 +4335,8 @@ void Engine::renderInspectorPanel() {
         hasMixedSelected([](const SceneObject& candidate) { return candidate.hasLight; }) ||
         hasMixedSelected([](const SceneObject& candidate) { return candidate.hasLight2D; }) ||
         hasMixedSelected([](const SceneObject& candidate) { return candidate.hasReflectionCast; }) ||
+        hasMixedSelected([](const SceneObject& candidate) { return candidate.hasInstancer; }) ||
+        hasMixedSelected([](const SceneObject& candidate) { return candidate.hasTerrain; }) ||
         hasMixedSelected([](const SceneObject& candidate) { return candidate.hasShadowCaster2D; }) ||
         !sharedScriptsLayout
     );
@@ -4587,6 +4637,8 @@ void Engine::renderInspectorPanel() {
     bool animationSectionChanged = false;
     bool skeletalSectionChanged = false;
     bool reverbSectionChanged = false;
+    bool instancerSectionChanged = false;
+    bool terrainSectionChanged = false;
     bool cameraSectionChanged = false;
     bool cameraFollowSectionChanged = false;
     bool postFxSectionChanged = false;
@@ -4658,7 +4710,7 @@ void Engine::renderInspectorPanel() {
         if (key == "Light" || key == "Light2D" || key == "ShadowCaster2D") return iconCompLight;
         if (key == "PostFX") return iconCompVolume;
         if (key == "AudioSource" || key == "ReverbZone" || key == "AudioFX") return iconCompAudio;
-        if (key == "Renderer") return iconCompMesh;
+        if (key == "Renderer" || key == "Terrain" || key == "Instancer") return iconCompMesh;
         if (key == "Collider" || key == "Collider2D") return iconCompCollider;
         if (key == "Rigidbody3D" || key == "Rigidbody2D") return iconCompRigidbody;
         if (key == "ParticleSystem2D") return iconCompParticle;
@@ -4954,6 +5006,8 @@ void Engine::renderInspectorPanel() {
         CameraFollow2D,
         PostFX,
         ReflectionCast,
+        Instancer,
+        Terrain,
         Renderer,
         Light,
         Light2D,
@@ -5008,6 +5062,8 @@ void Engine::renderInspectorPanel() {
         CameraFollow2DComponent cameraFollow2D;
         PostFXSettings postFx;
         ReflectionCastComponent reflectionCast;
+        InstancerComponent instancer;
+        TerrainComponent terrain;
         InspectorRendererClipboardData renderer;
         LightComponent light;
         Light2DComponent light2D;
@@ -7677,6 +7733,11 @@ void Engine::renderInspectorPanel() {
                     changed = true;
                     syncClipPreviewVolume(AudioPreviewContext::AudioSourceComponent, src.volume);
                 }
+                fieldRow(Loc::T("COMPONENT_AUDIO_SOURCE_PITCH", "Pitch"));
+                if (ImGui::SliderFloat("##Pitch", &src.pitch, 0.05f, 4.0f, "%.2f")) {
+                    src.pitch = std::clamp(src.pitch, 0.05f, 4.0f);
+                    changed = true;
+                }
                 if (boolRow(Loc::T("COMPONENT_AUDIO_SOURCE_LOOP", "Loop"), &src.loop)) { changed = true; }
                 if (boolRow(Loc::T("COMPONENT_AUDIO_SOURCE_PLAY_ON_START", "Play On Start"), &src.playOnStart)) { changed = true; }
                 fieldRow(spatialBlendLabel);
@@ -9574,6 +9635,12 @@ void Engine::renderInspectorPanel() {
                 if (boolRow(Loc::T("COMPONENT_SKELETAL_LOOP", "Loop"), &obj.skeletal.loop)) { changed = true; }
                 if (boolRow(Loc::T("COMPONENT_SKELETAL_GPU_SKINNING", "GPU Skinning"), &obj.skeletal.useGpuSkinning)) { changed = true; }
                 if (boolRow(Loc::T("COMPONENT_SKELETAL_CPU_FALLBACK", "CPU Fallback"), &obj.skeletal.allowCpuFallback)) { changed = true; }
+                if (boolRow(Loc::T("COMPONENT_SKELETAL_ALWAYS_RENDER", "Never Cull"), &obj.skeletal.alwaysRender)) { changed = true; }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("%s", Loc::T("COMPONENT_SKELETAL_ALWAYS_RENDER_TIP",
+                        "Always draw this skinned mesh, even when its bounds are outside the camera view. "
+                        "Use it on your own VR rig. Select all of the rig's meshes to set it on every one at once."));
+                }
                 fieldRow(Loc::T("COMPONENT_SKELETAL_MAX_BONES", "Max Bones"));
                 if (ImGui::DragInt("##MaxBones", &obj.skeletal.maxBones, 1, 8, 128)) {
                     obj.skeletal.maxBones = std::clamp(obj.skeletal.maxBones, 8, 128);
@@ -10925,6 +10992,755 @@ void Engine::renderInspectorPanel() {
         ImGui::PopStyleColor();
     }
 
+    if (inspectorComponentKey == "instancer" && obj.hasInstancer && sharedInstancer) {
+        ImGui::Dummy(ImVec2(0.0f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.30f, 0.48f, 0.30f, 1.0f));
+        bool changed = false;
+        bool removeInstancer = false;
+        InstancerComponent& inst = obj.instancer;
+        auto header = drawComponentHeader(Loc::T("COMPONENT_INSTANCER", "Instancer"), "Instancer", "instancer", &inst.enabled, true, [&]() {
+            drawStandardComponentMenu(
+                "instancer",
+                "Copy Component Values",
+                "Paste Component Values as New",
+                "Paste Component Values as Value Overrides",
+                inspectorClipboard.kind == InspectorClipboardKind::Instancer,
+                [&]() { inst = InstancerComponent{}; changed = true; },
+                [&]() { inspectorClipboard.kind = InspectorClipboardKind::Instancer; inspectorClipboard.instancer = inst; },
+                [&]() { obj.hasInstancer = true; inst = inspectorClipboard.instancer; inst.touch(); changed = true; },
+                [&]() { inst = inspectorClipboard.instancer; inst.touch(); changed = true; },
+                removeInstancer);
+        });
+        if (header.enabledChanged) {
+            inst.touch();
+            changed = true;
+        }
+        if (header.open) {
+            InspectorBodyScope _ibs(*this);
+            ImGui::PushID("Instancer");
+
+            // Per-prototype instance counts for the headers and the stats line.
+            std::vector<int> protoCounts(inst.prototypes.size(), 0);
+            if (inst.instances) {
+                for (const InstancerInstance& instance : *inst.instances) {
+                    if (instance.prototype < protoCounts.size()) ++protoCounts[instance.prototype];
+                }
+            }
+            ImGui::TextDisabled("%zu instances, %zu prototypes. Templates are scene objects; every mesh under them is drawn once per instance.",
+                                inst.instanceCount(), inst.prototypes.size());
+
+            // ---- Prototypes -------------------------------------------------------------
+            ImGui::SeparatorText("Prototypes");
+            int removePrototype = -1;
+            int clearPrototype = -1;
+            for (size_t p = 0; p < inst.prototypes.size(); ++p) {
+                InstancerPrototype& proto = inst.prototypes[p];
+                ImGui::PushID(static_cast<int>(p));
+                const SceneObject* templateObject = proto.sourceObjectId >= 0 ? findObjectById(proto.sourceObjectId) : nullptr;
+                std::string title = "[" + std::to_string(p) + "] " +
+                    (templateObject ? templateObject->name : std::string("(no template)")) +
+                    "  x" + std::to_string(protoCounts[p]);
+                const bool protoOpen = ImGui::TreeNodeEx("##Proto", ImGuiTreeNodeFlags_DefaultOpen |
+                                                         ImGuiTreeNodeFlags_SpanAvailWidth |
+                                                         ImGuiTreeNodeFlags_Framed, "%s", title.c_str());
+                if (ImGui::BeginPopupContextItem("##ProtoMenu")) {
+                    if (ImGui::MenuItem("Select Template", nullptr, false, templateObject != nullptr)) {
+                        setPrimarySelection(proto.sourceObjectId);
+                    }
+                    if (ImGui::MenuItem("Remove Its Instances", nullptr, false, protoCounts[p] > 0)) {
+                        clearPrototype = static_cast<int>(p);
+                    }
+                    if (ImGui::MenuItem("Remove Prototype")) {
+                        removePrototype = static_cast<int>(p);
+                    }
+                    ImGui::EndPopup();
+                }
+                if (protoOpen) {
+                    if (drawObjectReferenceSlot("Template", "Template", proto.sourceObjectId, obj.id, "Template")) {
+                        changed = true;
+                    }
+                    if (drawObjectReferenceSlot("LodTemplate", "LOD1 Template", proto.lodSourceObjectId, obj.id, "LOD Template")) {
+                        changed = true;
+                    }
+                    if (templateObject) {
+                        const int meshCount = InstancerTools::CountTemplateMeshes(sceneObjects, proto.sourceObjectId);
+                        if (meshCount == 0) {
+                            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.45f, 0.35f, 1.0f));
+                            ImGui::TextWrapped("The template has no mesh renderers under it, so nothing is drawn.");
+                            ImGui::PopStyleColor();
+                        } else if (templateObject->enabled) {
+                            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.75f, 0.35f, 1.0f));
+                            ImGui::TextWrapped("The template is enabled, so it also draws itself at its own position.");
+                            ImGui::PopStyleColor();
+                            if (ImGui::SmallButton("Disable Template")) {
+                                recordState("instancerDisableTemplate");
+                                if (SceneObject* editable = findObjectById(proto.sourceObjectId)) {
+                                    editable->enabled = false;
+                                }
+                                updateHierarchyWorldTransforms();
+                                markRuntimeScriptBindingsDirty();
+                                projectManager.currentProject.hasUnsavedChanges = true;
+                            }
+                        } else {
+                            ImGui::TextDisabled("%d mesh(es) per instance.", meshCount);
+                        }
+                    }
+                    if (beginCompFields("##Fields_InstancerProto")) {
+                        fieldRow("LOD Distance");
+                        if (ImGui::DragFloat("##LodDist", &proto.lodDistance, 0.5f, 0.0f, 5000.0f, "%.1f m")) changed = true;
+                        fieldRow("Max Draw Distance");
+                        if (ImGui::DragFloat("##MaxDist", &proto.maxDrawDistance, 1.0f, 0.0f, 20000.0f, "%.0f m")) changed = true;
+                        if (boolRow("Cast Shadows", &proto.castShadows)) changed = true;
+                        fieldRow("Shadow Distance");
+                        if (ImGui::DragFloat("##ShadowDist", &proto.shadowDistance, 1.0f, 0.0f, 5000.0f, "%.0f m")) changed = true;
+                        int colliderMode = static_cast<int>(proto.colliderMode);
+                        const char* colliderLabels[] = {"None", "Capsule (trunk)"};
+                        fieldRow("Collider");
+                        if (ImGui::Combo("##Collider", &colliderMode, colliderLabels, IM_ARRAYSIZE(colliderLabels))) {
+                            proto.colliderMode = colliderMode == 1 ? InstancerColliderMode::Capsule : InstancerColliderMode::None;
+                            changed = true;
+                        }
+                        if (proto.colliderMode == InstancerColliderMode::Capsule) {
+                            fieldRow("Capsule Radius");
+                            if (ImGui::DragFloat("##CapR", &proto.colliderRadius, 0.01f, 0.02f, 20.0f, "%.2f")) changed = true;
+                            fieldRow("Capsule Height");
+                            if (ImGui::DragFloat("##CapH", &proto.colliderHeight, 0.05f, 0.1f, 200.0f, "%.2f")) changed = true;
+                            fieldRow("Capsule Offset Y");
+                            if (ImGui::DragFloat("##CapY", &proto.colliderOffsetY, 0.05f, -50.0f, 50.0f, "%.2f")) changed = true;
+                            noteRow("Static colliders are created for every instance when Play starts.");
+                        }
+                        if (boolRow("Align To Ground", &proto.alignToGround)) changed = true;
+                        fieldRow("Scatter Weight");
+                        if (ImGui::DragFloat("##Weight", &proto.scatterWeight, 0.01f, 0.0f, 100.0f, "%.2f")) changed = true;
+                        fieldRow("Scale Min");
+                        if (ImGui::DragFloat("##ScaleMin", &proto.scaleMin, 0.005f, 0.05f, 20.0f, "%.2f")) changed = true;
+                        fieldRow("Scale Max");
+                        if (ImGui::DragFloat("##ScaleMax", &proto.scaleMax, 0.005f, 0.05f, 20.0f, "%.2f")) changed = true;
+                        endCompFields();
+                    }
+                    ImGui::TreePop();
+                }
+                ImGui::PopID();
+            }
+            if (removePrototype >= 0 || clearPrototype >= 0) {
+                recordState("instancerPrototype");
+                if (removePrototype >= 0) InstancerTools::RemovePrototype(obj, removePrototype);
+                else InstancerTools::ClearInstances(obj, clearPrototype);
+                projectManager.currentProject.hasUnsavedChanges = true;
+            }
+            if (ImGui::Button("Add Prototype")) {
+                recordState("instancerAddPrototype");
+                inst.prototypes.emplace_back();
+                inst.touch();
+                projectManager.currentProject.hasUnsavedChanges = true;
+            }
+            ImGui::SameLine();
+            ImGui::Button("Drop a template object here");
+            if (ImGui::BeginDragDropTarget()) {
+                if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("SCENE_OBJECT")) {
+                    if (payload->DataSize == sizeof(int)) {
+                        const int droppedId = *static_cast<const int*>(payload->Data);
+                        if (droppedId != obj.id && droppedId >= 0) {
+                            recordState("instancerAddPrototype");
+                            InstancerPrototype fresh;
+                            fresh.sourceObjectId = droppedId;
+                            inst.prototypes.push_back(fresh);
+                            inst.touch();
+                            projectManager.currentProject.hasUnsavedChanges = true;
+                        }
+                    }
+                }
+                ImGui::EndDragDropTarget();
+            }
+
+            // ---- Tools ------------------------------------------------------------------
+            ImGui::SeparatorText("Convert");
+            ImGui::TextDisabled("Turns this object's direct children into instances when their meshes match a prototype's template.");
+            static bool convertNested = false;
+            ImGui::Checkbox("Also search nested children", &convertNested);
+            ImGui::BeginDisabled(inst.prototypes.empty() || obj.childIds.empty());
+            if (ImGui::Button("Convert Children To Instances")) {
+                s_pendingInstancerConvert = obj.id;   // deletes objects: runs before the next inspector frame
+                s_pendingInstancerConvertNested = convertNested;
+            }
+            ImGui::EndDisabled();
+
+            ImGui::SeparatorText("Scatter");
+            static InstancerTools::ScatterParams scatter;
+            if (beginCompFields("##Fields_InstancerScatter")) {
+                int shape = static_cast<int>(scatter.shape);
+                const char* shapeLabels[] = {"Box", "Circle"};
+                fieldRow("Area");
+                if (ImGui::Combo("##Shape", &shape, shapeLabels, IM_ARRAYSIZE(shapeLabels))) {
+                    scatter.shape = shape == 1 ? InstancerTools::ScatterParams::Shape::Circle
+                                               : InstancerTools::ScatterParams::Shape::Box;
+                }
+                if (scatter.shape == InstancerTools::ScatterParams::Shape::Box) {
+                    fieldRow("Size X / Z");
+                    ImGui::DragFloat2("##BoxSize", &scatter.boxSize.x, 0.5f, 1.0f, 5000.0f, "%.0f m");
+                } else {
+                    fieldRow("Radius");
+                    ImGui::DragFloat("##Radius", &scatter.radius, 0.5f, 1.0f, 5000.0f, "%.0f m");
+                }
+                const float area = scatter.shape == InstancerTools::ScatterParams::Shape::Box
+                    ? scatter.boxSize.x * scatter.boxSize.y
+                    : 3.14159265f * scatter.radius * scatter.radius;
+                fieldRow("Count");
+                ImGui::DragInt("##Count", &scatter.count, 1.0f, 1, 200000);
+                noteRow(("= " + std::to_string(static_cast<int>(std::lround(scatter.count * 100.0f / std::max(area, 1.0f)))) +
+                         " per 100 m2").c_str());
+                fieldRow("Min Spacing");
+                ImGui::DragFloat("##Spacing", &scatter.minSpacing, 0.05f, 0.0f, 100.0f, "%.2f m");
+                fieldRow("Seed");
+                int seed = static_cast<int>(scatter.seed);
+                if (ImGui::DragInt("##Seed", &seed, 1.0f, 0, 1000000)) scatter.seed = static_cast<uint32_t>(std::max(seed, 0));
+                boolRow("Random Yaw", &scatter.randomYaw);
+                boolRow("Avoid Existing", &scatter.avoidExisting);
+                fieldRow("Y Offset");
+                ImGui::DragFloat("##YOff", &scatter.yOffset, 0.01f, -50.0f, 50.0f, "%.2f");
+                endCompFields();
+            }
+            ImGui::TextDisabled(InstancerTools::GetGroundQuery()
+                ? "Ground: snaps to the terrain and avoids paths, ponds and clearings."
+                : "Ground: no terrain registered, instances sit on the instancer's Y plane.");
+            ImGui::BeginDisabled(inst.prototypes.empty());
+            if (ImGui::Button("Scatter")) {
+                recordState("instancerScatter");
+                const InstancerTools::ScatterResult result = InstancerTools::Scatter(sceneObjects, obj.id, scatter);
+                ++scatter.seed;   // the next press gives a different layout
+                projectManager.currentProject.hasUnsavedChanges = true;
+                addConsoleMessage("Instancer scatter: placed " + std::to_string(result.placed) +
+                                  " (rejected: " + std::to_string(result.rejectedSpacing) + " spacing, " +
+                                  std::to_string(result.rejectedKeepOut) + " keep-out, " +
+                                  std::to_string(result.rejectedNoGround) + " no ground)",
+                                  ConsoleMessageType::Info);
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::BeginDisabled(inst.instanceCount() == 0);
+            if (ImGui::Button("Clear All Instances")) {
+                recordState("instancerClear");
+                InstancerTools::ClearInstances(obj, -1);
+                projectManager.currentProject.hasUnsavedChanges = true;
+            }
+            ImGui::EndDisabled();
+            ImGui::BeginDisabled(inst.instanceCount() == 0 || !InstancerTools::GetGroundQuery());
+            if (ImGui::Button("Snap To Terrain")) {
+                recordState("instancerSnapToGround");
+                const InstancerTools::SnapResult snap = InstancerTools::SnapToGround(sceneObjects, obj.id, false);
+                projectManager.currentProject.hasUnsavedChanges = true;
+                addConsoleMessage("Instancer snap: " + std::to_string(snap.snapped) + " seated on the terrain, " +
+                                  std::to_string(snap.noGround) + " outside any terrain",
+                                  ConsoleMessageType::Info);
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Moves every instance's height onto the terrain surface (and re-tilts Align To Ground prototypes).");
+            ImGui::SameLine();
+            if (ImGui::Button("Remove Instances In Paths / Ponds")) {
+                recordState("instancerRemoveKeepOut");
+                const InstancerTools::SnapResult snap = InstancerTools::SnapToGround(sceneObjects, obj.id, true);
+                projectManager.currentProject.hasUnsavedChanges = true;
+                addConsoleMessage("Instancer: removed " + std::to_string(snap.removedKeepOut) + " instances standing on paths, ponds or keep-out clearings",
+                                  ConsoleMessageType::Info);
+            }
+            ImGui::EndDisabled();
+            ImGui::PopID();
+        }
+        if (removeInstancer) {
+            obj.hasInstancer = false;
+            obj.instancer = InstancerComponent{};
+            changed = true;
+        }
+        if (changed) {
+            inst.touch();   // `inst` is the live component unless it was just removed; harmless either way
+            instancerSectionChanged = true;
+            projectManager.currentProject.hasUnsavedChanges = true;
+        }
+        ImGui::PopStyleColor();
+    }
+
+    if (inspectorComponentKey == "terrain" && obj.hasTerrain && sharedTerrain) {
+        ImGui::Dummy(ImVec2(0.0f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.46f, 0.38f, 0.24f, 1.0f));
+        bool changed = false;
+        bool removeTerrain = false;
+        TerrainComponent& ter = obj.terrain;
+        const auto resetTerrainSettings = [&]() {
+            const TerrainComponent fresh;
+            ter.size = fresh.size;
+            ter.heightScale = fresh.heightScale;
+            ter.heightOffset = fresh.heightOffset;
+            ter.castShadows = fresh.castShadows;
+            ter.collision = fresh.collision;
+            ter.lodDistance = fresh.lodDistance;
+            for (int li = 0; li < 4; ++li) ter.layers[li] = fresh.layers[li];
+            ter.grassEnabled = fresh.grassEnabled;
+            ter.grassDensityScale = fresh.grassDensityScale;
+            ter.grassBladeHeight = fresh.grassBladeHeight;
+            ter.grassBladeWidth = fresh.grassBladeWidth;
+            ter.grassHeightVariation = fresh.grassHeightVariation;
+            ter.grassBend = fresh.grassBend;
+            ter.grassDistance = fresh.grassDistance;
+            ter.grassWindStrength = fresh.grassWindStrength;
+            ter.grassDryAmount = fresh.grassDryAmount;
+            ter.grassBaseColor = fresh.grassBaseColor;
+            ter.grassTipColor = fresh.grassTipColor;
+            ter.grassDryColor = fresh.grassDryColor;
+            ter.waterEnabled = fresh.waterEnabled;
+            ter.waterShallowColor = fresh.waterShallowColor;
+            ter.waterDeepColor = fresh.waterDeepColor;
+            ter.waterClarity = fresh.waterClarity;
+            ter.waterWaveScale = fresh.waterWaveScale;
+            ter.waterWaveStrength = fresh.waterWaveStrength;
+            ter.waterReflection = fresh.waterReflection;
+            ter.waterFoam = fresh.waterFoam;
+            ter.ponds.clear();
+            ter.clearings.clear();
+            ter.genSeed = fresh.genSeed;
+            ter.genAmplitude = fresh.genAmplitude;
+            ter.genScale = fresh.genScale;
+            ter.genOctaves = fresh.genOctaves;
+            ter.genPersistence = fresh.genPersistence;
+            ter.genRidged = fresh.genRidged;
+            ter.savedHeightRevision = 0;
+            changed = true;
+        };
+        auto header = drawComponentHeader(Loc::T("COMPONENT_TERRAIN", "Terrain"), "Terrain", "terrain", &ter.enabled, true, [&]() {
+            drawStandardComponentMenu(
+                "terrain",
+                "Copy Component Values",
+                "Paste Component Values as New",
+                "Paste Component Values as Value Overrides",
+                inspectorClipboard.kind == InspectorClipboardKind::Terrain,
+                [&]() { resetTerrainSettings(); },
+                [&]() { inspectorClipboard.kind = InspectorClipboardKind::Terrain; inspectorClipboard.terrain = ter; },
+                [&]() {
+                    obj.hasTerrain = true;
+                    ter = inspectorClipboard.terrain;
+                    ter.dataPath.clear();   // the pasted copy gets its own .modterrain on the next save
+                    ter.savedHeightRevision = 0;
+                    ter.savedSplatRevision = 0;
+                    changed = true;
+                },
+                [&]() {
+                    const std::string keepPath = ter.dataPath;
+                    ter = inspectorClipboard.terrain;
+                    ter.dataPath = keepPath;
+                    ter.savedHeightRevision = 0;
+                    ter.savedSplatRevision = 0;
+                    changed = true;
+                },
+                removeTerrain);
+        });
+        if (header.enabledChanged) changed = true;
+        if (header.open) {
+            InspectorBodyScope _ibs(*this);
+            ImGui::PushID("Terrain");
+
+            const bool hasData = ter.hasData();
+            if (hasData) {
+                ImGui::TextDisabled("%d x %d samples, %.2f m per sample, splat %d x %d",
+                                    ter.resolution, ter.resolution, TerrainRuntime::CellSize(ter),
+                                    ter.splatResolution, ter.splatResolution);
+            }
+            ImGui::TextDisabled("Data: %s%s", ter.dataPath.empty() ? "(assigned when the scene is saved)" : ter.dataPath.c_str(),
+                                ter.dataDirty() ? "   [modified]" : "");
+            if (!hasData) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.75f, 0.35f, 1.0f));
+                ImGui::TextWrapped("This terrain has no height data (the .modterrain file is missing or unreadable).");
+                ImGui::PopStyleColor();
+                if (ImGui::Button("Create Flat Terrain")) {
+                    recordState("terrainCreateFlat");
+                    TerrainRuntime::InitializeFlat(ter, 0.0f);
+                    projectManager.currentProject.hasUnsavedChanges = true;
+                    changed = true;
+                }
+            }
+
+            // ---- Shape ---------------------------------------------------------------------
+            ImGui::SeparatorText("Shape");
+            if (beginCompFields("##Fields_TerrainShape")) {
+                bool shapeChanged = false;
+                fieldRow("Size");
+                if (ImGui::DragFloat("##Size", &ter.size, 1.0f, 8.0f, 8192.0f, "%.0f m")) shapeChanged = true;
+                fieldRow("Height Scale");
+                if (ImGui::DragFloat("##HeightScale", &ter.heightScale, 0.1f, 0.1f, 2000.0f, "%.1f m")) shapeChanged = true;
+                fieldRow("Height Offset");
+                if (ImGui::DragFloat("##HeightOffset", &ter.heightOffset, 0.1f, -1000.0f, 1000.0f, "%.1f m")) shapeChanged = true;
+                noteRow("Local Y of the lowest possible height. Painted terrain stays between Offset and Offset + Scale.");
+                static const int kResolutions[] = {129, 257, 513, 1025, 2049};
+                static const char* kResolutionLabels[] = {"129", "257", "513", "1025", "2049"};
+                int resIndex = 2;
+                for (int i = 0; i < 5; ++i) if (ter.resolution == kResolutions[i]) resIndex = i;
+                fieldRow("Resolution");
+                if (ImGui::Combo("##Resolution", &resIndex, kResolutionLabels, IM_ARRAYSIZE(kResolutionLabels)) &&
+                    kResolutions[resIndex] != ter.resolution) {
+                    recordState("terrainResolution");
+                    TerrainRuntime::Resize(ter, kResolutions[resIndex], ter.splatResolution);
+                    shapeChanged = true;
+                }
+                static const int kSplatResolutions[] = {256, 512, 1024, 2048};
+                static const char* kSplatLabels[] = {"256", "512", "1024", "2048"};
+                int splatIndex = 1;
+                for (int i = 0; i < 4; ++i) if (ter.splatResolution == kSplatResolutions[i]) splatIndex = i;
+                fieldRow("Paint Resolution");
+                if (ImGui::Combo("##SplatResolution", &splatIndex, kSplatLabels, IM_ARRAYSIZE(kSplatLabels)) &&
+                    kSplatResolutions[splatIndex] != ter.splatResolution) {
+                    recordState("terrainSplatResolution");
+                    TerrainRuntime::Resize(ter, ter.resolution, kSplatResolutions[splatIndex]);
+                    shapeChanged = true;
+                }
+                if (boolRow("Cast Shadows", &ter.castShadows)) changed = true;
+                if (boolRow("Collision", &ter.collision)) changed = true;
+                fieldRow("LOD Distance");
+                if (ImGui::DragFloat("##LodDistance", &ter.lodDistance, 1.0f, 5.0f, 2000.0f, "%.0f m")) changed = true;
+                endCompFields();
+                if (shapeChanged) {
+                    ter.savedHeightRevision = 0;   // size / height scale live in the sidecar header too
+                    changed = true;
+                }
+            }
+
+            // ---- Sculpt and paint brush ----------------------------------------------------
+            ImGui::SeparatorText("Sculpt & Paint");
+            ImGui::BeginDisabled(!hasData);
+            if (ImGui::Checkbox("Edit Terrain", &terrainBrushEnabled)) {
+                if (!terrainBrushEnabled) endTerrainStroke();
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("While on, the left mouse button sculpts/paints in the Scene view and the transform gizmo is hidden.\n"
+                                  "[ and ] change the radius. Shift inverts Raise/Lower and erases Grass Density. Each stroke is one undo step.");
+            }
+            using BrushMode = TerrainRuntime::BrushMode;
+            const struct { BrushMode mode; const char* label; } kBrushModes[] = {
+                {BrushMode::Raise, "Raise"}, {BrushMode::Lower, "Lower"}, {BrushMode::Smooth, "Smooth"},
+                {BrushMode::Flatten, "Flatten"}, {BrushMode::PaintLayer, "Paint"}, {BrushMode::GrassDensity, "Grass"}};
+            for (size_t bi = 0; bi < IM_ARRAYSIZE(kBrushModes); ++bi) {
+                if (bi > 0) ImGui::SameLine();
+                if (ImGui::RadioButton(kBrushModes[bi].label, terrainBrush.mode == kBrushModes[bi].mode)) {
+                    terrainBrush.mode = kBrushModes[bi].mode;
+                    terrainBrushEnabled = true;
+                }
+            }
+            if (beginCompFields("##Fields_TerrainBrush")) {
+                fieldRow("Radius");
+                ImGui::DragFloat("##BrushRadius", &terrainBrush.radius, 0.1f, 0.5f, 400.0f, "%.1f m");
+                fieldRow("Strength");
+                ImGui::SliderFloat("##BrushStrength", &terrainBrush.strength, 0.01f, 1.0f, "%.2f");
+                fieldRow("Falloff");
+                ImGui::SliderFloat("##BrushFalloff", &terrainBrush.falloff, 0.0f, 1.0f, "%.2f");
+                if (terrainBrush.mode == BrushMode::PaintLayer) {
+                    static const char* kLayerNames[] = {"Grass", "Forest Floor / Dirt", "Path", "Rock"};
+                    fieldRow("Layer");
+                    ImGui::Combo("##BrushLayer", &terrainBrush.layer, kLayerNames, IM_ARRAYSIZE(kLayerNames));
+                } else if (terrainBrush.mode == BrushMode::Flatten) {
+                    boolRow("Fixed Height", &terrainFlattenFixed);
+                    if (terrainFlattenFixed) {
+                        fieldRow("Height");
+                        ImGui::DragFloat("##FlattenHeight", &terrainBrush.flattenHeight, 0.05f, -1000.0f, 3000.0f, "%.2f m");
+                    } else {
+                        noteRow("Flattens toward the height under the cursor when the stroke starts.");
+                    }
+                } else if (terrainBrush.mode == BrushMode::GrassDensity) {
+                    boolRow("Erase", &terrainBrush.invert);
+                    noteRow("Thins the 3D grass without changing the ground texture (full everywhere by default).");
+                }
+                endCompFields();
+            }
+            ImGui::EndDisabled();
+
+            // ---- Layers --------------------------------------------------------------------
+            ImGui::SeparatorText("Layers");
+            ImGui::TextDisabled("Empty texture slots use a built-in procedural tile (grass, forest floor, path, rock).");
+            static const char* kLayerTitles[4] = {"Grass", "Forest Floor / Dirt", "Path", "Rock (slopes)"};
+            for (int li = 0; li < 4; ++li) {
+                TerrainLayer& layer = ter.layers[li];
+                ImGui::PushID(li);
+                const std::string title = std::string(kLayerTitles[li]) + (layer.albedoPath.empty() ? "  (procedural)" : "");
+                if (ImGui::TreeNodeEx("##Layer", ImGuiTreeNodeFlags_SpanAvailWidth | ImGuiTreeNodeFlags_Framed, "%s", title.c_str())) {
+                    if (drawAssetReferenceSlot("##LayerAlbedo", "Albedo", layer.albedoPath, FileCategory::Texture, "Texture")) changed = true;
+                    if (drawAssetReferenceSlot("##LayerNormal", "Normal", layer.normalPath, FileCategory::Texture, "Normal Map")) changed = true;
+                    if (beginCompFields("##Fields_TerrainLayer")) {
+                        fieldRow("Tiling");
+                        if (ImGui::DragFloat("##Tiling", &layer.tiling, 0.05f, 0.1f, 500.0f, "%.2f m")) changed = true;
+                        fieldRow("Tint");
+                        if (ImGui::ColorEdit3("##Tint", &layer.tint.x, ImGuiColorEditFlags_NoInputs)) changed = true;
+                        fieldRow("Normal Strength");
+                        if (ImGui::SliderFloat("##NormalStrength", &layer.normalStrength, 0.0f, 3.0f, "%.2f")) changed = true;
+                        endCompFields();
+                    }
+                    ImGui::TreePop();
+                }
+                ImGui::PopID();
+            }
+
+            // ---- Grass ---------------------------------------------------------------------
+            ImGui::SeparatorText("Grass");
+            if (ImGui::Checkbox("Grass##TerrainGrass", &ter.grassEnabled)) changed = true;
+            ImGui::SameLine();
+            ImGui::TextDisabled("3D blades grown on the Grass layer (and the Grass brush's density)");
+            ImGui::BeginDisabled(!ter.grassEnabled);
+            if (beginCompFields("##Fields_TerrainGrass")) {
+                fieldRow("Density");
+                if (ImGui::DragFloat("##GrassDensity", &ter.grassDensityScale, 0.02f, 0.0f, 1.0e6f, "%.2f")) changed = true;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Blade count multiplier, no upper limit (GPU cost grows linearly)");
+                fieldRow("Blade Height");
+                if (ImGui::DragFloat("##GrassHeight", &ter.grassBladeHeight, 0.01f, 0.05f, 3.0f, "%.2f m")) changed = true;
+                fieldRow("Blade Width");
+                if (ImGui::DragFloat("##GrassWidth", &ter.grassBladeWidth, 0.001f, 0.005f, 0.3f, "%.3f m")) changed = true;
+                fieldRow("Height Variation");
+                if (ImGui::SliderFloat("##GrassVariation", &ter.grassHeightVariation, 0.0f, 1.0f, "%.2f")) changed = true;
+                fieldRow("Bend");
+                if (ImGui::SliderFloat("##GrassBend", &ter.grassBend, 0.0f, 1.5f, "%.2f")) changed = true;
+                fieldRow("Distance");
+                if (ImGui::DragFloat("##GrassDistance", &ter.grassDistance, 0.5f, 10.0f, 200.0f, "%.0f m")) changed = true;
+                fieldRow("Wind Strength");
+                if (ImGui::SliderFloat("##GrassWind", &ter.grassWindStrength, 0.0f, 4.0f, "%.2f")) changed = true;
+                fieldRow("Dry Patches");
+                if (ImGui::SliderFloat("##GrassDry", &ter.grassDryAmount, 0.0f, 1.0f, "%.2f")) changed = true;
+                fieldRow("Root Colour");
+                if (ImGui::ColorEdit3("##GrassBase", &ter.grassBaseColor.x, ImGuiColorEditFlags_NoInputs)) changed = true;
+                fieldRow("Tip Colour");
+                if (ImGui::ColorEdit3("##GrassTip", &ter.grassTipColor.x, ImGuiColorEditFlags_NoInputs)) changed = true;
+                fieldRow("Dry Colour");
+                if (ImGui::ColorEdit3("##GrassDryColour", &ter.grassDryColor.x, ImGuiColorEditFlags_NoInputs)) changed = true;
+                endCompFields();
+            }
+            ImGui::EndDisabled();
+            ImGui::TextDisabled("Three LOD rings around the camera; nothing is uploaded per frame. No grass on paths, rock or in ponds.");
+
+            // ---- Water ---------------------------------------------------------------------
+            ImGui::SeparatorText("Water");
+            if (ImGui::Checkbox("Pond Water##TerrainWater", &ter.waterEnabled)) changed = true;
+            ImGui::SameLine();
+            ImGui::TextDisabled("%zu pond%s (see Ponds below)", ter.ponds.size(), ter.ponds.size() == 1 ? "" : "s");
+            ImGui::BeginDisabled(!ter.waterEnabled);
+            if (beginCompFields("##Fields_TerrainWater")) {
+                fieldRow("Shallow Colour");
+                if (ImGui::ColorEdit3("##WaterShallow", &ter.waterShallowColor.x, ImGuiColorEditFlags_NoInputs)) changed = true;
+                fieldRow("Deep Colour");
+                if (ImGui::ColorEdit3("##WaterDeep", &ter.waterDeepColor.x, ImGuiColorEditFlags_NoInputs)) changed = true;
+                fieldRow("Clarity");
+                if (ImGui::DragFloat("##WaterClarity", &ter.waterClarity, 0.02f, 0.05f, 30.0f, "%.2f m")) changed = true;
+                fieldRow("Wave Size");
+                if (ImGui::DragFloat("##WaterWaveScale", &ter.waterWaveScale, 0.02f, 0.1f, 10.0f, "%.2f")) changed = true;
+                fieldRow("Wave Strength");
+                if (ImGui::SliderFloat("##WaterWaveStrength", &ter.waterWaveStrength, 0.0f, 2.0f, "%.2f")) changed = true;
+                fieldRow("Reflection");
+                if (ImGui::SliderFloat("##WaterReflection", &ter.waterReflection, 0.0f, 2.0f, "%.2f")) changed = true;
+                fieldRow("Shore Foam");
+                if (ImGui::SliderFloat("##WaterFoam", &ter.waterFoam, 0.0f, 2.0f, "%.2f")) changed = true;
+                endCompFields();
+            }
+            ImGui::EndDisabled();
+
+            // ---- Generate ------------------------------------------------------------------
+            ImGui::SeparatorText("Generate");
+            static TerrainRuntime::GenerateOptions genOptions;
+            if (beginCompFields("##Fields_TerrainGenerate")) {
+                fieldRow("Seed");
+                if (ImGui::DragInt("##GenSeed", &ter.genSeed, 1.0f, 0, 1000000)) changed = true;
+                fieldRow("Amplitude");
+                if (ImGui::DragFloat("##GenAmplitude", &ter.genAmplitude, 0.05f, 0.0f, 500.0f, "%.1f m")) changed = true;
+                fieldRow("Feature Size");
+                if (ImGui::DragFloat("##GenScale", &ter.genScale, 0.5f, 2.0f, 2000.0f, "%.0f m")) changed = true;
+                fieldRow("Octaves");
+                if (ImGui::SliderInt("##GenOctaves", &ter.genOctaves, 1, 8)) changed = true;
+                fieldRow("Persistence");
+                if (ImGui::SliderFloat("##GenPersistence", &ter.genPersistence, 0.1f, 0.9f, "%.2f")) changed = true;
+                fieldRow("Ridged");
+                if (ImGui::SliderFloat("##GenRidged", &ter.genRidged, 0.0f, 1.0f, "%.2f")) changed = true;
+                fieldRow("Base Height");
+                ImGui::DragFloat("##GenBase", &genOptions.baseHeightMetres, 0.1f, -1000.0f, 2000.0f, "%.1f m");
+                boolRow("Flatten Clearings", &genOptions.applyClearings);
+                boolRow("Carve Ponds", &genOptions.carvePonds);
+                boolRow("Paint By Slope", &genOptions.autoPaint);
+                if (genOptions.autoPaint) {
+                    fieldRow("Rock Slope");
+                    ImGui::SliderFloat("##GenRockSlope", &genOptions.rockSlopeDegrees, 15.0f, 80.0f, "%.0f deg");
+                }
+                if (genOptions.carvePonds) {
+                    fieldRow("Pond Depth");
+                    ImGui::DragFloat("##GenPondDepth", &genOptions.pondDepth, 0.05f, 0.2f, 20.0f, "%.1f m");
+                }
+                endCompFields();
+            }
+            if (ImGui::Button("Generate Terrain")) {
+                recordState("terrainGenerate");
+                TerrainRuntime::Generate(ter, genOptions);
+                projectManager.currentProject.hasUnsavedChanges = true;
+                changed = true;
+            }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Replaces the heights (and, with Paint By Slope, the paint) from this recipe.");
+            ImGui::SameLine();
+            if (ImGui::Button("New Seed")) {
+                recordState("terrainGenerate");
+                ter.genSeed = static_cast<int>(std::rand() % 1000000);
+                TerrainRuntime::Generate(ter, genOptions);
+                projectManager.currentProject.hasUnsavedChanges = true;
+                changed = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Reset To Flat")) {
+                recordState("terrainFlat");
+                TerrainRuntime::InitializeFlat(ter, genOptions.baseHeightMetres);
+                projectManager.currentProject.hasUnsavedChanges = true;
+                changed = true;
+            }
+            {
+                static int fillLayer = 0;
+                static const char* kFillNames[] = {"Grass", "Forest Floor / Dirt", "Path", "Rock"};
+                ImGui::SetNextItemWidth(150.0f);
+                ImGui::Combo("##FillLayer", &fillLayer, kFillNames, IM_ARRAYSIZE(kFillNames));
+                ImGui::SameLine();
+                if (ImGui::Button("Fill Paint") && hasData) {
+                    recordState("terrainFill");
+                    std::vector<uint8_t>& splat = ter.mutableSplat();
+                    for (size_t i = 0; i + 3 < splat.size(); i += 4) {
+                        splat[i] = splat[i + 1] = splat[i + 2] = splat[i + 3] = 0;
+                        splat[i + static_cast<size_t>(fillLayer)] = 255;
+                    }
+                    TerrainRect all;
+                    all.include(0, 0, ter.splatResolution - 1, ter.splatResolution - 1);
+                    ter.markSplatChanged(all, true);
+                    projectManager.currentProject.hasUnsavedChanges = true;
+                    changed = true;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Paint By Slope") && hasData) {
+                    recordState("terrainAutoPaint");
+                    TerrainRuntime::AutoPaint(ter, genOptions.rockSlopeDegrees);
+                    projectManager.currentProject.hasUnsavedChanges = true;
+                    changed = true;
+                }
+            }
+
+            // ---- Ponds ---------------------------------------------------------------------
+            ImGui::SeparatorText("Ponds");
+            int removePond = -1;
+            for (size_t pi = 0; pi < ter.ponds.size(); ++pi) {
+                TerrainPond& pond = ter.ponds[pi];
+                ImGui::PushID(static_cast<int>(pi));
+                if (ImGui::TreeNodeEx("##Pond", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanAvailWidth | ImGuiTreeNodeFlags_Framed,
+                                      "Pond %zu  (r %.1f m)", pi + 1, pond.radius)) {
+                    if (beginCompFields("##Fields_TerrainPond")) {
+                        const float half = ter.size * 0.5f;
+                        fieldRow("Center X / Z");
+                        if (ImGui::DragFloat2("##PondCenter", &pond.center.x, 0.25f, -half, half, "%.1f")) changed = true;
+                        fieldRow("Radius");
+                        if (ImGui::DragFloat("##PondRadius", &pond.radius, 0.1f, 0.5f, 500.0f, "%.1f m")) changed = true;
+                        fieldRow("Water Height");
+                        if (ImGui::DragFloat("##PondHeight", &pond.waterHeight, 0.02f, -1000.0f, 3000.0f, "%.2f m")) changed = true;
+                        endCompFields();
+                    }
+                    if (ImGui::SmallButton("Remove Pond")) removePond = static_cast<int>(pi);
+                    ImGui::TreePop();
+                }
+                ImGui::PopID();
+            }
+            if (removePond >= 0) {
+                recordState("terrainPondRemove");
+                ter.ponds.erase(ter.ponds.begin() + removePond);
+                changed = true;
+            }
+            if (ImGui::Button("Add Pond")) {
+                recordState("terrainPondAdd");
+                TerrainPond pond;
+                if (terrainBrushHasHit) {
+                    const glm::vec3 local = glm::vec3(glm::inverse(TerrainRuntime::WorldMatrix(obj)) * glm::vec4(terrainBrushHitWorld, 1.0f));
+                    pond.center = glm::vec2(local.x, local.z);
+                }
+                pond.waterHeight = hasData ? TerrainRuntime::LocalHeightAt(ter, pond.center.x, pond.center.y) - 0.3f : 0.0f;
+                ter.ponds.push_back(pond);
+                changed = true;
+            }
+            ImGui::SameLine();
+            ImGui::BeginDisabled(ter.ponds.empty() || !hasData);
+            if (ImGui::Button("Carve Ponds")) {
+                recordState("terrainCarvePonds");
+                TerrainRuntime::CarvePonds(ter, genOptions.pondDepth);
+                projectManager.currentProject.hasUnsavedChanges = true;
+                changed = true;
+            }
+            ImGui::EndDisabled();
+            ImGui::TextDisabled("Ponds keep Scatter and grass out; the water surface fills the carved basin below each pond's Water Height.");
+
+            // ---- Clearings -----------------------------------------------------------------
+            ImGui::SeparatorText("Clearings");
+            int removeClearing = -1;
+            for (size_t ci = 0; ci < ter.clearings.size(); ++ci) {
+                TerrainClearing& clearing = ter.clearings[ci];
+                ImGui::PushID(static_cast<int>(ci));
+                if (ImGui::TreeNodeEx("##Clearing", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanAvailWidth | ImGuiTreeNodeFlags_Framed,
+                                      "Clearing %zu  (%s)", ci + 1, clearing.rectangle ? "rectangle" : "circle")) {
+                    if (beginCompFields("##Fields_TerrainClearing")) {
+                        const float half = ter.size * 0.5f;
+                        fieldRow("Center X / Z");
+                        if (ImGui::DragFloat2("##ClearingCenter", &clearing.center.x, 0.25f, -half, half, "%.1f")) changed = true;
+                        if (boolRow("Rectangle", &clearing.rectangle)) changed = true;
+                        if (clearing.rectangle) {
+                            fieldRow("Half Extents");
+                            if (ImGui::DragFloat2("##ClearingSize", &clearing.size.x, 0.25f, 0.5f, half, "%.1f m")) changed = true;
+                            fieldRow("Rotation");
+                            if (ImGui::DragFloat("##ClearingRotation", &clearing.rotationDegrees, 0.5f, -360.0f, 360.0f, "%.0f deg")) changed = true;
+                        } else {
+                            fieldRow("Radius");
+                            if (ImGui::DragFloat("##ClearingRadius", &clearing.size.x, 0.25f, 0.5f, half, "%.1f m")) changed = true;
+                        }
+                        fieldRow("Blend");
+                        if (ImGui::DragFloat("##ClearingBlend", &clearing.blend, 0.1f, 0.0f, 200.0f, "%.1f m")) changed = true;
+                        if (boolRow("Fixed Height", &clearing.useHeight)) changed = true;
+                        if (clearing.useHeight) {
+                            fieldRow("Height");
+                            if (ImGui::DragFloat("##ClearingHeight", &clearing.height, 0.05f, -1000.0f, 3000.0f, "%.2f m")) changed = true;
+                        }
+                        if (boolRow("Keep Scatter Out", &clearing.keepOut)) changed = true;
+                        endCompFields();
+                    }
+                    if (ImGui::SmallButton("Remove Clearing")) removeClearing = static_cast<int>(ci);
+                    ImGui::TreePop();
+                }
+                ImGui::PopID();
+            }
+            if (removeClearing >= 0) {
+                recordState("terrainClearingRemove");
+                ter.clearings.erase(ter.clearings.begin() + removeClearing);
+                changed = true;
+            }
+            if (ImGui::Button("Add Clearing")) {
+                recordState("terrainClearingAdd");
+                TerrainClearing clearing;
+                if (terrainBrushHasHit) {
+                    const glm::vec3 local = glm::vec3(glm::inverse(TerrainRuntime::WorldMatrix(obj)) * glm::vec4(terrainBrushHitWorld, 1.0f));
+                    clearing.center = glm::vec2(local.x, local.z);
+                }
+                ter.clearings.push_back(clearing);
+                changed = true;
+            }
+            ImGui::SameLine();
+            ImGui::BeginDisabled(ter.clearings.empty() || !hasData);
+            if (ImGui::Button("Flatten Clearings")) {
+                recordState("terrainFlattenClearings");
+                TerrainRuntime::ApplyClearings(ter);
+                projectManager.currentProject.hasUnsavedChanges = true;
+                changed = true;
+            }
+            ImGui::EndDisabled();
+            ImGui::TextDisabled("Keep-out clearings, ponds and painted paths stop the Instancer's Scatter.");
+            ImGui::PopID();
+        }
+        if (removeTerrain) {
+            if (terrainBrushEnabled) { terrainBrushEnabled = false; endTerrainStroke(); }
+            obj.hasTerrain = false;
+            obj.terrain = TerrainComponent{};
+            changed = true;
+        }
+        if (changed) {
+            terrainSectionChanged = true;
+            projectManager.currentProject.hasUnsavedChanges = true;
+        }
+        ImGui::PopStyleColor();
+    }
+
     if (inspectorComponentKey == "renderer" && obj.hasRenderer && sharedRenderer) {
         ImGui::Dummy(ImVec2(0.0f, 1.0f));
         bool rendererChanged = false;
@@ -12034,11 +12850,7 @@ void Engine::renderInspectorPanel() {
                     if (binary.empty()) {
                         const std::string stem = NativeScriptArtifactStem(fs::path(sc.path));
                         if (!stem.empty() && projectManager.currentProject.isLoaded) {
-#if defined(_WIN32)
-                            const char* ext = ".dll";
-#else
-                            const char* ext = ".so";
-#endif
+                            const char* ext = NativeScriptArtifactExtension();
                             const fs::path candidates[] = {
                                 projectManager.currentProject.projectPath / "Library" / "CompiledScripts" / (stem + ext),
                                 projectManager.currentProject.projectPath / "Cache" / "ScriptBin" / (stem + ext),
@@ -12608,6 +13420,17 @@ void Engine::renderInspectorPanel() {
             UpdateLegacyTypeFromComponents(obj);
             componentChanged = true;
         });
+        addEntry("Rendering/Instancer", !obj.hasInstancer, [&]() {
+            obj.hasInstancer = true;
+            obj.instancer = InstancerComponent{};
+            componentChanged = true;
+        });
+        addEntry("Rendering/Terrain", !obj.hasTerrain, [&]() {
+            obj.hasTerrain = true;
+            obj.terrain = TerrainComponent{};
+            TerrainRuntime::InitializeFlat(obj.terrain, 0.0f);
+            componentChanged = true;
+        });
         addEntry("Lights/Directional", !obj.hasLight, [&]() {
             obj.hasLight = true;
             obj.light = LightComponent{};
@@ -12975,15 +13798,9 @@ void Engine::renderInspectorPanel() {
                     std::string ext = it->path().extension().string();
                     std::transform(ext.begin(), ext.end(), ext.begin(),
                                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-#ifdef _WIN32
-                    if (ext == ".dll") {
+                    if (ext == NativeScriptArtifactExtension()) {
                         cachedScriptBinaries.push_back(it->path());
                     }
-#else
-                    if (ext == ".so") {
-                        cachedScriptBinaries.push_back(it->path());
-                    }
-#endif
                 }
             }
         }
@@ -13832,6 +14649,8 @@ void Engine::renderInspectorPanel() {
             APPLY_CHANGED_MATERIAL_FIELD(metallic);
             APPLY_CHANGED_MATERIAL_FIELD(roughness);
             APPLY_CHANGED_MATERIAL_FIELD(occlusionStrength);
+            APPLY_CHANGED_MATERIAL_FIELD(clearcoat);
+            APPLY_CHANGED_MATERIAL_FIELD(clearcoatRoughness);
             APPLY_CHANGED_MATERIAL_FIELD(emissionColor);
             APPLY_CHANGED_MATERIAL_FIELD(emissionStrength);
             APPLY_CHANGED_MATERIAL_FIELD(alphaCutoff);
@@ -13946,6 +14765,7 @@ void Engine::renderInspectorPanel() {
             APPLY_CHANGED_COMPONENT_FIELD(audioSource, enabled);
             APPLY_CHANGED_COMPONENT_FIELD(audioSource, clipPath);
             APPLY_CHANGED_COMPONENT_FIELD(audioSource, volume);
+            APPLY_CHANGED_COMPONENT_FIELD(audioSource, pitch);
             APPLY_CHANGED_COMPONENT_FIELD(audioSource, loop);
             APPLY_CHANGED_COMPONENT_FIELD(audioSource, playOnStart);
             APPLY_CHANGED_COMPONENT_FIELD(audioSource, spatial);
@@ -14101,6 +14921,7 @@ void Engine::renderInspectorPanel() {
             APPLY_CHANGED_COMPONENT_FIELD(skeletal, loop);
             APPLY_CHANGED_COMPONENT_FIELD(skeletal, skeletonRootId);
             APPLY_CHANGED_COMPONENT_FIELD(skeletal, maxBones);
+            APPLY_CHANGED_COMPONENT_FIELD(skeletal, alwaysRender);
             APPLY_CHANGED_COMPONENT_FIELD(skeletal, boneNames);
             APPLY_CHANGED_COMPONENT_FIELD(skeletal, boneNodeIds);
             APPLY_CHANGED_COMPONENT_FIELD(skeletal, armatureNodeIds);
@@ -14312,6 +15133,8 @@ void Engine::renderInspectorPanel() {
             APPLY_CHANGED_MATERIAL_FIELD(metallic);
             APPLY_CHANGED_MATERIAL_FIELD(roughness);
             APPLY_CHANGED_MATERIAL_FIELD(occlusionStrength);
+            APPLY_CHANGED_MATERIAL_FIELD(clearcoat);
+            APPLY_CHANGED_MATERIAL_FIELD(clearcoatRoughness);
             APPLY_CHANGED_MATERIAL_FIELD(emissionColor);
             APPLY_CHANGED_MATERIAL_FIELD(emissionStrength);
             APPLY_CHANGED_MATERIAL_FIELD(alphaCutoff);
@@ -14672,7 +15495,7 @@ void Engine::renderInspectorPanel() {
         collider2DSectionChanged || parallax2DSectionChanged || audioSourceSectionChanged || audioFXSectionChanged ||
         videoPlayerSectionChanged || particleSystem2DSectionChanged || groundBakedSectionChanged || obstacleSectionChanged ||
         agentSectionChanged || animationSectionChanged || skeletalSectionChanged ||
-        reverbSectionChanged || cameraSectionChanged || cameraFollowSectionChanged ||
+        reverbSectionChanged || instancerSectionChanged || terrainSectionChanged || cameraSectionChanged || cameraFollowSectionChanged ||
         postFxSectionChanged || rendererSectionChanged || lightSectionChanged ||
         light2DSectionChanged || shadowCaster2DSectionChanged || scriptsChanged ||
         inspectorOrderChanged || componentChanged;

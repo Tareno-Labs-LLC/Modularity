@@ -39,6 +39,29 @@ using quat = glm::quat;
 using Quaternion = quat;
 using string = std::string;
 
+inline glm::vec3 GetObjectReferencePosition(ScriptContext& ctx, const SceneObject& object) {
+    if (HasUIComponent(object) && object.ui.type != UIElementType::None) {
+        glm::vec2 worldUiPos(object.ui.position.x, object.ui.position.y);
+        int parentId = object.parentId;
+        int guard = 0;
+        while (parentId >= 0 && guard < 256) {
+            ++guard;
+            SceneObject* parent = ctx.FindObjectById(parentId);
+            if (!parent) break;
+            if (HasUIComponent(*parent) && parent->ui.type != UIElementType::None) {
+                worldUiPos += parent->ui.position;
+                parentId = parent->parentId;
+                continue;
+            }
+            worldUiPos += glm::vec2(parent->position.x, parent->position.y);
+            break;
+        }
+        return glm::vec3(worldUiPos.x, worldUiPos.y, object.position.z);
+    }
+    return object.position;
+}
+
+
 using String = std::string;
 template <typename T> using Array = std::vector<T>;
 template <typename T> using List = std::vector<T>;
@@ -554,6 +577,110 @@ inline bool IsAlive(const std::string& ref) {
     return ps && (ps->playing || !ps->particles.empty() || ps->runtimePendingEmit > 0);
 }
 } // namespace Particles
+
+// Height / surface queries against a Terrain component (the object `ref` names). Header-only so a
+// compiled script needs nothing from the engine beyond the SceneObject layout. All positions are
+// world space; every function is safe on an unresolved ref or a terrain without data.
+namespace Terrain {
+namespace detail {
+inline SceneObject* Find(const std::string& ref) {
+    if (ref.empty()) return nullptr;
+    SceneObject* o = SmartResolveRef(ref);
+    if (!o || !o->hasTerrain || !o->terrain.enabled || !o->terrain.hasData()) return nullptr;
+    return o;
+}
+inline glm::mat4 World(const SceneObject& o) {
+    glm::mat4 m(1.0f);
+    m = glm::translate(m, o.position);
+    m = glm::rotate(m, glm::radians(o.rotation.x), glm::vec3(1.0f, 0.0f, 0.0f));
+    m = glm::rotate(m, glm::radians(o.rotation.y), glm::vec3(0.0f, 1.0f, 0.0f));
+    m = glm::rotate(m, glm::radians(o.rotation.z), glm::vec3(0.0f, 0.0f, 1.0f));
+    return glm::scale(m, o.scale);
+}
+// Terrain-local height in metres (same triangulation as the renderer and the collider).
+inline float LocalHeight(const TerrainComponent& t, float lx, float lz, bool* inside) {
+    const float half = t.size * 0.5f;
+    const float cell = t.size / static_cast<float>(t.resolution - 1);
+    if (inside) *inside = lx >= -half && lx <= half && lz >= -half && lz <= half;
+    const float maxIndex = static_cast<float>(t.resolution - 1);
+    const float fx = std::min(std::max((lx + half) / cell, 0.0f), maxIndex);
+    const float fz = std::min(std::max((lz + half) / cell, 0.0f), maxIndex);
+    const int x0 = std::min(static_cast<int>(fx), t.resolution - 2);
+    const int z0 = std::min(static_cast<int>(fz), t.resolution - 2);
+    const float tx = fx - static_cast<float>(x0);
+    const float tz = fz - static_cast<float>(z0);
+    const std::vector<float>& h = *t.heights;
+    const auto at = [&](int x, int z) { return h[static_cast<size_t>(z) * static_cast<size_t>(t.resolution) + static_cast<size_t>(x)]; };
+    const float ha = at(x0, z0), hb = at(x0 + 1, z0), hc = at(x0, z0 + 1), hd = at(x0 + 1, z0 + 1);
+    const float n = tz <= tx ? ha + (hb - ha) * tx + (hd - hb) * tz : ha + (hd - hc) * tx + (hc - ha) * tz;
+    return t.heightOffset + n * t.heightScale;
+}
+inline bool ToLocal(const SceneObject& o, float wx, float wz, glm::mat4& world, glm::vec3& local) {
+    world = World(o);
+    const glm::mat4 inv = glm::inverse(world);
+    local = glm::vec3(inv * glm::vec4(wx, o.position.y, wz, 1.0f));
+    bool inside = false;
+    const float ly = LocalHeight(o.terrain, local.x, local.z, &inside);
+    if (!inside) return false;
+    const glm::vec3 surface = glm::vec3(world * glm::vec4(local.x, ly, local.z, 1.0f));
+    local = glm::vec3(inv * glm::vec4(wx, surface.y, wz, 1.0f));   // one refinement for tilted terrains
+    return true;
+}
+} // namespace detail
+
+inline bool Exists(const std::string& ref) { return detail::Find(ref) != nullptr; }
+
+// World Y of the ground at (x, z), or `fallback` outside the terrain.
+inline float HeightAt(const std::string& ref, float x, float z, float fallback = 0.0f) {
+    const SceneObject* o = detail::Find(ref);
+    if (!o) return fallback;
+    glm::mat4 world;
+    glm::vec3 local;
+    if (!detail::ToLocal(*o, x, z, world, local)) return fallback;
+    const float ly = detail::LocalHeight(o->terrain, local.x, local.z, nullptr);
+    return glm::vec3(world * glm::vec4(local.x, ly, local.z, 1.0f)).y;
+}
+
+// World-space surface normal at (x, z); straight up outside the terrain.
+inline glm::vec3 NormalAt(const std::string& ref, float x, float z) {
+    const SceneObject* o = detail::Find(ref);
+    if (!o) return glm::vec3(0.0f, 1.0f, 0.0f);
+    glm::mat4 world;
+    glm::vec3 local;
+    if (!detail::ToLocal(*o, x, z, world, local)) return glm::vec3(0.0f, 1.0f, 0.0f);
+    const float d = std::max(0.05f, o->terrain.size / static_cast<float>(o->terrain.resolution - 1));
+    const float hx0 = detail::LocalHeight(o->terrain, local.x - d, local.z, nullptr);
+    const float hx1 = detail::LocalHeight(o->terrain, local.x + d, local.z, nullptr);
+    const float hz0 = detail::LocalHeight(o->terrain, local.x, local.z - d, nullptr);
+    const float hz1 = detail::LocalHeight(o->terrain, local.x, local.z + d, nullptr);
+    const glm::vec3 n = glm::normalize(glm::vec3(hx0 - hx1, 2.0f * d, hz0 - hz1));
+    return glm::normalize(glm::vec3(glm::transpose(glm::inverse(world)) * glm::vec4(n, 0.0f)));
+}
+
+// Paint weights at (x, z): x grass, y forest floor, z path, w rock (sums to 1). Grass outside the terrain.
+inline glm::vec4 LayerWeightAt(const std::string& ref, float x, float z) {
+    const SceneObject* o = detail::Find(ref);
+    if (!o || !o->terrain.splat) return glm::vec4(1.0f, 0.0f, 0.0f, 0.0f);
+    glm::mat4 world;
+    glm::vec3 local;
+    if (!detail::ToLocal(*o, x, z, world, local)) return glm::vec4(1.0f, 0.0f, 0.0f, 0.0f);
+    const TerrainComponent& t = o->terrain;
+    const int res = t.splatResolution;
+    const std::vector<uint8_t>& splat = *t.splat;
+    if (splat.size() < static_cast<size_t>(res) * static_cast<size_t>(res) * 4u) return glm::vec4(1.0f, 0.0f, 0.0f, 0.0f);
+    const int i = std::min(std::max(static_cast<int>((local.x / t.size + 0.5f) * static_cast<float>(res)), 0), res - 1);
+    const int j = std::min(std::max(static_cast<int>((local.z / t.size + 0.5f) * static_cast<float>(res)), 0), res - 1);
+    const uint8_t* texel = &splat[(static_cast<size_t>(j) * static_cast<size_t>(res) + static_cast<size_t>(i)) * 4u];
+    const glm::vec4 w(texel[0], texel[1], texel[2], texel[3]);
+    const float sum = w.x + w.y + w.z + w.w;
+    return sum > 0.5f ? w / sum : glm::vec4(1.0f, 0.0f, 0.0f, 0.0f);
+}
+
+// True where the ground is painted as a path (weight above `threshold`).
+inline bool IsPath(const std::string& ref, float x, float z, float threshold = 0.5f) {
+    return LayerWeightAt(ref, x, z).z >= threshold;
+}
+} // namespace Terrain
 
 template <typename T>
 inline T& Config() {

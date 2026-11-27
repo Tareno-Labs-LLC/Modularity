@@ -54,4 +54,51 @@ public:
     virtual bool getContactNormal(int objectId, glm::vec3& outNormal) const = 0;
 
     virtual bool setObjectsCollisionIgnored(int objectAId, int objectBId, bool ignored) = 0;
+
+    // Point-based queries/forces. Points are world space. Defaults report "unsupported" so a
+    // backend that does not implement them keeps compiling and fails cleanly at runtime.
+    virtual bool addForceAtPosition(int id, const glm::vec3& force, const glm::vec3& worldPoint) {
+        (void)id; (void)force; (void)worldPoint; return false;
+    }
+    virtual bool addImpulseAtPosition(int id, const glm::vec3& impulse, const glm::vec3& worldPoint) {
+        (void)id; (void)impulse; (void)worldPoint; return false;
+    }
+    virtual bool getPointVelocity(int id, const glm::vec3& worldPoint, glm::vec3& outVelocity) const {
+        (void)id; (void)worldPoint; (void)outVelocity; return false;
+    }
+    virtual bool getCenterOfMassPosition(int id, glm::vec3& outWorldCenterOfMass) const {
+        (void)id; (void)outWorldCenterOfMass; return false;
+    }
+    // Live simulated pose of the body origin (not the interpolated render pose).
+    virtual bool getActorPoseQuat(int id, glm::vec3& outPosition, glm::quat& outRotation) const {
+        (void)id; (void)outPosition; (void)outRotation; return false;
+    }
+    virtual bool getMass(int id, float& outMassKg) const {
+        (void)id; (void)outMassKg; return false;
+    }
+    // Like raycastClosest, but ignores ignoreId explicitly (-1 = none) and can skip sensors.
+    virtual bool raycastClosestFiltered(const glm::vec3& origin, const glm::vec3& dir, float distance,
+                                        int ignoreId, bool skipSensors,
+                                        glm::vec3* hitPos, glm::vec3* hitNormal, float* hitDistance,
+                                        int* hitActorId, float* hitFriction) const {
+        (void)skipSensors;
+        return raycastClosest(origin, dir, distance, ignoreId, hitPos, hitNormal, hitDistance,
+                              hitActorId, nullptr, hitFriction, nullptr);
+    }
+
+    // Called by simulate() before every fixed physics step with that step's dt, so the engine
+    // can run script FixedUpdate hooks. Forces added from inside the callback apply to exactly
+    // that step. Plain function pointer + user data: no allocation, cheap to re-set per frame.
+    using PreStepCallback = void (*)(void* user, float stepDeltaTime);
+    void setPreStepCallback(PreStepCallback callback, void* user) {
+        mPreStepCallback = callback;
+        mPreStepUser = user;
+    }
+
+protected:
+    void invokePreStepCallback(float stepDeltaTime) {
+        if (mPreStepCallback) mPreStepCallback(mPreStepUser, stepDeltaTime);
+    }
+    PreStepCallback mPreStepCallback = nullptr;
+    void* mPreStepUser = nullptr;
 };

@@ -54,6 +54,7 @@ script_dir="$(find_modularity_root)" || {
     exit 1
 }
 
+host_system="$(uname -s)"
 build_platform="native"
 build_platform_label="Linux"
 build_dir="${script_dir}/build"
@@ -253,7 +254,12 @@ process_build_output_line() {
         return
     fi
 
-    local lower="${line,,}"
+    local lower
+    if (( BASH_VERSINFO[0] >= 4 )); then
+        lower="${line,,}"
+    else
+        lower="$(printf '%s' "${line}" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+    fi
     local issue_text="[${step}] ${line}"
 
     if [[ "${lower}" == *"0 errors generated"* ]]; then
@@ -281,7 +287,7 @@ print_issue_summary() {
     local max_items=8
     local i
 
-    if [[ "${#build_warning_messages[@]}" -gt 0 ]]; then
+    if [[ -n "${build_warning_messages[*]-}" ]]; then
         printf "\n%sWarnings (%d):%s\n" "${C_YELLOW}" "${#build_warning_messages[@]}" "${C_RESET}"
         for ((i = 0; i < ${#build_warning_messages[@]} && i < max_items; i++)); do
             printf "  %s %s\n" "${ICON_WARN}" "${build_warning_messages[$i]}"
@@ -291,7 +297,7 @@ print_issue_summary() {
         fi
     fi
 
-    if [[ "${#build_error_messages[@]}" -gt 0 ]]; then
+    if [[ -n "${build_error_messages[*]-}" ]]; then
         printf "\n%sErrors (%d):%s\n" "${C_RED}" "${#build_error_messages[@]}" "${C_RESET}"
         for ((i = 0; i < ${#build_error_messages[@]} && i < max_items; i++)); do
             printf "  %s %s\n" "${ICON_ERROR}" "${build_error_messages[$i]}"
@@ -332,7 +338,7 @@ run_long_step() {
     fi
 
     local log_file
-    log_file="$(mktemp "/tmp/modularity-build-step-${current_step}.XXXX.log")"
+    log_file="$(mktemp "/tmp/modularity-build-step-${current_step}.XXXXXX")"
     local start_step=${SECONDS}
     local spinner_frames='-\|/'
     local spinner_index=0
@@ -389,14 +395,14 @@ finish() {
 
     if [[ "${exit_code}" -eq 0 ]]; then
         printf "%s%s================================%s\n" "${C_RESET}" "${C_BOLD}" "${C_RESET}"
-        printf "%s   Modularity - Native Linux Build Complete%s\n" "${C_BOLD}" "${C_RESET}"
+        printf "%s   Modularity - %s Build Complete%s\n" "${C_BOLD}" "${build_platform_label}" "${C_RESET}"
         printf "%s================================%s\n" "${C_BOLD}" "${C_RESET}"
         log_ok "Build completed in ${duration}s."
         log_info "Artifacts: ${build_dir}"
         print_issue_summary
     else
         printf "%s%s================================%s\n" "${C_RESET}" "${C_BOLD}" "${C_RESET}"
-        printf "%s   Modularity - Native Linux Build Failed%s\n" "${C_BOLD}" "${C_RESET}"
+        printf "%s   Modularity - %s Build Failed%s\n" "${C_BOLD}" "${build_platform_label}" "${C_RESET}"
         printf "%s================================%s\n" "${C_BOLD}" "${C_RESET}"
         log_error "Build failed after ${duration}s at step: ${last_step} (exit code ${exit_code})."
         print_issue_summary
@@ -420,11 +426,13 @@ Options:
   --cpu-target=<level>    x86-64 ISA target: baseline (default, ships to everyone),
                           x86-64-v2, x86-64-v3, x86-64-v4, or native
   --native                Shorthand for --cpu-target=native (DEV ONLY; do not ship)
-  --generator=<name>      Force CMake generator (e.g. Ninja, "Unix Makefiles")
+  --generator=<name>      Force CMake generator (e.g. Ninja, "Unix Makefiles", Xcode on macOS)
   --discord               Enable optional Discord Rich Presence (default: off)
   --no-discord            Build without the Discord Social SDK
   --jobs=<N>              Parallel compile jobs (default: nproc - 2, min 1)
   --skip-deps             Skip automatic dependency checks/install
+  --rebuild-webkit        Rebuild and reinstall existing local WPEWebKit SDK (Linux)
+  --no-webkit             Disable local WPEWebKit SDK integration
   --zip                   Package as .zip (default; fast to compress)
   --7z                    Package as .7z (smaller, but much slower to compress)
   --fsanitize             Build with AddressSanitizer + UBSan (-DMODULARITY_ENABLE_ASAN=ON)
@@ -449,6 +457,8 @@ discord_sdk="OFF"
 # Higher levels (or --native) are developer-only and must not be shipped.
 cpu_target="baseline"
 skip_deps=0
+rebuild_webkit=0
+use_local_webkit=1
 package_format="ZIP"
 enable_asan=0
 jolt_lto="auto"
@@ -530,6 +540,12 @@ for arg in "$@"; do
         --skip-deps)
             skip_deps=1
             ;;
+        --rebuild-webkit)
+            rebuild_webkit=1
+            ;;
+        --no-webkit)
+            use_local_webkit=0
+            ;;
         --zip|--ZIP)
             package_format="ZIP"
             ;;
@@ -562,6 +578,11 @@ for arg in "$@"; do
         ;;
     esac
 done
+
+if [[ "${build_platform}" == "native" && "${host_system}" == "Darwin" ]]; then
+    build_platform="macos"
+    build_platform_label="macOS"
+fi
 
 if [[ "${build_platform}" == "android" ]]; then
     # The Android APK is produced by the native editor (it cross-builds the
@@ -817,6 +838,114 @@ install_optional_first_hit() {
     return 1
 }
 
+# Prefer the Codex-built WPEWebKit SDK over a potentially broken system copy.
+# An override can point to another complete installation prefix.
+webkit_sdk_root="${MODULARITY_WPE_WEBKIT_SDK:-${script_dir}/build/wpe-2.54.3-jxl012/install}"
+webkit_obj_root="${MODULARITY_WPE_WEBKIT_OBJ:-${script_dir}/build/wpe-2.54.3-jxl012/obj}"
+webkit_local_active=0
+
+configure_local_webkit() {
+    [[ "${host_system}" == "Linux" && "${build_platform}" == "native" && "${use_local_webkit}" -eq 1 ]] || return 0
+    local pc_dir="${webkit_sdk_root}/lib/pkgconfig"
+    local lib="${webkit_sdk_root}/lib/libWPEWebKit-2.0.so.1"
+    if [[ ! -f "${pc_dir}/wpe-webkit-2.0.pc" || ! -e "${lib}" ]]; then
+        log_info "Local WPEWebKit SDK not found; using system dependency detection."
+        return 0
+    fi
+    export PKG_CONFIG_PATH="${pc_dir}${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
+    # Avoid using a system lib when its SONAME matches but dependencies differ.
+    export LD_LIBRARY_PATH="${webkit_sdk_root}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    if ! pkg-config --exists 'wpe-webkit-2.0 >= 2.54'; then
+        log_warn "Local WPEWebKit package metadata is invalid; falling back to system detection."
+        return 0
+    fi
+    local missing
+    missing="$(ldd "${lib}" 2>/dev/null)" || {
+        log_warn "Cannot inspect local WPEWebKit runtime dependencies."
+        return 0
+    }
+    if [[ "${missing}" == *'not found'* ]]; then
+        log_warn "Local WPEWebKit has unresolved dependencies; system fallback may be required."
+        return 0
+    fi
+    webkit_local_active=1
+    # This variable is already consumed by Modularity's CMake integration.
+    cmake_platform_args+=(-DMODULARITY_WPE_WEBKIT_ROOT="${script_dir}/build/WPEWebKit")
+    log_ok "Using local WPEWebKit $(pkg-config --modversion wpe-webkit-2.0) from ${webkit_sdk_root}"
+}
+
+rebuild_local_webkit() {
+    [[ "${rebuild_webkit}" -eq 1 ]] || return 0
+    if [[ "${host_system}" != "Linux" || "${build_platform}" != "native" ]]; then
+        log_error "--rebuild-webkit is only supported for native Linux builds."
+        return 1
+    fi
+    if [[ ! -f "${webkit_obj_root}/CMakeCache.txt" ]]; then
+        log_error "No existing WebKit CMake build at ${webkit_obj_root}; cannot safely reproduce Codex's original configure options."
+        return 1
+    fi
+    log_info "Rebuilding existing WebKit configuration (this may take a while)..."
+    cmake --build "${webkit_obj_root}" --parallel "${jobs}" || return 1
+    cmake --install "${webkit_obj_root}" --prefix "${webkit_sdk_root}" || return 1
+    log_ok "Local WebKit SDK rebuilt and installed."
+}
+
+stage_local_webkit() {
+    [[ "${webkit_local_active}" -eq 1 ]] || return 0
+    local dst="${script_dir}/build/WPEWebKit"
+    mkdir -p "${dst}/lib" "${dst}/bin"
+    # Preserve symlink chains, SONAMEs and executable permissions.
+    local f
+    for f in "${webkit_sdk_root}"/lib/libWPEWebKit-2.0.so* \
+             "${webkit_sdk_root}"/lib/libWPEInjectedBundle.so*; do
+        [[ -e "${f}" || -L "${f}" ]] || continue
+        cp -a -- "${f}" "${dst}/lib/"
+    done
+    # Helper processes are part of the WPE runtime, not optional SDK tools.
+    for f in WPEWebProcess WPEGPUProcess WPENetworkProcess; do
+        if [[ -x "${webkit_sdk_root}/bin/${f}" ]]; then
+            cp -a -- "${webkit_sdk_root}/bin/${f}" "${dst}/bin/"
+        elif [[ -x "${webkit_obj_root}/bin/${f}" ]]; then
+            cp -a -- "${webkit_obj_root}/bin/${f}" "${dst}/bin/"
+        else
+            log_warn "WebKit helper ${f} not found in the SDK or build tree."
+        fi
+    done
+    log_ok "Staged local WPEWebKit libraries and helpers in ${dst}"
+}
+
+codex_webview_ready() {
+    pkg-config --exists "wpe-webkit-2.0 >= 2.54" wpe-platform-headless-2.0 || return 1
+
+    local lib_dir dependencies
+    lib_dir="$(pkg-config --variable=libdir wpe-webkit-2.0)" || return 1
+    [[ -n "${lib_dir}" ]] || return 1
+    dependencies="$(ldd "${lib_dir}/libWPEWebKit-2.0.so" 2>/dev/null)" || return 1
+    [[ "${dependencies}" != *"not found"* ]]
+}
+
+ensure_codex_webview_dependency() {
+    if [[ "${webkit_local_active}" -eq 1 ]] || codex_webview_ready; then
+        return
+    fi
+
+    local package
+    case "${pkg_manager}" in
+        apt) package=libwpewebkit-2.0-dev ;;
+        pacman) package=wpewebkit ;;
+        dnf|zypper) package='pkgconfig(wpe-platform-headless-2.0)' ;;
+        xbps) package=wpewebkit-devel ;;
+        *) return ;;
+    esac
+
+    log_info "Installing optional Codex webview dependency (${package})..."
+    if install_packages "${package}" && codex_webview_ready; then
+        log_ok "WPE WebKit is ready for the embedded Codex panel."
+    else
+        log_warn "WPE WebKit 2.54+ is unavailable. Codex Plugin can use the system browser."
+    fi
+}
+
 ensure_linux_dependencies() {
     detect_package_manager
 
@@ -957,15 +1086,15 @@ ensure_linux_dependencies() {
 
     if [[ "${need_install}" -eq 0 ]]; then
         log_ok "Build dependencies already present."
-        return
+    else
+        log_info "Missing prerequisites detected: ${missing[*]}"
+        log_info "Installing packages using ${pkg_manager}..."
+        install_packages "${required_pkgs[@]}"
     fi
 
-    log_info "Missing prerequisites detected: ${missing[*]}"
-    log_info "Installing packages using ${pkg_manager}..."
+    ensure_codex_webview_dependency
 
-    install_packages "${required_pkgs[@]}"
-
-    if [[ "${build_profile}" == "low" ]]; then
+    if [[ "${need_install}" -eq 0 || "${build_profile}" == "low" ]]; then
         return
     fi
 
@@ -1060,16 +1189,62 @@ verify_lfs_assets() {
         fi
     done
 
-    if [[ "${#missing[@]}" -gt 0 || "${#pointers[@]}" -gt 0 ]]; then
-        if [[ "${#missing[@]}" -gt 0 ]]; then
+    if [[ -n "${missing[*]-}" || -n "${pointers[*]-}" ]]; then
+        if [[ -n "${missing[*]-}" ]]; then
             log_error "Missing required LFS assets: ${missing[*]}"
         fi
-        if [[ "${#pointers[@]}" -gt 0 ]]; then
+        if [[ -n "${pointers[*]-}" ]]; then
             log_error "Git LFS assets are still pointer files: ${pointers[*]}"
         fi
         log_error "Install git-lfs, then run: git lfs install && git lfs pull"
         return 1
     fi
+}
+
+setup_macos_toolchain() {
+    local clang clangxx sdk
+    if ! clang="$(xcrun --sdk macosx --find clang 2>/dev/null)" ||
+       ! clangxx="$(xcrun --sdk macosx --find clang++ 2>/dev/null)" ||
+       ! sdk="$(xcrun --sdk macosx --show-sdk-path 2>/dev/null)"; then
+        log_error "Please Select Xcode or install the Command Line Tools with 'xcode-select --install.'"
+        return 1
+    fi
+
+    local brew_bin prefix glfw_prefix
+    if ! brew_bin="$(command -v brew)"; then
+        for brew_bin in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+            [[ -x "${brew_bin}" ]] && break
+        done
+        if [[ ! -x "${brew_bin}" ]]; then
+            log_error "Heads up! Homebrew is required for GLFW and the build tools. Please Install it from https://brew.sh/."
+            return 1
+        fi
+    fi
+    prefix="$("${brew_bin}" --prefix)" || return 1
+    export PATH="${prefix}/bin:${PATH}"
+
+    if [[ "${skip_deps}" -eq 0 ]]; then
+        local formula
+        local -a missing=()
+        for formula in cmake ninja pkgconf git-lfs glfw freetype libsndfile opusfile ffmpeg; do
+            if [[ -z "$("${brew_bin}" list --versions "${formula}" 2>/dev/null)" ]]; then
+                missing+=("${formula}")
+            fi
+        done
+        if [[ -n "${missing[*]-}" ]]; then
+            "${brew_bin}" install "${missing[@]}" || return 1
+        fi
+    fi
+
+    glfw_prefix="$("${brew_bin}" --prefix glfw)" || return 1
+    cmake_platform_args+=(
+        -DCMAKE_C_COMPILER="${clang}"
+        -DCMAKE_CXX_COMPILER="${clangxx}"
+        -DCMAKE_OBJCXX_COMPILER="${clangxx}"
+        -DCMAKE_OSX_SYSROOT="${sdk}"
+        -DCMAKE_PREFIX_PATH="${prefix}"
+        -Dglfw3_DIR="${glfw_prefix}/lib/cmake/glfw3"
+    )
 }
 
 configure_ccache() {
@@ -1093,11 +1268,11 @@ clean_editor_build() {
         for child in "${clean_root}"/* "${clean_root}"/.[!.]* "${clean_root}"/..?*; do
             [[ -e "${child}" || -L "${child}" ]] || continue
             case "${child##*/}" in
-                android-sdk|android-sdk-smoke|android-clang|embedded-compilers) continue ;;
+                android-sdk|android-sdk-smoke|android-clang|embedded-compilers|wpe-2.54.3-jxl012|WPEWebKit) continue ;;
             esac
             rm -rf -- "${child}"
         done
-        log_ok "Cleaned ${build_dir}; kept Android SDK/compiler caches"
+        log_ok "Cleaned ${build_dir}; kept Android SDK/compiler caches and local WPEWebKit"
     fi
 }
 
@@ -1135,7 +1310,12 @@ configure_editor_build() {
     if [[ ! -f "${build_dir}/CMakeCache.txt" && -n "${cmake_generator}" ]]; then
         generator_args=(-G "${cmake_generator}")
     fi
-    cmake "${generator_args[@]}" -S "${script_dir}" -B "${build_dir}" \
+    local -a output_args=()
+    if [[ "${build_platform}" == "macos" ]]; then
+        output_args=(-DMODULARITY_DEV_EXPORT_DIR="${build_dir}")
+    fi
+    cmake ${generator_args[@]+"${generator_args[@]}"} -S "${script_dir}" -B "${build_dir}" \
+        ${output_args[@]+"${output_args[@]}"} \
         "${cmake_platform_args[@]}" \
         -DMONO_ROOT=/usr \
         -DMODULARITY_BUILD_CPP_STANDARD="${build_cpp_standard}" \
@@ -1145,11 +1325,11 @@ configure_editor_build() {
 }
 
 build_editor_targets() {
-    cmake --build "${build_dir}" --parallel "${jobs}"
+    cmake --build "${build_dir}" --config "${build_type}" --parallel "${jobs}"
 }
 
 install_editor_targets() {
-    cmake --install "${build_dir}" --prefix "${build_dir}/install"
+    cmake --install "${build_dir}" --config "${build_type}" --prefix "${build_dir}/install"
 }
 
 copy_third_party_libraries() {
@@ -1179,7 +1359,12 @@ configure_player_build() {
     if [[ ! -f "${player_cache_dir}/CMakeCache.txt" && -n "${cmake_generator}" ]]; then
         generator_args=(-G "${cmake_generator}")
     fi
-    cmake "${generator_args[@]}" -S "${script_dir}" -B "${player_cache_dir}" \
+    local -a output_args=()
+    if [[ "${build_platform}" == "macos" ]]; then
+        output_args=(-DMODULARITY_DEV_EXPORT_DIR="${player_cache_dir}")
+    fi
+    cmake ${generator_args[@]+"${generator_args[@]}"} -S "${script_dir}" -B "${player_cache_dir}" \
+        ${output_args[@]+"${output_args[@]}"} \
         "${cmake_platform_args[@]}" \
         -DMONO_ROOT=/usr \
         -DMODULARITY_BUILD_CPP_STANDARD="${build_cpp_standard}" \
@@ -1190,7 +1375,7 @@ configure_player_build() {
 }
 
 build_player_target() {
-    cmake --build "${player_cache_dir}" --target ModularityPlayer --parallel "${jobs}"
+    cmake --build "${player_cache_dir}" --config "${build_type}" --target ModularityPlayer --parallel "${jobs}"
 }
 
 install_desktop_integration() {
@@ -1245,8 +1430,10 @@ finalize_packaging() {
     if [[ -f "${build_dir}/Resources/imgui.ini" ]]; then
         cp "${build_dir}/Resources/imgui.ini" "${build_dir}/"
     fi
-    ln -sfn "${build_dir}/compile_commands.json" "${script_dir}/compile_commands.json"
-    (cd "${build_dir}" && cpack -G "${package_format}")
+    if [[ -f "${build_dir}/compile_commands.json" ]]; then
+        ln -sfn "${build_dir}/compile_commands.json" "${script_dir}/compile_commands.json"
+    fi
+    (cd "${build_dir}" && cpack -C "${build_type}" -G "${package_format}")
 }
 
 verify_release_isa() {
@@ -1455,7 +1642,10 @@ run_android_build() {
 show_stage_hierarchy() {
     local -a stages=()
 
-    if [[ "${skip_deps}" -eq 0 && "${build_platform}" != "windows" && "$(uname -s)" == "Linux" ]]; then
+    if [[ "${build_platform}" == "macos" ]]; then
+        stages+=("Select Xcode toolchain and check Homebrew dependencies")
+    fi
+    if [[ "${skip_deps}" -eq 0 && "${build_platform}" != "windows" && "${host_system}" == "Linux" ]]; then
         stages+=("Check/install system dependencies")
     fi
     if [[ "${clean_build}" -eq 1 ]]; then
@@ -1475,7 +1665,7 @@ show_stage_hierarchy() {
         "Collect player engine libraries"
         "Package artifacts and resources"
     )
-    if [[ "${build_platform}" != "windows" && "$(uname -s)" == "Linux" ]]; then
+    if [[ "${build_platform}" != "windows" && "${host_system}" == "Linux" ]]; then
         stages+=("Verify CPU/ISA compatibility of packaged binaries")
         stages+=("Install desktop icon and .desktop entries")
     fi
@@ -1494,18 +1684,24 @@ show_stage_hierarchy() {
 
 base_steps=11
 total_steps="${base_steps}"
+if [[ "${build_platform}" == "macos" ]]; then
+    total_steps=$((total_steps + 1))
+fi
 if [[ "${clean_build}" -eq 1 ]]; then
     total_steps=$((total_steps + 2))
 fi
-if [[ "${skip_deps}" -eq 0 && "${build_platform}" != "windows" && "$(uname -s)" == "Linux" ]]; then
+if [[ "${skip_deps}" -eq 0 && "${build_platform}" != "windows" && "${host_system}" == "Linux" ]]; then
     total_steps=$((total_steps + 1))
 fi
-if [[ "${build_platform}" != "windows" && "$(uname -s)" == "Linux" ]]; then
+if [[ "${build_platform}" != "windows" && "${host_system}" == "Linux" ]]; then
     # +1 for desktop integration, +1 for the CPU/ISA verification step.
     total_steps=$((total_steps + 2))
 fi
 
 build_started=1
+if [[ "${build_platform}" == "macos" ]]; then
+    run_step "Please Wait while Modularity's Builder Sets up Xcode and Homebrew..." setup_macos_toolchain
+fi
 discard_foreign_cmake_cache "${build_dir}"
 discard_foreign_cmake_cache "${player_cache_dir}"
 detect_cmake_generator
@@ -1523,12 +1719,16 @@ fi
 log_info "Package format: ${package_format}"
 if [[ "${build_profile}" == "low" ]]; then
     log_info "Build profile: low - PhysX, Vulkan and OpenXR off${build_profile_reason}"
+elif [[ "${build_platform}" == "macos" ]]; then
+    log_info "Build profile: macOS defaults (OpenGL and Jolt)"
 else
     log_info "Build profile: full"
 fi
 warn_if_profile_switch
 log_info "JoltPhysics LTO: ${jolt_lto}${jolt_lto_reason}"
-if [[ "${cpu_target}" == "native" ]]; then
+if [[ "${build_platform}" == "macos" ]]; then
+    log_info "macOS host architecture: $(uname -m)"
+elif [[ "${cpu_target}" == "native" ]]; then
     log_warn "CPU target: native (DEV ONLY — host-specific ISA; do not ship this build)"
 else
     log_info "CPU target: ${cpu_target} (x86-64 ISA level for shipped binaries)"
@@ -1543,7 +1743,7 @@ fi
 # let it produce the signed APK. It does not run the desktop player-cache /
 # packaging / ISA-verification stages.
 if [[ "${build_platform}" == "android" ]]; then
-    if [[ "${skip_deps}" -eq 0 && "$(uname -s)" == "Linux" ]]; then
+    if [[ "${skip_deps}" -eq 0 && "${host_system}" == "Linux" ]]; then
         run_step "Installing Dependencies" ensure_linux_dependencies
     fi
     configure_ccache
@@ -1553,10 +1753,10 @@ fi
 
 show_stage_hierarchy
 
-if [[ "${skip_deps}" -eq 0 && "${build_platform}" != "windows" && "$(uname -s)" == "Linux" ]]; then
+if [[ "${skip_deps}" -eq 0 && "${build_platform}" != "windows" && "${host_system}" == "Linux" ]]; then
     run_step "Installing Dependencies" ensure_linux_dependencies
-elif [[ "${skip_deps}" -eq 0 ]]; then
-    log_warn "Auto dependency install is only implemented for native Linux builds."
+elif [[ "${skip_deps}" -eq 0 && "${build_platform}" != "macos" ]]; then
+    log_warn "Auto dependency install is available for native Linux and macOS builds."
 fi
 
 configure_ccache
@@ -1567,6 +1767,9 @@ if [[ "${clean_build}" -eq 1 ]]; then
 fi
 
 run_long_step "Syncing Submodules" sync_submodules
+rebuild_local_webkit
+configure_local_webkit
+stage_local_webkit
 run_long_step "Configuring Editor" configure_editor_build
 run_long_step "Building Editor" build_editor_targets
 run_long_step "Installing Editor" install_editor_targets
@@ -1577,7 +1780,7 @@ run_long_step "Building Player" build_player_target
 run_long_step "Collecting Player Libs" copy_third_party_libraries "${player_cache_dir}"
 run_long_step "Collecting Player Engine Libs" copy_engine_libraries "${player_cache_dir}"
 run_long_step "Packaging Engine" finalize_packaging
-if [[ "${build_platform}" != "windows" && "$(uname -s)" == "Linux" ]]; then
+if [[ "${build_platform}" != "windows" && "${host_system}" == "Linux" ]]; then
     run_step "Verifying CPU/ISA" verify_release_isa
     run_long_step "Installing Desktop Icon" install_desktop_integration
 fi

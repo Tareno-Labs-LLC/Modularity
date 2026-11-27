@@ -16,8 +16,10 @@
 #include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
 #include <Jolt/Physics/Collision/Shape/ConvexHullShape.h>
 #include <Jolt/Physics/Collision/Shape/MeshShape.h>
+#include <Jolt/Physics/Collision/Shape/HeightFieldShape.h>
 #include <Jolt/Physics/Collision/Shape/RotatedTranslatedShape.h>
 #include <Jolt/Physics/Collision/Shape/ScaledShape.h>
+#include <Jolt/Physics/Collision/Shape/OffsetCenterOfMassShape.h>
 #include <Jolt/Physics/Collision/RayCast.h>
 #include <Jolt/Physics/Collision/CastResult.h>
 #include <Jolt/Physics/Collision/NarrowPhaseQuery.h>
@@ -26,6 +28,8 @@
 #include <Jolt/Physics/Collision/ContactListener.h>
 #include <algorithm>
 #include <cmath>
+#include "InstancerRuntime.h"
+#include "TerrainRuntime.h"
 #include <cstdarg>
 #include <cstdint>
 #include <iostream>
@@ -564,6 +568,19 @@ JoltPhysicsBackend::BodyRecord JoltPhysicsBackend::createBodyFor(const SceneObje
     const JPH::Quat rot = bakeWorldStaticMesh ? JPH::Quat::sIdentity() : ToJQuat(obj.rotation);
     const JPH::ObjectLayer layer = wantsDynamic ? JoltLayers::MOVING : JoltLayers::NON_MOVING;
     const bool transformLocked = obj.rigidbody.isKinematic || obj.IsInvariable;
+
+    // Custom center of mass: rbCenterOfMass is a local-space point relative to the body origin
+    // (the object pivot), same meaning as PhysX's setMassAndUpdateInertia massLocalPose. Only the
+    // mass distribution moves; the body origin, and therefore GetPosition/obj.position, stays put.
+    if (wantsDynamic && !transformLocked && obj.rigidbody.useCustomCenterOfMass) {
+        const JPH::Vec3 desiredCom = ToJVec3(obj.rigidbody.centerOfMass);
+        const JPH::Vec3 comOffset = desiredCom - shape->GetCenterOfMass();
+        if (comOffset.LengthSq() > 1.0e-12f) {
+            JPH::OffsetCenterOfMassShapeSettings comSettings(comOffset, shape);
+            JPH::ShapeSettings::ShapeResult comResult = comSettings.Create();
+            if (comResult.IsValid()) shape = comResult.Get();
+        }
+    }
     const JPH::EMotionType motionType = wantsDynamic
         ? (transformLocked ? JPH::EMotionType::Kinematic : JPH::EMotionType::Dynamic)
         : JPH::EMotionType::Static;
@@ -620,9 +637,94 @@ JoltPhysicsBackend::BodyRecord JoltPhysicsBackend::createBodyFor(const SceneObje
     return rec;
 }
 
+void JoltPhysicsBackend::createInstancerBodies(const SceneObject& obj) {
+    if (!obj.hasInstancer || !obj.instancer.enabled || !obj.instancer.instances || !mPhysicsSystem) return;
+    const InstancerComponent& comp = obj.instancer;
+    bool anyCollider = false;
+    for (const InstancerPrototype& proto : comp.prototypes) {
+        anyCollider = anyCollider || proto.colliderMode == InstancerColliderMode::Capsule;
+    }
+    if (!anyCollider) return;
+
+    const glm::mat4 world = InstancerRuntime::ObjectWorldMatrix(obj);
+    JPH::BodyInterface& bi = mPhysicsSystem->GetBodyInterfaceNoLock();
+    size_t created = 0;
+    for (const InstancerInstance& instance : *comp.instances) {
+        if (instance.prototype >= comp.prototypes.size()) continue;
+        const InstancerPrototype& proto = comp.prototypes[instance.prototype];
+        if (proto.colliderMode != InstancerColliderMode::Capsule) continue;
+        const InstancerRuntime::InstanceCapsule capsule =
+            InstancerRuntime::BuildInstanceCapsule(proto, instance, world);
+        const float cylinderHalf = std::max(0.01f, (capsule.height - capsule.radius * 2.0f) * 0.5f);
+        JPH::CapsuleShapeSettings shapeSettings(cylinderHalf, capsule.radius);
+        shapeSettings.SetEmbedded();
+        JPH::ShapeSettings::ShapeResult shapeResult = shapeSettings.Create();
+        if (!shapeResult.IsValid()) continue;
+        // The capsule is centred on its body, so lift the body half a height above the base.
+        const glm::vec3 centre = capsule.base + capsule.rotation * glm::vec3(0.0f, capsule.height * 0.5f, 0.0f);
+        JPH::BodyCreationSettings settings(shapeResult.Get(), ToJVec3(centre),
+                                           JPH::Quat(capsule.rotation.x, capsule.rotation.y, capsule.rotation.z, capsule.rotation.w),
+                                           JPH::EMotionType::Static, JoltLayers::NON_MOVING);
+        settings.mUserData = static_cast<uint64_t>(obj.id) + 1u;
+        settings.mFriction = 0.8f;
+        settings.mRestitution = 0.0f;
+        const JPH::BodyID bodyId = bi.CreateAndAddBody(settings, JPH::EActivation::DontActivate);
+        if (bodyId.IsInvalid()) continue;
+        mInstancerBodies.push_back(bodyId);
+        mIdsByBody[bodyId.GetIndexAndSequenceNumber()] = obj.id;
+        ++created;
+    }
+    if (created > 0) {
+        std::cout << "[Instancer] '" << obj.name << "': " << created << " trunk colliders\n";
+    }
+}
+
+void JoltPhysicsBackend::createTerrainBody(const SceneObject& obj) {
+    if (!obj.hasTerrain || !mPhysicsSystem || !obj.terrain.collision || !TerrainRuntime::IsActive(obj)) return;
+    const TerrainComponent& t = obj.terrain;
+    const glm::mat4 world = InstancerRuntime::ObjectWorldMatrix(obj);
+    // The body carries the terrain's position and rotation; scale is baked into the heightfield's
+    // own offset/scale ("offset + scale * (x, height, z)" per sample).
+    const glm::vec3 scale(glm::length(glm::vec3(world[0])), glm::length(glm::vec3(world[1])), glm::length(glm::vec3(world[2])));
+    if (scale.x < 1e-5f || scale.y < 1e-5f || scale.z < 1e-5f) return;
+    const glm::mat3 rotationMatrix(glm::vec3(world[0]) / scale.x, glm::vec3(world[1]) / scale.y, glm::vec3(world[2]) / scale.z);
+    const glm::quat rotation = glm::normalize(glm::quat_cast(rotationMatrix));
+    const float cell = TerrainRuntime::CellSize(t);
+    const float half = t.size * 0.5f;
+    JPH::HeightFieldShapeSettings shapeSettings(t.heights->data(),
+        JPH::Vec3(-half * scale.x, t.heightOffset * scale.y, -half * scale.z),
+        JPH::Vec3(cell * scale.x, t.heightScale * scale.y, cell * scale.z),
+        static_cast<JPH::uint32>(t.resolution));
+    shapeSettings.mBlockSize = 4;
+    shapeSettings.mBitsPerSample = 8;
+    shapeSettings.SetEmbedded();
+    JPH::ShapeSettings::ShapeResult shapeResult = shapeSettings.Create();
+    if (!shapeResult.IsValid()) {
+        std::cerr << "[Terrain] '" << obj.name << "': heightfield collider failed: " << shapeResult.GetError().c_str() << "\n";
+        return;
+    }
+    JPH::BodyInterface& bi = mPhysicsSystem->GetBodyInterfaceNoLock();
+    JPH::BodyCreationSettings settings(shapeResult.Get(), ToJVec3(glm::vec3(world[3])),
+                                       JPH::Quat(rotation.x, rotation.y, rotation.z, rotation.w),
+                                       JPH::EMotionType::Static, JoltLayers::NON_MOVING);
+    settings.mUserData = static_cast<uint64_t>(obj.id) + 1u;
+    settings.mFriction = 0.8f;
+    settings.mRestitution = 0.0f;
+    const JPH::BodyID bodyId = bi.CreateAndAddBody(settings, JPH::EActivation::DontActivate);
+    if (bodyId.IsInvalid()) return;
+    mInstancerBodies.push_back(bodyId);
+    mIdsByBody[bodyId.GetIndexAndSequenceNumber()] = obj.id;
+    std::cout << "[Terrain] '" << obj.name << "': heightfield collider " << t.resolution << "x" << t.resolution << "\n";
+}
+
 void JoltPhysicsBackend::clearBodies() {
     if (mPhysicsSystem) {
         JPH::BodyInterface& bi = mPhysicsSystem->GetBodyInterfaceNoLock();
+        for (const JPH::BodyID& bodyId : mInstancerBodies) {
+            if (bodyId.IsInvalid()) continue;
+            bi.RemoveBody(bodyId);
+            bi.DestroyBody(bodyId);
+        }
         for (auto& [id, rec] : mBodies) {
             if (!rec.bodyId.IsInvalid()) {
                 bi.RemoveBody(rec.bodyId);
@@ -630,6 +732,7 @@ void JoltPhysicsBackend::clearBodies() {
             }
         }
     }
+    mInstancerBodies.clear();
     mBodies.clear();
     mIdsByBody.clear();
     std::lock_guard<std::mutex> lock(mCollisionEventMutex);
@@ -646,6 +749,8 @@ void JoltPhysicsBackend::onPlayStart(const std::vector<SceneObject>& objects) {
     mIdsByBody.reserve(objects.size());
     for (const auto& obj : objects) {
         if (!IsObjectEnabledInHierarchy(obj)) continue;
+        if (obj.hasInstancer) createInstancerBodies(obj);
+        if (obj.hasTerrain) createTerrainBody(obj);
         BodyRecord rec = createBodyFor(obj);
         if (rec.bodyId.IsInvalid()) continue;
         mBodies[obj.id] = rec;
@@ -793,6 +898,76 @@ bool JoltPhysicsBackend::addAngularImpulse(int id, const glm::vec3& impulse) {
     return true;
 }
 
+bool JoltPhysicsBackend::addForceAtPosition(int id, const glm::vec3& force, const glm::vec3& worldPoint) {
+    auto it = mBodies.find(id);
+    if (it == mBodies.end()) return false;
+    BodyRecord& rec = it->second;
+    if (rec.bodyId.IsInvalid() || !rec.isDynamic || rec.isKinematic) return false;
+    // Jolt accumulates forces until the next PhysicsSystem::Update and clears them after it,
+    // so a force added from FixedUpdate acts on exactly the following step.
+    mPhysicsSystem->GetBodyInterfaceNoLock().AddForce(rec.bodyId, ToJVec3(force), ToJVec3(worldPoint),
+                                                       JPH::EActivation::Activate);
+    return true;
+}
+
+bool JoltPhysicsBackend::addImpulseAtPosition(int id, const glm::vec3& impulse, const glm::vec3& worldPoint) {
+    auto it = mBodies.find(id);
+    if (it == mBodies.end()) return false;
+    BodyRecord& rec = it->second;
+    if (rec.bodyId.IsInvalid() || !rec.isDynamic || rec.isKinematic) return false;
+    // BodyInterface::AddImpulse activates a sleeping body itself.
+    mPhysicsSystem->GetBodyInterfaceNoLock().AddImpulse(rec.bodyId, ToJVec3(impulse), ToJVec3(worldPoint));
+    return true;
+}
+
+bool JoltPhysicsBackend::getPointVelocity(int id, const glm::vec3& worldPoint, glm::vec3& outVelocity) const {
+    auto it = mBodies.find(id);
+    if (it == mBodies.end()) return false;
+    const BodyRecord& rec = it->second;
+    if (rec.bodyId.IsInvalid() || !rec.isDynamic) return false;
+    JPH::BodyInterface& bi = mPhysicsSystem->GetBodyInterfaceNoLock();
+    outVelocity = FromJVec3(bi.GetPointVelocity(rec.bodyId, ToJVec3(worldPoint)));
+    return true;
+}
+
+bool JoltPhysicsBackend::getCenterOfMassPosition(int id, glm::vec3& outWorldCenterOfMass) const {
+    auto it = mBodies.find(id);
+    if (it == mBodies.end()) return false;
+    const BodyRecord& rec = it->second;
+    if (rec.bodyId.IsInvalid()) return false;
+    JPH::BodyInterface& bi = mPhysicsSystem->GetBodyInterfaceNoLock();
+    outWorldCenterOfMass = FromJVec3(bi.GetCenterOfMassPosition(rec.bodyId));
+    return true;
+}
+
+bool JoltPhysicsBackend::getActorPoseQuat(int id, glm::vec3& outPosition, glm::quat& outRotation) const {
+    auto it = mBodies.find(id);
+    if (it == mBodies.end()) return false;
+    const BodyRecord& rec = it->second;
+    if (rec.bodyId.IsInvalid()) return false;
+    JPH::BodyInterface& bi = mPhysicsSystem->GetBodyInterfaceNoLock();
+    JPH::Vec3 p;
+    JPH::Quat q;
+    bi.GetPositionAndRotation(rec.bodyId, p, q);
+    outPosition = FromJVec3(p);
+    outRotation = glm::quat(q.GetW(), q.GetX(), q.GetY(), q.GetZ());
+    return true;
+}
+
+bool JoltPhysicsBackend::getMass(int id, float& outMassKg) const {
+    auto it = mBodies.find(id);
+    if (it == mBodies.end()) return false;
+    const BodyRecord& rec = it->second;
+    if (rec.bodyId.IsInvalid() || !rec.isDynamic || rec.isKinematic) return false;
+    JPH::BodyLockRead lock(mPhysicsSystem->GetBodyLockInterface(), rec.bodyId);
+    if (!lock.Succeeded()) return false;
+    const JPH::Body& body = lock.GetBody();
+    const JPH::MotionProperties* mp = body.GetMotionPropertiesUnchecked();
+    if (!mp || mp->GetInverseMassUnchecked() <= 0.0f) return false;
+    outMassKg = 1.0f / mp->GetInverseMassUnchecked();
+    return true;
+}
+
 bool JoltPhysicsBackend::refreshObject(const SceneObject& obj) {
     if (!isReady()) return false;
     auto existing = mBodies.find(obj.id);
@@ -835,6 +1010,20 @@ namespace {
         }
         bool ShouldCollideLocked(const Body& inBody) const override {
             return inBody.GetID() != ignore;
+        }
+    };
+
+    // Ignores one body (optional) and, when asked, every sensor/trigger body.
+    class IgnoreBodyAndSensorsFilter final : public BodyFilter {
+    public:
+        BodyID ignore;
+        bool skipSensors = true;
+        bool ShouldCollide(const BodyID& inBodyID) const override {
+            return inBodyID != ignore;
+        }
+        bool ShouldCollideLocked(const Body& inBody) const override {
+            if (inBody.GetID() == ignore) return false;
+            return !(skipSensors && inBody.IsSensor());
         }
     };
 } // namespace
@@ -897,6 +1086,47 @@ bool JoltPhysicsBackend::raycastClosest(const glm::vec3& origin,
     return true;
 }
 
+bool JoltPhysicsBackend::raycastClosestFiltered(const glm::vec3& origin, const glm::vec3& dir, float distance,
+                                                int ignoreId, bool skipSensors,
+                                                glm::vec3* hitPos, glm::vec3* hitNormal, float* hitDistance,
+                                                int* hitActorId, float* hitFriction) const {
+    if (hitActorId) *hitActorId = -1;
+    if (hitFriction) *hitFriction = 0.9f;
+    if (!isReady() || distance <= 0.0f) return false;
+
+    const float dirLenSq = glm::dot(dir, dir);
+    if (!(dirLenSq > 1.0e-12f) || !std::isfinite(dirLenSq)) return false;
+    const glm::vec3 normDir = dir / std::sqrt(dirLenSq);
+
+    JPH::RRayCast ray(ToJVec3(origin), ToJVec3(normDir * distance));
+    JPH::RayCastResult result;
+
+    IgnoreBodyAndSensorsFilter bodyFilter;
+    bodyFilter.skipSensors = skipSensors;
+    if (ignoreId >= 0) {
+        auto it = mBodies.find(ignoreId);
+        if (it != mBodies.end()) bodyFilter.ignore = it->second.bodyId;
+    }
+
+    const JPH::NarrowPhaseQuery& q = mPhysicsSystem->GetNarrowPhaseQuery();
+    if (!q.CastRay(ray, result, {}, {}, bodyFilter)) return false;
+
+    JPH::BodyLockRead lock(mPhysicsSystem->GetBodyLockInterface(), result.mBodyID);
+    if (!lock.Succeeded()) return false;
+    const JPH::Body& body = lock.GetBody();
+
+    const JPH::Vec3 hitPoint = ray.GetPointOnRay(result.mFraction);
+    if (hitPos) *hitPos = FromJVec3(hitPoint);
+    if (hitNormal) *hitNormal = FromJVec3(body.GetWorldSpaceSurfaceNormal(result.mSubShapeID2, hitPoint));
+    if (hitDistance) *hitDistance = result.mFraction * distance;
+    if (hitFriction) *hitFriction = body.GetFriction();
+    if (hitActorId) {
+        auto idIt = mIdsByBody.find(result.mBodyID.GetIndexAndSequenceNumber());
+        if (idIt != mIdsByBody.end()) *hitActorId = idIt->second;
+    }
+    return true;
+}
+
 void JoltPhysicsBackend::simulate(float deltaTime, std::vector<SceneObject>& objects) {
     if (!isReady() || deltaTime <= 0.0f) return;
 
@@ -929,12 +1159,32 @@ void JoltPhysicsBackend::simulate(float deltaTime, std::vector<SceneObject>& obj
                 objIt->second->collider.enabled && objIt->second->collider.isTrigger;
             if (rec.isDynamic != wantsDynamicNow || rec.isTrigger != wantsTriggerNow) {
                 idsToRecreate.push_back(id);
+                continue;
+            }
+            // Custom center of mass is baked into the shape, so a change needs a rebuild.
+            const SceneObject& comObj = *objIt->second;
+            const bool simulatedDynamic = wantsDynamicNow &&
+                !(comObj.rigidbody.isKinematic || comObj.IsInvariable);
+            if (simulatedDynamic) {
+                const bool wantsCustomCom = comObj.rigidbody.useCustomCenterOfMass;
+                const glm::vec3 comDelta = rec.centerOfMass - comObj.rigidbody.centerOfMass;
+                if (rec.useCustomCenterOfMass != wantsCustomCom ||
+                    (wantsCustomCom && glm::dot(comDelta, comDelta) > 1.0e-10f)) {
+                    idsToRecreate.push_back(id);
+                }
             }
         }
         for (int id : idsToRecreate) {
             auto recIt = mBodies.find(id);
             if (recIt == mBodies.end()) continue;
             BodyRecord& rec = recIt->second;
+            if (rec.isDynamic == (objectsById[id]->hasRigidbody && objectsById[id]->rigidbody.enabled) &&
+                rec.isTrigger == (objectsById[id]->hasCollider && objectsById[id]->collider.enabled &&
+                                  objectsById[id]->collider.isTrigger)) {
+                // Only the custom center of mass changed: rebuild the shape, keep the velocities.
+                refreshObject(*objectsById[id]);
+                continue;
+            }
             endCollisionPairsForObject(id);
             if (!rec.bodyId.IsInvalid()) {
                 mIdsByBody.erase(rec.bodyId.GetIndexAndSequenceNumber());
@@ -1051,12 +1301,22 @@ void JoltPhysicsBackend::simulate(float deltaTime, std::vector<SceneObject>& obj
     }
 
     int substeps = 0;
+    const SceneObject* objectsDataBeforeSteps = objects.data();
+    const size_t objectCountBeforeSteps = objects.size();
     while (mTimeAccumulator >= fixedDt && substeps < kMaxSubsteps) {
+        // Script FixedUpdate hooks. Forces/torques they add are consumed by this Update and
+        // then cleared by Jolt (kCollisionSteps == 1, so every Update is a single last step).
+        invokePreStepCallback(fixedDt);
         mPhysicsSystem->Update(fixedDt, kCollisionSteps, mTempAllocator.get(), mJobSystem.get());
         mTimeAccumulator -= fixedDt;
         ++substeps;
     }
     if (substeps == kMaxSubsteps) mTimeAccumulator = 0.0f;
+    if (objects.data() != objectsDataBeforeSteps || objects.size() != objectCountBeforeSteps) {
+        // A FixedUpdate hook created or deleted scene objects; the cached pointers are stale.
+        objectsById.clear();
+        for (SceneObject& obj : objects) objectsById[obj.id] = &obj;
+    }
 
     if (substeps > 0) {
         for (auto& [id, rec] : mBodies) {

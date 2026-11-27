@@ -6,6 +6,7 @@
 #include "../../ThirdParty/glm/gtc/type_ptr.hpp"
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <iostream>
@@ -371,12 +372,75 @@ void Shader::use()
 
 int Shader::getUniformLocation(const std::string& name) const
 {
+    // Locations belong to one program object.
+    if (uniformCacheProgram != ID) {
+        uniformLocationCache.clear();
+        uniformNameSlots.clear();
+        uniformNameSlotCount = 0;
+        uniformCacheProgram = ID;
+    }
     auto it = uniformLocationCache.find(name);
     if (it != uniformLocationCache.end()) {
         return it->second;
     }
     int location = glGetUniformLocation(ID, name.c_str());
     uniformLocationCache.emplace(name, location);
+    return location;
+}
+
+int Shader::getUniformLocation(const char* name) const
+{
+    if (!name) return -1;
+
+    // FNV-1a over the characters; the length falls out of the same pass.
+    unsigned int hash = 2166136261u;
+    size_t length = 0;
+    for (; name[length] != '\0'; ++length) {
+        hash = (hash ^ static_cast<unsigned char>(name[length])) * 16777619u;
+    }
+    // An empty name cannot be told apart from a free slot.
+    if (length == 0) return getUniformLocation(std::string());
+    if (uniformCacheProgram != ID) {
+        uniformLocationCache.clear();
+        uniformNameSlots.clear();
+        uniformNameSlotCount = 0;
+        uniformCacheProgram = ID;
+    }
+
+    if (uniformNameSlots.empty()) uniformNameSlots.resize(128);
+    size_t mask = uniformNameSlots.size() - 1;
+    size_t index = hash & mask;
+    while (!uniformNameSlots[index].name.empty()) {
+        const UniformNameSlot& slot = uniformNameSlots[index];
+        if (slot.hash == hash && slot.name.size() == length &&
+            std::memcmp(slot.name.data(), name, length) == 0) {
+            return slot.location;
+        }
+        index = (index + 1) & mask;
+    }
+
+    // First sighting of this name: resolve through the string-keyed cache so
+    // both paths always agree, then remember it.
+    const int location = getUniformLocation(std::string(name, length));
+    if ((uniformNameSlotCount + 1) * 2 > uniformNameSlots.size()) {
+        std::vector<UniformNameSlot> grown(uniformNameSlots.size() * 2);
+        const size_t grownMask = grown.size() - 1;
+        for (UniformNameSlot& slot : uniformNameSlots) {
+            if (slot.name.empty()) continue;
+            size_t target = slot.hash & grownMask;
+            while (!grown[target].name.empty()) target = (target + 1) & grownMask;
+            grown[target] = std::move(slot);
+        }
+        uniformNameSlots.swap(grown);
+        mask = grownMask;
+        index = hash & mask;
+        while (!uniformNameSlots[index].name.empty()) index = (index + 1) & mask;
+    }
+    UniformNameSlot& slot = uniformNameSlots[index];
+    slot.name.assign(name, length);
+    slot.hash = hash;
+    slot.location = location;
+    ++uniformNameSlotCount;
     return location;
 }
 
@@ -446,6 +510,52 @@ void Shader::setMat4(const std::string &name, const glm::mat4 &mat) const
 }
 
 void Shader::setMat4Array(const std::string &name, const glm::mat4 *data, int count) const
+{
+    if (count <= 0 || !data) return;
+    glUniformMatrix4fv(getUniformLocation(name), count, GL_FALSE, glm::value_ptr(data[0]));
+}
+
+void Shader::setBool(const char *name, bool value) const
+{
+    glUniform1i(getUniformLocation(name), (int)value);
+}
+
+void Shader::setInt(const char *name, int value) const
+{
+    glUniform1i(getUniformLocation(name), value);
+}
+
+void Shader::setFloat(const char *name, float value) const
+{
+    glUniform1f(getUniformLocation(name), value);
+}
+
+void Shader::setVec2(const char *name, const glm::vec2 &value) const
+{
+    glUniform2fv(getUniformLocation(name), 1, &value[0]);
+}
+
+void Shader::setVec3(const char *name, const glm::vec3 &value) const
+{
+    glUniform3fv(getUniformLocation(name), 1, &value[0]);
+}
+
+void Shader::setVec4(const char *name, const glm::vec4 &value) const
+{
+    glUniform4fv(getUniformLocation(name), 1, &value[0]);
+}
+
+void Shader::setMat3(const char *name, const glm::mat3 &mat) const
+{
+    glUniformMatrix3fv(getUniformLocation(name), 1, GL_FALSE, glm::value_ptr(mat));
+}
+
+void Shader::setMat4(const char *name, const glm::mat4 &mat) const
+{
+    glUniformMatrix4fv(getUniformLocation(name), 1, GL_FALSE, glm::value_ptr(mat));
+}
+
+void Shader::setMat4Array(const char *name, const glm::mat4 *data, int count) const
 {
     if (count <= 0 || !data) return;
     glUniformMatrix4fv(getUniformLocation(name), count, GL_FALSE, glm::value_ptr(data[0]));

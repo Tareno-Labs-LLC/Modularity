@@ -8,6 +8,8 @@
 #include "ModuCPPLanguagePack.h"
 #include "Rendering.h"
 #include "ModelLoader.h"
+#include "InstancerRuntime.h"
+#include "TerrainRuntime.h"
 #ifdef __ANDROID__
 #include "AndroidRuntime/AndroidRuntime.h"
 #endif
@@ -1268,6 +1270,8 @@ bool SceneSerializationInternal::WriteLegacySceneStream(std::ostream& file,
         file << "skyboxWeatherRainOpacity=" << skyboxSettings.weather.rainOpacity << "\n";
         file << "skyboxWeatherRainSpeed=" << skyboxSettings.weather.rainSpeed << "\n";
         file << "skyboxWeatherRainScale=" << skyboxSettings.weather.rainScale << "\n";
+        file << "skyboxRain3D=" << (skyboxSettings.weather.rain3D ? 1 : 0) << "\n";
+        file << "skyboxRainDensity=" << skyboxSettings.weather.rainDensity << "\n";
         file << "skyboxWeatherLightningInterval=" << skyboxSettings.weather.lightningInterval << "\n";
         file << "skyboxWeatherLightningIntensity=" << skyboxSettings.weather.lightningIntensity << "\n";
         file << "skyboxWeatherAmbienceVolume=" << skyboxSettings.weather.ambienceVolume << "\n";
@@ -1286,6 +1290,11 @@ bool SceneSerializationInternal::WriteLegacySceneStream(std::ostream& file,
         file << "skyboxWindPulseFrequency=" << skyboxSettings.wind.pulseFrequency << "\n";
         file << "skyboxWindMultiplier=" << skyboxSettings.wind.multiplier << "\n";
         file << "skyboxWindFollowWeather=" << (skyboxSettings.wind.followWeather ? 1 : 0) << "\n";
+        file << "skyboxAtmosphereModel=" << skyboxSettings.atmosphereModel << "\n";
+        file << "skyboxTurbidity=" << skyboxSettings.turbidity << "\n";
+        file << "skyboxSunSize=" << skyboxSettings.sunSize << "\n";
+        file << "skyboxSunIntensity=" << skyboxSettings.sunIntensity << "\n";
+        file << "skyboxFogMatchSky=" << (skyboxSettings.fogMatchSky ? 1 : 0) << "\n";
         file << "skyboxCloudHorizonFade=" << skyboxSettings.cloudHorizonFade << "\n";
         file << "skyboxSkyResolution=" << skyboxSettings.skyResolution << "\n";
         file << "skyboxSkyRefreshInterval=" << skyboxSettings.skyRefreshInterval << "\n";
@@ -1325,6 +1334,10 @@ bool SceneSerializationInternal::WriteLegacySceneStream(std::ostream& file,
         file << "skyboxEnvironmentReflectionIntensity=" << skyboxSettings.environmentReflectionIntensity << "\n";
         file << "skyboxReflectionDistanceFadeStart=" << skyboxSettings.reflectionDistanceFadeStart << "\n";
         file << "skyboxReflectionDistanceFadeEnd=" << skyboxSettings.reflectionDistanceFadeEnd << "\n";
+        file << "skyboxEnvironmentLighting=" << skyboxSettings.environmentLightingIntensity << "\n";
+        file << "skyboxSkyLightingReflections=" << (skyboxSettings.skyLightingReflections ? 1 : 0) << "\n";
+        file << "skyboxWetness=" << skyboxSettings.wetness << "\n";
+        file << "skyboxPuddleAmount=" << skyboxSettings.puddleAmount << "\n";
         file << "fogEnabled=" << (skyboxSettings.fogEnabled ? 1 : 0) << "\n";
         file << "fogMode=" << skyboxSettings.fogMode << "\n";
         file << "fogColor=" << skyboxSettings.fogColor.r << "," << skyboxSettings.fogColor.g << "," << skyboxSettings.fogColor.b << "\n";
@@ -1522,6 +1535,7 @@ bool SceneSerializationInternal::WriteLegacySceneStream(std::ostream& file,
                 file << "audioEnabled=" << (obj.audioSource.enabled ? 1 : 0) << "\n";
                 file << "audioClip=" << obj.audioSource.clipPath << "\n";
                 file << "audioVolume=" << obj.audioSource.volume << "\n";
+                file << "audioPitch=" << obj.audioSource.pitch << "\n";
                 file << "audioLoop=" << (obj.audioSource.loop ? 1 : 0) << "\n";
                 file << "audioPlayOnStart=" << (obj.audioSource.playOnStart ? 1 : 0) << "\n";
                 file << "audioSpatial=" << (AudioSourceUsesSpatialization(obj.audioSource) ? 1 : 0) << "\n";
@@ -1881,6 +1895,7 @@ bool SceneSerializationInternal::WriteLegacySceneStream(std::ostream& file,
                 file << "skelPlaySpeed=" << obj.skeletal.playSpeed << "\n";
                 file << "skelLoop=" << (obj.skeletal.loop ? 1 : 0) << "\n";
                 file << "skelMaxBones=" << obj.skeletal.maxBones << "\n";
+                if (obj.skeletal.alwaysRender) file << "skelAlwaysRender=1\n";
             }
             file << "materialColor=" << obj.material.color.r << "," << obj.material.color.g << "," << obj.material.color.b << "\n";
             file << "materialAlpha=" << obj.material.alpha << "\n";
@@ -1910,6 +1925,8 @@ bool SceneSerializationInternal::WriteLegacySceneStream(std::ostream& file,
             file << "materialMetallic=" << obj.material.metallic << "\n";
             file << "materialRoughness=" << obj.material.roughness << "\n";
             file << "materialOcclusionStrength=" << obj.material.occlusionStrength << "\n";
+            file << "materialClearcoat=" << obj.material.clearcoat << "\n";
+            file << "materialClearcoatRoughness=" << obj.material.clearcoatRoughness << "\n";
             file << "materialEmissionColor=" << obj.material.emissionColor.r << "," << obj.material.emissionColor.g << "," << obj.material.emissionColor.b << "\n";
             file << "materialEmissionStrength=" << obj.material.emissionStrength << "\n";
             file << "materialAlphaCutoff=" << obj.material.alphaCutoff << "\n";
@@ -1979,6 +1996,104 @@ bool SceneSerializationInternal::WriteLegacySceneStream(std::ostream& file,
             file << "lightShadowOpacityFadeIn=" << obj.light.shadowOpacityFadeIn << "\n";
             file << "lightShadowOpacityFadeOut=" << obj.light.shadowOpacityFadeOut << "\n";
             file << "lightEnabled=" << (obj.light.enabled ? 1 : 0) << "\n";
+            if (obj.hasInstancer) {
+                const InstancerComponent& inst = obj.instancer;
+                file << "hasInstancer=1\n";
+                file << "instancerEnabled=" << (inst.enabled ? 1 : 0) << "\n";
+                file << "instancerProtoCount=" << inst.prototypes.size() << "\n";
+                for (size_t pi = 0; pi < inst.prototypes.size(); ++pi) {
+                    const InstancerPrototype& p = inst.prototypes[pi];
+                    const std::string k = "instancerProto" + std::to_string(pi);
+                    file << k << "Source=" << p.sourceObjectId << "\n";
+                    file << k << "LodSource=" << p.lodSourceObjectId << "\n";
+                    file << k << "LodDistance=" << p.lodDistance << "\n";
+                    file << k << "MaxDistance=" << p.maxDrawDistance << "\n";
+                    file << k << "Shadows=" << (p.castShadows ? 1 : 0) << "\n";
+                    file << k << "ShadowDistance=" << p.shadowDistance << "\n";
+                    file << k << "Collider=" << static_cast<int>(p.colliderMode) << "\n";
+                    file << k << "ColliderRadius=" << p.colliderRadius << "\n";
+                    file << k << "ColliderHeight=" << p.colliderHeight << "\n";
+                    file << k << "ColliderOffsetY=" << p.colliderOffsetY << "\n";
+                    file << k << "Align=" << (p.alignToGround ? 1 : 0) << "\n";
+                    file << k << "Weight=" << p.scatterWeight << "\n";
+                    file << k << "ScaleMin=" << p.scaleMin << "\n";
+                    file << k << "ScaleMax=" << p.scaleMax << "\n";
+                }
+                file << "instancerCount=" << inst.instanceCount() << "\n";
+                if (inst.instanceCount() > 0) {
+                    file << "instancerData=" << InstancerRuntime::EncodeInstances(*inst.instances) << "\n";
+                }
+            }
+            if (obj.hasTerrain) {
+                const TerrainComponent& ter = obj.terrain;
+                file << "hasTerrain=1\n";
+                file << "terrainEnabled=" << (ter.enabled ? 1 : 0) << "\n";
+                file << "terrainSize=" << ter.size << "\n";
+                file << "terrainHeightScale=" << ter.heightScale << "\n";
+                file << "terrainHeightOffset=" << ter.heightOffset << "\n";
+                file << "terrainResolution=" << ter.resolution << "\n";
+                file << "terrainSplatResolution=" << ter.splatResolution << "\n";
+                file << "terrainCastShadows=" << (ter.castShadows ? 1 : 0) << "\n";
+                file << "terrainCollision=" << (ter.collision ? 1 : 0) << "\n";
+                file << "terrainLodDistance=" << ter.lodDistance << "\n";
+                if (!ter.dataPath.empty()) file << "terrainData=" << ter.dataPath << "\n";
+                file << "terrainGrassEnabled=" << (ter.grassEnabled ? 1 : 0) << "\n";
+                file << "terrainGrassDensity=" << ter.grassDensityScale << "\n";
+                file << "terrainGrassBladeHeight=" << ter.grassBladeHeight << "\n";
+                file << "terrainGrassBladeWidth=" << ter.grassBladeWidth << "\n";
+                file << "terrainGrassHeightVariation=" << ter.grassHeightVariation << "\n";
+                file << "terrainGrassBend=" << ter.grassBend << "\n";
+                file << "terrainGrassDistance=" << ter.grassDistance << "\n";
+                file << "terrainGrassWind=" << ter.grassWindStrength << "\n";
+                file << "terrainGrassDry=" << ter.grassDryAmount << "\n";
+                file << "terrainGrassBaseColor=" << ter.grassBaseColor.x << "," << ter.grassBaseColor.y << "," << ter.grassBaseColor.z << "\n";
+                file << "terrainGrassTipColor=" << ter.grassTipColor.x << "," << ter.grassTipColor.y << "," << ter.grassTipColor.z << "\n";
+                file << "terrainGrassDryColor=" << ter.grassDryColor.x << "," << ter.grassDryColor.y << "," << ter.grassDryColor.z << "\n";
+                file << "terrainWaterEnabled=" << (ter.waterEnabled ? 1 : 0) << "\n";
+                file << "terrainWaterShallowColor=" << ter.waterShallowColor.x << "," << ter.waterShallowColor.y << "," << ter.waterShallowColor.z << "\n";
+                file << "terrainWaterDeepColor=" << ter.waterDeepColor.x << "," << ter.waterDeepColor.y << "," << ter.waterDeepColor.z << "\n";
+                file << "terrainWaterClarity=" << ter.waterClarity << "\n";
+                file << "terrainWaterWaveScale=" << ter.waterWaveScale << "\n";
+                file << "terrainWaterWaveStrength=" << ter.waterWaveStrength << "\n";
+                file << "terrainWaterReflection=" << ter.waterReflection << "\n";
+                file << "terrainWaterFoam=" << ter.waterFoam << "\n";
+                file << "terrainGenSeed=" << ter.genSeed << "\n";
+                file << "terrainGenAmplitude=" << ter.genAmplitude << "\n";
+                file << "terrainGenScale=" << ter.genScale << "\n";
+                file << "terrainGenOctaves=" << ter.genOctaves << "\n";
+                file << "terrainGenPersistence=" << ter.genPersistence << "\n";
+                file << "terrainGenRidged=" << ter.genRidged << "\n";
+                for (int li = 0; li < 4; ++li) {
+                    const TerrainLayer& layer = ter.layers[li];
+                    const std::string k = "terrainLayer" + std::to_string(li);
+                    if (!layer.albedoPath.empty()) file << k << "Albedo=" << layer.albedoPath << "\n";
+                    if (!layer.normalPath.empty()) file << k << "Normal=" << layer.normalPath << "\n";
+                    file << k << "Tiling=" << layer.tiling << "\n";
+                    file << k << "Tint=" << layer.tint.x << "," << layer.tint.y << "," << layer.tint.z << "\n";
+                    file << k << "NormalStrength=" << layer.normalStrength << "\n";
+                }
+                file << "terrainPondCount=" << ter.ponds.size() << "\n";
+                for (size_t pi = 0; pi < ter.ponds.size(); ++pi) {
+                    const TerrainPond& pond = ter.ponds[pi];
+                    const std::string k = "terrainPond" + std::to_string(pi);
+                    file << k << "Center=" << pond.center.x << "," << pond.center.y << "\n";
+                    file << k << "Radius=" << pond.radius << "\n";
+                    file << k << "Height=" << pond.waterHeight << "\n";
+                }
+                file << "terrainClearingCount=" << ter.clearings.size() << "\n";
+                for (size_t ci = 0; ci < ter.clearings.size(); ++ci) {
+                    const TerrainClearing& c = ter.clearings[ci];
+                    const std::string k = "terrainClearing" + std::to_string(ci);
+                    file << k << "Center=" << c.center.x << "," << c.center.y << "\n";
+                    file << k << "Size=" << c.size.x << "," << c.size.y << "\n";
+                    file << k << "Rotation=" << c.rotationDegrees << "\n";
+                    file << k << "Rect=" << (c.rectangle ? 1 : 0) << "\n";
+                    file << k << "Blend=" << c.blend << "\n";
+                    file << k << "UseHeight=" << (c.useHeight ? 1 : 0) << "\n";
+                    file << k << "Height=" << c.height << "\n";
+                    file << k << "KeepOut=" << (c.keepOut ? 1 : 0) << "\n";
+                }
+            }
             if (obj.hasReflectionCast) {
                 file << "reflectionCastEnabled=" << (obj.reflectionCast.enabled ? 1 : 0) << "\n";
                 file << "reflectionCastUpdateMode=" << static_cast<int>(obj.reflectionCast.updateMode) << "\n";
@@ -2584,6 +2699,97 @@ void ParseVec4(const std::string& value, Vec4T& out) {
     sscanf(value.c_str(), "%f,%f,%f,%f", &out.x, &out.y, &out.z, &out.w);
 }
 
+// terrain* keys: scalar settings plus terrainLayer<N>/terrainPond<N>/terrainClearing<N> groups.
+// Returns false when the key is not a terrain key (the caller keeps looking).
+bool ParseTerrainKey(SceneObject& obj, const std::string& key, const std::string& value) {
+    if (key.compare(0, 7, "terrain") != 0) return false;
+    TerrainComponent& t = obj.terrain;
+    obj.hasTerrain = true;
+    const std::string field = key.substr(7);
+    const auto groupIndex = [&](const char* prefix, size_t& index, std::string& rest) {
+        const size_t plen = std::strlen(prefix);
+        if (field.compare(0, plen, prefix) != 0) return false;
+        size_t end = plen;
+        while (end < field.size() && std::isdigit(static_cast<unsigned char>(field[end]))) ++end;
+        if (end == plen || end - plen > 5) return false;
+        index = static_cast<size_t>(std::stoul(field.substr(plen, end - plen)));
+        rest = field.substr(end);
+        return true;
+    };
+    size_t index = 0;
+    std::string rest;
+    if (field == "Enabled") t.enabled = std::stoi(value) != 0;
+    else if (field == "Size") t.size = std::clamp(std::stof(value), 1.0f, 100000.0f);
+    else if (field == "HeightScale") t.heightScale = std::clamp(std::stof(value), 0.01f, 100000.0f);
+    else if (field == "HeightOffset") t.heightOffset = std::stof(value);
+    else if (field == "Resolution") t.resolution = std::clamp(std::stoi(value), 3, 4097);
+    else if (field == "SplatResolution") t.splatResolution = std::clamp(std::stoi(value), 16, 4096);
+    else if (field == "CastShadows") t.castShadows = std::stoi(value) != 0;
+    else if (field == "Collision") t.collision = std::stoi(value) != 0;
+    else if (field == "LodDistance") t.lodDistance = std::max(1.0f, std::stof(value));
+    else if (field == "Data") t.dataPath = value;
+    else if (field == "GrassEnabled") t.grassEnabled = std::stoi(value) != 0;
+    else if (field == "GrassDensity") t.grassDensityScale = std::max(std::stof(value), 0.0f);
+    else if (field == "GrassBladeHeight") t.grassBladeHeight = std::clamp(std::stof(value), 0.02f, 5.0f);
+    else if (field == "GrassBladeWidth") t.grassBladeWidth = std::clamp(std::stof(value), 0.002f, 1.0f);
+    else if (field == "GrassHeightVariation") t.grassHeightVariation = std::clamp(std::stof(value), 0.0f, 1.0f);
+    else if (field == "GrassBend") t.grassBend = std::clamp(std::stof(value), 0.0f, 1.5f);
+    else if (field == "GrassDistance") t.grassDistance = std::clamp(std::stof(value), 5.0f, 400.0f);
+    else if (field == "GrassWind") t.grassWindStrength = std::clamp(std::stof(value), 0.0f, 10.0f);
+    else if (field == "GrassDry") t.grassDryAmount = std::clamp(std::stof(value), 0.0f, 1.0f);
+    else if (field == "GrassBaseColor") ParseVec3(value, t.grassBaseColor);
+    else if (field == "GrassTipColor") ParseVec3(value, t.grassTipColor);
+    else if (field == "GrassDryColor") ParseVec3(value, t.grassDryColor);
+    else if (field == "WaterEnabled") t.waterEnabled = std::stoi(value) != 0;
+    else if (field == "WaterShallowColor") ParseVec3(value, t.waterShallowColor);
+    else if (field == "WaterDeepColor") ParseVec3(value, t.waterDeepColor);
+    else if (field == "WaterClarity") t.waterClarity = std::clamp(std::stof(value), 0.05f, 100.0f);
+    else if (field == "WaterWaveScale") t.waterWaveScale = std::clamp(std::stof(value), 0.05f, 20.0f);
+    else if (field == "WaterWaveStrength") t.waterWaveStrength = std::clamp(std::stof(value), 0.0f, 3.0f);
+    else if (field == "WaterReflection") t.waterReflection = std::clamp(std::stof(value), 0.0f, 3.0f);
+    else if (field == "WaterFoam") t.waterFoam = std::clamp(std::stof(value), 0.0f, 3.0f);
+    else if (field == "GenSeed") t.genSeed = std::stoi(value);
+    else if (field == "GenAmplitude") t.genAmplitude = std::stof(value);
+    else if (field == "GenScale") t.genScale = std::max(1.0f, std::stof(value));
+    else if (field == "GenOctaves") t.genOctaves = std::clamp(std::stoi(value), 1, 10);
+    else if (field == "GenPersistence") t.genPersistence = std::stof(value);
+    else if (field == "GenRidged") t.genRidged = std::stof(value);
+    else if (field == "PondCount") t.ponds.resize(static_cast<size_t>(std::clamp(std::stoi(value), 0, 256)));
+    else if (field == "ClearingCount") t.clearings.resize(static_cast<size_t>(std::clamp(std::stoi(value), 0, 256)));
+    else if (groupIndex("Layer", index, rest)) {
+        if (index < 4) {
+            TerrainLayer& layer = t.layers[index];
+            if (rest == "Albedo") layer.albedoPath = value;
+            else if (rest == "Normal") layer.normalPath = value;
+            else if (rest == "Tiling") layer.tiling = std::max(0.01f, std::stof(value));
+            else if (rest == "Tint") ParseVec3(value, layer.tint);
+            else if (rest == "NormalStrength") layer.normalStrength = std::stof(value);
+        }
+    } else if (groupIndex("Pond", index, rest)) {
+        if (index < 256) {
+            if (t.ponds.size() <= index) t.ponds.resize(index + 1);
+            TerrainPond& pond = t.ponds[index];
+            if (rest == "Center") ParseVec2(value, pond.center);
+            else if (rest == "Radius") pond.radius = std::max(0.1f, std::stof(value));
+            else if (rest == "Height") pond.waterHeight = std::stof(value);
+        }
+    } else if (groupIndex("Clearing", index, rest)) {
+        if (index < 256) {
+            if (t.clearings.size() <= index) t.clearings.resize(index + 1);
+            TerrainClearing& c = t.clearings[index];
+            if (rest == "Center") ParseVec2(value, c.center);
+            else if (rest == "Size") ParseVec2(value, c.size);
+            else if (rest == "Rotation") c.rotationDegrees = std::stof(value);
+            else if (rest == "Rect") c.rectangle = std::stoi(value) != 0;
+            else if (rest == "Blend") c.blend = std::max(0.0f, std::stof(value));
+            else if (rest == "UseHeight") c.useHeight = std::stoi(value) != 0;
+            else if (rest == "Height") c.height = std::stof(value);
+            else if (rest == "KeepOut") c.keepOut = std::stoi(value) != 0;
+        }
+    }
+    return true;
+}
+
 void ParseMinMaxFloat(const std::string& value, ParticleSystem2DComponent::MinMaxFloat& out) {
     int random = out.random ? 1 : 0;
     if (sscanf(value.c_str(), "%f,%f,%d", &out.min, &out.max, &random) >= 2) {
@@ -2855,6 +3061,10 @@ const std::unordered_map<std::string, KeyHandler>& GetSceneObjectKeyHandlers() {
         {"audioEnabled", +[](SceneObject& obj, const std::string& value) { obj.audioSource.enabled = std::stoi(value) != 0; }},
         {"audioClip", +[](SceneObject& obj, const std::string& value) { obj.audioSource.clipPath = value; }},
         {"audioVolume", +[](SceneObject& obj, const std::string& value) { obj.audioSource.volume = std::stof(value); }},
+        {"audioPitch", +[](SceneObject& obj, const std::string& value) {
+            const float pitch = std::stof(value);
+            obj.audioSource.pitch = std::isfinite(pitch) ? std::clamp(pitch, 0.05f, 4.0f) : 1.0f;
+        }},
         {"audioLoop", +[](SceneObject& obj, const std::string& value) { obj.audioSource.loop = std::stoi(value) != 0; }},
         {"audioPlayOnStart", +[](SceneObject& obj, const std::string& value) { obj.audioSource.playOnStart = std::stoi(value) != 0; }},
         {"audioSpatial", +[](SceneObject& obj, const std::string& value) {
@@ -3161,6 +3371,7 @@ const std::unordered_map<std::string, KeyHandler>& GetSceneObjectKeyHandlers() {
         {"skelPlaySpeed", +[](SceneObject& obj, const std::string& value) { obj.skeletal.playSpeed = std::stof(value); }},
         {"skelLoop", +[](SceneObject& obj, const std::string& value) { obj.skeletal.loop = std::stoi(value) != 0; }},
         {"skelMaxBones", +[](SceneObject& obj, const std::string& value) { obj.skeletal.maxBones = std::stoi(value); }},
+        {"skelAlwaysRender", +[](SceneObject& obj, const std::string& value) { obj.skeletal.alwaysRender = std::stoi(value) != 0; }},
         {"materialColor", +[](SceneObject& obj, const std::string& value) { ParseVec3(value, obj.material.color); }},
         {"materialAlpha", +[](SceneObject& obj, const std::string& value) { obj.material.alpha = std::clamp(std::stof(value), 0.0f, 1.0f); }},
         {"materialAmbient", +[](SceneObject& obj, const std::string& value) { obj.material.ambientStrength = std::stof(value); }},
@@ -3188,6 +3399,8 @@ const std::unordered_map<std::string, KeyHandler>& GetSceneObjectKeyHandlers() {
         {"materialMetallic", +[](SceneObject& obj, const std::string& value) { obj.material.metallic = std::clamp(std::stof(value), 0.0f, 1.0f); }},
         {"materialRoughness", +[](SceneObject& obj, const std::string& value) { obj.material.roughness = std::clamp(std::stof(value), 0.0f, 1.0f); }},
         {"materialOcclusionStrength", +[](SceneObject& obj, const std::string& value) { obj.material.occlusionStrength = std::clamp(std::stof(value), 0.0f, 1.0f); }},
+        {"materialClearcoat", +[](SceneObject& obj, const std::string& value) { obj.material.clearcoat = std::clamp(std::stof(value), 0.0f, 1.0f); }},
+        {"materialClearcoatRoughness", +[](SceneObject& obj, const std::string& value) { obj.material.clearcoatRoughness = std::clamp(std::stof(value), 0.0f, 1.0f); }},
         {"materialEmissionColor", +[](SceneObject& obj, const std::string& value) { ParseVec3(value, obj.material.emissionColor); }},
         {"materialEmissionStrength", +[](SceneObject& obj, const std::string& value) { obj.material.emissionStrength = std::max(0.0f, std::stof(value)); }},
         {"materialAlphaCutoff", +[](SceneObject& obj, const std::string& value) { obj.material.alphaCutoff = std::clamp(std::stof(value), 0.0f, 1.0f); }},
@@ -3307,6 +3520,23 @@ const std::unordered_map<std::string, KeyHandler>& GetSceneObjectKeyHandlers() {
         {"reflectionCastBlend", +[](SceneObject& obj, const std::string& value) { obj.hasReflectionCast = true; obj.reflectionCast.blendDistance = std::max(0.0f, std::stof(value)); }},
         {"reflectionCastIntensity", +[](SceneObject& obj, const std::string& value) { obj.hasReflectionCast = true; obj.reflectionCast.intensity = std::clamp(std::stof(value), 0.0f, 2.0f); }},
         {"reflectionCastResolution", +[](SceneObject& obj, const std::string& value) { obj.hasReflectionCast = true; obj.reflectionCast.resolution = std::clamp(std::stoi(value), 32, 1024); }},
+        {"hasTerrain", +[](SceneObject& obj, const std::string& value) { obj.hasTerrain = std::stoi(value) != 0; }},
+        {"hasInstancer", +[](SceneObject& obj, const std::string& value) { obj.hasInstancer = std::stoi(value) != 0; }},
+        {"instancerEnabled", +[](SceneObject& obj, const std::string& value) { obj.hasInstancer = true; obj.instancer.enabled = std::stoi(value) != 0; }},
+        {"instancerProtoCount", +[](SceneObject& obj, const std::string& value) {
+             obj.hasInstancer = true;
+             obj.instancer.prototypes.resize(static_cast<size_t>(std::clamp(std::stoi(value), 0, 4096)));
+         }},
+        {"instancerCount", +[](SceneObject& obj, const std::string&) { obj.hasInstancer = true; }},
+        {"instancerData", +[](SceneObject& obj, const std::string& value) {
+             obj.hasInstancer = true;
+             std::vector<InstancerInstance> decoded;
+             if (!InstancerRuntime::DecodeInstances(value, decoded)) {
+                 std::cerr << "[Instancer] '" << obj.name << "' has a damaged instance list; kept "
+                           << decoded.size() << " instances\n";
+             }
+             obj.instancer.setInstances(std::move(decoded));
+         }},
         {"light2dEnabled", +[](SceneObject& obj, const std::string& value) { obj.light2D.enabled = (std::stoi(value) != 0); obj.hasLight2D = true; }},
         {"light2dType", +[](SceneObject& obj, const std::string& value) { obj.light2D.type = static_cast<Light2DType>(std::stoi(value)); obj.hasLight2D = true; }},
         {"light2dColor", +[](SceneObject& obj, const std::string& value) { ParseVec4(value, obj.light2D.color); obj.hasLight2D = true; }},
@@ -3900,6 +4130,10 @@ bool SceneSerializationInternal::LoadLegacySceneStream(std::istream& file,
                 sceneSkyboxSettings.weather.rainSpeed = std::max(0.0f, std::stof(value));
             } else if (key == "skyboxWeatherRainScale") {
                 sceneSkyboxSettings.weather.rainScale = std::max(0.05f, std::stof(value));
+            } else if (key == "skyboxRain3D") {
+                sceneSkyboxSettings.weather.rain3D = ParseProjectBool(value);
+            } else if (key == "skyboxRainDensity") {
+                sceneSkyboxSettings.weather.rainDensity = std::clamp(std::stof(value), 0.0f, 4.0f);
             } else if (key == "skyboxWeatherLightningInterval") {
                 sceneSkyboxSettings.weather.lightningInterval = std::max(0.5f, std::stof(value));
             } else if (key == "skyboxWeatherLightningIntensity") {
@@ -3943,6 +4177,20 @@ bool SceneSerializationInternal::LoadLegacySceneStream(std::istream& file,
                     std::max(0.0f, ParseFloatNoThrow(value, sceneSkyboxSettings.wind.multiplier));
             } else if (key == "skyboxWindFollowWeather") {
                 sceneSkyboxSettings.wind.followWeather = ParseProjectBool(TrimCopy(value));
+            } else if (key == "skyboxAtmosphereModel") {
+                sceneSkyboxSettings.atmosphereModel =
+                    std::clamp(static_cast<int>(ParseFloatNoThrow(value, static_cast<float>(sceneSkyboxSettings.atmosphereModel))), 0, 1);
+            } else if (key == "skyboxTurbidity") {
+                sceneSkyboxSettings.turbidity =
+                    std::clamp(ParseFloatNoThrow(value, sceneSkyboxSettings.turbidity), 1.0f, 10.0f);
+            } else if (key == "skyboxSunSize") {
+                sceneSkyboxSettings.sunSize =
+                    std::clamp(ParseFloatNoThrow(value, sceneSkyboxSettings.sunSize), 0.05f, 20.0f);
+            } else if (key == "skyboxSunIntensity") {
+                sceneSkyboxSettings.sunIntensity =
+                    std::clamp(ParseFloatNoThrow(value, sceneSkyboxSettings.sunIntensity), 0.0f, 10.0f);
+            } else if (key == "skyboxFogMatchSky") {
+                sceneSkyboxSettings.fogMatchSky = ParseProjectBool(TrimCopy(value));
             } else if (key == "skyboxCloudHorizonFade") {
                 sceneSkyboxSettings.cloudHorizonFade = std::clamp(std::stof(value), 0.0f, 1.0f);
             } else if (key == "skyboxSkyResolution") {
@@ -4027,6 +4275,15 @@ bool SceneSerializationInternal::LoadLegacySceneStream(std::istream& file,
                 sceneSkyboxSettings.reflectionDistanceFadeStart = std::max(0.0f, std::stof(value));
             } else if (key == "skyboxReflectionDistanceFadeEnd") {
                 sceneSkyboxSettings.reflectionDistanceFadeEnd = std::max(0.01f, std::stof(value));
+            } else if (key == "skyboxEnvironmentLighting") {
+                sceneSkyboxSettings.environmentLightingIntensity = std::clamp(std::stof(value), 0.0f, 4.0f);
+            } else if (key == "skyboxSkyLightingReflections") {
+                sceneSkyboxSettings.skyLightingReflections = std::stoi(value) != 0;
+            } else if (key == "skyboxWetness") {
+                const float wet = std::stof(value);
+                sceneSkyboxSettings.wetness = wet < 0.0f ? -1.0f : std::min(wet, 1.0f);
+            } else if (key == "skyboxPuddleAmount") {
+                sceneSkyboxSettings.puddleAmount = std::clamp(std::stof(value), 0.0f, 1.0f);
             } else if (key == "fogEnabled") {
                 sceneSkyboxSettings.fogEnabled = std::stoi(value) != 0;
             } else if (key == "fogMode") {
@@ -4048,6 +4305,37 @@ bool SceneSerializationInternal::LoadLegacySceneStream(std::istream& file,
                 auto handlerIt = handlers.find(key);
                 if (handlerIt != handlers.end()) {
                     handlerIt->second(*currentObj, value);
+                } else if (ParseTerrainKey(*currentObj, key, value)) {
+                    // handled: terrain* keys
+                } else if (key.rfind("instancerProto", 0) == 0) {
+                    // instancerProto<index><Field>: one prototype setting.
+                    currentObj->hasInstancer = true;
+                    size_t digitsEnd = 14;
+                    while (digitsEnd < key.size() && std::isdigit(static_cast<unsigned char>(key[digitsEnd]))) ++digitsEnd;
+                    if (digitsEnd > 14 && digitsEnd - 14 < 6) {
+                        const size_t index = static_cast<size_t>(std::stoul(key.substr(14, digitsEnd - 14)));
+                        if (index < 4096) {
+                            auto& protos = currentObj->instancer.prototypes;
+                            if (protos.size() <= index) protos.resize(index + 1);
+                            InstancerPrototype& proto = protos[index];
+                            const std::string field = key.substr(digitsEnd);
+                            if (field == "Source") proto.sourceObjectId = std::stoi(value);
+                            else if (field == "LodSource") proto.lodSourceObjectId = std::stoi(value);
+                            else if (field == "LodDistance") proto.lodDistance = std::stof(value);
+                            else if (field == "MaxDistance") proto.maxDrawDistance = std::stof(value);
+                            else if (field == "Shadows") proto.castShadows = std::stoi(value) != 0;
+                            else if (field == "ShadowDistance") proto.shadowDistance = std::stof(value);
+                            else if (field == "Collider") proto.colliderMode = std::stoi(value) == 1
+                                ? InstancerColliderMode::Capsule : InstancerColliderMode::None;
+                            else if (field == "ColliderRadius") proto.colliderRadius = std::stof(value);
+                            else if (field == "ColliderHeight") proto.colliderHeight = std::stof(value);
+                            else if (field == "ColliderOffsetY") proto.colliderOffsetY = std::stof(value);
+                            else if (field == "Align") proto.alignToGround = std::stoi(value) != 0;
+                            else if (field == "Weight") proto.scatterWeight = std::stof(value);
+                            else if (field == "ScaleMin") proto.scaleMin = std::stof(value);
+                            else if (field == "ScaleMax") proto.scaleMax = std::stof(value);
+                        }
+                    }
                 } else if (key.rfind("animClip", 0) == 0) {
                     currentObj->hasAnimation = true;
                     size_t underscore = key.find('_');
@@ -4227,6 +4515,12 @@ bool SceneSerializationInternal::LoadLegacySceneStream(std::istream& file,
         }
 
         for (auto& obj : objects) {
+            if (obj.hasTerrain) {
+                std::string terrainError;
+                if (!TerrainRuntime::LoadSidecar(obj.terrain, &terrainError)) {
+                    std::cerr << "[Terrain] '" << obj.name << "': " << terrainError << " (using a flat terrain)\n";
+                }
+            }
             EnsureInspectorComponentMetadata(obj);
             if (!obj.hasAnimation) {
                 if (!obj.animation.clips.empty() ||

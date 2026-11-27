@@ -5,8 +5,12 @@
 #include "Lighting2DTypes.h"
 #include "AudioFX.h"
 #include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <memory>
 #include <type_traits>
 #include <unordered_set>
+#include <vector>
 
 enum class ObjectType {
     Cube = 0,
@@ -111,6 +115,11 @@ struct MaterialProperties {
     float metallic = 0.0f;
     float roughness = 0.5f;
     float occlusionStrength = 1.0f;
+    // Clear lacquer over the base layer (car paint, varnish): a second GGX lobe
+    // with a fixed F0 of 0.04. 0 leaves the material exactly as before. Only the
+    // PBR path reads these.
+    float clearcoat = 0.0f;
+    float clearcoatRoughness = 0.04f;
 
     glm::vec3 emissionColor = glm::vec3(1.0f);
     float emissionStrength = 0.0f;
@@ -378,6 +387,14 @@ struct SkeletalAnimationComponent {
     bool loop = true;
     int skeletonRootId = -1;
     int maxBones = 128;
+    // Never frustum-cull this skinned mesh (e.g. the player's own VR rig, which should
+    // always draw however the IK has posed it). Serialized as skelAlwaysRender.
+    bool alwaysRender = false;
+    // Runtime only: mesh-local box enclosing the current skinned pose, rebuilt each frame
+    // by Engine::updateSkinningMatrices. Culling uses it instead of the bind-pose box.
+    bool poseBoundsValid = false;
+    glm::vec3 poseBoundsMin{0.0f};
+    glm::vec3 poseBoundsMax{0.0f};
     std::vector<std::string> boneNames;
     std::vector<int> boneNodeIds;
     std::vector<int> armatureNodeIds;
@@ -424,6 +441,230 @@ struct ReflectionCastComponent {
     float intensity = 1.0f;
     int resolution = 128;
     bool baked = false;
+};
+
+// Instancer: one Empty object that draws (and optionally collides) thousands of copies of
+// template objects. A prototype's template is any scene object (normally a disabled tree/rock
+// hierarchy); every mesh-bearing descendant is drawn once per instance through the renderer's
+// instance groups, so a forest costs a handful of draw calls instead of one object per tree.
+enum class InstancerColliderMode {
+    None = 0,
+    Capsule = 1
+};
+
+struct InstancerPrototype {
+    int sourceObjectId = -1;          // Template object (root of the hierarchy that is drawn).
+    int lodSourceObjectId = -1;       // Optional cheaper template used beyond lodDistance.
+    float lodDistance = 80.0f;        // Metres from the camera; <= 0 disables LOD switching.
+    float maxDrawDistance = 400.0f;   // Instances farther than this are not drawn; <= 0 = unlimited.
+    bool castShadows = true;
+    float shadowDistance = 120.0f;    // Instances farther than this skip the shadow pass; <= 0 = unlimited.
+    InstancerColliderMode colliderMode = InstancerColliderMode::None;
+    float colliderRadius = 0.35f;     // Capsule, in metres before the instance scale.
+    float colliderHeight = 4.0f;
+    float colliderOffsetY = 0.0f;     // Capsule base offset above the instance origin.
+    bool alignToGround = false;       // Scatter / convert tilt the instance to the ground normal.
+    float scatterWeight = 1.0f;       // Relative share when scattering several prototypes.
+    float scaleMin = 0.85f;           // Scatter scale range (multiplies the template scale).
+    float scaleMax = 1.25f;
+};
+
+struct InstancerInstance {
+    glm::vec3 position = glm::vec3(0.0f);   // Local to the instancer object.
+    float yawDegrees = 0.0f;
+    float scale = 1.0f;                     // Uniform, multiplies the template's own scale.
+    uint16_t prototype = 0;
+    uint8_t tint = 255;                     // Reserved per-instance variation byte (255 = none).
+    int8_t tiltX = 0;                       // Ground-normal xz components * 127 (alignToGround).
+    int8_t tiltZ = 0;
+};
+
+struct InstancerComponent {
+    bool enabled = true;
+    std::vector<InstancerPrototype> prototypes;
+    // Copy-on-write: scene undo snapshots copy SceneObjects, so thousands of instances must
+    // never be deep-copied per snapshot. Edit only through mutableInstances().
+    std::shared_ptr<std::vector<InstancerInstance>> instances;
+    // Not saved. Globally unique and bumped by every edit (and every load) so renderer and
+    // physics caches can tell "same list" from "different list that reuses the allocation".
+    uint64_t revision = 0;
+
+    size_t instanceCount() const { return instances ? instances->size() : 0u; }
+    static uint64_t NextRevision() {
+        static std::atomic<uint64_t> counter{0};
+        return ++counter;
+    }
+    void touch() { revision = NextRevision(); }
+    std::vector<InstancerInstance>& mutableInstances() {
+        if (!instances) {
+            instances = std::make_shared<std::vector<InstancerInstance>>();
+        } else if (instances.use_count() > 1) {
+            instances = std::make_shared<std::vector<InstancerInstance>>(*instances);
+        }
+        touch();
+        return *instances;
+    }
+    void setInstances(std::vector<InstancerInstance> list) {
+        instances = std::make_shared<std::vector<InstancerInstance>>(std::move(list));
+        touch();
+    }
+};
+
+// Terrain: one Empty object that owns a heightmap + splat map and draws/collides as chunked ground.
+// Local space is centred: X/Z span [-size/2, size/2], local Y = heightOffset + height01 * heightScale.
+// Heights and splat live behind shared_ptr (copy-on-write) so undo snapshots stay cheap, and are
+// stored in a sidecar `.modterrain` file (see TerrainRuntime.h), never in the scene text.
+struct TerrainLayer {
+    std::string albedoPath;                 // Empty = procedural default for the slot.
+    std::string normalPath;
+    float tiling = 4.0f;                    // Metres per texture repeat.
+    glm::vec3 tint = glm::vec3(1.0f);
+    float normalStrength = 1.0f;
+};
+
+struct TerrainPond {
+    glm::vec2 center = glm::vec2(0.0f);     // Terrain-local XZ.
+    float radius = 8.0f;
+    float waterHeight = 0.0f;               // Terrain-local Y of the water surface.
+};
+
+struct TerrainClearing {
+    glm::vec2 center = glm::vec2(0.0f);     // Terrain-local XZ.
+    glm::vec2 size = glm::vec2(12.0f, 12.0f);   // Circle: x = radius. Rectangle: half extents.
+    float rotationDegrees = 0.0f;           // Rectangles only.
+    bool rectangle = false;
+    float blend = 8.0f;                     // Metres of smooth falloff outside the shape.
+    bool useHeight = false;                 // false: flatten to the terrain height at the centre.
+    float height = 0.0f;                    // Terrain-local Y when useHeight.
+    bool keepOut = true;                    // Instancer scatter stays out (open space for the author).
+};
+
+struct TerrainRect {
+    int minX = 0, minZ = 0, maxX = -1, maxZ = -1;   // Inclusive sample rect; empty when max < min.
+    bool empty() const { return maxX < minX || maxZ < minZ; }
+    void include(int x0, int z0, int x1, int z1) {
+        if (empty()) { minX = x0; minZ = z0; maxX = x1; maxZ = z1; return; }
+        minX = std::min(minX, x0); minZ = std::min(minZ, z0);
+        maxX = std::max(maxX, x1); maxZ = std::max(maxZ, z1);
+    }
+};
+
+struct TerrainComponent {
+    bool enabled = true;
+    float size = 256.0f;                    // World X/Z extent in metres (before object scale).
+    float heightScale = 30.0f;              // Metres for a normalized height of 1.
+    float heightOffset = -10.0f;            // Metres added to every height (local Y of normalized 0).
+    int resolution = 513;                   // Height samples per side.
+    int splatResolution = 512;              // Splat texels per side.
+    bool castShadows = true;
+    bool collision = true;                  // Static Jolt heightfield at play start.
+    float lodDistance = 70.0f;              // Metres to the first LOD step; doubles per level.
+    TerrainLayer layers[4];                 // R grass, G forest floor/dirt, B path, A rock.
+
+    // GPU grass (RenderGrass: generated in the vertex shader around the camera, nothing uploaded per frame).
+    bool grassEnabled = true;
+    float grassDensityScale = 1.0f;         // >= 0 multiplier (unbounded) on the blade count of every LOD ring.
+    float grassBladeHeight = 0.70f;         // Metres, average blade (varies per blade and per patch).
+    float grassBladeWidth = 0.045f;         // Metres at the root of a close-up blade.
+    float grassHeightVariation = 0.55f;      // 0 uniform .. 1 very uneven.
+    float grassBend = 0.35f;                // How far blades arch over (0 straight .. 1 drooping).
+    float grassDistance = 45.0f;            // Metres; blades shrink and thin out towards this.
+    float grassWindStrength = 1.0f;         // Multiplier on the scene wind.
+    float grassDryAmount = 0.22f;           // Share of the field covered by dry / yellow patches.
+    glm::vec3 grassBaseColor = glm::vec3(0.05f, 0.13f, 0.025f);   // Display colour at the root.
+    glm::vec3 grassTipColor = glm::vec3(0.58f, 0.73f, 0.16f);     // ... at the tip.
+    glm::vec3 grassDryColor = glm::vec3(0.64f, 0.56f, 0.27f);     // Dry patches.
+
+    // Pond water surface (RenderGrass.cpp). Ponds themselves are the list below.
+    bool waterEnabled = true;
+    glm::vec3 waterShallowColor = glm::vec3(0.10f, 0.30f, 0.24f);
+    glm::vec3 waterDeepColor = glm::vec3(0.012f, 0.07f, 0.075f);
+    float waterClarity = 1.6f;              // Metres of depth that hide 63% of what lies below.
+    float waterWaveScale = 1.0f;            // Ripple size multiplier (1 = ~0.5 m ripples).
+    float waterWaveStrength = 0.35f;        // Normal perturbation.
+    float waterReflection = 1.0f;           // Sky reflection multiplier.
+    float waterFoam = 0.6f;                 // Shore foam amount.
+    std::vector<TerrainPond> ponds;
+    std::vector<TerrainClearing> clearings;
+    std::string dataPath;                   // Project-relative `.modterrain` sidecar ("" = assigned on save).
+
+    // Generate panel recipe (remembered so a terrain can be re-rolled).
+    int genSeed = 1;
+    float genAmplitude = 3.0f;              // Metres of hills.
+    float genScale = 90.0f;                 // Metres per base noise feature.
+    int genOctaves = 5;
+    float genPersistence = 0.5f;
+    float genRidged = 0.0f;                 // 0 smooth fBm .. 1 ridged.
+
+    // Copy-on-write payloads. Edit only through the Terrain runtime helpers / begin*Edit().
+    std::shared_ptr<std::vector<float>> heights;     // resolution^2, normalized 0..1, index z*res+x
+    std::shared_ptr<std::vector<uint8_t>> splat;     // splatResolution^2 * 4 (RGBA8), row = Z
+    // Optional painted grass density (splatResolution^2, 255 = full). Null = full everywhere.
+    // Shares splatRevision: any change to it also bumps the splat revision.
+    std::shared_ptr<std::vector<uint8_t>> grassDensity;
+    // Not saved: globally unique ids bumped on every change/load, so renderer, physics and the
+    // sidecar writer can tell "same data" from "different data that reuses the allocation".
+    uint64_t heightRevision = 0;
+    uint64_t splatRevision = 0;
+    // Dirty rectangles accumulated since `*DirtyBase` so the renderer can rebuild only the touched
+    // chunks. Only valid for a consumer whose last seen revision lies in [base, current].
+    TerrainRect heightDirty;
+    TerrainRect splatDirty;
+    uint64_t heightDirtyBase = 0;
+    uint64_t splatDirtyBase = 0;
+    // The revisions last written to / read from the sidecar. Mutable: the scene writer is const.
+    mutable uint64_t savedHeightRevision = 0;
+    mutable uint64_t savedSplatRevision = 0;
+
+    static uint64_t NextRevision() {
+        static std::atomic<uint64_t> counter{0};
+        return ++counter;
+    }
+    bool hasData() const { return heights && splat && resolution >= 2; }
+    bool dataDirty() const {
+        return hasData() && (heightRevision != savedHeightRevision || splatRevision != savedSplatRevision);
+    }
+    // Start a height edit: unshares the buffer, returns it for writing. Follow with
+    // markHeightsChanged(rect) once the touched sample rectangle is known.
+    std::vector<float>& mutableHeights() {
+        if (!heights) heights = std::make_shared<std::vector<float>>();
+        else if (heights.use_count() > 1) heights = std::make_shared<std::vector<float>>(*heights);
+        return *heights;
+    }
+    std::vector<uint8_t>& mutableSplat() {
+        if (!splat) splat = std::make_shared<std::vector<uint8_t>>();
+        else if (splat.use_count() > 1) splat = std::make_shared<std::vector<uint8_t>>(*splat);
+        return *splat;
+    }
+    void markHeightsChanged(const TerrainRect& rect, bool newStroke) {
+        const uint64_t previous = heightRevision;
+        heightRevision = NextRevision();
+        if (newStroke || heightDirty.empty() || heightDirtyBase > previous) {
+            heightDirty = rect;
+            heightDirtyBase = previous;
+        } else {
+            if (!rect.empty()) heightDirty.include(rect.minX, rect.minZ, rect.maxX, rect.maxZ);
+        }
+    }
+    void markSplatChanged(const TerrainRect& rect, bool newStroke) {
+        const uint64_t previous = splatRevision;
+        splatRevision = NextRevision();
+        if (newStroke || splatDirty.empty() || splatDirtyBase > previous) {
+            splatDirty = rect;
+            splatDirtyBase = previous;
+        } else {
+            if (!rect.empty()) splatDirty.include(rect.minX, rect.minZ, rect.maxX, rect.maxZ);
+        }
+    }
+    // Whole-buffer replacement (generate, load, resize): consumers do a full rebuild.
+    void markAllChanged() {
+        heightRevision = NextRevision();
+        splatRevision = NextRevision();
+        heightDirty = TerrainRect{};
+        splatDirty = TerrainRect{};
+        heightDirtyBase = heightRevision;
+        splatDirtyBase = splatRevision;
+    }
 };
 
 enum class SceneCameraType {
@@ -983,6 +1224,7 @@ struct AudioSourceComponent {
     bool enabled = true;
     std::string clipPath;
     float volume = 1.0f;
+    float pitch = 1.0f; // playback-rate multiplier, clamped to [0.05, 4] when applied
     bool loop = true;
     bool playOnStart = true;
     bool spatial = true;
@@ -1458,6 +1700,10 @@ public:
     bool IsInvariable = false;
     // Derived each hierarchy update: true when all ancestors are locally enabled.
     bool hierarchyEnabled = true;
+    // Derived each hierarchy update (not serialized): true when some ancestor can move this
+    // object at runtime (rigidbody, player controller, scripts or animation). Such objects
+    // are excluded from world-space static merging.
+    bool hierarchyMovingAncestor = false;
     int layer = 0;
     std::string tag = "Untagged";
     glm::vec4 editorIconTint = glm::vec4(1.0f);
@@ -1534,6 +1780,10 @@ public:
     ParticleSystem2DComponent particleSystem2D;
     bool hasReverbZone = false;
     ReverbZoneComponent reverbZone;
+    bool hasInstancer = false;
+    InstancerComponent instancer;
+    bool hasTerrain = false;
+    TerrainComponent terrain;
     bool hasXROrigin = false;
     XROriginComponent xrOrigin;
     bool hasXRCamera = false;
@@ -1748,6 +1998,8 @@ inline const std::vector<std::string>& GetDefaultInspectorComponentOrderTemplate
         "animation",
         "skeletal_animation",
         "reverb_zone",
+        "instancer",
+        "terrain",
         "xr_origin",
         "xr_camera",
         "xr_controller",
@@ -1820,6 +2072,8 @@ inline void EnsureInspectorComponentMetadata(SceneObject& obj) {
     if (obj.hasAnimation) presentKeys.push_back("animation");
     if (obj.hasSkeletalAnimation) presentKeys.push_back("skeletal_animation");
     if (obj.hasReverbZone) presentKeys.push_back("reverb_zone");
+    if (obj.hasInstancer) presentKeys.push_back("instancer");
+    if (obj.hasTerrain) presentKeys.push_back("terrain");
     if (obj.hasXROrigin) presentKeys.push_back("xr_origin");
     if (obj.hasXRCamera) presentKeys.push_back("xr_camera");
     if (obj.hasXRController) presentKeys.push_back("xr_controller");

@@ -10,6 +10,16 @@ inline std::string NativeScriptArtifactStem(const fs::path& sourcePath) {
     }
     return stem;
 }
+inline constexpr const char* NativeScriptArtifactExtension() {
+#if defined(_WIN32)
+    return ".dll";
+#elif defined(__APPLE__)
+    return ".dylib";
+#else
+    return ".so";
+#endif
+}
+
 enum class ScriptOptimizationLevel {
     None,
     Speed
@@ -50,6 +60,20 @@ struct ScriptCompileOutput {
     std::string compileLog;
     std::string linkLog;
     fs::path producedBinaryPath;
+};
+// Held by a background compile worker for the length of one job: everything the thread does,
+// and every compiler process it spawns, runs below the editor's UI thread. Without it a 2-core
+// machine hands the compilers both cores and the editor drops to a few fps for the whole batch.
+// Foreground builds (export) do not take one and keep normal priority.
+class ScriptBackgroundBuildScope {
+    public:
+        ScriptBackgroundBuildScope();
+        ~ScriptBackgroundBuildScope();
+        ScriptBackgroundBuildScope(const ScriptBackgroundBuildScope&) = delete;
+        ScriptBackgroundBuildScope& operator=(const ScriptBackgroundBuildScope&) = delete;
+    private:
+        int previousPriority = 0;
+        bool applied = false;
 };
 class ScriptCompiler {
     public:

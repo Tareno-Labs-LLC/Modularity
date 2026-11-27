@@ -436,12 +436,24 @@ private:
         unsigned int depthCube = 0;
         int resolution = 0;
         uint64_t renderedFrame = UINT64_MAX, contentKey = 0;
+        // Hash of everything the last render drew (light, casters, matrices, alpha inputs).
+        // Only trusted while casterSignatureValid; re-creating the map clears it.
+        uint64_t casterSignature = 0;
+        bool casterSignatureValid = false;
     };
     struct ShadowDirectionalMap {
         unsigned int fbo = 0;
         unsigned int depthTexture = 0;
         int resolution = 0;
         uint64_t renderedFrame = UINT64_MAX, contentKey = 0;
+        uint64_t casterSignature = 0;
+        bool casterSignatureValid = false;
+    };
+    // One light's casters, gathered once so the signature and every cube face share the walk.
+    struct ShadowCasterRef {
+        uint32_t index = 0;
+        Mesh* mesh = nullptr;
+        glm::mat4 model{1.0f};
     };
     struct MirrorUpdateState {
         glm::vec3 lastCameraPos = glm::vec3(FLT_MAX);
@@ -458,12 +470,16 @@ private:
         unsigned int depth = 0;
         int resolution = 0;
         bool hasCapture = false;
+        // Highest mip level of cube (0 when it has no mip chain). Roughness picks
+        // a level from this in frag.glsl.
+        float maxLod = 0.0f;
     };
     struct SkyboxReflectionTarget {
         unsigned int fbo = 0;
         unsigned int cube = 0;
         unsigned int depth = 0;
         int resolution = 0;
+        float maxLod = 0.0f;
         uint64_t signature = 0;
         bool hasCapture = false;
         double lastCaptureSec = -1.0;
@@ -521,9 +537,23 @@ private:
         bool reflectionResolved = false;  // reflectionCube/Intensity already looked up
         unsigned int reflectionCube = 0;
         float reflectionIntensity = 0.0f;
+        // >= 0: a leader item for an Instancer part. Its matrices live in
+        // instancerState->viewBatches[instancerBatch]; the object is a (usually disabled) template.
+        int instancerBatch = -1;
+        // >= 0: a leader item for a Terrain object. Its chunk meshes live in
+        // terrainState->viewPool/viewBatches[terrainBatch] and are drawn one by one.
+        int terrainBatch = -1;
+        // >= 0: a leader item that draws the grass / pond water of terrainState->viewBatches[n]
+        // (RenderGrass.cpp). Generated entirely in the vertex shader; no mesh is drawn.
+        int grassBatch = -1;
+        int waterBatch = -1;
     };
     // Everything behind Project Settings > Optimization: per-object caches, pass
     // buffers, multi-draw and GPU culling resources. RenderOptimizationInternal.h.
+    struct InstancerState;
+    std::unique_ptr<InstancerState> instancerState;   // Instancer component caches (lazy)
+    struct TerrainState;                              // RenderTerrainInternal.h / RenderTerrain.cpp
+    std::unique_ptr<TerrainState> terrainState;       // Terrain component GPU state (lazy)
     struct InstanceState;
     std::unique_ptr<InstanceState> instanceState;
     struct StereoState;
@@ -638,6 +668,8 @@ private:
     int maxRealtimeLights = 10;
     int shadowMapResolution = 512;
     glm::vec3 ambientColor = glm::vec3(0.2f, 0.2f, 0.2f);
+    // 0 = flat ambient (legacy). 1 = sky-tinted hemisphere ambient when no environment cube is captured.
+    float ambientHemisphere = 0.0f;
     int sceneLightBudget = 20;
     int directionalLightAllowance = 1;
     bool mainLightEnabled = true;
@@ -678,6 +710,50 @@ private:
     uint64_t textureCacheGeneration = 0;
     WeatherDrive weatherDrive;
     float weatherTime = 0.0f;
+
+    // -- 3D rain (RenderRain.cpp) --
+    // Streaks and splashes are generated entirely in the vertex shaders from
+    // gl_InstanceID/gl_VertexID, the camera position and a clock, so nothing is
+    // uploaded per frame. The occlusion map is an orthographic depth render of
+    // the scene from straight above the camera, refreshed only when the camera
+    // has moved or a few frames have passed.
+    static constexpr int kRainMaxLights = 8;
+    struct RainState {
+        unsigned int vao = 0;
+        unsigned int occlusionFbo = 0;
+        unsigned int occlusionDepth = 0;
+        int occlusionResolution = 0;
+        bool occlusionValid = false;
+        glm::vec3 occlusionCenter = glm::vec3(0.0f);
+        glm::mat4 occlusionMatrix = glm::mat4(1.0f);
+        int occlusionAge = 0;
+        const void* occlusionSceneData = nullptr;
+        size_t occlusionSceneCount = 0;
+        uint64_t clockFrame = ~0ull;
+        double lastWallTime = -1.0;
+        double clock = 0.0;
+        glm::vec3 lastCameraPos = glm::vec3(0.0f);
+        glm::vec3 cameraVelocity = glm::vec3(0.0f);
+        bool haveLastCamera = false;
+        // Filled by renderSceneInternal from its light list right before the pass.
+        int lightCount = 0;
+        glm::vec4 lightPosRange[kRainMaxLights];   // xyz position, w range (0 = infinite)
+        glm::vec4 lightColorType[kRainMaxLights];  // rgb colour * intensity, w type (1 point, 2 spot)
+        glm::vec4 lightDirCone[kRainMaxLights];    // xyz spot direction, w inner cos
+        float lightOuterCos[kRainMaxLights] = {};
+        glm::vec3 sunDirection = glm::vec3(0.0f, -1.0f, 0.0f); // direction light travels
+        glm::vec3 sunColor = glm::vec3(0.0f);
+    };
+    RainState rainState;
+    // Resolves an object to the mesh, model matrix and cull sphere the main pass would use;
+    // supplied by renderSceneInternal (its helpers are local to Rendering.cpp).
+    using RainMeshResolver = Mesh* (*)(void* context, const SceneObject& obj, glm::mat4& outModel,
+                                       glm::vec3& outCenter, float& outRadius);
+    // Rain-driven wetness, integrated once per frame in updateSurfaceWetness.
+    float weatherWetness = 0.0f;
+    float surfaceWetness = 0.0f;
+    double surfaceWetnessLastSec = -1.0;
+    void updateSurfaceWetness();
     SceneWindState sceneWind;
 
     bool warnedTextureCacheThrashing = false;
@@ -698,6 +774,9 @@ private:
     uint64_t lastStaticMergeCheckFrameSerial = std::numeric_limits<uint64_t>::max();
     std::unordered_map<int, ShadowCubeMap> shadowCubeMaps;
     std::unordered_map<int, ShadowDirectionalMap> shadowDirectionalMaps;
+    // Per-light scratch lists, kept between frames so the shadow pass does not allocate.
+    std::vector<ShadowCasterRef> shadowCasterScratch;
+    std::vector<std::pair<uint32_t, Mesh*>> shadowCasterOptScratch;
     std::unordered_map<int, RenderTarget> mirrorTargets;
     std::unordered_map<int, MirrorUpdateState> mirrorUpdateStates;
     std::unordered_map<int, ReflectionCastTarget> reflectionCastTargets;
@@ -760,6 +839,14 @@ private:
     void renderParticleSystems(const std::vector<SceneObject>& sceneObjects,
                                const glm::mat4& view, const glm::mat4& proj);
     void releaseParticleBuffers();
+    // World-space rain and splashes for this view (RenderRain.cpp). No-op unless the
+    // weather is raining and SkyboxSettings::weather.rain3D is on.
+    void renderWeatherRain(const Camera& camera, const std::vector<SceneObject>& sceneObjects,
+                           const glm::mat4& view, const glm::mat4& proj, int width, int height,
+                           RainMeshResolver resolveMesh, void* resolveContext);
+    void updateRainOcclusion(const glm::vec3& cameraPos, const std::vector<SceneObject>& sceneObjects,
+                             RainMeshResolver resolveMesh, void* resolveContext);
+    void releaseRainResources();
     void refreshTextureCacheBudget(bool force = false);
     void purgeTextureCacheIfNeeded();
     float updateEyeAdaptation(unsigned int sourceTexture, int width, int height,
@@ -820,6 +907,8 @@ public:
     bool forceReloadShader(const std::string& vert, const std::string& frag);
     void setAmbientColor(const glm::vec3& color) { ambientColor = color; }
     glm::vec3 getAmbientColor() const { return ambientColor; }
+    void setAmbientHemisphere(float amount) { ambientHemisphere = std::clamp(amount, 0.0f, 1.0f); }
+    float getAmbientHemisphere() const { return ambientHemisphere; }
     void setShadowMapResolution(int resolution) { shadowMapResolution = std::clamp(resolution, 128, 4096); }
     int getShadowMapResolution() const { return shadowMapResolution; }
     void setMaxRealtimeLights(int count) { maxRealtimeLights = std::clamp(count, 1, kRendererMaxRealtimeLights); }
@@ -849,10 +938,22 @@ public:
     void setDefaultTextureFormatPolicy(TextureFormatPolicy policy);
     TextureFormatPolicy getDefaultTextureFormatPolicy() const { return defaultTextureFormatPolicy; }
     void setMaxTextureDimension(int maxDimension);
+    // One source of truth for anything that reacts to rain (3D rain, surface wetness):
+    // 0..1, already scaled by the weather mode and intensity; 0 when weather is off.
+    float getRainIntensity() const { return weatherDrive.active ? weatherDrive.rainAmount : 0.0f; }
+    // The weather clock (seconds, advanced by weather wind speed) the post rain uses.
+    float getWeatherTime() const { return weatherTime; }
+    const WeatherDrive& getWeatherDrive() const { return weatherDrive; }
+    // True when rain is drawn in world space this frame (the screen-space streaks are skipped).
+    bool isRain3DActive() const;
     void setWeatherDrive(const WeatherDrive& drive, float weatherTimeSeconds) {
         weatherDrive = drive;
         weatherTime = weatherTimeSeconds;
+        updateSurfaceWetness();
     }
+    // Wetness the lit shaders apply this frame: the scene override when set,
+    // otherwise the level the weather has ramped surfaces to.
+    float getSurfaceWetness() const { return surfaceWetness; }
     // Foliage wind, resolved once per frame by the engine before any view renders,
     // so every view, XR eye and shadow pass animates from the same time and value.
     void setSceneWind(const SceneWindState& wind) { sceneWind = wind; }

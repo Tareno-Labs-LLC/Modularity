@@ -54,6 +54,12 @@ struct WeatherSettings {
     // cheaper than any particle count that would look convincing - and it
     // costs the same on a Quest as on a desktop.
     float rainScale = 1.0f;
+    // World-space rain (RenderRain.cpp): instanced streaks in a camera-following
+    // volume, occluded by a top-down depth map so it stops under roofs, plus
+    // splashes on the surfaces it lands on. When on, the screen-space streaks
+    // above are turned off. rainDensity scales the streak/splash count.
+    bool rain3D = true;
+    float rainDensity = 1.0f;
 
     // -- Lightning --
     // Average seconds between strikes; the actual gap is randomised around it
@@ -136,6 +142,16 @@ struct SkyboxSettings {
     float environmentReflectionIntensity = 0.5f;
     float reflectionDistanceFadeStart = 4.0f;
     float reflectionDistanceFadeEnd = 24.0f;
+    // Image-based lighting from the captured sky cube: diffuse irradiance in
+    // place of the flat ambient colour alone, plus roughness-filtered specular
+    // reflections for PBR materials. 0 restores the old flat ambient exactly.
+    float environmentLightingIntensity = 1.0f;
+    bool skyLightingReflections = true;
+    // Surface wetness. -1 follows the weather (rain wets over ~20 s, dries over
+    // ~60 s); 0..1 forces a fixed level.
+    float wetness = -1.0f;
+    // How much standing water collects on wet, upward-facing rough surfaces.
+    float puddleAmount = 0.5f;
     bool fogEnabled = false;
     int fogMode = 0; // 0 linear, 1 exponential, 2 exponential squared
     float fogStart = 20.0f;
@@ -148,6 +164,26 @@ struct SkyboxSettings {
     // deriving it from timeOfDay. Off by default: existing scenes drive the sky
     // with timeOfDay and would otherwise jump the moment they are opened.
     bool sunFollowsDirectionalLight = false;
+
+    // -- Atmosphere --
+    //
+    // 0 is the original hand-tuned gradient sky; 1 is the physically based
+    // single-scattering atmosphere (Rayleigh + Mie + ozone). 1 is the default,
+    // so scenes that never set it get the new sky; set 0 to get the old look
+    // back. Model 1 also puts the timeOfDay arc on its documented schedule
+    // (0.25 sunrise, 0.5 noon, 0.75 sunset); model 0 keeps its original arc.
+    int atmosphereModel = 1;
+    // Aerosol haze. 2.5 is a clear day; higher is a hazier, whiter horizon and
+    // a wider glow around the sun.
+    float turbidity = 2.5f;
+    // Sun disk angular diameter in degrees (the real sun is ~0.53).
+    float sunSize = 0.8f;
+    // Scales sunlight into the sky, sun disk and clouds.
+    float sunIntensity = 1.0f;
+    // Physical/legacy procedural sky only: feed the scene fog the sky's own
+    // horizon colour instead of fogColor, so distant geometry dissolves into
+    // the sky rather than into a fixed grey.
+    bool fogMatchSky = true;
 
 
     // -- Volumetric clouds --
@@ -337,6 +373,19 @@ private:
     bool bakedCameraValid = false;
     glm::vec3 currentCameraPos = glm::vec3(0.0f);
     uint64_t cameraFrameSerial = ~0ull;
+    // True once the cube holds a mip chain (generated after every full bake).
+    bool bakedHasMips = false;
+    // GL_RGBA16F normally; GL_RGB10_A2 if the driver will not render to
+    // half-float. Alpha carries how much the baked clouds hide the sun.
+    unsigned int bakedFormat = 0;
+
+    // Sky horizon colour the scene fog is matched to. Recomputed on the CPU
+    // (a port of the shader's atmosphere, ~100 samples) only when something
+    // it depends on changes; the renderer reads it per draw.
+    glm::vec3 matchedFogColor = glm::vec3(0.65f, 0.72f, 0.78f);
+    bool matchedFogValid = false;
+    float matchedFogKey[12] = {};
+    void refreshMatchedFogColor();
 
     void setupMesh();
     bool reloadShader();
@@ -347,7 +396,8 @@ private:
     bool cachedSkyUsable() const;
     void applySkyUniforms(const glm::mat4& viewMat, const glm::mat4& projMat,
                           float viewportW, float viewportH,
-                          const glm::vec2& cameraAngles, bool sampleBaked);
+                          const glm::vec2& cameraAngles, bool sampleBaked,
+                          bool drawSunDisk = true);
     void drawSkyTriangle();
 
 public:
@@ -366,7 +416,10 @@ public:
     void setSettings(const SkyboxSettings& newSettings);
     // This frame's resolved weather. The skybox only consumes it; the schedule
     // and the audio live with the engine.
-    void setWeatherDrive(const WeatherDrive& drive) { weatherDrive = drive; }
+    void setWeatherDrive(const WeatherDrive& drive) {
+        weatherDrive = drive;
+        refreshMatchedFogColor();
+    }
     // Where the clouds are marched from. Without this they are an infinitely
     // distant dome you can never reach.
     //
@@ -388,6 +441,18 @@ public:
     // sky (lens flare, for one). Matches the shader's own choice either way.
     glm::vec3 resolvedSunDirection() const;
     const SkyboxSettings& getSettings() const { return settings; }
+    // Display-space sky colour just above the horizon, averaged around the
+    // compass (no clouds). Matches what skybox_frag.glsl draws there.
+    glm::vec3 horizonColor() const { return matchedFogColor; }
+    // The colour the scene fog should use this frame: the sky horizon when
+    // fogMatchSky is on and the procedural sky is showing, else fogColor.
+    glm::vec3 sceneFogColor() const;
+    // The baked procedural-sky cube (display-space colour, alpha = sun
+    // occlusion by clouds), or 0 while there is no complete bake. Mipmapped
+    // after every full bake when bakedSkyHasMips() is true.
+    unsigned int getBakedSkyCube() const { return bakedHasFullCapture ? bakedCube : 0u; }
+    int getBakedSkyResolution() const { return bakedResolution; }
+    bool bakedSkyHasMips() const { return bakedHasMips; }
 };
 
 #endif

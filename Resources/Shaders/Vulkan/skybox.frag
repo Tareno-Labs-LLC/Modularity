@@ -171,21 +171,12 @@ vec3 proceduralSky(vec3 dir, vec3 sunDir, float dayAmount) {
     return skyColor;
 }
 
-vec3 scrollingSky(vec3 dir) {
-    float yaw = atan(dir.z, dir.x) / (2.0 * PI) + 0.5;
-    float vertical = asin(clamp(dir.y, -0.96, 0.96)) / PI + 0.5;
-    float horizonLift = mix(0.0, uSky.camera.y * 0.18, uSky.params.w);
-    float wind = uSky.camera.w * 0.018;
-    vec2 uv = vec2((yaw + uSky.camera.x * uSky.camera.z * 0.35 + wind) * uSky.scroll.x,
-                   (vertical + horizonLift + sin(yaw * 6.28318 + uSky.camera.w * 0.22) * 0.012) * uSky.scroll.y);
-    vec3 cloudColor = texture(uScrollTex, uv).rgb;
-
-    vec2 highUv = vec2(uv.x + uSky.camera.w * 0.006, (0.82 + horizonLift) * uSky.scroll.y);
-    vec3 zenithColor = texture(uScrollTex, highUv).rgb;
-    float zenithFade = smoothstep(0.70, 0.92, dir.y);
-    float nadirFade = smoothstep(-0.72, -0.92, dir.y);
-    vec3 bottomColor = texture(uScrollTex, vec2(uv.x, (0.08 + horizonLift) * uSky.scroll.y)).rgb;
-    return mix(mix(cloudColor, zenithColor, zenithFade), bottomColor, nadirFade);
+vec3 scrollingSky() {
+    vec2 uv = gl_FragCoord.xy / max(uSky.scroll.zw, vec2(1.0));
+    uv.y = 1.0 - uv.y;
+    uv += vec2(uSky.camera.x * uSky.camera.z,
+               uSky.camera.y * uSky.params.w / PI);
+    return texture(uScrollTex, uv * uSky.scroll.xy).rgb;
 }
 
 void main() {
@@ -201,7 +192,7 @@ void main() {
     float nightAmount = 1.0 - dayAmount;
 
     if (skyMode > 0.5 && hasScrollTexture > 0.5) {
-        fragColor = vec4(scrollingSky(dir), 1.0);
+        fragColor = vec4(scrollingSky(), 1.0);
         return;
     }
 

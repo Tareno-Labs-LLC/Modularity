@@ -1,12 +1,15 @@
 #include "../EditorLocalization.h"
 #include "Engine.h"
+#include "ModuCPPTranspiler.h"
+#include "imgui_internal.h"
 
 #include <fstream>
 #include <sstream>
 #include <algorithm>
 #include <cctype>
+#include <map>
+#include <regex>
 #include <unordered_set>
-#include <unordered_map>
 #include <cstdlib>
 
 #if defined(_WIN32)
@@ -17,15 +20,6 @@ namespace Loc = Modularity::Loc;
 
 namespace {
     using ScriptEditorLanguage = ScriptLanguageServiceLanguage;
-
-    static uint64_t hashBuffer(const std::string& text) {
-        uint64_t hash = 1469598103934665603ull;
-        for (unsigned char c : text) {
-            hash ^= static_cast<uint64_t>(c);
-            hash *= 1099511628211ull;
-        }
-        return hash;
-    }
 
     static std::string toLowerCopy(std::string value) {
         std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
@@ -89,12 +83,15 @@ namespace {
 
     static void initializeScriptEditor(TextEditor& editor) {
         auto palette = editor.GetPalette();
+        palette[(int)TextEditor::PaletteIndex::Background] = IM_COL32(13, 13, 14, 255);
+        palette[(int)TextEditor::PaletteIndex::Keyword] = IM_COL32(102, 180, 226, 255);
+        palette[(int)TextEditor::PaletteIndex::String] = IM_COL32(238, 123, 125, 255);
         palette[(int)TextEditor::PaletteIndex::KnownIdentifier] = IM_COL32(220, 180, 70, 255);
         palette[(int)TextEditor::PaletteIndex::Preprocessor] = IM_COL32(110, 170, 220, 255);
         palette[(int)TextEditor::PaletteIndex::PreprocIdentifier] = IM_COL32(230, 165, 80, 255);
+        palette[(int)TextEditor::PaletteIndex::LineNumber] = IM_COL32(69, 155, 162, 255);
         editor.SetPalette(palette);
         editor.SetShowWhitespaces(true);
-        editor.SetAllowTabInput(false);
         editor.SetSmartTabDelete(true);
     }
 
@@ -457,23 +454,105 @@ void Engine::renderModuCppNvimWarningPopup() {
 #endif
 }
 
+namespace {
+    struct ScriptingFileRow {
+        size_t index;
+        std::string key;
+        std::string label;
+        size_t icon;
+        bool batchCapable;
+    };
+
+    struct ScriptingFolder {
+        std::map<std::string, ScriptingFolder> folders;
+        std::vector<ScriptingFileRow> files;
+    };
+
+    static constexpr const char* kScriptIconPaths[] = {
+        "Resources/Engine-Root/Scripting IDE/ModuCPP Icon.png",
+        "Resources/Engine-Root/Scripting IDE/CPP Icon.png",
+        "Resources/Engine-Root/Scripting IDE/C Icon.png",
+        "Resources/Engine-Root/File Explorer/File Icon Script.png"
+    };
+
+    static bool isRelativeToRoot(const fs::path& relative) {
+        return !relative.empty() && *relative.begin() != "..";
+    }
+
+    static ScriptLanguageServiceDocumentData analyzeScriptBuffer(
+        TextEditor& editor, const fs::path& path, const std::string& buffer) {
+        auto language = ScriptLanguageService::analyzeDocument(path, buffer);
+        if (language.language == ScriptEditorLanguage::Cpp || language.language == ScriptEditorLanguage::C) {
+            language.functionSignatures["Begin"] = "void Begin()";
+            language.functionSignatures["TickUpdate"] = "void TickUpdate(float deltaTime)";
+            language.functionSignatures["Spec"] = "void Spec()";
+            language.functionSignatures["TestEditor"] = "void TestEditor()";
+            language.functionSignatures["Update"] = "void Update(float deltaTime)";
+        }
+        editor.SetLanguageDefinition(buildLanguageDefinition(language.language, language.functions, language.defines));
+        return language;
+    }
+}
+
 void Engine::refreshScriptingFileList() {
     scriptingFileList.clear();
     scriptingCompletions.clear();
+    scriptingDirectory.clear();
     if (!projectManager.currentProject.isLoaded) {
         return;
     }
 
-    fs::path configPath = resolveScriptsConfigPath(projectManager.currentProject);
+    const Project& project = projectManager.currentProject;
     ScriptBuildConfig config;
     std::string error;
-    const bool hasConfig = scriptCompiler.loadConfig(configPath, config, error);
+    const bool hasConfig = scriptCompiler.loadConfig(resolveScriptsConfigPath(project), config, error);
+    scriptingDirectory = (hasConfig ? config.scriptsDir : project.assetsPath / "Scripts").lexically_normal();
     ScriptLanguageServiceProjectData projectData = ScriptLanguageService::scanProjectFiles(
-        projectManager.currentProject.projectPath,
-        projectManager.currentProject.assetsPath,
-        hasConfig ? &config : nullptr);
+        project.projectPath, project.assetsPath, hasConfig ? &config : nullptr);
     scriptingFileList = std::move(projectData.files);
     scriptingCompletions = std::move(projectData.projectSymbols);
+    for (auto& document : scriptEditorDocuments) {
+        document->completionPoolDirty = true;
+    }
+}
+
+void Engine::syncScriptEditorProject() {
+    const Project& project = projectManager.currentProject;
+    const fs::path path = project.isLoaded ? project.projectPath : fs::path{};
+    if (scriptingProjectPath == path) return;
+
+    scriptingProjectPath = path;
+    activeScriptEditor = nullptr;
+    scriptEditorPendingClose = nullptr;
+    selectScriptEditorTab = false;
+    scriptEditorDocuments.clear();
+    scriptingFilesDirty = true;
+}
+
+bool Engine::loadScriptEditorDocument(ScriptEditorDocument& document) {
+    std::ifstream file(document.filePath);
+    if (!file.is_open()) {
+        addConsoleMessage("Failed to read script: " + document.filePath.string(), ConsoleMessageType::Error);
+        return false;
+    }
+
+    std::ostringstream buffer;
+    buffer << file.rdbuf();
+    if (file.bad() || buffer.bad()) {
+        addConsoleMessage("Failed to read script: " + document.filePath.string(), ConsoleMessageType::Error);
+        return false;
+    }
+
+    document.buffer = buffer.str();
+    document.language = analyzeScriptBuffer(document.editor, document.filePath, document.buffer);
+    document.editor.SetText(document.buffer);
+    document.completionPoolDirty = true;
+    document.transpiledPreviewDirty = true;
+    document.dirty = false;
+    std::error_code ec;
+    document.lastWriteTime = fs::last_write_time(document.filePath, ec);
+    document.hasWriteTime = !ec;
+    return true;
 }
 
 void Engine::openScriptInEditor(const fs::path& path) {
@@ -491,31 +570,25 @@ void Engine::openScriptInEditor(const fs::path& path) {
         return;
     }
 
-    std::ifstream file(normalized);
-    std::stringstream buffer;
-    if (file.is_open()) {
-        buffer << file.rdbuf();
-    }
-    scriptEditorState.filePath = normalized;
-    scriptEditorState.buffer = buffer.str();
-    if (!scriptTextEditorReady) {
-        initializeScriptEditor(scriptTextEditor);
-        scriptTextEditorReady = true;
+    syncScriptEditorProject();
+    const std::string key = normalizeScriptSelectionKey(normalized);
+    const auto existing = std::find_if(scriptEditorDocuments.begin(), scriptEditorDocuments.end(),
+                                       [&](const auto& document) { return document->key == key; });
+    if (existing != scriptEditorDocuments.end()) {
+        activeScriptEditor = existing->get();
+    } else {
+        auto document = std::make_unique<ScriptEditorDocument>();
+        document->filePath = std::move(normalized);
+        document->key = key;
+        document->name = document->filePath.filename().string();
+        document->tabLabel = document->name + "###" + key;
+        initializeScriptEditor(document->editor);
+        if (!loadScriptEditorDocument(*document)) return;
+        activeScriptEditor = document.get();
+        scriptEditorDocuments.push_back(std::move(document));
     }
 
-    scriptLanguageDocument = ScriptLanguageService::analyzeDocument(normalized, scriptEditorState.buffer);
-    scriptTextEditor.SetLanguageDefinition(buildLanguageDefinition(
-        scriptLanguageDocument.language,
-        scriptLanguageDocument.functions,
-        scriptLanguageDocument.defines));
-
-    scriptTextEditor.SetText(scriptEditorState.buffer);
-    scriptEditorState.dirty = false;
-    scriptEditorState.hasWriteTime = false;
-    if (fs::exists(normalized, ec)) {
-        scriptEditorState.lastWriteTime = fs::last_write_time(normalized, ec);
-        scriptEditorState.hasWriteTime = !ec;
-    }
+    selectScriptEditorTab = true;
     showScriptingWindow = true;
 }
 
@@ -526,832 +599,822 @@ void Engine::renderScriptingWindow() {
         return;
     }
 
-    bool listRefreshedThisFrame = false;
-    if (scriptingFilesDirty) {
-        refreshScriptingFileList();
-        scriptingFilesDirty = false;
-        listRefreshedThisFrame = true;
+    syncScriptEditorProject();
+    if (selectScriptEditorTab) ImGui::SetNextWindowFocus();
+    if (!ImGui::Begin(Loc::Window("WINDOW_SCRIPTING", "Scripting"), &showScriptingWindow)) {
+        ImGui::End();
+        return;
     }
-
-    ImGui::Begin(Loc::Window("WINDOW_SCRIPTING", "Scripting"), &showScriptingWindow);
     if (!projectManager.currentProject.isLoaded) {
         ImGui::TextDisabled("Load a project to edit scripts.");
         ImGui::End();
         return;
     }
 
-    ImGuiIO& io = ImGui::GetIO();
-    static std::vector<std::string> symbols;
-    static uint64_t symbolsHash = 0;
-    static std::vector<std::string> bufferIdentifiers;
-    static std::vector<std::string> bufferFunctions;
-    static std::vector<std::string> bufferDefines;
-    static std::unordered_map<std::string, std::string> functionSignatures;
-    static uint64_t identifiersHash = 0;
-    static fs::path identifiersFilePath;
-    static ScriptLanguageServiceLanguage activeLanguage = ScriptLanguageServiceLanguage::Cpp;
-    static std::vector<std::string> completionPool;
-    static std::vector<std::string> activeSuggestions;
-    static std::string activePrefix;
-    static bool completionPoolDirty = true;
-    static int selectedSuggestionIndex = 0;
-    static bool completionManuallyDismissed = false;
-    static std::string completionDismissPrefix;
-    static bool completionPopupVisibleLastFrame = false;
-    static fs::path reloadCheckPath;
-    static bool cachedCanReload = false;
-    static double lastReloadCheckTime = 0.0;
-    static std::string cachedFilterLower;
-    static std::vector<int> filteredScriptIndices;
-    static std::unordered_set<std::string> selectedCompileScripts;
     static bool showFilePane = true;
-    static bool showDetailsPane = true;
+    static bool showMinimap = true;
     static bool showDiagnosticsPane = true;
-    static float filePaneWidth = 240.0f;
-    static float detailsPaneWidth = 250.0f;
-    static float diagnosticsPaneHeight = 160.0f;
-
-    if (listRefreshedThisFrame) {
-        completionPoolDirty = true;
+    static bool showIntelliSense = false;
+    static float filePaneWidth = 202.0f;
+    static float diagnosticsPaneHeight = 148.0f;
+    static ScriptingFolder fileTree;
+    static std::string cachedFilter;
+    static std::unordered_set<std::string> selectedCompileScripts;
+    static fs::path batchProjectPath;
+    if (batchProjectPath != scriptingProjectPath) {
+        batchProjectPath = scriptingProjectPath;
+        selectedCompileScripts.clear();
     }
 
-    ImGui::TextDisabled("Script & Shader Editor");
-    ImGui::SameLine();
-    if (ImGui::Button("Refresh List")) {
-        scriptingFilesDirty = true;
+    const bool listRefreshed = scriptingFilesDirty;
+    if (listRefreshed) {
+        refreshScriptingFileList();
+        scriptingFilesDirty = false;
     }
-    ImGui::SameLine();
-    ImGui::Checkbox("Files", &showFilePane);
-    ImGui::SameLine();
-    ImGui::Checkbox("Details", &showDetailsPane);
-    ImGui::SameLine();
-    ImGui::Checkbox("Diagnostics", &showDiagnosticsPane);
 
-    ImGui::Separator();
-
-    const float topSplitThickness = 4.0f;
-    if (showFilePane) {
-        float availWidth = ImGui::GetContentRegionAvail().x;
-        const float minFilePane = 180.0f;
-        const float minMainPane = 380.0f;
-        const float maxFilePane = std::max(minFilePane, availWidth - minMainPane - topSplitThickness);
-        filePaneWidth = std::clamp(filePaneWidth, minFilePane, maxFilePane);
-
-        ImGui::BeginChild("ScriptingFiles", ImVec2(filePaneWidth, 0.0f), true);
-        ImGui::TextDisabled("Scripts / Shaders");
-        bool filterChanged = ImGui::InputTextWithHint("##ScriptFilter", "Filter", scriptingFilter, sizeof(scriptingFilter));
-        ImGui::Separator();
-
-        std::string filterLower = toLowerCopy(scriptingFilter);
-        if (listRefreshedThisFrame || filterChanged || filterLower != cachedFilterLower) {
-            cachedFilterLower = filterLower;
-            filteredScriptIndices.clear();
-            filteredScriptIndices.reserve(scriptingFileList.size());
-            for (size_t i = 0; i < scriptingFileList.size(); ++i) {
-                if (!cachedFilterLower.empty()) {
-                    std::string labelLower = toLowerCopy(scriptingFileList[i].filename().string());
-                    if (labelLower.find(cachedFilterLower) == std::string::npos) {
-                        continue;
-                    }
-                }
-                filteredScriptIndices.push_back(static_cast<int>(i));
-            }
-            std::unordered_set<std::string> visibleKeys;
-            visibleKeys.reserve(scriptingFileList.size());
-            for (const auto& scriptPath : scriptingFileList) {
-                visibleKeys.insert(normalizeScriptSelectionKey(scriptPath));
-            }
-            for (auto it = selectedCompileScripts.begin(); it != selectedCompileScripts.end(); ) {
-                if (visibleKeys.find(*it) == visibleKeys.end()) {
-                    it = selectedCompileScripts.erase(it);
-                } else {
-                    ++it;
-                }
-            }
+    auto saveDocument = [&](ScriptEditorDocument& document) {
+        std::ofstream out(document.filePath);
+        out << document.buffer;
+        out.close();
+        if (!out) {
+            addConsoleMessage("Failed to save script: " + document.filePath.string(), ConsoleMessageType::Error);
+            return false;
         }
-
-        int selectedBatchCount = static_cast<int>(selectedCompileScripts.size());
-        ImGui::TextDisabled("Batch Selection: %d", selectedBatchCount);
-        ImGui::SameLine();
-        ImGui::BeginDisabled(selectedBatchCount == 0 || compileInProgress);
-        if (ImGui::Button("Compile Selected")) {
-            std::vector<fs::path> batch;
-            batch.reserve(selectedCompileScripts.size());
-            for (const auto& scriptPath : scriptingFileList) {
-                const std::string key = normalizeScriptSelectionKey(scriptPath);
-                if (selectedCompileScripts.find(key) == selectedCompileScripts.end()) {
-                    continue;
-                }
-                const std::string ext = extensionLower(scriptPath);
-                if (ext == ".cs" || ext == ".csproj") {
-                    continue;
-                }
-                batch.push_back(scriptPath);
-            }
-            if (!batch.empty()) {
-                queueScriptCompileBatch(batch);
-            }
+        document.dirty = false;
+        std::error_code ec;
+        document.lastWriteTime = fs::last_write_time(document.filePath, ec);
+        document.hasWriteTime = !ec;
+        if (scriptEditorAutoCompileOnSave && ScriptLanguageService::isCompilableScriptPath(document.filePath)) {
+            compileScriptFile(document.filePath);
         }
-        ImGui::EndDisabled();
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Clear Selection")) {
-            selectedCompileScripts.clear();
+        return true;
+    };
+
+    auto closeDocument = [&](ScriptEditorDocument* document) {
+        auto it = std::find_if(scriptEditorDocuments.begin(), scriptEditorDocuments.end(),
+                               [&](const auto& tab) { return tab.get() == document; });
+        if (it == scriptEditorDocuments.end()) return;
+        if (activeScriptEditor == document) {
+            activeScriptEditor = it != scriptEditorDocuments.begin() ? (it - 1)->get()
+                : (it + 1 != scriptEditorDocuments.end() ? (it + 1)->get() : nullptr);
+            selectScriptEditorTab = activeScriptEditor != nullptr;
         }
+        scriptEditorDocuments.erase(it);
+    };
 
-        ImGui::Spacing();
-
-        ImGuiListClipper clipper;
-        clipper.Begin(static_cast<int>(filteredScriptIndices.size()));
-        while (clipper.Step()) {
-            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
-                const fs::path& scriptPath = scriptingFileList[filteredScriptIndices[row]];
-                std::string label = scriptPath.filename().string();
-                const std::string key = normalizeScriptSelectionKey(scriptPath);
-                const bool selected = (scriptEditorState.filePath == scriptPath);
-                const std::string ext = extensionLower(scriptPath);
-                const bool batchCapable = ext != ".cs" && ext != ".csproj";
-
-                ImGui::PushID(filteredScriptIndices[row]);
-                bool compileSelected = selectedCompileScripts.find(key) != selectedCompileScripts.end();
-                if (!batchCapable) {
-                    ImGui::BeginDisabled();
-                }
-                if (ImGui::Checkbox("##BatchSelect", &compileSelected)) {
-                    if (compileSelected) {
-                        selectedCompileScripts.insert(key);
-                    } else {
-                        selectedCompileScripts.erase(key);
-                    }
-                }
-                if (!batchCapable) {
-                    ImGui::EndDisabled();
-                }
-                ImGui::SameLine();
-                ImGuiSelectableFlags rowFlags = ImGuiSelectableFlags_SpanAvailWidth;
-                if (ImGui::Selectable(label.c_str(), selected, rowFlags)) {
-                    openScriptInEditor(scriptPath);
-                }
-                if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
-                    if (batchCapable) {
-                        if (compileSelected) {
-                            selectedCompileScripts.erase(key);
-                        } else {
-                            selectedCompileScripts.insert(key);
-                        }
-                    }
-                }
-                ImGui::PopID();
-            }
-        }
-        ImGui::EndChild();
-
-        ImGui::SameLine();
-        float splitterHeight = ImGui::GetContentRegionAvail().y;
-        if (splitterHeight < 1.0f) splitterHeight = 1.0f;
-        ImGui::InvisibleButton("ScriptingFilePaneSplitter", ImVec2(topSplitThickness, splitterHeight));
-        if (ImGui::IsItemHovered() || ImGui::IsItemActive()) {
-            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
-        }
-        if (ImGui::IsItemActive()) {
-            filePaneWidth += io.MouseDelta.x;
-            filePaneWidth = std::clamp(filePaneWidth, minFilePane, maxFilePane);
-        }
-        ImGui::SameLine();
-    }
-
-    ImGui::BeginChild("ScriptingEditor", ImVec2(0.0f, 0.0f), false);
-    ImGui::TextDisabled("Active File");
+    ImGuiStyle& style = ImGui::GetStyle();
+    const bool checkboxSwitch = style.CheckboxSwitch;
+    style.CheckboxSwitch = true;
+    ImGui::Checkbox("Auto-compile on save", &scriptEditorAutoCompileOnSave);
+    style.CheckboxSwitch = checkboxSwitch;
     ImGui::SameLine();
-    std::string fileLabel = scriptEditorState.filePath.empty()
-        ? std::string("None")
-        : scriptEditorState.filePath.filename().string();
-    ImGui::TextUnformatted(fileLabel.c_str());
+    ImGui::BeginDisabled(!activeScriptEditor);
+    if (ImGui::Button("Save")) saveDocument(*activeScriptEditor);
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    const bool canCompile = activeScriptEditor && ScriptLanguageService::isCompilableScriptPath(activeScriptEditor->filePath);
+    ImGui::BeginDisabled(!canCompile);
+    if (ImGui::Button("Compile")) compileScriptFile(activeScriptEditor->filePath);
+    ImGui::EndDisabled();
 
-    bool hasFile = !scriptEditorState.filePath.empty();
-    bool canCompileFile = hasFile && ScriptLanguageService::isCompilableScriptPath(scriptEditorState.filePath);
-    ImGui::SameLine();
-    if (!hasFile) {
-        ImGui::BeginDisabled();
-    }
-    if (ImGui::Button("Save")) {
-        std::ofstream out(scriptEditorState.filePath);
-        if (out.is_open()) {
-            scriptEditorState.buffer = scriptTextEditor.GetText();
-            out << scriptEditorState.buffer;
-            scriptEditorState.dirty = false;
-            std::error_code ec;
-            scriptEditorState.lastWriteTime = fs::last_write_time(scriptEditorState.filePath, ec);
-            scriptEditorState.hasWriteTime = !ec;
-            cachedCanReload = false;
-            lastReloadCheckTime = glfwGetTime();
-            if (scriptEditorState.autoCompileOnSave && canCompileFile) {
-                compileScriptFile(scriptEditorState.filePath);
-            }
-        }
-    }
-    ImGui::SameLine();
-    if (!canCompileFile) {
-        ImGui::BeginDisabled();
-    }
-    if (ImGui::Button("Compile")) {
-        compileScriptFile(scriptEditorState.filePath);
-    }
-    if (!canCompileFile) {
-        ImGui::EndDisabled();
-    }
-    ImGui::SameLine();
-    if (!canCompileFile) {
-        ImGui::BeginDisabled();
-    }
-    ImGui::Checkbox("Auto-compile on save", &scriptEditorState.autoCompileOnSave);
-    if (!canCompileFile) {
-        ImGui::EndDisabled();
-    }
-    if (!hasFile) {
-        ImGui::EndDisabled();
-    }
-
-    bool canReload = false;
-    if (reloadCheckPath != scriptEditorState.filePath) {
-        reloadCheckPath = scriptEditorState.filePath;
-        cachedCanReload = false;
-        lastReloadCheckTime = 0.0;
-    }
-    if (hasFile && scriptEditorState.hasWriteTime) {
+    static std::string reloadCheckKey;
+    static double lastReloadCheckTime = 0.0;
+    static bool canReload = false;
+    if (activeScriptEditor && activeScriptEditor->hasWriteTime) {
         const double now = glfwGetTime();
-        if (now - lastReloadCheckTime >= 0.25) {
+        if (reloadCheckKey != activeScriptEditor->key || now - lastReloadCheckTime >= 0.25) {
+            reloadCheckKey = activeScriptEditor->key;
             lastReloadCheckTime = now;
-            cachedCanReload = false;
             std::error_code ec;
-            if (fs::exists(scriptEditorState.filePath, ec)) {
-                auto diskTime = fs::last_write_time(scriptEditorState.filePath, ec);
-                if (!ec && diskTime > scriptEditorState.lastWriteTime) {
-                    cachedCanReload = true;
-                }
+            const auto diskTime = fs::last_write_time(activeScriptEditor->filePath, ec);
+            canReload = !ec && diskTime != activeScriptEditor->lastWriteTime;
+        }
+        if (canReload) {
+            ImGui::SameLine();
+            if (ImGui::Button("Reload")) {
+                if (loadScriptEditorDocument(*activeScriptEditor)) canReload = false;
             }
+            ImGui::SetItemTooltip("The file changed on disk. Reload it from disk.");
         }
-        canReload = cachedCanReload;
-    }
-    if (canReload) {
-        ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.35f, 1.0f), "File changed on disk");
-        ImGui::SameLine();
-        if (ImGui::Button("Reload")) {
-            openScriptInEditor(scriptEditorState.filePath);
-            cachedCanReload = false;
-            lastReloadCheckTime = glfwGetTime();
-        }
+    } else {
+        reloadCheckKey.clear();
     }
 
-    ImGui::Separator();
-
-    if (ImGui::BeginTabBar("ScriptingTabs")) {
-        if (ImGui::BeginTabItem("Editor")) {
-            if (hasFile) {
-                if (!scriptTextEditorReady) {
-                    initializeScriptEditor(scriptTextEditor);
-                    scriptTextEditorReady = true;
-                }
-
-                ScriptLanguageServiceLanguage language = ScriptLanguageService::detectLanguage(scriptEditorState.filePath);
-                uint64_t bufferHash = hashBuffer(scriptEditorState.buffer);
-                bool fileChanged = (identifiersFilePath != scriptEditorState.filePath);
-                bool languageChanged = (activeLanguage != language);
-                if (bufferHash != identifiersHash || fileChanged || languageChanged) {
-                    identifiersHash = bufferHash;
-                    identifiersFilePath = scriptEditorState.filePath;
-                    activeLanguage = language;
-
-                    scriptLanguageDocument = ScriptLanguageService::analyzeDocument(
-                        scriptEditorState.filePath,
-                        scriptEditorState.buffer);
-                    bufferIdentifiers = scriptLanguageDocument.identifiers;
-                    bufferFunctions = scriptLanguageDocument.functions;
-                    bufferDefines = scriptLanguageDocument.defines;
-                    functionSignatures = scriptLanguageDocument.functionSignatures;
-                    if (language == ScriptEditorLanguage::Cpp || language == ScriptEditorLanguage::C) {
-                        functionSignatures["Begin"] = "void Begin()";
-                        functionSignatures["TickUpdate"] = "void TickUpdate(float deltaTime)";
-                        functionSignatures["Spec"] = "void Spec()";
-                        functionSignatures["TestEditor"] = "void TestEditor()";
-                        functionSignatures["Update"] = "void Update(float deltaTime)";
-                    }
-                    scriptTextEditor.SetLanguageDefinition(buildLanguageDefinition(
-                        scriptLanguageDocument.language,
-                        bufferFunctions,
-                        bufferDefines));
-                    completionPoolDirty = true;
-                }
-
-                auto rebuildCompletionPool = [&]() -> bool {
-                    if (!completionPoolDirty) return false;
-                    completionPool.clear();
-                    std::unordered_set<std::string> poolSet;
-                    const auto& langDef = scriptTextEditor.GetLanguageDefinition();
-                    for (const auto& kw : langDef.mKeywords) poolSet.insert(kw);
-                    for (const auto& identifier : langDef.mIdentifiers) poolSet.insert(identifier.first);
-                    for (const auto& identifier : langDef.mPreprocIdentifiers) poolSet.insert(identifier.first);
-                    for (const auto& entry : scriptingCompletions) poolSet.insert(entry);
-                    for (const auto& entry : symbols) poolSet.insert(entry);
-                    for (const auto& entry : bufferIdentifiers) poolSet.insert(entry);
-                    for (const auto& entry : bufferFunctions) poolSet.insert(entry);
-                    for (const auto& entry : bufferDefines) poolSet.insert(entry);
-                    for (const auto& entry : scriptLanguageDocument.variables) poolSet.insert(entry);
-                    for (const auto& entry : scriptLanguageDocument.moducppImports) poolSet.insert(entry);
-                    for (const auto& entry : scriptLanguageDocument.moducppInspectorFields) poolSet.insert(entry);
-                    for (const auto& entry : scriptLanguageDocument.moducppCompletions) poolSet.insert(entry);
-                    completionPool.assign(poolSet.begin(), poolSet.end());
-                    std::sort(completionPool.begin(), completionPool.end());
-                    completionPoolDirty = false;
-                    return true;
-                };
-
-                struct ActiveTokenInfo {
-                    bool valid = false;
-                    TextEditor::Coordinates cursor;
-                    TextEditor::Coordinates start;
-                    TextEditor::Coordinates end;
-                    std::string word;
-                    std::string prefix;
-                };
-
-                auto activeToken = [&]() -> ActiveTokenInfo {
-                    ActiveTokenInfo token;
-                    token.cursor = scriptTextEditor.GetCursorPosition();
-                    TextEditor::Coordinates probe = token.cursor;
-                    token.word = scriptTextEditor.GetWordAtPublic(probe);
-                    if (token.word.empty() && token.cursor.mColumn > 0) {
-                        probe = TextEditor::Coordinates(token.cursor.mLine, token.cursor.mColumn - 1);
-                        token.word = scriptTextEditor.GetWordAtPublic(probe);
-                    }
-                    if (token.word.empty()) return token;
-                    token.start = scriptTextEditor.FindWordStartPublic(probe);
-                    token.end = scriptTextEditor.FindWordEndPublic(probe);
-                    int prefixLength = std::clamp(token.cursor.mColumn - token.start.mColumn, 0, static_cast<int>(token.word.size()));
-                    token.prefix = token.word.substr(0, static_cast<size_t>(prefixLength));
-                    token.valid = true;
-                    return token;
-                };
-
-                auto updateSuggestions = [&](const std::string& prefix) {
-                    bool prefixChanged = (prefix != activePrefix);
-                    activePrefix = prefix;
-                    if (prefixChanged) {
-                        selectedSuggestionIndex = 0;
-                    }
-                    if (!completionDismissPrefix.empty() && activePrefix != completionDismissPrefix) {
-                        completionManuallyDismissed = false;
-                    }
-                    if (!activePrefix.empty()) {
-                        activeSuggestions = ScriptLanguageService::buildCompletionList(completionPool, activePrefix);
-                    } else {
-                        activeSuggestions.clear();
-                    }
-                    if (activeSuggestions.empty()) {
-                        selectedSuggestionIndex = 0;
-                    } else {
-                        selectedSuggestionIndex = std::clamp(selectedSuggestionIndex, 0, static_cast<int>(activeSuggestions.size()) - 1);
-                    }
-                };
-
-                auto applySuggestion = [&](const std::string& suggestion) {
-                    ActiveTokenInfo token = activeToken();
-                    TextEditor::Coordinates cursor = scriptTextEditor.GetCursorPosition();
-                    TextEditor::Coordinates replaceStart = token.valid
-                        ? token.start
-                        : TextEditor::Coordinates(cursor.mLine, std::max(0, cursor.mColumn - static_cast<int>(activePrefix.size())));
-                    TextEditor::Coordinates replaceEnd = token.valid ? token.end : cursor;
-                    scriptTextEditor.SetSelection(replaceStart, replaceEnd);
-                    scriptTextEditor.Delete();
-                    scriptTextEditor.InsertText(suggestion.c_str());
-                    scriptEditorState.dirty = true;
-                    scriptEditorState.buffer = scriptTextEditor.GetText();
-                    completionPoolDirty = true;
-                    completionManuallyDismissed = true;
-                    completionDismissPrefix = suggestion;
-                };
-
-                bool poolRebuiltBeforeRender = rebuildCompletionPool();
-                ActiveTokenInfo tokenBeforeRender = activeToken();
-                if (poolRebuiltBeforeRender || tokenBeforeRender.prefix != activePrefix) {
-                    updateSuggestions(tokenBeforeRender.prefix);
-                }
-                bool interceptCompletionKeys = !activeSuggestions.empty() && !activePrefix.empty() && !completionManuallyDismissed;
-                scriptTextEditor.SetAllowTabInput(!interceptCompletionKeys);
-                scriptTextEditor.SetAllowArrowNavigation(!interceptCompletionKeys);
-                scriptTextEditor.SetAllowEnterInput(!interceptCompletionKeys);
-
-                const float paneSplitter = 4.0f;
-                const float minEditorHeight = 120.0f;
-                float availHeight = ImGui::GetContentRegionAvail().y;
-                if (showDiagnosticsPane) {
-                    diagnosticsPaneHeight = std::clamp(diagnosticsPaneHeight, 100.0f, std::max(100.0f, availHeight - minEditorHeight - paneSplitter));
-                }
-                float editorRowHeight = showDiagnosticsPane
-                    ? std::max(minEditorHeight, availHeight - diagnosticsPaneHeight - paneSplitter)
-                    : availHeight;
-
-                ImVec2 editorRectMin(0.0f, 0.0f);
-                ImVec2 editorRectMax(0.0f, 0.0f);
-                bool hasEditorRect = false;
-
-                ImGui::BeginChild("ScriptEditorRow", ImVec2(0.0f, editorRowHeight), false);
-                float rowAvailWidth = ImGui::GetContentRegionAvail().x;
-                const float minEditorWidth = 220.0f;
-                const float minDetailsWidth = 170.0f;
-                if (showDetailsPane) {
-                    float maxDetailsWidth = std::max(minDetailsWidth, rowAvailWidth - minEditorWidth - paneSplitter);
-                    detailsPaneWidth = std::clamp(detailsPaneWidth, minDetailsWidth, maxDetailsWidth);
-                }
-                float editorPaneWidth = showDetailsPane
-                    ? std::max(minEditorWidth, rowAvailWidth - detailsPaneWidth - paneSplitter)
-                    : rowAvailWidth;
-
-                ImGui::BeginChild("ScriptEditorPane", ImVec2(editorPaneWidth, 0.0f), true);
-                scriptTextEditor.Render("##ScriptEditor", ImVec2(0.0f, 0.0f), false);
-                editorRectMin = ImGui::GetItemRectMin();
-                editorRectMax = ImGui::GetItemRectMax();
-                hasEditorRect = true;
-                if (scriptTextEditor.IsTextChanged()) {
-                    scriptEditorState.dirty = true;
-                    scriptEditorState.buffer = scriptTextEditor.GetText();
-                }
-                ImGui::EndChild();
-
-                if (showDetailsPane) {
-                    ImGui::SameLine();
-                    float detailsSplitterHeight = ImGui::GetContentRegionAvail().y;
-                    if (detailsSplitterHeight < 1.0f) detailsSplitterHeight = 1.0f;
-                    ImGui::InvisibleButton("ScriptingDetailsSplitter", ImVec2(paneSplitter, detailsSplitterHeight));
-                    if (ImGui::IsItemHovered() || ImGui::IsItemActive()) {
-                        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
-                    }
-                    if (ImGui::IsItemActive()) {
-                        detailsPaneWidth -= io.MouseDelta.x;
-                        float maxDetailsWidth = std::max(minDetailsWidth, rowAvailWidth - minEditorWidth - paneSplitter);
-                        detailsPaneWidth = std::clamp(detailsPaneWidth, minDetailsWidth, maxDetailsWidth);
-                    }
-                    ImGui::SameLine();
-                    ImGui::BeginChild("ScriptDetailsPane", ImVec2(0.0f, 0.0f), true);
-                    ImGui::TextDisabled("Symbols");
-                    if (!symbols.empty()) {
-                        ImGuiListClipper symbolClipper;
-                        symbolClipper.Begin(static_cast<int>(symbols.size()));
-                        while (symbolClipper.Step()) {
-                            for (int i = symbolClipper.DisplayStart; i < symbolClipper.DisplayEnd; ++i) {
-                                ImGui::BulletText("%s", symbols[static_cast<size_t>(i)].c_str());
-                            }
-                        }
-                    } else {
-                        ImGui::TextDisabled("No symbols detected.");
-                    }
-                    ImGui::Separator();
-                    ImGui::TextDisabled("IntelliSense");
-                    ImGui::Text("Pool: %d", static_cast<int>(completionPool.size()));
-                    ImGui::Text("Prefix: %s", activePrefix.empty() ? "-" : activePrefix.c_str());
-                    ImGui::Text("Suggestions: %d", static_cast<int>(activeSuggestions.size()));
-                    ImGui::EndChild();
-                }
-                ImGui::EndChild();
-
-                if (showDiagnosticsPane) {
-                    float splitterWidth = ImGui::GetContentRegionAvail().x;
-                    if (splitterWidth < 1.0f) splitterWidth = 1.0f;
-                    ImGui::InvisibleButton("ScriptingDiagnosticsSplitter", ImVec2(splitterWidth, paneSplitter));
-                    if (ImGui::IsItemHovered() || ImGui::IsItemActive()) {
-                        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
-                    }
-                    if (ImGui::IsItemActive()) {
-                        diagnosticsPaneHeight -= io.MouseDelta.y;
-                        diagnosticsPaneHeight = std::clamp(diagnosticsPaneHeight, 100.0f,
-                            std::max(100.0f, availHeight - minEditorHeight - paneSplitter));
-                    }
-
-                    ImGui::BeginChild("ScriptDiagnosticsPane", ImVec2(0.0f, diagnosticsPaneHeight), true);
-                    if (ImGui::BeginTabBar("ScriptDiagnosticsTabs")) {
-                        if (ImGui::BeginTabItem("Diagnostics")) {
-                            int errorCount = 0;
-                            int warningCount = 0;
-                            int infoCount = 0;
-                            for (const auto& diagnostic : lastCompileDiagnostics) {
-                                if (diagnostic.severity == Modularity::ScriptDiagnosticSeverity::Error) {
-                                    ++errorCount;
-                                } else if (diagnostic.severity == Modularity::ScriptDiagnosticSeverity::Warning) {
-                                    ++warningCount;
-                                } else {
-                                    ++infoCount;
-                                }
-                            }
-
-                            ImGui::Text("Status: %s", lastCompileStatus.empty() ? "Idle" : lastCompileStatus.c_str());
-                            ImGui::Text("Errors: %d  Warnings: %d  Info: %d", errorCount, warningCount, infoCount);
-                            ImGui::Separator();
-                            if (lastCompileDiagnostics.empty()) {
-                                ImGui::TextDisabled("No diagnostics.");
-                            } else {
-                                for (size_t index = 0; index < lastCompileDiagnostics.size(); ++index) {
-                                    const auto& diagnostic = lastCompileDiagnostics[index];
-                                    const ImVec4 color =
-                                        diagnostic.severity == Modularity::ScriptDiagnosticSeverity::Error
-                                            ? ImVec4(0.94f, 0.45f, 0.45f, 1.0f)
-                                            : diagnostic.severity == Modularity::ScriptDiagnosticSeverity::Warning
-                                                ? ImVec4(0.95f, 0.79f, 0.40f, 1.0f)
-                                                : ImVec4(0.55f, 0.78f, 0.95f, 1.0f);
-
-                                    ImGui::PushID(static_cast<int>(index));
-                                    ImGui::TextColored(
-                                        color,
-                                        "[%s][%s] %s",
-                                        Modularity::scriptDiagnosticSeverityToString(diagnostic.severity),
-                                        diagnostic.code.c_str(),
-                                        diagnostic.message.c_str());
-                                    if (!diagnostic.hint.empty()) {
-                                        ImGui::TextWrapped("Hint: %s", diagnostic.hint.c_str());
-                                    }
-                                    if (!diagnostic.source.empty()) {
-                                        ImGui::TextDisabled("Source: %s", diagnostic.source.c_str());
-                                    }
-                                    if (diagnostic.line > 0) {
-                                        ImGui::TextDisabled("Line: %d", diagnostic.line);
-                                    }
-                                    if (!diagnostic.rawDetails.empty() && ImGui::TreeNode("Raw Details")) {
-                                        ImGui::TextDisabled("Origin: %s", Modularity::scriptDiagnosticOriginToString(diagnostic.origin));
-                                        if (diagnostic.column > 0) {
-                                            ImGui::TextDisabled("Column: %d", diagnostic.column);
-                                        }
-                                        if (!diagnostic.sourceLine.empty()) {
-                                            ImGui::TextWrapped("Code: %s", diagnostic.sourceLine.c_str());
-                                        }
-                                        ImGui::Separator();
-                                        ImGui::TextWrapped("%s", diagnostic.rawDetails.c_str());
-                                        ImGui::TreePop();
-                                    }
-                                    if (index + 1 < lastCompileDiagnostics.size()) {
-                                        ImGui::Separator();
-                                    }
-                                    ImGui::PopID();
-                                }
-                            }
-                            ImGui::EndTabItem();
-                        }
-                        if (ImGui::BeginTabItem("Output")) {
-                            if (lastCompileLog.empty()) {
-                                ImGui::TextDisabled("No build output.");
-                            } else {
-                                ImGui::BeginChild("ScriptOutputLog", ImVec2(0.0f, 0.0f), false,
-                                    ImGuiWindowFlags_HorizontalScrollbar);
-                                ImGui::TextUnformatted(lastCompileLog.c_str());
-                                ImGui::EndChild();
-                            }
-                            ImGui::EndTabItem();
-                        }
-                        ImGui::EndTabBar();
-                    }
-                    ImGui::EndChild();
-                }
-
-                uint64_t newHash = hashBuffer(scriptEditorState.buffer);
-                if (newHash != symbolsHash) {
-                    symbolsHash = newHash;
-                    scriptLanguageDocument = ScriptLanguageService::analyzeDocument(
-                        scriptEditorState.filePath,
-                        scriptEditorState.buffer);
-                    bufferIdentifiers = scriptLanguageDocument.identifiers;
-                    bufferFunctions = scriptLanguageDocument.functions;
-                    bufferDefines = scriptLanguageDocument.defines;
-                    functionSignatures = scriptLanguageDocument.functionSignatures;
-                    if (scriptLanguageDocument.language == ScriptEditorLanguage::Cpp ||
-                        scriptLanguageDocument.language == ScriptEditorLanguage::C) {
-                        functionSignatures["Begin"] = "void Begin()";
-                        functionSignatures["TickUpdate"] = "void TickUpdate(float deltaTime)";
-                        functionSignatures["Spec"] = "void Spec()";
-                        functionSignatures["TestEditor"] = "void TestEditor()";
-                        functionSignatures["Update"] = "void Update(float deltaTime)";
-                    }
-                    symbols = scriptLanguageDocument.symbols;
-                    scriptTextEditor.SetLanguageDefinition(buildLanguageDefinition(
-                        scriptLanguageDocument.language,
-                        bufferFunctions,
-                        bufferDefines));
-                    completionPoolDirty = true;
-                }
-                bool poolRebuiltAfterRender = rebuildCompletionPool();
-                ActiveTokenInfo tokenAfterRender = activeToken();
-                if (poolRebuiltAfterRender || tokenAfterRender.prefix != activePrefix) {
-                    updateSuggestions(tokenAfterRender.prefix);
-                }
-
-                bool editorFocused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
-                if (editorFocused && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
-                    completionManuallyDismissed = false;
-                    completionDismissPrefix.clear();
-                }
-
-                bool completionVisible = editorFocused &&
-                    hasEditorRect &&
-                    scriptTextEditor.HasCursorScreenPosition() &&
-                    !activeSuggestions.empty() &&
-                    !activePrefix.empty() &&
-                    !completionManuallyDismissed;
-
-                if (completionVisible) {
-                    if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, false)) {
-                        if (selectedSuggestionIndex <= 0) {
-                            selectedSuggestionIndex = static_cast<int>(activeSuggestions.size()) - 1;
-                        } else {
-                            --selectedSuggestionIndex;
-                        }
-                    }
-                    if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, false)) {
-                        selectedSuggestionIndex = (selectedSuggestionIndex + 1) % static_cast<int>(activeSuggestions.size());
-                    }
-                    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
-                        completionManuallyDismissed = true;
-                        completionDismissPrefix = activePrefix;
-                        completionVisible = false;
-                    } else if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_Tab, false)) {
-                        const std::string accepted = activeSuggestions[static_cast<size_t>(selectedSuggestionIndex)];
-                        applySuggestion(accepted);
-                        completionVisible = false;
-                    }
-                }
-
-                bool completionFlippedUp = false;
-                ImVec2 caretPos = scriptTextEditor.GetCursorScreenPositionPublic();
-                float lineHeight = ImGui::GetTextLineHeightWithSpacing();
-                if (completionVisible) {
-                    bool popupJustOpened = !completionPopupVisibleLastFrame;
-                    const int visibleRows = std::min(10, static_cast<int>(activeSuggestions.size()));
-                    const float popupWidth = 340.0f;
-                    const float popupHeight = lineHeight * (visibleRows + 1.9f);
-                    ImVec2 popupPos = popupPositionWithinBounds(caretPos, popupWidth, popupHeight, lineHeight,
-                        editorRectMin, editorRectMax, &completionFlippedUp);
-                    ImGui::SetNextWindowPos(popupPos, ImGuiCond_Always);
-                    ImGui::SetNextWindowSize(ImVec2(popupWidth, popupHeight), ImGuiCond_Always);
-                    ImGuiWindowFlags popupFlags =
-                        ImGuiWindowFlags_NoDocking |
-                        ImGuiWindowFlags_NoTitleBar |
-                        ImGuiWindowFlags_NoResize |
-                        ImGuiWindowFlags_NoMove |
-                        ImGuiWindowFlags_NoSavedSettings |
-                        ImGuiWindowFlags_NoFocusOnAppearing;
-                    if (ImGui::Begin("##ScriptCompletionPopup", nullptr, popupFlags)) {
-                        ImGui::TextDisabled("Autocomplete");
-                        ImGui::Separator();
-                        ImGui::BeginChild("##ScriptCompletionList", ImVec2(0.0f, 0.0f), false,
-                            ImGuiWindowFlags_AlwaysVerticalScrollbar);
-                        for (size_t i = 0; i < activeSuggestions.size(); ++i) {
-                            bool selected = (static_cast<int>(i) == selectedSuggestionIndex);
-                            if (ImGui::Selectable(activeSuggestions[i].c_str(), selected)) {
-                                selectedSuggestionIndex = static_cast<int>(i);
-                                applySuggestion(activeSuggestions[i]);
-                                completionVisible = false;
-                                break;
-                            }
-                            if (selected && popupJustOpened) {
-                                ImGui::SetScrollHereY(0.5f);
-                            }
-                        }
-                        ImGui::EndChild();
-                    }
-                    ImGui::End();
-                }
-                completionPopupVisibleLastFrame = completionVisible;
-
-                if (editorFocused && hasEditorRect && scriptTextEditor.HasCursorScreenPosition()) {
-                    std::string signatureLabel;
-                    ScriptLanguageServiceFunctionCallContext callCtx = ScriptLanguageService::detectFunctionCallContext(
-                        scriptTextEditor.GetCurrentLineText(),
-                        scriptTextEditor.GetCursorPosition().mColumn);
-                    if (callCtx.valid) {
-                        auto tryFindSignature = [&](const std::string& name) -> std::string {
-                            auto it = functionSignatures.find(name);
-                            if (it != functionSignatures.end()) return it->second;
-                            size_t scope = name.rfind("::");
-                            if (scope != std::string::npos && scope + 2 < name.size()) {
-                                std::string shortName = name.substr(scope + 2);
-                                it = functionSignatures.find(shortName);
-                                if (it != functionSignatures.end()) return it->second;
-                            }
-                            return {};
-                        };
-                        signatureLabel = tryFindSignature(callCtx.functionName);
-                        if (signatureLabel.empty()) {
-                            signatureLabel = callCtx.functionName + "(...)";
-                        }
-
-                        std::vector<std::string> params = ScriptLanguageService::splitSignatureParameters(signatureLabel);
-                        const float sigWidth = 420.0f;
-                        const float sigHeight = params.empty()
-                            ? lineHeight * 2.2f
-                            : lineHeight * std::clamp(static_cast<float>(params.size() + 2), 3.0f, 8.0f);
-
-                        ImVec2 sigPos;
-                        if (completionVisible && !completionFlippedUp) {
-                            sigPos = ImVec2(caretPos.x, caretPos.y - sigHeight - 6.0f);
-                            sigPos.x = std::clamp(sigPos.x, editorRectMin.x, std::max(editorRectMin.x, editorRectMax.x - sigWidth));
-                            sigPos.y = std::clamp(sigPos.y, editorRectMin.y, std::max(editorRectMin.y, editorRectMax.y - sigHeight));
-                        } else {
-                            sigPos = popupPositionWithinBounds(caretPos, sigWidth, sigHeight, lineHeight,
-                                editorRectMin, editorRectMax, nullptr);
-                        }
-
-                        ImGui::SetNextWindowPos(sigPos, ImGuiCond_Always);
-                        ImGui::SetNextWindowSize(ImVec2(sigWidth, sigHeight), ImGuiCond_Always);
-                        ImGuiWindowFlags sigFlags =
-                            ImGuiWindowFlags_NoDocking |
-                            ImGuiWindowFlags_NoTitleBar |
-                            ImGuiWindowFlags_NoResize |
-                            ImGuiWindowFlags_NoMove |
-                            ImGuiWindowFlags_NoSavedSettings |
-                            ImGuiWindowFlags_NoFocusOnAppearing;
-                        if (ImGui::Begin("##ScriptSignaturePopup", nullptr, sigFlags)) {
-                            ImGui::TextUnformatted(signatureLabel.c_str());
-                            if (!params.empty()) {
-                                ImGui::Separator();
-                                const int highlighted = std::clamp(callCtx.activeParameter, 0, static_cast<int>(params.size()) - 1);
-                                for (size_t i = 0; i < params.size(); ++i) {
-                                    bool isActive = static_cast<int>(i) == highlighted;
-                                    ImVec4 color = isActive
-                                        ? ImVec4(0.96f, 0.84f, 0.40f, 1.0f)
-                                        : ImVec4(0.75f, 0.75f, 0.78f, 1.0f);
-                                    ImGui::TextColored(color, "%s%s", isActive ? "> " : "  ", params[i].c_str());
-                                }
-                            }
-                        }
-                        ImGui::End();
-                    }
-                }
-
-                if (completionVisible && scriptTextEditor.HasCursorScreenPosition() && !activeSuggestions.empty()) {
-                    const std::string& suggestion = activeSuggestions[static_cast<size_t>(selectedSuggestionIndex)];
-                    if (suggestion.size() > activePrefix.size() && suggestion.rfind(activePrefix, 0) == 0) {
-                        std::string ghost = suggestion.substr(activePrefix.size());
-                        ImU32 ghostColor = IM_COL32(180, 180, 180, 110);
-                        ImGui::GetForegroundDrawList()->AddText(scriptTextEditor.GetCursorScreenPositionPublic(),
-                            ghostColor, ghost.c_str());
-                    }
-                }
-            } else {
-                scriptTextEditor.SetAllowTabInput(true);
-                scriptTextEditor.SetAllowArrowNavigation(true);
-                scriptTextEditor.SetAllowEnterInput(true);
-                ImGui::TextDisabled("Select a script or shader file to start editing.");
-            }
-            ImGui::EndTabItem();
+    const float optionsWidth = ImGui::CalcTextSize("...").x + style.FramePadding.x * 2.0f;
+    const float optionsX = ImGui::GetContentRegionAvail().x + ImGui::GetCursorPosX() - optionsWidth;
+    if (ImGui::GetWindowPos().x + optionsX >= ImGui::GetItemRectMax().x + style.ItemSpacing.x) {
+        ImGui::SameLine(optionsX);
+    }
+    if (ImGui::Button("...##ScriptingOptions", ImVec2(optionsWidth, 0.0f))) {
+        ImGui::OpenPopup("Scripting Options");
+    }
+    ImGui::SetItemTooltip("Scripting options");
+    if (ImGui::BeginPopup("Scripting Options")) {
+        if (ImGui::MenuItem("Refresh Files")) scriptingFilesDirty = true;
+        ImGui::MenuItem("File Tree", nullptr, &showFilePane);
+        ImGui::MenuItem("Minimap", nullptr, &showMinimap);
+        ImGui::MenuItem("Diagnostics and Output", nullptr, &showDiagnosticsPane);
+        if (ImGui::MenuItem("IntelliSense", nullptr, &showIntelliSense) && showIntelliSense) {
+            showDiagnosticsPane = true;
         }
-        if (ImGui::BeginTabItem("Intellisense")) {
-            ScriptBuildConfig config;
-            std::string error;
-            fs::path configPath = resolveScriptsConfigPath(projectManager.currentProject);
-            bool hasConfig = scriptCompiler.loadConfig(configPath, config, error);
-            if (hasConfig) {
-                packageManager.applyToBuildConfig(config);
-                ImGui::TextDisabled("Compiler");
-                ImGui::Text("Standard: %s", config.cppStandard.c_str());
-                ImGui::Separator();
-                ImGui::TextDisabled("Include Dirs");
-                for (const auto& includeDir : config.includeDirs) {
-                    ImGui::BulletText("%s", includeDir.string().c_str());
-                }
-                ImGui::Separator();
-                ImGui::TextDisabled("Defines");
-                for (const auto& def : config.defines) {
-                    ImGui::BulletText("%s", def.c_str());
-                }
-            } else {
-                ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.55f, 1.0f), "Scripts.modu not loaded");
-                if (!error.empty()) {
-                    ImGui::TextWrapped("%s", error.c_str());
-                }
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14.0f);
+        ImGui::InputTextWithHint("##ScriptFilter", "Filter files", scriptingFilter, sizeof(scriptingFilter));
+        ImGui::Separator();
+        const size_t batchCount = selectedCompileScripts.size();
+        ImGui::TextDisabled("%zu selected for compile", batchCount);
+        if (ImGui::MenuItem("Compile Selected", nullptr, false, batchCount > 0 && !compileInProgress)) {
+            std::vector<fs::path> batch;
+            batch.reserve(batchCount);
+            for (const fs::path& path : scriptingFileList) {
+                if (selectedCompileScripts.contains(normalizeScriptSelectionKey(path))) batch.push_back(path);
             }
-
-            ImGui::Separator();
-            ImGui::TextDisabled("Outline");
-            if (!symbols.empty()) {
-                for (const auto& symbol : symbols) {
-                    ImGui::BulletText("%s", symbol.c_str());
-                }
-            } else {
-                ImGui::TextDisabled("No symbols detected.");
-            }
-            ImGui::EndTabItem();
+            if (!batch.empty()) queueScriptCompileBatch(batch);
         }
-        if (ImGui::BeginTabItem("Build")) {
-            ImGui::TextDisabled("Compile Status");
-            ImGui::Text("%s", lastCompileStatus.c_str());
-            if (!lastCompileLog.empty()) {
-                ImGui::Separator();
-                ImGui::TextDisabled("Output");
-                ImGui::BeginChild("CompileLog", ImVec2(0.0f, 0.0f), true);
-                ImGui::TextUnformatted(lastCompileLog.c_str());
-                ImGui::EndChild();
+        if (ImGui::MenuItem("Clear Selection", nullptr, false, batchCount > 0)) selectedCompileScripts.clear();
+        ImGui::EndPopup();
+    }
+
+    ScriptEditorDocument* closedDocument = nullptr;
+    bool confirmClose = false;
+    if (!scriptEditorDocuments.empty() &&
+        ImGui::BeginTabBar("ScriptingDocuments", ImGuiTabBarFlags_AutoSelectNewTabs | ImGuiTabBarFlags_FittingPolicyScroll)) {
+        const bool selectRequestedTab = selectScriptEditorTab;
+        selectScriptEditorTab = false;
+        for (const auto& document : scriptEditorDocuments) {
+            bool tabOpen = true;
+            ImGuiTabItemFlags flags = document->dirty ? ImGuiTabItemFlags_UnsavedDocument : ImGuiTabItemFlags_None;
+            if (selectRequestedTab && activeScriptEditor == document.get()) flags |= ImGuiTabItemFlags_SetSelected;
+            if (ImGui::BeginTabItem(document->tabLabel.c_str(), &tabOpen, flags)) {
+                if (!selectRequestedTab) activeScriptEditor = document.get();
+                ImGui::EndTabItem();
             }
-            ImGui::EndTabItem();
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", document->filePath.string().c_str());
+            if (!tabOpen) {
+                if (document->dirty) {
+                    scriptEditorPendingClose = document.get();
+                    confirmClose = true;
+                } else {
+                    closedDocument = document.get();
+                }
+            }
         }
         ImGui::EndTabBar();
     }
 
+    if (confirmClose) ImGui::OpenPopup("Close Script");
+    if (scriptEditorPendingClose && ImGui::BeginPopupModal("Close Script", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("Save changes to %s?", scriptEditorPendingClose->name.c_str());
+        if (ImGui::Button("Save") && saveDocument(*scriptEditorPendingClose)) {
+            closedDocument = scriptEditorPendingClose;
+            scriptEditorPendingClose = nullptr;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Discard")) {
+            closedDocument = scriptEditorPendingClose;
+            scriptEditorPendingClose = nullptr;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) {
+            scriptEditorPendingClose = nullptr;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+    if (closedDocument) closeDocument(closedDocument);
+
+    if (listRefreshed || cachedFilter != scriptingFilter) {
+        cachedFilter = scriptingFilter;
+        const std::string filter = toLowerCopy(cachedFilter);
+        fileTree = {};
+        fileTree.folders.try_emplace("Scripts");
+        fileTree.folders.try_emplace("Assets");
+        std::unordered_set<std::string> validBatchKeys;
+        for (size_t index = 0; index < scriptingFileList.size(); ++index) {
+            const fs::path& path = scriptingFileList[index];
+            std::string key = normalizeScriptSelectionKey(path);
+            if (selectedCompileScripts.contains(key)) validBatchKeys.insert(key);
+
+            std::string name = path.filename().string();
+            if (!filter.empty() && toLowerCopy(name).find(filter) == std::string::npos) continue;
+
+            fs::path relative = scriptingDirectory.empty() ? fs::path{} : path.lexically_relative(scriptingDirectory);
+            if (isRelativeToRoot(relative)) {
+                relative = "Scripts" / relative;
+            } else {
+                relative = path.lexically_relative(scriptingProjectPath);
+                if (!isRelativeToRoot(relative)) relative = "External" / path.relative_path();
+            }
+            ScriptingFolder* folder = &fileTree;
+            for (const auto& part : relative.parent_path()) {
+                folder = &folder->folders[part.string()];
+            }
+
+            const std::string ext = extensionLower(path);
+            size_t icon = 3;
+            if (ext == ".moducpp") icon = 0;
+            else if (ext == ".c") icon = 2;
+            else if (ext != ".cs" && ScriptLanguageService::detectLanguage(path) == ScriptEditorLanguage::Cpp) icon = 1;
+            folder->files.push_back({ index, std::move(key), std::move(name), icon, ext != ".cs" && ext != ".csproj" });
+        }
+        selectedCompileScripts.swap(validBatchKeys);
+        auto sortFiles = [&](auto&& sort, ScriptingFolder& folder) -> void {
+            std::sort(folder.files.begin(), folder.files.end(), [](const auto& lhs, const auto& rhs) {
+                return lhs.label < rhs.label;
+            });
+            for (auto& entry : folder.folders) sort(sort, entry.second);
+        };
+        sortFiles(sortFiles, fileTree);
+    }
+
+    const float splitter = 4.0f;
+    const float minimumFileWidth = 104.0f;
+    const float width = ImGui::GetContentRegionAvail().x;
+    const float fileWidthBudget = width - 160.0f - splitter;
+    if (showFilePane && fileWidthBudget >= minimumFileWidth) {
+        const float renderedWidth = std::clamp(filePaneWidth, minimumFileWidth, fileWidthBudget);
+        if (ImGui::BeginChild("ScriptingFiles", ImVec2(renderedWidth, 0.0f), ImGuiChildFlags_Borders)) {
+            struct ScriptIcon {
+                ImTextureID id = ImTextureID_Invalid;
+                bool flipY = false;
+            };
+            ScriptIcon icons[IM_ARRAYSIZE(kScriptIconPaths)];
+            bool requestedIcons[IM_ARRAYSIZE(kScriptIconPaths)] = {};
+            auto getIcon = [&](size_t index) {
+                if (!requestedIcons[index]) {
+                    requestedIcons[index] = true;
+                    const char* path = kScriptIconPaths[index];
+                    if (usingVulkan() && vulkanRendererInitialized && vulkanRenderer) {
+                        icons[index].id = vulkanRenderer->getOrCreateUIImage(path);
+                    } else if (rendererInitialized) {
+                        if (Texture* texture = renderer.getTexture(path, MaterialProperties::TextureFilter::Point);
+                            texture && texture->GetID() != 0) {
+                            icons[index] = { static_cast<ImTextureID>(texture->GetID()), true };
+                        }
+                    }
+                }
+                return icons[index];
+            };
+
+            const float iconWidth = ImGui::GetFontSize();
+            const float iconHeight = iconWidth * 14.0f / 15.0f;
+            const auto drawFolder = [&](auto&& draw, const std::string& name, const ScriptingFolder& folder, bool defaultOpen = false) -> void {
+                ImGui::PushID(name.c_str());
+                if (!cachedFilter.empty()) ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+                ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_SpanAvailWidth;
+                if (defaultOpen) flags |= ImGuiTreeNodeFlags_DefaultOpen;
+                if (ImGui::TreeNodeEx("Folder", flags, "%s", name.c_str())) {
+                    for (const auto& [childName, child] : folder.folders) draw(draw, childName, child);
+                    for (const auto& row : folder.files) {
+                        ImGui::PushID(row.key.c_str());
+                        const ImVec2 pos = ImGui::GetCursorScreenPos();
+                        const bool batchSelected = selectedCompileScripts.contains(row.key);
+                        const bool fileActive = activeScriptEditor && activeScriptEditor->key == row.key;
+                        if (ImGui::Selectable("##ScriptFile", fileActive || batchSelected,
+                                              ImGuiSelectableFlags_SpanAvailWidth)) {
+                            if (ImGui::GetIO().KeyCtrl && row.batchCapable) {
+                                if (batchSelected) selectedCompileScripts.erase(row.key);
+                                else selectedCompileScripts.insert(row.key);
+                            } else {
+                                openScriptInEditor(scriptingFileList[row.index]);
+                            }
+                        }
+                        const bool visible = ImGui::IsItemVisible();
+                        const bool hovered = ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal);
+                        const float right = ImGui::GetItemRectMax().x - 3.0f;
+                        if (ImGui::BeginPopupContextItem("Script File Actions")) {
+                            if (ImGui::MenuItem("Open")) openScriptInEditor(scriptingFileList[row.index]);
+                            if (ImGui::MenuItem("Select for Compile", nullptr, batchSelected, row.batchCapable)) {
+                                if (batchSelected) selectedCompileScripts.erase(row.key);
+                                else selectedCompileScripts.insert(row.key);
+                            }
+                            ImGui::EndPopup();
+                        }
+                        if (hovered) ImGui::SetTooltip("%s", scriptingFileList[row.index].string().c_str());
+                        if (visible) {
+                            const ScriptIcon icon = getIcon(row.icon);
+                            ImDrawList* drawList = ImGui::GetWindowDrawList();
+                            if (icon.id != ImTextureID_Invalid) {
+                                const float y = pos.y + (ImGui::GetTextLineHeight() - iconHeight) * 0.5f;
+                                drawList->AddImage(icon.id, ImVec2(pos.x, y), ImVec2(pos.x + iconWidth, y + iconHeight),
+                                                   ImVec2(0.0f, icon.flipY ? 1.0f : 0.0f),
+                                                   ImVec2(1.0f, icon.flipY ? 0.0f : 1.0f));
+                            }
+                            const ImVec2 labelPos(pos.x + iconWidth + 4.0f, pos.y);
+                            if (labelPos.x < right) {
+                                ImGui::RenderTextEllipsis(drawList, labelPos, ImVec2(right, pos.y + ImGui::GetTextLineHeight()),
+                                                          right, row.label.c_str(), nullptr, nullptr);
+                            }
+                        }
+                        ImGui::PopID();
+                    }
+                    ImGui::TreePop();
+                }
+                ImGui::PopID();
+            };
+
+            drawFolder(drawFolder, "Scripts", fileTree.folders.at("Scripts"), true);
+            drawFolder(drawFolder, "Assets", fileTree.folders.at("Assets"));
+            for (const auto& [name, folder] : fileTree.folders) {
+                if (name != "Scripts" && name != "Assets") drawFolder(drawFolder, name, folder);
+            }
+        }
+        ImGui::EndChild();
+        ImGui::SameLine(0.0f, 0.0f);
+        ImGui::InvisibleButton("ScriptingFilePaneSplitter", ImVec2(splitter, std::max(1.0f, ImGui::GetContentRegionAvail().y)));
+        if (ImGui::IsItemHovered() || ImGui::IsItemActive()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+        if (ImGui::IsItemActive()) {
+            filePaneWidth = std::clamp(renderedWidth + ImGui::GetIO().MouseDelta.x, minimumFileWidth, fileWidthBudget);
+        }
+        ImGui::SameLine(0.0f, 0.0f);
+    }
+
+    if (ImGui::BeginChild("ScriptingEditor", ImVec2(0.0f, 0.0f), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar)) {
+        const float height = ImGui::GetContentRegionAvail().y;
+        const float verticalSpacing = style.ItemSpacing.y * 2.0f + splitter;
+        const float minEditorHeight = 76.0f;
+        const float minDiagnosticsHeight = 68.0f;
+        const float maxDiagnosticsHeight = height - minEditorHeight - verticalSpacing;
+        const bool diagnosticsVisible = showDiagnosticsPane && maxDiagnosticsHeight >= minDiagnosticsHeight;
+        const float renderedDiagnosticsHeight = diagnosticsVisible
+            ? std::clamp(diagnosticsPaneHeight, minDiagnosticsHeight, maxDiagnosticsHeight) : 0.0f;
+        const float editorHeight = diagnosticsVisible ? height - renderedDiagnosticsHeight - verticalSpacing : height;
+
+        if (ImGui::BeginChild("ScriptEditorPane", ImVec2(0.0f, editorHeight), ImGuiChildFlags_None,
+                              ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
+            if (activeScriptEditor) {
+                ScriptEditorDocument& document = *activeScriptEditor;
+                ImGui::PushID(document.key.c_str());
+                if (ImGui::BeginTabBar("ScriptViews")) {
+                    if (ImGui::BeginTabItem("Script")) {
+                        document.showTranspiled = false;
+                        ImGui::EndTabItem();
+                    }
+                    if (document.language.language == ScriptEditorLanguage::ModuCPP && ImGui::BeginTabItem("Transpiled")) {
+                        document.showTranspiled = true;
+                        ImGui::EndTabItem();
+                    }
+                    ImGui::EndTabBar();
+                }
+                const float minimapWidth = showMinimap ? ImGui::GetFontSize() * 4.5f : 0.0f;
+                if (document.showTranspiled) {
+                    if (document.transpiledPreviewDirty) {
+                        document.transpiledPreviewDirty = false;
+                        document.transpiledError.clear();
+                        ModuCPPTranspileResult result;
+                        try {
+                            ModuCPPTranspiler transpiler;
+                            if (transpiler.transpile(document.filePath, document.buffer, result, document.transpiledError)) {
+                                if (!document.transpiledEditor) {
+                                    document.transpiledEditor = std::make_unique<TextEditor>();
+                                    initializeScriptEditor(*document.transpiledEditor);
+                                    document.transpiledEditor->SetShowWhitespaces(false);
+                                    document.transpiledEditor->SetReadOnly(true);
+                                }
+                                document.transpiledEditor->SetLanguageDefinition(
+                                    result.generatedC ? TextEditor::LanguageDefinition::C() : TextEditor::LanguageDefinition::CPlusPlus());
+                                document.transpiledEditor->SetText(result.generatedSource);
+                            } else if (document.transpiledError.empty()) {
+                                document.transpiledError = "Could not transpile this script.";
+                            }
+                        } catch (const std::regex_error& error) {
+                            document.transpiledError = error.what();
+                        }
+                    }
+                    if (!document.transpiledError.empty()) {
+                        ImGui::TextWrapped("%s", document.transpiledError.c_str());
+                    } else if (document.transpiledEditor) {
+                        document.transpiledEditor->Render("TranspiledSource", ImVec2(0.0f, 0.0f), true, minimapWidth);
+                    }
+                } else {
+                    renderScriptEditorDocument(document, minimapWidth);
+                }
+                ImGui::PopID();
+            } else {
+                ImGui::TextDisabled("Select a script or shader file to start editing.");
+            }
+        }
+        ImGui::EndChild();
+
+        if (diagnosticsVisible) {
+            ImGui::InvisibleButton("ScriptingDiagnosticsSplitter",
+                                   ImVec2(std::max(1.0f, ImGui::GetContentRegionAvail().x), splitter));
+            if (ImGui::IsItemHovered() || ImGui::IsItemActive()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+            if (ImGui::IsItemActive()) {
+                diagnosticsPaneHeight = std::clamp(renderedDiagnosticsHeight - ImGui::GetIO().MouseDelta.y,
+                                                   minDiagnosticsHeight, maxDiagnosticsHeight);
+            }
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(4.0f, 3.0f));
+            if (ImGui::BeginChild("ScriptDiagnosticsPane", ImVec2(0.0f, renderedDiagnosticsHeight),
+                                  ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar)) {
+                if (ImGui::BeginTabBar("ScriptDiagnosticsTabs")) {
+                    if (ImGui::BeginTabItem("Diagnostics")) {
+                        renderScriptDiagnostics();
+                        ImGui::EndTabItem();
+                    }
+                    if (ImGui::BeginTabItem("Output")) {
+                        if (!lastCompileStatus.empty()) ImGui::TextUnformatted(lastCompileStatus.c_str());
+                        if (lastCompileLog.empty()) {
+                            ImGui::TextDisabled("No build output.");
+                        } else {
+                            if (ImGui::BeginChild("ScriptOutputLog", ImVec2(0.0f, 0.0f), ImGuiChildFlags_None,
+                                                  ImGuiWindowFlags_HorizontalScrollbar)) {
+                                ImGui::TextUnformatted(lastCompileLog.c_str());
+                            }
+                            ImGui::EndChild();
+                        }
+                        ImGui::EndTabItem();
+                    }
+                    if (showIntelliSense && ImGui::BeginTabItem("IntelliSense")) {
+                        if (ImGui::BeginChild("ScriptIntelliSense", ImVec2(0.0f, 0.0f))) {
+                            ScriptBuildConfig config;
+                            std::string error;
+                            if (scriptCompiler.loadConfig(resolveScriptsConfigPath(projectManager.currentProject), config, error)) {
+                                packageManager.applyToBuildConfig(config);
+                                ImGui::Text("Standard: %s", config.cppStandard.c_str());
+                                ImGui::SeparatorText("Include Directories");
+                                for (const auto& path : config.includeDirs) ImGui::BulletText("%s", path.string().c_str());
+                                ImGui::SeparatorText("Defines");
+                                for (const auto& define : config.defines) ImGui::BulletText("%s", define.c_str());
+                            } else {
+                                ImGui::TextWrapped("%s", error.c_str());
+                            }
+                            ImGui::SeparatorText("Outline");
+                            if (activeScriptEditor && !activeScriptEditor->language.symbols.empty()) {
+                                for (const auto& symbol : activeScriptEditor->language.symbols) ImGui::BulletText("%s", symbol.c_str());
+                            } else {
+                                ImGui::TextDisabled("No symbols detected.");
+                            }
+                        }
+                        ImGui::EndChild();
+                        ImGui::EndTabItem();
+                    }
+                    ImGui::EndTabBar();
+                }
+            }
+            ImGui::EndChild();
+            ImGui::PopStyleVar();
+        }
+    }
     ImGui::EndChild();
     ImGui::End();
+}
+
+void Engine::renderScriptEditorDocument(ScriptEditorDocument& document, float minimapWidth) {
+    static std::string completionDocumentKey;
+    static std::vector<std::string> completionPool;
+    static std::vector<std::string> activeSuggestions;
+    static std::string activePrefix;
+    static int selectedSuggestionIndex = 0;
+    static bool completionManuallyDismissed = false;
+    static std::string completionDismissPrefix;
+    static bool completionPopupVisibleLastFrame = false;
+
+    if (completionDocumentKey != document.key) {
+        completionDocumentKey = document.key;
+        document.completionPoolDirty = true;
+    }
+    if (document.completionPoolDirty) {
+        completionManuallyDismissed = false;
+        completionDismissPrefix.clear();
+        completionPopupVisibleLastFrame = false;
+    }
+    TextEditor& editor = document.editor;
+    const ImGuiIO& io = ImGui::GetIO();
+
+    auto rebuildCompletionPool = [&]() -> bool {
+        if (!document.completionPoolDirty) return false;
+        completionPool.clear();
+        std::unordered_set<std::string> poolSet;
+        const auto& langDef = editor.GetLanguageDefinition();
+        for (const auto& kw : langDef.mKeywords) poolSet.insert(kw);
+        for (const auto& identifier : langDef.mIdentifiers) poolSet.insert(identifier.first);
+        for (const auto& identifier : langDef.mPreprocIdentifiers) poolSet.insert(identifier.first);
+        for (const auto& entry : scriptingCompletions) poolSet.insert(entry);
+        for (const auto& entry : document.language.symbols) poolSet.insert(entry);
+        for (const auto& entry : document.language.identifiers) poolSet.insert(entry);
+        for (const auto& entry : document.language.functions) poolSet.insert(entry);
+        for (const auto& entry : document.language.defines) poolSet.insert(entry);
+        for (const auto& entry : document.language.variables) poolSet.insert(entry);
+        for (const auto& entry : document.language.moducppImports) poolSet.insert(entry);
+        for (const auto& entry : document.language.moducppInspectorFields) poolSet.insert(entry);
+        for (const auto& entry : document.language.moducppCompletions) poolSet.insert(entry);
+        completionPool.assign(poolSet.begin(), poolSet.end());
+        std::sort(completionPool.begin(), completionPool.end());
+        document.completionPoolDirty = false;
+        return true;
+    };
+
+    struct ActiveTokenInfo {
+        bool valid = false;
+        TextEditor::Coordinates cursor;
+        TextEditor::Coordinates start;
+        TextEditor::Coordinates end;
+        std::string word;
+        std::string prefix;
+    };
+
+    auto activeToken = [&]() -> ActiveTokenInfo {
+        ActiveTokenInfo token;
+        token.cursor = editor.GetCursorPosition();
+        TextEditor::Coordinates probe = token.cursor;
+        token.word = editor.GetWordAtPublic(probe);
+        if (token.word.empty() && token.cursor.mColumn > 0) {
+            probe = TextEditor::Coordinates(token.cursor.mLine, token.cursor.mColumn - 1);
+            token.word = editor.GetWordAtPublic(probe);
+        }
+        if (token.word.empty()) return token;
+        token.start = editor.FindWordStartPublic(probe);
+        token.end = editor.FindWordEndPublic(probe);
+        int prefixLength = std::clamp(token.cursor.mColumn - token.start.mColumn, 0, static_cast<int>(token.word.size()));
+        token.prefix = token.word.substr(0, static_cast<size_t>(prefixLength));
+        token.valid = true;
+        return token;
+    };
+
+    auto updateSuggestions = [&](const std::string& prefix) {
+        bool prefixChanged = (prefix != activePrefix);
+        activePrefix = prefix;
+        if (prefixChanged) {
+            selectedSuggestionIndex = 0;
+        }
+        if (!completionDismissPrefix.empty() && activePrefix != completionDismissPrefix) {
+            completionManuallyDismissed = false;
+        }
+        if (!activePrefix.empty()) {
+            activeSuggestions = ScriptLanguageService::buildCompletionList(completionPool, activePrefix);
+        } else {
+            activeSuggestions.clear();
+        }
+        if (activeSuggestions.empty()) {
+            selectedSuggestionIndex = 0;
+        } else {
+            selectedSuggestionIndex = std::clamp(selectedSuggestionIndex, 0, static_cast<int>(activeSuggestions.size()) - 1);
+        }
+    };
+
+    auto applySuggestion = [&](const std::string& suggestion) {
+        ActiveTokenInfo token = activeToken();
+        TextEditor::Coordinates cursor = editor.GetCursorPosition();
+        TextEditor::Coordinates replaceStart = token.valid
+            ? token.start
+            : TextEditor::Coordinates(cursor.mLine, std::max(0, cursor.mColumn - static_cast<int>(activePrefix.size())));
+        TextEditor::Coordinates replaceEnd = token.valid ? token.end : cursor;
+        editor.SetSelection(replaceStart, replaceEnd);
+        editor.Delete();
+        editor.InsertText(suggestion.c_str());
+        document.dirty = true;
+        document.buffer = editor.GetText();
+        document.language = analyzeScriptBuffer(editor, document.filePath, document.buffer);
+        document.completionPoolDirty = true;
+        document.transpiledPreviewDirty = true;
+        completionManuallyDismissed = true;
+        completionDismissPrefix = suggestion;
+    };
+
+    bool poolRebuiltBeforeRender = rebuildCompletionPool();
+    ActiveTokenInfo tokenBeforeRender = activeToken();
+    if (poolRebuiltBeforeRender || tokenBeforeRender.prefix != activePrefix) {
+        updateSuggestions(tokenBeforeRender.prefix);
+    }
+    bool interceptCompletionKeys = !activeSuggestions.empty() && !activePrefix.empty() && !completionManuallyDismissed;
+    editor.SetAllowTabInput(!interceptCompletionKeys);
+    editor.SetAllowArrowNavigation(!interceptCompletionKeys);
+    editor.SetAllowEnterInput(!interceptCompletionKeys);
+
+
+    const ImVec2 editorRectMin = ImGui::GetCursorScreenPos();
+    const ImVec2 available = ImGui::GetContentRegionAvail();
+    const float minimapSpace = minimapWidth > 0.0f && available.x >= minimapWidth + 120.0f
+        ? minimapWidth + 4.0f : 0.0f;
+    const ImVec2 editorRectMax(editorRectMin.x + available.x - minimapSpace, editorRectMin.y + available.y);
+    editor.Render("ScriptSource", ImVec2(0.0f, 0.0f), true, minimapWidth);
+    if (editor.IsTextChanged()) {
+        document.dirty = true;
+        document.buffer = editor.GetText();
+        document.language = analyzeScriptBuffer(editor, document.filePath, document.buffer);
+        document.completionPoolDirty = true;
+        document.transpiledPreviewDirty = true;
+    }
+
+    bool poolRebuiltAfterRender = rebuildCompletionPool();
+    ActiveTokenInfo tokenAfterRender = activeToken();
+    if (poolRebuiltAfterRender || tokenAfterRender.prefix != activePrefix) {
+        updateSuggestions(tokenAfterRender.prefix);
+    }
+
+    bool editorFocused = ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows);
+    if (editorFocused && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
+        completionManuallyDismissed = false;
+        completionDismissPrefix.clear();
+    }
+
+    bool completionVisible = editorFocused &&
+        editor.HasCursorScreenPosition() &&
+        !activeSuggestions.empty() &&
+        !activePrefix.empty() &&
+        !completionManuallyDismissed;
+
+    if (completionVisible) {
+        if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, false)) {
+            if (selectedSuggestionIndex <= 0) {
+                selectedSuggestionIndex = static_cast<int>(activeSuggestions.size()) - 1;
+            } else {
+                --selectedSuggestionIndex;
+            }
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, false)) {
+            selectedSuggestionIndex = (selectedSuggestionIndex + 1) % static_cast<int>(activeSuggestions.size());
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+            completionManuallyDismissed = true;
+            completionDismissPrefix = activePrefix;
+            completionVisible = false;
+        } else if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_Tab, false)) {
+            const std::string accepted = activeSuggestions[static_cast<size_t>(selectedSuggestionIndex)];
+            applySuggestion(accepted);
+            completionVisible = false;
+        }
+    }
+
+    bool completionFlippedUp = false;
+    ImVec2 caretPos = editor.GetCursorScreenPositionPublic();
+    float lineHeight = ImGui::GetTextLineHeightWithSpacing();
+    if (completionVisible) {
+        bool popupJustOpened = !completionPopupVisibleLastFrame;
+        const int visibleRows = std::min(10, static_cast<int>(activeSuggestions.size()));
+        const float popupWidth = 340.0f;
+        const float popupHeight = lineHeight * (visibleRows + 1.9f);
+        ImVec2 popupPos = popupPositionWithinBounds(caretPos, popupWidth, popupHeight, lineHeight,
+            editorRectMin, editorRectMax, &completionFlippedUp);
+        ImGui::SetNextWindowPos(popupPos, ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(popupWidth, popupHeight), ImGuiCond_Always);
+        ImGuiWindowFlags popupFlags =
+            ImGuiWindowFlags_NoDocking |
+            ImGuiWindowFlags_NoTitleBar |
+            ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove |
+            ImGuiWindowFlags_NoSavedSettings |
+            ImGuiWindowFlags_NoFocusOnAppearing;
+        if (ImGui::Begin("##ScriptCompletionPopup", nullptr, popupFlags)) {
+            ImGui::TextDisabled("Autocomplete");
+            ImGui::Separator();
+            ImGui::BeginChild("##ScriptCompletionList", ImVec2(0.0f, 0.0f), false,
+                ImGuiWindowFlags_AlwaysVerticalScrollbar);
+            for (size_t i = 0; i < activeSuggestions.size(); ++i) {
+                bool selected = (static_cast<int>(i) == selectedSuggestionIndex);
+                if (ImGui::Selectable(activeSuggestions[i].c_str(), selected)) {
+                    selectedSuggestionIndex = static_cast<int>(i);
+                    applySuggestion(activeSuggestions[i]);
+                    completionVisible = false;
+                    break;
+                }
+                if (selected && popupJustOpened) {
+                    ImGui::SetScrollHereY(0.5f);
+                }
+            }
+            ImGui::EndChild();
+        }
+        ImGui::End();
+    }
+    completionPopupVisibleLastFrame = completionVisible;
+
+    if (editorFocused && editor.HasCursorScreenPosition()) {
+        std::string signatureLabel;
+        ScriptLanguageServiceFunctionCallContext callCtx = ScriptLanguageService::detectFunctionCallContext(
+            editor.GetCurrentLineText(),
+            editor.GetCursorPosition().mColumn);
+        if (callCtx.valid) {
+            auto tryFindSignature = [&](const std::string& name) -> std::string {
+                auto it = document.language.functionSignatures.find(name);
+                if (it != document.language.functionSignatures.end()) return it->second;
+                size_t scope = name.rfind("::");
+                if (scope != std::string::npos && scope + 2 < name.size()) {
+                    std::string shortName = name.substr(scope + 2);
+                    it = document.language.functionSignatures.find(shortName);
+                    if (it != document.language.functionSignatures.end()) return it->second;
+                }
+                return {};
+            };
+            signatureLabel = tryFindSignature(callCtx.functionName);
+            if (signatureLabel.empty()) {
+                signatureLabel = callCtx.functionName + "(...)";
+            }
+
+            std::vector<std::string> params = ScriptLanguageService::splitSignatureParameters(signatureLabel);
+            const float sigWidth = 420.0f;
+            const float sigHeight = params.empty()
+                ? lineHeight * 2.2f
+                : lineHeight * std::clamp(static_cast<float>(params.size() + 2), 3.0f, 8.0f);
+
+            ImVec2 sigPos;
+            if (completionVisible && !completionFlippedUp) {
+                sigPos = ImVec2(caretPos.x, caretPos.y - sigHeight - 6.0f);
+                sigPos.x = std::clamp(sigPos.x, editorRectMin.x, std::max(editorRectMin.x, editorRectMax.x - sigWidth));
+                sigPos.y = std::clamp(sigPos.y, editorRectMin.y, std::max(editorRectMin.y, editorRectMax.y - sigHeight));
+            } else {
+                sigPos = popupPositionWithinBounds(caretPos, sigWidth, sigHeight, lineHeight,
+                    editorRectMin, editorRectMax, nullptr);
+            }
+
+            ImGui::SetNextWindowPos(sigPos, ImGuiCond_Always);
+            ImGui::SetNextWindowSize(ImVec2(sigWidth, sigHeight), ImGuiCond_Always);
+            ImGuiWindowFlags sigFlags =
+                ImGuiWindowFlags_NoDocking |
+                ImGuiWindowFlags_NoTitleBar |
+                ImGuiWindowFlags_NoResize |
+                ImGuiWindowFlags_NoMove |
+                ImGuiWindowFlags_NoSavedSettings |
+                ImGuiWindowFlags_NoFocusOnAppearing;
+            if (ImGui::Begin("##ScriptSignaturePopup", nullptr, sigFlags)) {
+                ImGui::TextUnformatted(signatureLabel.c_str());
+                if (!params.empty()) {
+                    ImGui::Separator();
+                    const int highlighted = std::clamp(callCtx.activeParameter, 0, static_cast<int>(params.size()) - 1);
+                    for (size_t i = 0; i < params.size(); ++i) {
+                        bool isActive = static_cast<int>(i) == highlighted;
+                        ImVec4 color = isActive
+                            ? ImVec4(0.96f, 0.84f, 0.40f, 1.0f)
+                            : ImVec4(0.75f, 0.75f, 0.78f, 1.0f);
+                        ImGui::TextColored(color, "%s%s", isActive ? "> " : "  ", params[i].c_str());
+                    }
+                }
+            }
+            ImGui::End();
+        }
+    }
+
+    if (completionVisible && editor.HasCursorScreenPosition() && !activeSuggestions.empty()) {
+        const std::string& suggestion = activeSuggestions[static_cast<size_t>(selectedSuggestionIndex)];
+        if (suggestion.size() > activePrefix.size() && suggestion.rfind(activePrefix, 0) == 0) {
+            std::string ghost = suggestion.substr(activePrefix.size());
+            ImU32 ghostColor = IM_COL32(180, 180, 180, 110);
+            ImGui::GetForegroundDrawList()->AddText(editor.GetCursorScreenPositionPublic(),
+                ghostColor, ghost.c_str());
+        }
+    }
+}
+
+void Engine::renderScriptDiagnostics() {
+    int errorCount = 0;
+    int warningCount = 0;
+    int infoCount = 0;
+    for (const auto& diagnostic : lastCompileDiagnostics) {
+        if (diagnostic.severity == Modularity::ScriptDiagnosticSeverity::Error) {
+            ++errorCount;
+        } else if (diagnostic.severity == Modularity::ScriptDiagnosticSeverity::Warning) {
+            ++warningCount;
+        } else {
+            ++infoCount;
+        }
+    }
+
+    ImGui::Text("Errors: %d  Warnings: %d  Info: %d", errorCount, warningCount, infoCount);
+    ImGui::Separator();
+    if (ImGui::BeginChild("ScriptDiagnosticList", ImVec2(0.0f, 0.0f))) {
+        for (size_t index = 0; index < lastCompileDiagnostics.size(); ++index) {
+            const auto& diagnostic = lastCompileDiagnostics[index];
+            const ImVec4 color =
+                diagnostic.severity == Modularity::ScriptDiagnosticSeverity::Error
+                    ? ImVec4(0.94f, 0.45f, 0.45f, 1.0f)
+                    : diagnostic.severity == Modularity::ScriptDiagnosticSeverity::Warning
+                        ? ImVec4(0.95f, 0.79f, 0.40f, 1.0f)
+                        : ImVec4(0.55f, 0.78f, 0.95f, 1.0f);
+
+            ImGui::PushID(static_cast<int>(index));
+            ImGui::TextColored(
+                color,
+                "[%s][%s] %s",
+                Modularity::scriptDiagnosticSeverityToString(diagnostic.severity),
+                diagnostic.code.c_str(),
+                diagnostic.message.c_str());
+            if (!diagnostic.hint.empty()) {
+                ImGui::TextWrapped("Hint: %s", diagnostic.hint.c_str());
+            }
+            if (!diagnostic.source.empty()) {
+                ImGui::TextDisabled("Source: %s", diagnostic.source.c_str());
+            }
+            if (diagnostic.line > 0) {
+                ImGui::TextDisabled("Line: %d", diagnostic.line);
+            }
+            if (!diagnostic.rawDetails.empty() && ImGui::TreeNode("Raw Details")) {
+                ImGui::TextDisabled("Origin: %s", Modularity::scriptDiagnosticOriginToString(diagnostic.origin));
+                if (diagnostic.column > 0) {
+                    ImGui::TextDisabled("Column: %d", diagnostic.column);
+                }
+                if (!diagnostic.sourceLine.empty()) {
+                    ImGui::TextWrapped("Code: %s", diagnostic.sourceLine.c_str());
+                }
+                ImGui::Separator();
+                ImGui::TextWrapped("%s", diagnostic.rawDetails.c_str());
+                ImGui::TreePop();
+            }
+            if (index + 1 < lastCompileDiagnostics.size()) {
+                ImGui::Separator();
+            }
+            ImGui::PopID();
+        }
+    }
+    ImGui::EndChild();
 }

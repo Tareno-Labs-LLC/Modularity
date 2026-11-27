@@ -93,6 +93,16 @@ class PhysicsSystem : public IPhysicsBackend {
         bool getContactNormal(int objectId, glm::vec3& outNormal) const override;
         void noteContactNormal(int objectAId, int objectBId, const glm::vec3& lowToHighNormal);
         bool setObjectsCollisionIgnored(int objectAId, int objectBId, bool ignored) override;
+        bool addForceAtPosition(int id, const glm::vec3& force, const glm::vec3& worldPoint) override;
+        bool addImpulseAtPosition(int id, const glm::vec3& impulse, const glm::vec3& worldPoint) override;
+        bool getPointVelocity(int id, const glm::vec3& worldPoint, glm::vec3& outVelocity) const override;
+        bool getCenterOfMassPosition(int id, glm::vec3& outWorldCenterOfMass) const override;
+        bool getActorPoseQuat(int id, glm::vec3& outPosition, glm::quat& outRotation) const override;
+        bool getMass(int id, float& outMassKg) const override;
+        bool raycastClosestFiltered(const glm::vec3& origin, const glm::vec3& dir, float distance,
+                                    int ignoreId, bool skipSensors,
+                                    glm::vec3* hitPos, glm::vec3* hitNormal, float* hitDistance,
+                                    int* hitActorId, float* hitFriction) const override;
     private:
         void clearActors();
         void applySceneGravity();

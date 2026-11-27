@@ -1,6 +1,8 @@
 #include "UIControls.h"
 #include "../../EditorLocalization.h"
+#include "../CodexPluginSetup.h"
 #include "Engine.h"
+#include "TerrainRuntime.h"
 
 namespace Loc = Modularity::Loc;
 
@@ -509,6 +511,16 @@ void Engine::renderMainMenuBar(bool embedded) {
     }
 
     if (ImGui::BeginMenu(Loc::T("MENU_TOOLS", "Tools"))) {
+#if defined(__linux__) && !defined(__ANDROID__) && !MODULARITY_RUNTIME_ONLY
+      std::error_code codexImportError;
+      const bool codexAvailable = projectManager.currentProject.isLoaded &&
+          (packageManager.isInstalled(CodexPluginSetup::PackageId) ||
+           fs::is_regular_file(projectManager.currentProject.projectPath / "Editor/Codex Plugin/codex_plugin.py", codexImportError));
+      if (codexAvailable && ImGui::MenuItem("Codex Plugin")) {
+        CodexPluginSetup::Open(projectManager.currentProject.projectPath,
+                               packageManager.installedPackageRoot(CodexPluginSetup::PackageId), !usingVulkan());
+      }
+#endif
       ImGui::MenuItem(Loc::Window("WINDOW_DOCTOR", "Modularity Doctor"), nullptr, &showModularityDoctorWindow);
 #if !MODULARITY_RUNTIME_ONLY
       bool prevVersionControl = showVersionControlWindow;
@@ -646,6 +658,10 @@ void Engine::renderMainMenuBar(bool embedded) {
     ImGui::PopStyleVar(2);
     if (embedded) ImGui::EndMenuBar(); else ImGui::EndMainMenuBar();
   }
+#if defined(__linux__) && !defined(__ANDROID__) && !MODULARITY_RUNTIME_ONLY
+  CodexPluginSetup::Draw();
+#endif
+
 
   if (triggerAboutModularityPopup) {
     playEditorSound(EditorSoundCue::DialogOpen, 0.95f);
@@ -1135,29 +1151,29 @@ void Engine::buildWorkspaceLayout(WorkspaceMode mode) {
     ImGui::DockBuilderDockWindow(Loc::WindowRef("Viewport"), dockMain);
   } else {
     ImGuiID dockLeft = ImGui::DockBuilderSplitNode(dockMain, ImGuiDir_Left,
-                                                   0.25f, nullptr, &dockMain);
+                                                   0.20f, nullptr, &dockMain);
     ImGuiID dockRight = ImGui::DockBuilderSplitNode(dockMain, ImGuiDir_Right,
-                                                    0.35f, nullptr, &dockMain);
-    ImGuiID dockUtility = ImGui::DockBuilderSplitNode(
-        dockRight, ImGuiDir_Down, 0.42f, nullptr, &dockRight);
+                                                    0.25f, nullptr, &dockMain);
+    ImGuiID dockBottom = ImGui::DockBuilderSplitNode(dockMain, ImGuiDir_Down,
+                                                     0.23f, nullptr, &dockMain);
 
-    ImGui::DockBuilderDockWindow(Loc::WindowRef("Project"), dockLeft);
-    ImGui::DockBuilderDockWindow(Loc::WindowRef("Version Control"), dockLeft);
     ImGui::DockBuilderDockWindow(Loc::WindowRef("Hierarchy"), dockLeft);
     ImGui::DockBuilderDockWindow(Loc::WindowRef("Camera"), dockLeft);
-    if (hasScriptingWindowPackage()) {
-      ImGui::DockBuilderDockWindow(Loc::WindowRef("Scripting"), dockRight);
-    }
     ImGui::DockBuilderDockWindow(Loc::WindowRef("Inspector"), dockRight);
     ImGui::DockBuilderDockWindow(Loc::WindowRef("Environment"), dockRight);
-    ImGui::DockBuilderDockWindow(Loc::WindowRef("Project Settings"), dockUtility);
-    ImGui::DockBuilderDockWindow(Loc::WindowRef("Modupak Manager"), dockUtility);
+    ImGui::DockBuilderDockWindow(Loc::WindowRef("Project"), dockBottom);
+    ImGui::DockBuilderDockWindow(Loc::WindowRef("Version Control"), dockBottom);
+    ImGui::DockBuilderDockWindow(Loc::WindowRef("Viewport"), dockMain);
+    ImGui::DockBuilderDockWindow(Loc::WindowRef("Game Viewport"), dockMain);
     if (hasSpriteEditorPackage()) {
       ImGui::DockBuilderDockWindow(Loc::WindowRef("Pixel Sprite Editor"), dockMain);
       ImGui::DockBuilderDockWindow(Loc::WindowRef("Assemblage"), dockMain);
     }
-    ImGui::DockBuilderDockWindow(Loc::WindowRef("Viewport"), dockMain);
-    ImGui::DockBuilderDockWindow(Loc::WindowRef("Game Viewport"), dockMain);
+    ImGui::DockBuilderDockWindow(Loc::WindowRef("Project Settings"), dockMain);
+    ImGui::DockBuilderDockWindow(Loc::WindowRef("Modupak Manager"), dockMain);
+    if (hasScriptingWindowPackage()) {
+      ImGui::DockBuilderDockWindow(Loc::WindowRef("Scripting"), dockMain);
+    }
   }
 
   ImGui::DockBuilderFinish(dockspaceId);
@@ -1258,6 +1274,16 @@ void Engine::renderSceneObjectCreateMenu(int parentId) {
       addObject(ObjectType::Plane, "Plane");
     if (ImGui::MenuItem("Torus"))
       addObject(ObjectType::Torus, "Torus");
+    ImGui::Separator();
+    if (ImGui::MenuItem("Terrain")) {
+      addObject(ObjectType::Empty, "Terrain");
+      if (SceneObject *created = lastCreated()) {
+        created->hasTerrain = true;
+        created->terrain = TerrainComponent{};
+        TerrainRuntime::InitializeFlat(created->terrain, 0.0f);
+        EnsureInspectorComponentMetadata(*created);
+      }
+    }
     ImGui::EndMenu();
   }
 
@@ -1621,6 +1647,14 @@ void Engine::renderSceneObjectCreateMenu(int parentId) {
   if (ImGui::BeginMenu("Environment / Volumes")) {
     if (ImGui::MenuItem("ModuVolume"))
       addObject(ObjectType::PostFXNode, "ModuVolume");
+    if (ImGui::MenuItem("Instancer")) {
+      addObject(ObjectType::Empty, "Instancer");
+      if (SceneObject *created = lastCreated()) {
+        created->hasInstancer = true;
+        created->instancer = InstancerComponent{};
+        EnsureInspectorComponentMetadata(*created);
+      }
+    }
     ImGui::EndMenu();
   }
 

@@ -73,6 +73,9 @@ namespace
         if (!MODULARITY_OPENGL_ES && profile != kAnyProfile)
         {
             glfwWindowHint(GLFW_OPENGL_PROFILE, profile);
+#if defined(__APPLE__)
+            glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
+#endif
         }
 
         return glfwCreateWindow(kDefaultWindowWidth, kDefaultWindowHeight, "Modularity", nullptr, nullptr);
@@ -100,18 +103,11 @@ namespace
 
 GLFWwindow* Window::makeWindow(Modularity::GraphicsBackend backend)
 {
-    // GLFW window icons are top-row-first.
-    const StbFlipScope flipForIcon(false);
-    unsigned char* pixels = stbi_load(
-        "Resources/Engine-Root/Modu-Logo.png",
-        &width,
-        &height,
-        &channels,
-        4
-    );
-
 #if defined(__ANDROID__)
     glfwInitHint(GLFW_PLATFORM, GLFW_PLATFORM_NULL);
+#elif defined(__APPLE__)
+    glfwInitHint(GLFW_PLATFORM, GLFW_PLATFORM_COCOA);
+    glfwInitHint(GLFW_COCOA_CHDIR_RESOURCES, GLFW_FALSE);
 #elif defined(__linux__)
     const char* wayland_display = std::getenv("WAYLAND_DISPLAY");
     const char* x11_display     = std::getenv("DISPLAY");
@@ -169,6 +165,13 @@ GLFWwindow* Window::makeWindow(Modularity::GraphicsBackend backend)
             window = tryCreateWindow(2, 0, kAnyProfile);
         }
 #else
+#if defined(__APPLE__)
+        window = tryCreateWindow(4, 1, GLFW_OPENGL_CORE_PROFILE);
+        if (!window)
+        {
+            window = tryCreateWindow(3, 3, GLFW_OPENGL_CORE_PROFILE);
+        }
+#else
         {
             static const int kCoreLadder[][2] = { {4, 6}, {4, 5}, {4, 3}, {3, 3} };
             for (const auto& version : kCoreLadder)
@@ -195,6 +198,7 @@ GLFWwindow* Window::makeWindow(Modularity::GraphicsBackend backend)
             std::cerr << "Failed to create GLFW window (OpenGL 3.0 any). Retrying...\n";
             window = tryCreateWindow(2, 1, kAnyProfile);
         }
+#endif
 #endif
     }
 
@@ -223,6 +227,16 @@ GLFWwindow* Window::makeWindow(Modularity::GraphicsBackend backend)
     }
 #endif
 
+#if !defined(__APPLE__)
+    // GLFW window icons are top-row-first.
+    const StbFlipScope flipForIcon(false);
+    unsigned char* pixels = stbi_load(
+        "Resources/Engine-Root/Modu-Logo.png",
+        &width,
+        &height,
+        &channels,
+        4
+    );
     if (pixels)
     {
         GLFWimage icon;
@@ -233,6 +247,7 @@ GLFWwindow* Window::makeWindow(Modularity::GraphicsBackend backend)
         glfwSetWindowIcon(window, 1, &icon);
         stbi_image_free(pixels);
     }
+#endif
 
     centerWindowOnPrimaryMonitor(window);
     glfwShowWindow(window);

@@ -6,6 +6,7 @@
 #include "SpritesheetFormat.h"
 #include "ThirdParty/ModuGUI/imgui.h"
 #include "XR/XRInput.h"
+#include "Network/HttpClient.h"
 #ifdef __ANDROID__
 #include "AndroidRuntime/AndroidRuntime.h"
 #include "AndroidScript.h"
@@ -1118,6 +1119,46 @@ bool ScriptContext::NetworkLeaveRoom() {
     return s && s->leaveRoom();
 }
 
+bool ScriptContext::NetworkJoinLobby() {
+    Net::NetworkSession* s = NetSession(this);
+    return s && s->joinLobby();
+}
+
+bool ScriptContext::NetworkRefreshRoomList() {
+    Net::NetworkSession* s = NetSession(this);
+    return s && s->refreshRoomList();
+}
+
+int ScriptContext::GetRoomCount() const {
+    const Net::NetworkSession* s = NetSessionConst(this);
+    if (!s) return 0;
+    return static_cast<int>(s->roomList().size());
+}
+
+std::string ScriptContext::GetRoomName(int index) const {
+    const Net::NetworkSession* s = NetSessionConst(this);
+    if (!s || index < 0) return std::string();
+    const auto& list = s->roomList();
+    if (static_cast<size_t>(index) >= list.size()) return std::string();
+    return list[static_cast<size_t>(index)].name;
+}
+
+int ScriptContext::GetRoomPlayerCount(int index) const {
+    const Net::NetworkSession* s = NetSessionConst(this);
+    if (!s || index < 0) return 0;
+    const auto& list = s->roomList();
+    if (static_cast<size_t>(index) >= list.size()) return 0;
+    return list[static_cast<size_t>(index)].playerCount;
+}
+
+int ScriptContext::GetRoomMaxPlayers(int index) const {
+    const Net::NetworkSession* s = NetSessionConst(this);
+    if (!s || index < 0) return 0;
+    const auto& list = s->roomList();
+    if (static_cast<size_t>(index) >= list.size()) return 0;
+    return list[static_cast<size_t>(index)].maxPlayers;
+}
+
 int ScriptContext::GetLocalNetworkPlayerId() const {
     const Net::NetworkSession* s = NetSessionConst(this);
     return s ? static_cast<int>(s->localPlayerId()) : static_cast<int>(Net::kInvalidPlayerId);
@@ -1251,6 +1292,103 @@ bool ScriptContext::GetAvatarPose(int playerId, int slot, glm::vec3& position, g
     position = glm::vec3(pose.position[0], pose.position[1], pose.position[2]);
     rotation = glm::quat(pose.rotation[3], pose.rotation[0], pose.rotation[1], pose.rotation[2]);
     return true;
+}
+
+unsigned int ScriptContext::HttpSend(const std::string& method, const std::string& url, const std::string& headers,
+                                     const std::string& body, int timeoutSeconds,
+                                     HttpCompleteFn onComplete, HttpReleaseFn onRelease, void* user) {
+    Net::Http::Request request;
+    request.method = method.empty() ? std::string("GET") : method;
+    request.url = url;
+    request.body = body;
+    request.timeoutSeconds = timeoutSeconds > 0 ? timeoutSeconds : 30;
+    std::istringstream lines(headers);
+    std::string line;
+    while (std::getline(lines, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const size_t colon = line.find(':');
+        if (colon == std::string::npos || colon == 0) continue;
+        size_t valueStart = colon + 1;
+        while (valueStart < line.size() && line[valueStart] == ' ') ++valueStart;
+        request.headers.emplace_back(line.substr(0, colon), line.substr(valueStart));
+    }
+    Net::Http::Completion complete;
+    if (onComplete) {
+        // The sender's context is a stack temporary; remember how to rebuild it.
+        Engine* owner = engine;
+        const int objectId = object ? object->id : -1;
+        long scriptIndex = -1;
+        if (object && script && script >= object->scripts.data() &&
+            script < object->scripts.data() + object->scripts.size()) {
+            scriptIndex = static_cast<long>(script - object->scripts.data());
+        }
+        complete = [onComplete, user, owner, objectId, scriptIndex](const Net::Http::Response& response) {
+            ScriptContext ctx;
+            ctx.engine = owner;
+            if (owner && objectId >= 0) {
+                if (SceneObject* obj = owner->findObjectById(objectId)) {
+                    ctx.object = obj;
+                    if (scriptIndex >= 0 && static_cast<size_t>(scriptIndex) < obj->scripts.size()) {
+                        ctx.script = &obj->scripts[static_cast<size_t>(scriptIndex)];
+                    }
+                }
+            }
+            onComplete(user, ctx, response.status, response.body.data(), response.body.size(), response.error.c_str());
+        };
+    }
+    Net::Http::Release release;
+    if (onRelease) release = [onRelease, user]() { onRelease(user); };
+    return Net::Http::Send(std::move(request), std::move(complete), std::move(release));
+}
+
+bool ScriptContext::IsHttpAvailable(std::string& reason) const {
+    reason.clear();
+    return Net::Http::IsAvailable(&reason);
+}
+
+std::string ScriptContext::GetDeviceUniqueId() const {
+    return Net::Http::DeviceUniqueId();
+}
+
+namespace {
+struct SharedValueEntry {
+    std::string value;
+    unsigned int revision = 0;
+};
+std::unordered_map<std::string, SharedValueEntry>& SharedValues() {
+    static std::unordered_map<std::string, SharedValueEntry> values;
+    return values;
+}
+} // namespace
+
+namespace ScriptSharedValues {
+void Clear() { SharedValues().clear(); }
+} // namespace ScriptSharedValues
+
+void ScriptContext::SetSharedValue(const std::string& key, const std::string& value) {
+    SharedValueEntry& entry = SharedValues()[key];
+    entry.value = value;
+    ++entry.revision;
+}
+
+std::string ScriptContext::GetSharedValue(const std::string& key, const std::string& fallback) const {
+    const auto& values = SharedValues();
+    const auto it = values.find(key);
+    return it == values.end() ? fallback : it->second.value;
+}
+
+bool ScriptContext::HasSharedValue(const std::string& key) const {
+    return SharedValues().count(key) != 0;
+}
+
+void ScriptContext::EraseSharedValue(const std::string& key) {
+    SharedValues().erase(key);
+}
+
+unsigned int ScriptContext::GetSharedValueRevision(const std::string& key) const {
+    const auto& values = SharedValues();
+    const auto it = values.find(key);
+    return it == values.end() ? 0u : it->second.revision;
 }
 
 glm::vec3 ScriptContext::QuatToEulerDegrees(const glm::quat& rotation) const {
@@ -2224,6 +2362,95 @@ bool ScriptContext::TeleportRigidbody(const glm::vec3& pos, const glm::vec3& rot
     return engine->teleportPhysicsActorFromScript(object->id, pos, object->rotation);
 }
 
+bool ScriptContext::AddRigidbodyForceAtPosition(const glm::vec3& force, const glm::vec3& worldPoint) {
+    if (!engine || !object || !HasRigidbody()) return false;
+    return engine->addRigidbodyForceAtPositionFromScript(object->id, force, worldPoint);
+}
+
+bool ScriptContext::AddObjectRigidbodyForceAtPosition(int objectId, const glm::vec3& force,
+                                                      const glm::vec3& worldPoint) {
+    if (!engine || objectId < 0) return false;
+    return engine->addRigidbodyForceAtPositionFromScript(objectId, force, worldPoint);
+}
+
+bool ScriptContext::AddRigidbodyImpulseAtPosition(const glm::vec3& impulse, const glm::vec3& worldPoint) {
+    if (!engine || !object || !HasRigidbody()) return false;
+    return engine->addRigidbodyImpulseAtPositionFromScript(object->id, impulse, worldPoint);
+}
+
+bool ScriptContext::AddObjectRigidbodyImpulseAtPosition(int objectId, const glm::vec3& impulse,
+                                                        const glm::vec3& worldPoint) {
+    if (!engine || objectId < 0) return false;
+    return engine->addRigidbodyImpulseAtPositionFromScript(objectId, impulse, worldPoint);
+}
+
+bool ScriptContext::AddObjectRigidbodyForce(int objectId, const glm::vec3& force) {
+    if (!engine || objectId < 0) return false;
+    return engine->addRigidbodyForceFromScript(objectId, force);
+}
+
+bool ScriptContext::AddObjectRigidbodyTorque(int objectId, const glm::vec3& torque) {
+    if (!engine || objectId < 0) return false;
+    return engine->addRigidbodyTorqueFromScript(objectId, torque);
+}
+
+bool ScriptContext::GetRigidbodyPointVelocity(const glm::vec3& worldPoint, glm::vec3& outVelocity) const {
+    if (!engine || !object || !HasRigidbody()) return false;
+    return engine->getRigidbodyPointVelocityFromScript(object->id, worldPoint, outVelocity);
+}
+
+bool ScriptContext::GetObjectRigidbodyPointVelocity(int objectId, const glm::vec3& worldPoint,
+                                                    glm::vec3& outVelocity) const {
+    if (!engine || objectId < 0) return false;
+    return engine->getRigidbodyPointVelocityFromScript(objectId, worldPoint, outVelocity);
+}
+
+bool ScriptContext::GetRigidbodyCenterOfMass(glm::vec3& outWorldCenterOfMass) const {
+    if (!engine || !object) return false;
+    return engine->getRigidbodyCenterOfMassFromScript(object->id, outWorldCenterOfMass);
+}
+
+bool ScriptContext::GetObjectRigidbodyCenterOfMass(int objectId, glm::vec3& outWorldCenterOfMass) const {
+    if (!engine || objectId < 0) return false;
+    return engine->getRigidbodyCenterOfMassFromScript(objectId, outWorldCenterOfMass);
+}
+
+bool ScriptContext::GetObjectRigidbodyAngularVelocity(int objectId, glm::vec3& outVelocity) const {
+    if (!engine || objectId < 0) return false;
+    return engine->getRigidbodyAngularVelocityFromScript(objectId, outVelocity);
+}
+
+bool ScriptContext::SetObjectRigidbodyAngularVelocity(int objectId, const glm::vec3& velocity) {
+    if (!engine || objectId < 0) return false;
+    return engine->setRigidbodyAngularVelocityFromScript(objectId, velocity);
+}
+
+bool ScriptContext::GetRigidbodyPhysicsPose(glm::vec3& outPosition, glm::quat& outRotation) const {
+    if (!engine || !object) return false;
+    return engine->getRigidbodyPhysicsPoseFromScript(object->id, outPosition, outRotation);
+}
+
+bool ScriptContext::GetObjectRigidbodyPhysicsPose(int objectId, glm::vec3& outPosition,
+                                                  glm::quat& outRotation) const {
+    if (!engine || objectId < 0) return false;
+    return engine->getRigidbodyPhysicsPoseFromScript(objectId, outPosition, outRotation);
+}
+
+bool ScriptContext::GetObjectRigidbodyMass(int objectId, float& outMassKg) const {
+    if (!engine || objectId < 0) return false;
+    return engine->getRigidbodyMassFromScript(objectId, outMassKg);
+}
+
+bool ScriptContext::RaycastClosestIgnoring(const glm::vec3& origin, const glm::vec3& dir, float distance,
+                                           int ignoreObjectId, glm::vec3* hitPos, glm::vec3* hitNormal,
+                                           float* hitDistance, int* hitObjectId, float* hitFriction,
+                                           bool skipSensors) const {
+    if (hitObjectId) *hitObjectId = -1;
+    if (!engine) return false;
+    return engine->raycastClosestIgnoringFromScript(origin, dir, distance, ignoreObjectId, skipSensors,
+                                                    hitPos, hitNormal, hitDistance, hitObjectId, hitFriction);
+}
+
 bool ScriptContext::HasAudioSource() const {
     return object && object->hasAudioSource && object->audioSource.enabled;
 }
@@ -2271,6 +2498,32 @@ bool ScriptContext::SetAudioVolume(float volume) {
     object->audioSource.volume = clamped;
     engine->markProjectDirty();
     return engine->setAudioVolumeFromScript(object->id, clamped);
+}
+
+bool ScriptContext::SetAudioPitch(float pitch) {
+    if (!engine || !object || !object->hasAudioSource) return false;
+    return engine->setAudioPitchFromScript(object->id, pitch);
+}
+
+bool ScriptContext::SetObjectAudioPitch(int objectId, float pitch) {
+    if (!engine || objectId < 0) return false;
+    return engine->setAudioPitchFromScript(objectId, pitch);
+}
+
+bool ScriptContext::SetObjectAudioVolume(int objectId, float volume) {
+    if (!engine || objectId < 0) return false;
+    return engine->setAudioVolumeFromScript(objectId, volume, false);
+}
+
+void ScriptContext::GetRenderStats(int& drawCalls, int& triangles, float& cpuFrameMs, float& gpuFrameMs) const {
+    if (!engine) {
+        drawCalls = 0;
+        triangles = 0;
+        cpuFrameMs = 0.0f;
+        gpuFrameMs = -1.0f;
+        return;
+    }
+    engine->getRenderStatsFromScript(drawCalls, triangles, cpuFrameMs, gpuFrameMs);
 }
 
 bool ScriptContext::SetAudioClip(const std::string& path) {
@@ -2892,6 +3145,16 @@ void ScriptContext::StopAllIEnums() {
     if (script) script->activeIEnums.clear();
 }
 
+bool ScriptContext::SetWeather(int mode, float intensity) {
+    if (!engine) return false;
+    return engine->setRuntimeWeather(mode, intensity);
+}
+
+bool ScriptContext::GetWeather(int& mode, float& intensity) const {
+    if (!engine) return false;
+    return engine->getRuntimeWeather(mode, intensity);
+}
+
 void ScriptContext::MarkDirty() {
     if (engine) {
         engine->markProjectDirty();
@@ -2987,6 +3250,7 @@ ScriptRuntime::Module* ScriptRuntime::getModule(const fs::path& binaryPath) {
         mod.testEditor = reinterpret_cast<TestEditorFn>(EmbeddedScript::Symbol(embeddedModule, "Script_TestEditor"));
         mod.update = reinterpret_cast<UpdateFn>(EmbeddedScript::Symbol(embeddedModule, "Script_Update"));
         mod.tickUpdate = reinterpret_cast<TickUpdateFn>(EmbeddedScript::Symbol(embeddedModule, "Script_TickUpdate"));
+        mod.fixedUpdate = reinterpret_cast<FixedUpdateFn>(EmbeddedScript::Symbol(embeddedModule, "Script_FixedUpdate"));
         mod.editorRender = reinterpret_cast<EditorRenderFn>(EmbeddedScript::Symbol(embeddedModule, "RenderEditorWindow"));
         mod.editorExit = reinterpret_cast<EditorExitFn>(EmbeddedScript::Symbol(embeddedModule, "ExitRenderEditorWindow"));
         mod.resetState = reinterpret_cast<ResetStateFn>(EmbeddedScript::Symbol(embeddedModule, "Script_ResetState"));
@@ -3033,6 +3297,7 @@ ScriptRuntime::Module* ScriptRuntime::getModule(const fs::path& binaryPath) {
     mod.testEditor = reinterpret_cast<TestEditorFn>(GetProcAddress(static_cast<HMODULE>(mod.handle), "Script_TestEditor"));
     mod.update = reinterpret_cast<UpdateFn>(GetProcAddress(static_cast<HMODULE>(mod.handle), "Script_Update"));
     mod.tickUpdate = reinterpret_cast<TickUpdateFn>(GetProcAddress(static_cast<HMODULE>(mod.handle), "Script_TickUpdate"));
+    mod.fixedUpdate = reinterpret_cast<FixedUpdateFn>(GetProcAddress(static_cast<HMODULE>(mod.handle), "Script_FixedUpdate"));
     mod.editorRender = reinterpret_cast<EditorRenderFn>(GetProcAddress(static_cast<HMODULE>(mod.handle), "RenderEditorWindow"));
     mod.editorExit = reinterpret_cast<EditorExitFn>(GetProcAddress(static_cast<HMODULE>(mod.handle), "ExitRenderEditorWindow"));
     mod.resetState = reinterpret_cast<ResetStateFn>(GetProcAddress(static_cast<HMODULE>(mod.handle), "Script_ResetState"));
@@ -3058,7 +3323,11 @@ ScriptRuntime::Module* ScriptRuntime::getModule(const fs::path& binaryPath) {
         }
         mod.loadedPath = loadPath;
         mod.loadedFromShadowCopy = true;
+#if defined(__APPLE__)
+        mod.handle = dlopen(loadPath.string().c_str(), RTLD_NOW | RTLD_LOCAL);
+#else
         mod.handle = dlopen(loadPath.string().c_str(), RTLD_LAZY);
+#endif
     }
     if (!mod.handle) {
         const char* err = dlerror();
@@ -3079,6 +3348,7 @@ ScriptRuntime::Module* ScriptRuntime::getModule(const fs::path& binaryPath) {
     mod.testEditor = reinterpret_cast<TestEditorFn>(dlsym(mod.handle, "Script_TestEditor"));
     mod.update = reinterpret_cast<UpdateFn>(dlsym(mod.handle, "Script_Update"));
     mod.tickUpdate = reinterpret_cast<TickUpdateFn>(dlsym(mod.handle, "Script_TickUpdate"));
+    mod.fixedUpdate = reinterpret_cast<FixedUpdateFn>(dlsym(mod.handle, "Script_FixedUpdate"));
     mod.editorRender = reinterpret_cast<EditorRenderFn>(dlsym(mod.handle, "RenderEditorWindow"));
     mod.editorExit = reinterpret_cast<EditorExitFn>(dlsym(mod.handle, "ExitRenderEditorWindow"));
     mod.resetState = reinterpret_cast<ResetStateFn>(dlsym(mod.handle, "Script_ResetState"));
@@ -3090,7 +3360,7 @@ ScriptRuntime::Module* ScriptRuntime::getModule(const fs::path& binaryPath) {
     {
         const char* err = dlerror();
         if (err && !mod.inspector && !mod.begin && !mod.spec && !mod.testEditor
-            && !mod.update && !mod.tickUpdate && !mod.editorRender && !mod.editorExit
+            && !mod.update && !mod.tickUpdate && !mod.fixedUpdate && !mod.editorRender && !mod.editorExit
             && !mod.collideEnter && !mod.collideHold && !mod.collideExit) {
             lastError = err;
         }
@@ -3138,7 +3408,7 @@ ScriptRuntime::Module* ScriptRuntime::getModule(const fs::path& binaryPath) {
     }
 
     if (!mod.inspector && !mod.begin && !mod.spec && !mod.testEditor
-        && !mod.update && !mod.tickUpdate && !mod.editorRender && !mod.editorExit
+        && !mod.update && !mod.tickUpdate && !mod.fixedUpdate && !mod.editorRender && !mod.editorExit
         && !mod.collideEnter && !mod.collideHold && !mod.collideExit) {
         unloadModuleHandle(mod.handle);
         if (mod.loadedFromShadowCopy && !mod.loadedPath.empty()) {
@@ -3196,6 +3466,27 @@ void ScriptRuntime::tickModule(const fs::path& binaryPath, ScriptContext& ctx, f
                       ctx.script->activeIEnums.end()) fn(ctx, deltaTime);
         }
     }
+}
+
+void ScriptRuntime::fixedUpdateModule(const fs::path& binaryPath, ScriptContext& ctx, float fixedDeltaTime) {
+    if (!ctx.object || !ctx.script || binaryPath.empty()) return;
+    Module* mod = nullptr;
+    auto it = loaded.find(binaryPath.string());
+    if (it != loaded.end()) {
+        mod = &it->second;
+    }
+#ifdef __ANDROID__
+    else {
+        // Soname-loaded modules are keyed by soname, not by path; resolve through getModule.
+        mod = getModule(binaryPath);
+    }
+#endif
+    // Not loaded yet: the frame's tickModule loads it and runs Begin before the first step.
+    if (!mod || !mod->fixedUpdate) return;
+    const int objId = ctx.object->id;
+    if (mod->begin && mod->beginCalledObjects.find(objId) == mod->beginCalledObjects.end()) return;
+    ScriptContextBinding binding(ctx);
+    mod->fixedUpdate(ctx, fixedDeltaTime);
 }
 
 void ScriptRuntime::dispatchCollision(const fs::path& binaryPath, ScriptContext& ctx,

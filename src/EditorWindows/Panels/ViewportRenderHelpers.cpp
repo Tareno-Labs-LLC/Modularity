@@ -214,6 +214,78 @@ void ApplyNearestTextureSampling(GLuint textureId) {
   glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previousTexture));
 }
 
+// Call right after Begin(). True when nothing the panel body submits could be seen or
+// interacted with this frame, so the caller may End() and return early.
+//  - Begin() returned false (hidden dock tab / collapsed), or
+//  - the window has sat entirely under an opaque dock-drawer rail (DockDrawer.cpp) for a
+//    moment. A folded drawer shrinks its node to the rail instead of hiding the window, so
+//    Begin() still returns true there.
+// Never true while a popup is open, a drag is in flight, or the panel owns focus or the
+// active item: popups, drag sources and key handling all live in panel bodies.
+// `railState` is caller-owned: one `static double[2] = {-1.0, -1.0}` per panel, holding
+// when the rail started covering the window and the last frame this was asked.
+bool CanSkipHiddenPanelBody(bool beginVisible, double *railState) {
+  ImGuiContext &g = *GImGui;
+  ImGuiWindow *window = g.CurrentWindow;
+  if (window == nullptr || railState == nullptr) {
+    return false;
+  }
+  double &railCoveredSince = railState[0];
+  // A gap in calls (panel closed for a while) must not count as time spent covered.
+  if (railState[1] != static_cast<double>(g.FrameCount - 1)) {
+    railCoveredSince = -1.0;
+  }
+  railState[1] = static_cast<double>(g.FrameCount);
+  const bool busy =
+      g.OpenPopupStack.Size > 0 || g.DragDropActive ||
+      (g.ActiveIdWindow != nullptr && g.ActiveIdWindow->RootWindow == window) ||
+      (g.NavWindow != nullptr && g.NavWindow->RootWindow == window);
+  if (busy) {
+    railCoveredSince = -1.0;
+    return false;
+  }
+  if (!beginVisible) {
+    railCoveredSince = -1.0;
+    return true;
+  }
+
+  bool covered = false;
+  ImGuiWindow *host = window->RootWindowDockTree;
+  // The rail fills itself with MenuBarBg; a translucent theme lets the panel show through.
+  if (window->DockNode != nullptr && host != nullptr && host != window &&
+      (ImGui::GetColorU32(ImGuiCol_MenuBarBg) & IM_COL32_A_MASK) == IM_COL32_A_MASK) {
+    const ImRect self = window->Rect();
+    // Front to back, stopping at our dock host: only windows drawn above it can cover us.
+    for (int i = g.Windows.Size - 1; i >= 0 && !covered; --i) {
+      const ImGuiWindow *other = g.Windows[i];
+      if (other == host) {
+        break;
+      }
+      // The rail is submitted after the panels, so this is last frame's rail.
+      if (!other->WasActive || other->Hidden || other->Viewport != window->Viewport ||
+          std::strncmp(other->Name, "##DockRail_", 11) != 0) {
+        continue;
+      }
+      // Hovering the rail is the only way to reopen the drawer: resume before the click.
+      if (g.HoveredWindow == other || g.ActiveIdWindow == other) {
+        continue;
+      }
+      const ImRect rail = other->Rect();
+      covered = rail.Min.x <= self.Min.x && rail.Min.y <= self.Min.y &&
+                rail.Max.x >= self.Max.x && rail.Max.y >= self.Max.y;
+    }
+  }
+  if (!covered) {
+    railCoveredSince = -1.0;
+    return false;
+  }
+  if (railCoveredSince < 0.0) {
+    railCoveredSince = g.Time;
+  }
+  // The rail fades and slides in while the drawer folds; wait until it has long settled.
+  return g.Time - railCoveredSince >= 0.35;
+}
+
 bool RuntimeUiDrawOrderLess(const SceneObject *a, const SceneObject *b) {
   if (a == nullptr || b == nullptr)
     return false;

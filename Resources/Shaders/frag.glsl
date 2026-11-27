@@ -100,6 +100,57 @@ uniform float giIntensity = 1.0;
 uniform int giConeSteps = 24;
 #endif
 
+// -- Image-based lighting --
+// Unit 22: the captured sky cube, with a full mip chain. The renderer only sets
+// hasEnvironmentCube when the driver has that many units, and the ES 2 profile
+// never declares it. Diffuse sky light comes from its smallest levels, specular
+// reflections from the level the roughness asks for.
+#ifndef MODU_ES2
+uniform samplerCube environmentCube;
+uniform bool hasEnvironmentCube = false;
+uniform bool skyLightingReflections = true;
+uniform float environmentIntensity = 1.0;
+uniform float environmentMaxLod = 0.0;
+// Sunlight reflected off a generic ground (albedo times the main directional
+// light's irradiance on a flat surface). The sky cube's lower half is haze, not
+// ground, so below the horizon lighting blends to this plus the sky's own share.
+uniform vec3 environmentGroundSun = vec3(0.0);
+#endif
+// True when reflectionCube holds a local ReflectionCast probe rather than the sky.
+uniform bool reflectionIsProbe = false;
+uniform float reflectionMaxLod = 0.0;
+
+// -- Hemisphere ambient --
+// Cheap sky-above / ground-below tint for the flat ambient term, used only when no
+// sky cube feeds image-based lighting. 0 (the default) leaves the flat ambient
+// exactly as it was; 1 is a full cool-sky / warm-ground gradient.
+uniform float ambientHemisphere = 0.0;
+vec3 ambientHemisphereTint(vec3 N)
+{
+    if (ambientHemisphere <= 0.0) return vec3(1.0);
+#ifndef MODU_ES2
+    if (hasEnvironmentCube && environmentIntensity > 0.0) return vec3(1.0);
+#endif
+    const vec3 skyTint = vec3(0.80, 0.95, 1.25);
+    const vec3 groundTint = vec3(0.55, 0.45, 0.35);
+    return mix(vec3(1.0), mix(groundTint, skyTint, clamp(N.y * 0.5 + 0.5, 0.0, 1.0)),
+               clamp(ambientHemisphere, 0.0, 1.0));
+}
+
+// -- Clearcoat --
+// Second specular lobe over the base (car paint lacquer). 0 is off.
+uniform float clearcoat = 0.0;
+uniform float clearcoatRoughness = 0.04;
+
+// -- Surface wetness --
+// surfaceWetness 0 skips the whole wet path. wetnessReceive is per draw (UI and
+// sprites stay dry).
+uniform float surfaceWetness = 0.0;
+uniform float rainAmount = 0.0;
+uniform float puddleAmount = 0.5;
+uniform float wetTime = 0.0;
+uniform bool wetnessReceive = true;
+
 uniform bool fogEnabled = false;
 uniform int fogMode = 0;
 uniform vec3 fogColor = vec3(0.65, 0.72, 0.78);
@@ -199,12 +250,53 @@ vec2 getDirectionalShadowTexelSize(int mapIndex)
 // Vogel disk: an even, isotropic point distribution that takes a rotation for
 // free. Poisson tables have to be stored; this is generated, so the tap count
 // can vary per pixel without carrying several tables.
-vec2 vogelDiskSample(int index, int count, float phi)
+//
+// The point is sqrt((i + 0.5) / N) * (cos(i*g + phi), sin(i*g + phi)). Only the
+// phi rotation and the 1/sqrt(N) scale vary, so the unrotated, unscaled points
+// sqrt(i + 0.5) * (cos(i*g), sin(i*g)) with g = 2.39996323 are tabulated and
+// the per-pixel rotation is applied by angle addition. Same sample set, with
+// no sqrt/cos/sin per tap - those dominate the filter on small integrated GPUs.
+// 32 entries covers the largest tap count shadowTapCount() can return.
+const vec2 kVogelDisk[32] = vec2[32](
+    vec2(0.707106781, 0.0),
+    vec2(-0.903088678, 0.827303354),
+    vec2(0.138231927, -1.57508474),
+    vec2(1.13828528, 1.48469075),
+    vec2(-2.08889288, -0.369494969),
+    vec2(1.978781, -1.25873974),
+    vec2(-0.66186239, 2.46210036),
+    vec2(-1.26224739, -2.43037683),
+    vec2(2.73856936, 1.00011892),
+    vec2(-2.8490234, 1.17603812),
+    vec2(1.37341538, -2.93491571),
+    vec2(1.01492414, 3.23572696),
+    vec2(-3.05898547, -1.77274023),
+    vec2(3.58853502, -0.788933722),
+    vec2(-2.19002373, 3.11509166),
+    vec2(-0.505952318, -3.90435811),
+    vec2(3.10602264, 2.61775158),
+    vec2(-4.17972756, 0.172851209),
+    vec2(3.04878572, -3.03395874),
+    vec2(-0.203968423, 4.41116729),
+    vec2(-2.90094024, -3.47628332),
+    vec2(4.59540098, 0.618295934),
+    vec2(-3.89366765, 2.70912388),
+    vec2(1.06396571, -4.72947957),
+    vec2(2.46092898, 4.29462787),
+    vec2(-4.81086613, -1.53478568),
+    vec2(4.67313587, -2.15912046),
+    vec2(-2.02450974, 4.83749525),
+    vec2(-1.80685329, -5.02347302),
+    vec2(4.80781582, 2.52683737),
+    vec2(-5.34026263, 1.40769138),
+    vec2(3.03543122, -4.72082168)
+);
+
+// rot = (cos(phi), sin(phi)), invSqrtCount = inversesqrt(float(count)).
+vec2 vogelDiskSample(int index, vec2 rot, float invSqrtCount)
 {
-    const float kGoldenAngle = 2.39996323;
-    float r = sqrt(float(index) + 0.5) / sqrt(float(count));
-    float theta = float(index) * kGoldenAngle + phi;
-    return vec2(r * cos(theta), r * sin(theta));
+    vec2 p = kVogelDisk[index];
+    return vec2(p.x * rot.x - p.y * rot.y, p.x * rot.y + p.y * rot.x) * invSqrtCount;
 }
 
 // Per-pixel rotation. Without it every pixel samples the same offsets and the
@@ -234,12 +326,14 @@ int shadowTapCount(float viewDistance)
 
 // Average depth of whatever is occluding this point, or -1 when nothing is.
 float directionalBlockerDepth(int mapIndex, vec2 uv, float refDepth, float bias,
-                              vec2 texelSize, float searchRadius, int taps, float phi)
+                              vec2 texelSize, float searchRadius, int taps, vec2 rot)
 {
     float sum = 0.0;
     float count = 0.0;
+    float invSqrtTaps = inversesqrt(float(taps));
+    vec2 offsetScale = texelSize * searchRadius;
     for (int i = 0; i < taps; ++i) {
-        vec2 offset = vogelDiskSample(i, taps, phi) * texelSize * searchRadius;
+        vec2 offset = vogelDiskSample(i, rot, invSqrtTaps) * offsetScale;
         float d = sampleDirectionalShadow(mapIndex, uv + offset);
         if (refDepth - bias > d) {
             sum += d;
@@ -278,6 +372,7 @@ float computeShadowOcclusion(int lightIndex, vec3 lightToFrag, float nl, vec3 wo
         float viewDistance = length(worldPos - viewPos);
         int taps = shadowTapCount(viewDistance);
         float phi = interleavedGradientNoise(gl_FragCoord.xy) * 6.2831853;
+        vec2 rot = vec2(cos(phi), sin(phi));
         float maxRadius = max(1.0, softness * 80.0);
 
         // Contact hardening: with no occluder found the point is lit outright,
@@ -289,7 +384,7 @@ float computeShadowOcclusion(int lightIndex, vec3 lightToFrag, float nl, vec3 wo
         if (shadowContactHardening) {
             float blocker = directionalBlockerDepth(mapIndex, projCoords.xy, projCoords.z,
                                                     bias, texelSize, maxRadius,
-                                                    max(taps / 2, 4), phi);
+                                                    max(taps / 2, 4), rot);
             if (blocker < 0.0) return 0.0;
             float gap = max(projCoords.z - blocker, 0.0);
             radius = clamp(gap / max(blocker, 0.0001) * maxRadius, 1.0, maxRadius);
@@ -298,15 +393,22 @@ float computeShadowOcclusion(int lightIndex, vec3 lightToFrag, float nl, vec3 wo
         // Gaussian-weighted accumulation. Weighting by distance from the centre
         // is what turns a disc of binary tests into a smooth falloff; a flat
         // average of the same taps still steps.
+        // dot(disk, disk) is (i + 0.5) / taps, so exp(-2 * dot) is the geometric
+        // series exp(-1/taps) * exp(-2/taps)^i: two exp per pixel, not one per tap.
         float shadow = 0.0;
         float weightSum = 0.0;
+        float invTaps = 1.0 / float(taps);
+        float invSqrtTaps = inversesqrt(float(taps));
+        float w = exp(-invTaps);
+        float wStep = exp(-2.0 * invTaps);
+        vec2 offsetScale = texelSize * radius;
+        float refDepth = projCoords.z - bias;
         for (int i = 0; i < taps; ++i) {
-            vec2 disk = vogelDiskSample(i, taps, phi);
-            float w = exp(-2.0 * dot(disk, disk));
-            vec2 offset = disk * texelSize * radius;
+            vec2 offset = vogelDiskSample(i, rot, invSqrtTaps) * offsetScale;
             float sampleDepth = sampleDirectionalShadow(mapIndex, projCoords.xy + offset);
-            shadow += w * ((projCoords.z - bias > sampleDepth) ? 1.0 : 0.0);
+            shadow += w * ((refDepth > sampleDepth) ? 1.0 : 0.0);
             weightSum += w;
+            w *= wStep;
         }
         return shadow / max(weightSum, 0.0001);
     }
@@ -333,6 +435,8 @@ float computeShadowOcclusion(int lightIndex, vec3 lightToFrag, float nl, vec3 wo
     float viewDistance = length(worldPos - viewPos);
     int taps = shadowTapCount(viewDistance);
     float phi = interleavedGradientNoise(gl_FragCoord.xy) * 6.2831853;
+    vec2 rot = vec2(cos(phi), sin(phi));
+    float refDepth = currentDepth - bias;
     float maxRadius = softness * (1.0 + currentDepth / farPlane);
 
     // Same contact-hardening idea as the directional path: size the penumbra by
@@ -342,11 +446,12 @@ float computeShadowOcclusion(int lightIndex, vec3 lightToFrag, float nl, vec3 wo
         float blockerSum = 0.0;
         float blockerCount = 0.0;
         int searchTaps = max(taps / 2, 4);
+        float invSqrtSearchTaps = inversesqrt(float(searchTaps));
         for (int i = 0; i < searchTaps; ++i) {
-            vec2 disk = vogelDiskSample(i, searchTaps, phi);
+            vec2 disk = vogelDiskSample(i, rot, invSqrtSearchTaps);
             vec3 offset = (tangent * disk.x + bitangent * disk.y) * maxRadius;
             float d = sampleShadowCube(mapIndex, lightToFrag + offset) * farPlane;
-            if (currentDepth - bias > d) {
+            if (refDepth > d) {
                 blockerSum += d;
                 blockerCount += 1.0;
             }
@@ -357,15 +462,20 @@ float computeShadowOcclusion(int lightIndex, vec3 lightToFrag, float nl, vec3 wo
         radius = clamp(gap / max(blocker, 0.0001) * maxRadius, maxRadius * 0.05, maxRadius);
     }
 
+    // Same geometric-series Gaussian weights as the directional filter.
     float shadow = 0.0;
     float weightSum = 0.0;
+    float invTaps = 1.0 / float(taps);
+    float invSqrtTaps = inversesqrt(float(taps));
+    float w = exp(-invTaps);
+    float wStep = exp(-2.0 * invTaps);
     for (int i = 0; i < taps; ++i) {
-        vec2 disk = vogelDiskSample(i, taps, phi);
-        float w = exp(-2.0 * dot(disk, disk));
+        vec2 disk = vogelDiskSample(i, rot, invSqrtTaps);
         vec3 offset = (tangent * disk.x + bitangent * disk.y) * radius;
         float closestDepth = sampleShadowCube(mapIndex, lightToFrag + offset) * farPlane;
-        shadow += w * ((currentDepth - bias > closestDepth) ? 1.0 : 0.0);
+        shadow += w * ((refDepth > closestDepth) ? 1.0 : 0.0);
         weightSum += w;
+        w *= wStep;
     }
     return shadow / max(weightSum, 0.0001);
 }
@@ -460,6 +570,248 @@ vec3 evaluateDirectSpecular(
 
     return (microfacet * smoothVisibility + enhanced) * lightColor * intensity * NdotL;
 }
+
+// Clearcoat lobe: GGX with Kelemen's visibility and a fixed F0 of 0.04 (a clear
+// lacquer or a water film). Returns the lobe's reflectance times NdotL, and the
+// Fresnel term that the layer below loses to it.
+float clearcoatLobe(vec3 Nc, vec3 V, vec3 L, float roughness, float amount, out float Fc)
+{
+    vec3 H = normalize(V + L);
+    float NoH = max(dot(Nc, H), 0.0);
+    float VoH = max(dot(V, H), 0.0);
+    float NoL = max(dot(Nc, L), 0.0);
+    float x = 1.0 - VoH;
+    float x2 = x * x;
+    Fc = (0.04 + 0.96 * x2 * x2 * x) * amount;
+    if (NoL <= 0.0) return 0.0;
+    float D = distributionGGX(NoH, roughness);
+    float visibility = 0.25 / max(VoH * VoH, 1e-4);
+    return D * visibility * Fc * NoL;
+}
+
+// Split-sum environment BRDF without a lookup texture: Karis' analytic fit
+// ("Physically Based Shading on Mobile"). Scale and bias for F0 integrated over
+// the lobe, so IBL specular stays energy-plausible across roughness.
+vec3 envBRDFApprox(vec3 F0, float roughness, float NoV)
+{
+    const vec4 c0 = vec4(-1.0, -0.0275, -0.572, 0.022);
+    const vec4 c1 = vec4(1.0, 0.0425, 1.04, -0.04);
+    vec4 r = roughness * c0 + c1;
+    float a004 = min(r.x * r.x, exp2(-9.28 * NoV)) * r.x + r.y;
+    vec2 AB = vec2(-1.04, 1.04) * a004 + r.zw;
+    return F0 * AB.x + AB.y;
+}
+
+// The sky and probe cubes hold display-encoded colour (they are rendered by the
+// same shaders that write the screen), so lighting decodes them first.
+vec3 decodeEnvironment(vec3 c)
+{
+    return pow(max(c, vec3(0.0)), vec3(2.2));
+}
+
+// Roughness to the fraction of the mip chain to read. The chain is a plain box
+// filter rather than a GGX prefilter, so this curve leans a little sharp.
+float environmentMipFraction(float roughness)
+{
+    return roughness * (1.7 - 0.7 * roughness);
+}
+
+#ifndef MODU_ES2
+const float kGroundAlbedo = 0.12;
+
+// What a generic lit ground looks like: the sun term from the renderer plus
+// the ground's share of sky light (the cube's 1x1 level is its average).
+vec3 environmentGround()
+{
+    vec3 skyAverage = decodeEnvironment(textureLod(environmentCube, vec3(0.0, 1.0, 0.0), environmentMaxLod).rgb);
+    return environmentGroundSun + skyAverage * kGroundAlbedo;
+}
+
+// The sky cube with the ground substituted below the horizon. The blend
+// widens with the mip so rough reflections get a soft horizon.
+vec3 sampleSkyCube(vec3 dir, float lod, vec3 ground)
+{
+    vec3 sky = decodeEnvironment(textureLod(environmentCube, dir, lod).rgb);
+    float width = 0.04 + 0.5 * lod / max(environmentMaxLod, 1.0);
+    return mix(sky, ground, smoothstep(0.02, -width, dir.y));
+}
+
+// Hemisphere irradiance: the sky from above, the ground from below. The sky
+// read is tilted upward so its blurred level does not pull in the haze band.
+vec3 environmentIrradiance(vec3 N)
+{
+    vec3 ground = environmentGround();
+    vec3 skyDir = normalize(vec3(N.x, max(N.y, 0.0) + 0.35, N.z));
+    vec3 sky = decodeEnvironment(textureLod(environmentCube, skyDir, max(environmentMaxLod - 1.0, 0.0)).rgb);
+    return mix(sky, ground, 0.5 - 0.5 * N.y);
+}
+
+vec3 sampleEnvironmentSpecular(vec3 R, float roughness)
+{
+    float mip = environmentMipFraction(roughness);
+    vec3 sky = vec3(0.0);
+    if (hasEnvironmentCube && skyLightingReflections) {
+        sky = sampleSkyCube(R, mip * environmentMaxLod, environmentGround()) * environmentIntensity;
+    }
+    if (hasReflectionCast && reflectionIsProbe) {
+        // The probe weight fades toward its blend distance; blend toward the sky
+        // there instead of toward black.
+        vec3 probe = decodeEnvironment(textureLod(reflectionCube, R, mip * reflectionMaxLod).rgb);
+        float w = max(reflectionIntensity, 0.0);
+        return probe * w + sky * (1.0 - min(w, 1.0));
+    }
+    return sky;
+}
+
+// -- Wet surfaces --
+//
+// Rain wetness, standing water and ripples, all procedural in world space so
+// nothing has to be authored per material. Kept identical in frag.glsl and
+// gbuffer_frag.glsl (GLSL 330 has no include): SSR reads roughness and normal
+// from the G-buffer, so if the two diverge the reflections stop matching the
+// surface they sit on.
+//
+// The water is modelled as a coat over the base material: a thin film on a
+// merely wet surface (rough, partial), a flat near-mirror sheet in a puddle.
+// That reuses the clearcoat lobe instead of adding a third one.
+float wetHash12(vec2 p)
+{
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+vec2 wetHash22(vec2 p)
+{
+    vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.xx + p3.yz) * p3.zy);
+}
+
+float wetValueNoise(vec2 p)
+{
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    vec2 u = f * f * (3.0 - 2.0 * f);
+    float a = wetHash12(i);
+    float b = wetHash12(i + vec2(1.0, 0.0));
+    float c = wetHash12(i + vec2(0.0, 1.0));
+    float d = wetHash12(i + vec2(1.0, 1.0));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+// One layer of expanding rain rings: at most one drop per cell per period,
+// re-rolled every strike so the pattern never visibly loops. The ring never
+// leaves its own cell, so no neighbour cells are visited. Returns the slope of
+// the water surface in world XZ.
+vec2 rainRippleLayer(vec2 p, float t, float density)
+{
+    vec2 cell = floor(p);
+    float cycle = t + wetHash12(cell) * 7.31;
+    float phase = fract(cycle);
+    vec2 h = wetHash22(cell + floor(cycle) * vec2(0.618, 1.414));
+    if (h.x > density) return vec2(0.0);
+    vec2 d = p - (cell + 0.3 + h * 0.4);
+    float r = length(d);
+    float x = (r - phase * 0.3) * 24.0;
+    if (abs(x) > 3.14159) return vec2(0.0);
+    float fade = 1.0 - phase;
+    float wave = sin(x) * (1.0 - abs(x) * 0.3183) * fade * fade;
+    return d / max(r, 1e-4) * wave;
+}
+
+vec2 rainRipples(vec2 xz, float t, float amount)
+{
+    vec2 p = xz * 3.3;
+    float density = clamp(amount * 0.85 + 0.1, 0.0, 1.0);
+    vec2 s = rainRippleLayer(p, t * 1.1, density);
+    s += rainRippleLayer(p * 1.17 + vec2(0.37, 0.61), t * 0.93 + 0.33, density);
+    s += rainRippleLayer(p * 0.83 + vec2(0.71, 0.19), t * 1.27 + 0.66, density);
+    return s;
+}
+
+// wet: 0..1 global wetness. Modifies the base layer (albedo darkening, lower
+// roughness, flattened normal in puddles) and raises the coat to the water
+// film where that is stronger than the material's own clearcoat.
+void applySurfaceWetness(vec3 P, vec3 geomN, float wet, float rain, float time,
+                         float puddles, float metallic,
+                         inout vec3 albedo, inout float roughness, inout vec3 norm,
+                         inout float coat, inout float coatRough, inout vec3 coatN)
+{
+    float up = geomN.y;
+    // Rough dielectrics soak water in; metals, glass and lacquer do not.
+    float porosity = (1.0 - metallic) * smoothstep(0.15, 0.6, roughness);
+    // Undersides stay mostly dry, walls catch less than the ground.
+    float wetLevel = wet * (up > -0.25 ? mix(0.6, 1.0, clamp(up, 0.0, 1.0)) : 0.25);
+
+    float vertical = 1.0 - abs(up);
+    if (vertical > 0.5) {
+        // Run-off streaks down walls: noise stretched vertically and sliding
+        // down while it rains.
+        vec2 along = vec2(-geomN.z, geomN.x);
+        float streak = wetValueNoise(vec2(dot(P.xz, along) * 9.0,
+                                          P.y * 1.4 + time * 0.6 * rain));
+        wetLevel *= mix(1.0, mix(0.5, 1.25, streak), smoothstep(0.5, 0.9, vertical));
+    }
+
+    float puddle = 0.0;
+    if (up > 0.7 && puddles > 0.0) {
+        float gate = clamp(porosity * 2.0, 0.0, 1.0) * (1.0 - coat);
+        if (gate > 0.01) {
+            float n = wetValueNoise(P.xz * 0.21) * 0.65 + wetValueNoise(P.xz * 0.83 + 17.0) * 0.35;
+            float coverage = puddles * smoothstep(0.3, 1.0, wet);
+            float threshold = 1.0 - coverage * 0.75;
+            float upMask = smoothstep(0.7, 0.92, up) * gate;
+            puddle = smoothstep(threshold, threshold + 0.04, n) * upMask;
+            // A damp ring around each puddle.
+            wetLevel = max(wetLevel, smoothstep(threshold - 0.15, threshold, n) * upMask * wet);
+        }
+    }
+    wetLevel = clamp(wetLevel, 0.0, 1.0);
+
+    float soak = max(wetLevel, puddle);
+    albedo *= 1.0 - 0.5 * porosity * soak;
+    roughness = mix(roughness, max(0.08, roughness * 0.5), wetLevel);
+    roughness = mix(roughness, 0.1, puddle);
+    // Standing water hides the surface detail below it.
+    norm = normalize(mix(norm, geomN, puddle));
+
+    vec3 waterN = geomN;
+    if (rain > 0.01 && up > 0.6) {
+        vec2 slope = rainRipples(P.xz, time, rain) * mix(0.12, 0.35, puddle);
+        waterN = normalize(geomN + vec3(-slope.x, 0.0, -slope.y));
+    }
+
+    float film = max(wetLevel * 0.85, puddle);
+    if (film > coat) {
+        coatRough = mix(mix(0.3, 0.1, wetLevel), 0.02, puddle);
+        coat = film;
+        coatN = waterN;
+    }
+    if (porosity < 0.3 && wetLevel > 0.05 && puddle < 0.5) {
+        // Lacquer, metal and glass shed water into beads. Each bead is a tiny
+        // lens: its normal tilts away from its centre, which breaks the coat's
+        // reflection up into droplets. One cell per pixel, projected on the
+        // dominant axis.
+        vec3 an = abs(geomN);
+        vec2 bp;
+        vec3 ax;
+        vec3 ay;
+        if (an.y >= an.x && an.y >= an.z) { bp = P.xz; ax = vec3(1.0, 0.0, 0.0); ay = vec3(0.0, 0.0, 1.0); }
+        else if (an.x >= an.z)            { bp = P.zy; ax = vec3(0.0, 0.0, 1.0); ay = vec3(0.0, 1.0, 0.0); }
+        else                              { bp = P.xy; ax = vec3(1.0, 0.0, 0.0); ay = vec3(0.0, 1.0, 0.0); }
+        bp *= 32.0;
+        vec2 cell = floor(bp);
+        vec2 h = wetHash22(cell);
+        vec2 d = fract(bp) - (0.3 + h * 0.4);
+        float radius = 0.1 + 0.18 * h.y;
+        float r2 = dot(d, d) / (radius * radius);
+        if (wetHash12(cell + 7.7) < wetLevel * 0.7 && r2 < 1.0) {
+            coatN = normalize(coatN + (ax * d.x + ay * d.y) * (0.9 / radius));
+        }
+    }
+}
+#endif // !MODU_ES2 (image-based lighting, wetness)
 
 float computeFogFactor()
 {
@@ -588,9 +940,17 @@ mat3 computeTBN(vec2 uv, vec3 N)
     vec3 dp2 = dFdy(FragPos);
     vec2 duv1 = dFdx(uv);
     vec2 duv2 = dFdy(uv);
-    vec3 tangent = normalize(dp1 * duv2.y - dp2 * duv1.y);
-    vec3 bitangent = normalize(-dp1 * duv2.x + dp2 * duv1.x);
-    return mat3(tangent, bitangent, N);
+    vec3 tangent = dp1 * duv2.y - dp2 * duv1.y;
+    vec3 bitangent = -dp1 * duv2.x + dp2 * duv1.x;
+    // Faces with collapsed UVs (zero UV area) or no screen-space change give zero vectors,
+    // and normalize(0) is NaN: the normal map then shades them black in speckled blotches
+    // that look like z-fighting. Fall back to any frame around N so the map is just flat there.
+    if (dot(tangent, tangent) < 1e-20 || dot(bitangent, bitangent) < 1e-20) {
+        vec3 axis = abs(N.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+        tangent = cross(axis, N);
+        bitangent = cross(N, tangent);
+    }
+    return mat3(normalize(tangent), normalize(bitangent), N);
 }
 
 #ifndef MODU_ES2
@@ -642,10 +1002,452 @@ vec2 parallaxOcclusionUv(vec2 uv, vec3 viewTangent)
 }
 #endif // !MODU_ES2 (parallax)
 
+
+#ifdef MODU_TERRAIN
+// ---- Terrain surface (compiled with the MODU_TERRAIN define) -------------------------------------
+// The terrain mesh uses the standard vertex stage: TexCoord is the position across the terrain
+// (0..1 on both axes), FragPos/Normal are world space. Everything below only replaces where the
+// base colour, normal, roughness and occlusion come from; lighting, shadows, IBL and fog below
+// are the unchanged material path.
+// Unit 0 (texture1): RGBA8 splat, R grass, G forest floor, B path, A rock.
+// terrainAlbedo: Texture2DArray, rgb albedo (gamma), a height proxy used for height blending.
+// terrainNormal: Texture2DArray, rg tangent normal xy (0..1), b roughness, a ambient occlusion.
+uniform sampler2DArray terrainAlbedo;
+uniform sampler2DArray terrainNormal;
+uniform vec4 terrainTiling = vec4(4.0);          // metres per repeat, layers 0..3
+uniform vec4 terrainNormalStrength = vec4(1.0);
+uniform vec3 terrainTint0 = vec3(1.0);
+uniform vec3 terrainTint1 = vec3(1.0);
+uniform vec3 terrainTint2 = vec3(1.0);
+uniform vec3 terrainTint3 = vec3(1.0);
+uniform float terrainSize = 256.0;               // local metres across the terrain
+uniform vec2 terrainGrassShade = vec2(0.0);         // x grass distance (0 = no grass), y how much the ground darkens under it
+uniform float terrainRockSlope = 0.8;            // normal.y below which slopes turn to rock
+
+float terrainHash(vec2 p)
+{
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+float terrainNoise(vec2 p)
+{
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    vec2 u = f * f * (3.0 - 2.0 * f);
+    return mix(mix(terrainHash(i), terrainHash(i + vec2(1.0, 0.0)), u.x),
+               mix(terrainHash(i + vec2(0.0, 1.0)), terrainHash(i + vec2(1.0, 1.0)), u.x), u.y);
+}
+
+struct TerrainSurface {
+    vec3 albedo;      // gamma space, like a sampled albedo texture
+    vec3 normal;      // world space
+    float roughness;
+    float ao;
+};
+
+// One planar layer: two samples at different scale/rotation blended by a slow noise to hide repetition.
+void terrainSamplePlanar(int layer, vec2 p, vec2 dpdx, vec2 dpdy, float tiling, float normalStrength,
+                         out vec4 albedo, out vec4 nrm)
+{
+    vec2 uv1 = p / tiling;
+    vec2 d1x = dpdx / tiling;
+    vec2 d1y = dpdy / tiling;
+    const mat2 M = mat2(0.62, -0.78, 0.78, 0.62) * 0.57;
+    vec2 uv2 = M * uv1 + vec2(0.31, 0.77);
+    vec2 d2x = M * d1x;
+    vec2 d2y = M * d1y;
+    float k = smoothstep(0.30, 0.70, terrainNoise(p * 0.045 + float(layer) * 17.3));
+    float l = float(layer);
+    vec4 a = mix(textureGrad(terrainAlbedo, vec3(uv1, l), d1x, d1y),
+                 textureGrad(terrainAlbedo, vec3(uv2, l), d2x, d2y), k);
+    vec4 n = mix(textureGrad(terrainNormal, vec3(uv1, l), d1x, d1y),
+                 textureGrad(terrainNormal, vec3(uv2, l), d2x, d2y), k);
+    n.rg = (n.rg - 0.5) * normalStrength + 0.5;
+    albedo = a;
+    nrm = n;
+}
+
+vec3 terrainUnpackNormal(vec2 rg)
+{
+    vec2 xy = rg * 2.0 - 1.0;
+    return vec3(xy, sqrt(max(1.0 - dot(xy, xy), 0.0)));
+}
+
+TerrainSurface terrainEvaluate(vec3 worldPos, vec3 geomN, vec2 terrainUv)
+{
+    TerrainSurface ts;
+    vec4 splat = texture(texture1, terrainUv);
+    vec2 p = (terrainUv - 0.5) * terrainSize;        // terrain-local XZ metres
+    vec2 dpdx = dFdx(p);
+    vec2 dpdy = dFdy(p);
+    vec3 dwx = dFdx(worldPos);
+    vec3 dwy = dFdy(worldPos);
+
+    // Slopes become rock regardless of the paint.
+    float slopeRock = smoothstep(terrainRockSlope, terrainRockSlope - 0.16, geomN.y);
+    vec4 w = splat;
+    w.a = max(w.a, slopeRock);
+    float rgbSum = w.r + w.g + w.b;
+    if (rgbSum > 1e-4) w.rgb = w.rgb / rgbSum * (1.0 - w.a);
+    else w.r = 1.0 - w.a;
+
+    vec3 T = normalize(vec3(1.0, 0.0, 0.0) - geomN * geomN.x);
+    vec3 B = cross(geomN, T);
+
+    vec4 albedoS[4];
+    vec4 nrmS[4];
+    albedoS[0] = albedoS[1] = albedoS[2] = albedoS[3] = vec4(0.0);
+    nrmS[0] = nrmS[1] = nrmS[2] = nrmS[3] = vec4(0.5, 0.5, 0.85, 1.0);
+    float wv[4] = float[](w.r, w.g, w.b, w.a);
+    float tiles[4] = float[](terrainTiling.x, terrainTiling.y, terrainTiling.z, terrainTiling.w);
+    float strengths[4] = float[](terrainNormalStrength.x, terrainNormalStrength.y, terrainNormalStrength.z, terrainNormalStrength.w);
+    for (int i = 0; i < 3; ++i) {
+        if (wv[i] > 0.004) terrainSamplePlanar(i, p, dpdx, dpdy, tiles[i], strengths[i], albedoS[i], nrmS[i]);
+    }
+    // Rock is triplanar so cliffs do not stretch.
+    vec3 rockWorldNormal = geomN;
+    if (wv[3] > 0.004) {
+        vec3 bw = pow(abs(geomN), vec3(4.0));
+        bw /= max(bw.x + bw.y + bw.z, 1e-4);
+        float t = tiles[3];
+        vec4 aX = vec4(0.0), aY = vec4(0.0), aZ = vec4(0.0);
+        vec4 nX = vec4(0.5, 0.5, 1.0, 1.0), nY = nX, nZ = nX;
+        vec4 tmpA, tmpN;
+        if (bw.x > 0.02) { terrainSamplePlanar(3, worldPos.zy, dwx.zy, dwy.zy, t, strengths[3], aX, nX); }
+        if (bw.y > 0.02) { terrainSamplePlanar(3, worldPos.xz, dwx.xz, dwy.xz, t, strengths[3], aY, nY); }
+        if (bw.z > 0.02) { terrainSamplePlanar(3, worldPos.xy, dwx.xy, dwy.xy, t, strengths[3], aZ, nZ); }
+        albedoS[3] = aX * bw.x + aY * bw.y + aZ * bw.z;
+        nrmS[3] = nX * bw.x + nY * bw.y + nZ * bw.z;
+        // Whiteout blend of the three projected tangent normals.
+        vec3 tx = terrainUnpackNormal(nX.rg);
+        vec3 ty = terrainUnpackNormal(nY.rg);
+        vec3 tz = terrainUnpackNormal(nZ.rg);
+        tx = vec3(tx.xy + geomN.zy, abs(tx.z) * geomN.x);
+        ty = vec3(ty.xy + geomN.xz, abs(ty.z) * geomN.y);
+        tz = vec3(tz.xy + geomN.xy, abs(tz.z) * geomN.z);
+        rockWorldNormal = normalize(tx.zyx * bw.x + ty.xzy * bw.y + tz.xyz * bw.z);
+    }
+
+    // Height blending: the layer whose texture is "taller" at this pixel wins the transition.
+    float hv[4];
+    float top = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        hv[i] = wv[i] > 0.004 ? wv[i] + albedoS[i].a * 0.55 : 0.0;
+        top = max(top, hv[i]);
+    }
+    float bwv[4];
+    float bsum = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        bwv[i] = max(hv[i] - (top - 0.30), 0.0) * step(0.004, wv[i]);
+        bsum += bwv[i];
+    }
+    bsum = max(bsum, 1e-4);
+
+    vec3 tints[4] = vec3[](terrainTint0, terrainTint1, terrainTint2, terrainTint3);
+    vec3 col = vec3(0.0);
+    vec3 nTangent = vec3(0.0);
+    float rough = 0.0;
+    float ao = 0.0;
+    vec3 rockN = vec3(0.0);
+    for (int i = 0; i < 4; ++i) {
+        float b = bwv[i] / bsum;
+        if (b <= 0.0) continue;
+        col += albedoS[i].rgb * tints[i] * b;
+        rough += nrmS[i].b * b;
+        ao += nrmS[i].a * b;
+        if (i < 3) nTangent += (T * (terrainUnpackNormal(nrmS[i].rg).x) + B * (terrainUnpackNormal(nrmS[i].rg).y) +
+                                geomN * (terrainUnpackNormal(nrmS[i].rg).z)) * b;
+        else rockN = rockWorldNormal * b;
+    }
+    vec3 nWorld = normalize(nTangent + rockN);
+    // Large-scale tint drift breaks up the flat look of a tiled ground, strongest on the grass layer.
+    float macro = terrainNoise(p * 0.018) * 0.6 + terrainNoise(p * 0.071 + 5.7) * 0.4;
+    vec3 drift = mix(vec3(0.90, 0.97, 0.86), vec3(1.10, 1.04, 0.92), macro);
+    col *= mix(vec3(1.0), drift, 0.35 + 0.65 * w.r);
+    if (terrainGrassShade.x > 0.0) {
+        // Under 3D grass the ground is the dark, shaded gap between the blades; it fades back to the
+        // plain tile where the grass stops.
+        float under = (1.0 - smoothstep(0.3 * terrainGrassShade.x, 1.05 * terrainGrassShade.x, length(viewPos - worldPos))) * w.r;
+        col *= mix(vec3(1.0), vec3(0.50, 0.55, 0.38), under * terrainGrassShade.y);
+    }
+    ts.albedo = clamp(col, 0.0, 1.0);
+    ts.normal = nWorld;
+    ts.roughness = clamp(rough, 0.05, 1.0);
+    ts.ao = clamp(ao, 0.0, 1.0);
+    return ts;
+}
+#endif // MODU_TERRAIN
+
+#if (defined(MODU_GRASS) || defined(MODU_WATER)) && !defined(MODU_ES2)
+// ---- Vegetation and water surfaces (compiled with MODU_GRASS / MODU_WATER) ---------------------------
+// Both skip the material path entirely: one lean lighting function each (sun + shadow map, nearby point
+// and spot lights, sky image based light, fog), written for surfaces that cover a lot of the screen.
+
+// Directional shadow for thin, unlit-by-self geometry: four rotated taps, with the receiver nudged
+// toward the light so a root sunk into the terrain does not shadow itself.
+float vegetationShadow(int i, vec3 worldPos, vec3 toLight)
+{
+    if (lightShadowKindArr[i] != 2 || lightShadowModeArr[i] <= 0) return 0.0;
+    int mapIndex = lightShadowMapArr[i];
+    if (mapIndex < 0 || mapIndex >= MAX_SHADOW_MAPS) return 0.0;
+    vec4 ls = lightShadowMatrixArr[i] * vec4(worldPos + toLight * 0.10, 1.0);
+    vec3 pc = ls.xyz / max(ls.w, 0.0001) * 0.5 + 0.5;
+    if (pc.z <= 0.0 || pc.z >= 1.0 || pc.x <= 0.0 || pc.x >= 1.0 || pc.y <= 0.0 || pc.y >= 1.0) return 0.0;
+    vec2 texel = getDirectionalShadowTexelSize(mapIndex);
+    float bias = max(lightShadowBiasArr[i], 0.0001) * 1.5;
+    float phi = interleavedGradientNoise(gl_FragCoord.xy) * 6.2831853;
+    vec2 rot = vec2(cos(phi), sin(phi));
+    float occluded = 0.0;
+    for (int k = 0; k < 4; ++k) {
+        vec2 o = vogelDiskSample(k, rot, 0.5) * texel * 2.0;
+        occluded += (pc.z - bias > sampleDirectionalShadow(mapIndex, pc.xy + o)) ? 1.0 : 0.0;
+    }
+    return occluded * 0.25;
+}
+
+vec3 vegetationAmbientScale()
+{
+    float ambientScale = (ambientStrength <= 0.2) ? ambientStrength * 5.0 : 1.0 + (ambientStrength - 0.2) * 1.25;
+    return vec3(ambientScale);
+}
+#endif
+
+#if defined(MODU_GRASS) && !defined(MODU_ES2)
+in vec4 vGrassColor;       // rgb display colour, a ambient occlusion
+in vec3 vGrassGround;      // terrain normal (world)
+
+void grassMain()
+{
+    vec3 V = normalize(viewPos - FragPos);
+    vec3 N = normalize(Normal);
+    if (dot(N, V) < 0.0) N = -N;
+    float t = TexCoord.y;
+    // Lit with a bent normal pulled toward the terrain's: a field reads as one soft surface, not as
+    // thousands of individually shaded ribbons.
+    vec3 Nl = normalize(mix(N, normalize(vGrassGround), 0.62));
+    vec3 albedo = pow(max(vGrassColor.rgb, vec3(0.0)), vec3(2.2));
+    float ao = vGrassColor.a;
+
+    vec3 lighting = vec3(0.0);
+    float ambientScale = vegetationAmbientScale().x;
+    if (hasEnvironmentCube && environmentIntensity > 0.0) {
+        vec3 irradiance = environmentIrradiance(Nl);
+        // Sky light also reaches the blade from behind (grass is thin).
+        vec3 through = environmentIrradiance(-Nl);
+        lighting += albedo * (irradiance + through * 0.35) * (ao * ambientScale * environmentIntensity);
+    } else {
+        lighting += albedo * ambientStrength * ambientColor * ambientHemisphereTint(Nl) * ao;
+    }
+
+    float thickness = mix(0.45, 1.0, t);   // tips are thin: more light gets through
+    for (int i = 0; i < MAX_LIGHTS; ++i) {
+        if (i >= lightCount) break;
+        float intensity = lightIntensityArr[i];
+        if (intensity <= 0.0) continue;
+        int ltype = lightTypeArr[i];
+        vec3 L;
+        float attenuation = 1.0;
+        if (ltype == 0) {
+            L = -normalize(lightDirArr[i]);
+        } else if (ltype == 1 || ltype == 2) {
+            vec3 d = lightPosArr[i] - FragPos;
+            float dist = length(d);
+            L = d / max(dist, 1e-4);
+            float range = lightRangeArr[i];
+            if (range > 0.0) {
+                if (dist > range) continue;
+                float falloff = clamp(1.0 - dist / range, 0.0, 1.0);
+                attenuation = falloff * falloff;
+            }
+            if (ltype == 2) {
+                float cosTheta = dot(-L, normalize(lightDirArr[i]));
+                attenuation *= smoothstep(lightOuterCosArr[i], lightInnerCosArr[i], cosTheta);
+            }
+        } else {
+            continue;
+        }
+        if (attenuation <= 0.0) continue;
+
+        float nl = dot(Nl, L);
+        // Wrapped diffuse: thin blades scatter, so the terminator is soft.
+        float diffuse = clamp(nl * 0.75 + 0.25, 0.0, 1.0);
+        // Light shining through the blade toward the eye (looking at the sun through a field), and light
+        // striking the back of the blade.
+        float toward = pow(clamp(dot(-L, V), 0.0, 1.0), 3.0);
+        float transmission = (toward * 0.85 + clamp(-nl, 0.0, 1.0) * 0.30) * thickness;
+        vec3 Hv = normalize(L + V);
+        float sheen = pow(max(dot(N, Hv), 0.0), 48.0) * 0.06 * t;
+        float shadow = ltype == 0 ? vegetationShadow(i, FragPos, L) : 0.0;
+        vec3 lightColor = lightColorArr[i] * (intensity * attenuation);
+        lighting += (1.0 - shadow) * lightColor *
+                    (albedo * (diffuse * mix(0.55, 1.0, ao) + transmission * vec3(1.05, 1.15, 0.55)) + vec3(sheen));
+    }
+
+    vec3 finalColor = pow(max(lighting, vec3(0.0)), vec3(1.0 / 2.2));
+    FragColor = vec4(applyFog(finalColor), 1.0);
+}
+#endif // MODU_GRASS
+
+#if defined(MODU_WATER) && !defined(MODU_ES2)
+uniform sampler2D grassHeightTex;   // terrain heights (R32F), shared with the grass pass
+uniform vec4 grassTerrain;          // x size, y resolution, z height offset, w height scale (terrain-local metres)
+uniform mat4 waterInverse;          // world -> terrain-local
+uniform vec3 waterShallow;          // display colours
+uniform vec3 waterDeep;
+uniform vec4 waterParams;           // x clarity (m), y wave scale, z wave strength, w sky reflection
+uniform vec4 waterParams2;          // x foam, y time (s)
+
+float waterBedHeight(vec2 l)
+{
+    float res = grassTerrain.y;
+    float cell = grassTerrain.x / (res - 1.0);
+    vec2 f = clamp((l + 0.5 * grassTerrain.x) / cell, vec2(0.0), vec2(res - 1.001));
+    ivec2 i0 = ivec2(f);
+    vec2 t = f - vec2(i0);
+    float h00 = texelFetch(grassHeightTex, i0, 0).r;
+    float h10 = texelFetch(grassHeightTex, i0 + ivec2(1, 0), 0).r;
+    float h01 = texelFetch(grassHeightTex, i0 + ivec2(0, 1), 0).r;
+    float h11 = texelFetch(grassHeightTex, i0 + ivec2(1, 1), 0).r;
+    return grassTerrain.z + mix(mix(h00, h10, t.x), mix(h01, h11, t.x), t.y) * grassTerrain.w;
+}
+
+// Sum of travelling sine waves plus a scrolling noise ripple: a height-field gradient, no textures.
+vec3 waterNormal(vec2 p, float time, float scale, float strength, float distanceFade)
+{
+    vec2 g = vec2(0.0);
+    const vec2 dirs[5] = vec2[5](vec2(0.92, 0.38), vec2(-0.55, 0.83), vec2(0.18, -0.98), vec2(-0.87, -0.49), vec2(0.62, -0.78));
+    const float freqs[5] = float[5](1.9, 3.1, 4.7, 7.3, 11.1);
+    const float speeds[5] = float[5](0.9, 1.15, 1.45, 1.8, 2.3);
+    const float amps[5] = float[5](0.050, 0.036, 0.026, 0.017, 0.011);
+    for (int k = 0; k < 5; ++k) {
+        float f = freqs[k] / max(scale, 0.05);
+        float phase = dot(p, dirs[k]) * f + time * speeds[k];
+        g += dirs[k] * (cos(phase) * f * amps[k]);
+    }
+    vec2 q = p / max(scale, 0.05);
+    float e = 0.06;
+    float n0 = wetValueNoise(q * 5.0 + vec2(time * 0.35, -time * 0.22));
+    float nx = wetValueNoise((q + vec2(e, 0.0)) * 5.0 + vec2(time * 0.35, -time * 0.22));
+    float nz = wetValueNoise((q + vec2(0.0, e)) * 5.0 + vec2(time * 0.35, -time * 0.22));
+    g += vec2(nx - n0, nz - n0) / e * 0.045;
+    g *= strength * distanceFade;
+    return normalize(vec3(-g.x, 1.0, -g.y));
+}
+
+void waterMain()
+{
+    vec3 localPos = (waterInverse * vec4(FragPos, 1.0)).xyz;
+    float bed = waterBedHeight(localPos.xz);
+    float depth = localPos.y - bed;
+    if (depth <= 0.004) discard;
+
+    vec3 V = normalize(viewPos - FragPos);
+    float viewDistance = length(viewPos - FragPos);
+    float time = waterParams2.y;
+    float distanceFade = 1.0 - smoothstep(25.0, 90.0, viewDistance) * 0.6;
+    vec3 N = waterNormal(FragPos.xz, time, waterParams.y, waterParams.z, distanceFade);
+    float NoV = clamp(dot(N, V), 0.0, 1.0);
+    float fresnel = 0.02 + 0.98 * pow(1.0 - NoV, 5.0);
+    fresnel = clamp(fresnel, 0.0, 1.0);
+
+    float absorb = 1.0 - exp(-depth / max(waterParams.x, 0.05));
+    vec3 shallow = pow(max(waterShallow, vec3(0.0)), vec3(2.2));
+    vec3 deep = pow(max(waterDeep, vec3(0.0)), vec3(2.2));
+    vec3 body = mix(shallow, deep, smoothstep(0.0, 1.0, absorb));
+
+    // Light on the water body: sky from above plus the sun's share, shadowed by trees.
+    vec3 skyLight;
+    if (hasEnvironmentCube && environmentIntensity > 0.0) {
+        skyLight = environmentIrradiance(vec3(0.0, 1.0, 0.0)) * environmentIntensity * vegetationAmbientScale().x;
+    } else {
+        skyLight = ambientStrength * ambientColor * ambientHemisphereTint(vec3(0.0, 1.0, 0.0)) * 3.0;
+    }
+    vec3 sunBody = vec3(0.0);
+    vec3 specular = vec3(0.0);
+    for (int i = 0; i < MAX_LIGHTS; ++i) {
+        if (i >= lightCount) break;
+        float intensity = lightIntensityArr[i];
+        if (intensity <= 0.0) continue;
+        int ltype = lightTypeArr[i];
+        vec3 L;
+        float attenuation = 1.0;
+        if (ltype == 0) {
+            L = -normalize(lightDirArr[i]);
+        } else if (ltype == 1 || ltype == 2) {
+            vec3 d = lightPosArr[i] - FragPos;
+            float dist = length(d);
+            L = d / max(dist, 1e-4);
+            float range = lightRangeArr[i];
+            if (range > 0.0) {
+                if (dist > range) continue;
+                float falloff = clamp(1.0 - dist / range, 0.0, 1.0);
+                attenuation = falloff * falloff;
+            }
+            if (ltype == 2) {
+                float cosTheta = dot(-L, normalize(lightDirArr[i]));
+                attenuation *= smoothstep(lightOuterCosArr[i], lightInnerCosArr[i], cosTheta);
+            }
+        } else {
+            continue;
+        }
+        if (attenuation <= 0.0 || L.y <= 0.0) continue;
+        float shadow = 0.0;
+        if (lightShadowKindArr[i] != 0) {
+            shadow = computeShadowOcclusion(i, FragPos - lightPosArr[i], max(L.y, 0.05), FragPos);
+        }
+        vec3 lightColor = lightColorArr[i] * (intensity * attenuation) * (1.0 - shadow);
+        sunBody += lightColor * (0.18 * L.y);
+        vec3 Hv = normalize(L + V);
+        float nh = max(dot(N, Hv), 0.0);
+        specular += lightColor * (pow(nh, 900.0) * 18.0 + pow(nh, 90.0) * 0.45) * fresnel;
+    }
+    vec3 bodyLit = body * (skyLight * 0.9 + sunBody);
+
+    // Sky reflection from the environment cube; a flat sky colour when there is none.
+    vec3 R = reflect(-V, N);
+    R.y = abs(R.y);
+    vec3 reflection;
+    if (hasEnvironmentCube && environmentIntensity > 0.0) {
+        reflection = sampleEnvironmentSpecular(R, 0.04);
+    } else {
+        reflection = ambientColor * (ambientStrength * 5.0 + 0.1) * mix(vec3(0.7, 0.8, 1.0), vec3(0.5, 0.7, 1.0), R.y) * 2.0;
+    }
+    reflection *= waterParams.w * (skyLightingReflections ? 1.0 : 0.0);
+
+    vec3 color = bodyLit * (1.0 - fresnel) + reflection * fresnel + specular;
+    float alpha = mix(0.30, 0.97, smoothstep(0.0, 1.0, absorb)) + fresnel * 0.9;
+
+    // Shore: soft edge and a ragged band of foam where the water thins out.
+    float shoreNoise = wetValueNoise(FragPos.xz * 3.1 + vec2(time * 0.12, time * 0.08)) * 0.7 +
+                       wetValueNoise(FragPos.xz * 9.0 - vec2(time * 0.2, 0.0)) * 0.3;
+    float foam = (1.0 - smoothstep(0.02, 0.10 + 0.20 * shoreNoise, depth)) * waterParams2.x;
+    foam = clamp(foam * (0.55 + 0.9 * shoreNoise), 0.0, 1.0);
+    vec3 foamColor = vec3(0.78, 0.82, 0.80) * (skyLight * 0.5 + vec3(0.25));
+    color = mix(color, foamColor, foam);
+    alpha = max(alpha, foam);
+    alpha *= smoothstep(0.004, 0.06, depth);
+
+    vec3 finalColor = pow(max(color, vec3(0.0)), vec3(1.0 / 2.2));
+    FragColor = vec4(applyFog(finalColor), clamp(alpha, 0.0, 1.0));
+}
+#endif // MODU_WATER
+
 void main()
 {
+#if defined(MODU_GRASS) && !defined(MODU_ES2)
+    grassMain();
+}
+#elif defined(MODU_WATER) && !defined(MODU_ES2)
+    waterMain();
+}
+#else
     vec2 uv = TexCoord * uvTransform.xy + uvTransform.zw;
     vec3 norm = normalize(Normal);
+    // Before normal mapping: the clearcoat and any water sit on the smooth shape,
+    // not on the base layer's surface detail.
+    vec3 geomN = norm;
     vec3 viewDir = normalize(viewPos - FragPos);
 
     // Parallax is part of the PBR feature set: the Inspector hides the height
@@ -680,7 +1482,12 @@ void main()
 #endif
 
     // Texture mixing (corrected)
+#ifdef MODU_TERRAIN
+    TerrainSurface ts = terrainEvaluate(FragPos, geomN, TexCoord);
+    vec4 tex1 = vec4(ts.albedo, 1.0);
+#else
     vec4 tex1 = texture(texture1, uv);
+#endif
     vec3 texColor = tex1.rgb;
     if (hasOverlay) {
         vec4 overlay = texture(overlayTex, uv);
@@ -731,6 +1538,9 @@ void main()
         norm = viewFacingMappedNormal(normalize(TBN * mapN), normalize(Normal), viewDir);
     }
 
+#ifdef MODU_TERRAIN
+    norm = viewFacingMappedNormal(ts.normal, geomN, viewDir);
+#endif
     vec3 albedo = pow(max(baseColor, vec3(0.0)), vec3(2.2));
     float metallic;
     float roughness;
@@ -769,17 +1579,39 @@ void main()
         smoothness = clamp(shininess / 256.0, 0.0, 1.0);
         roughness = clamp(1.0 - smoothness, 0.03, 1.0);
     }
+
+#ifdef MODU_TERRAIN
+    metallic = 0.0;
+    roughness = ts.roughness;
+    smoothness = 1.0 - roughness;
+#endif
+    float coatAmount = usePbr ? clamp(clearcoat, 0.0, 1.0) : 0.0;
+    float coatRough = clamp(clearcoatRoughness, 0.02, 1.0);
+    vec3 coatN = geomN;
+#ifndef MODU_ES2
+    // Uniform branch: a dry scene pays one comparison.
+    if (surfaceWetness > 0.001 && wetnessReceive) {
+        applySurfaceWetness(FragPos, geomN, clamp(surfaceWetness, 0.0, 1.0), rainAmount, wetTime,
+                            puddleAmount, metallic, albedo, roughness, norm,
+                            coatAmount, coatRough, coatN);
+        roughness = clamp(roughness, 0.03, 1.0);
+        smoothness = 1.0 - roughness;
+    }
+#endif
     vec3 F0 = mix(vec3(0.04), albedo, metallic);
     vec3 diffuseColor = albedo * (1.0 - metallic);
 
     // Ambient occlusion darkens indirect light only - direct light is already
     // occluded by the shadow maps, and folding AO into it double-darkens.
     float occlusion = 1.0;
+#ifdef MODU_TERRAIN
+    occlusion = ts.ao;
+#endif
     if (hasOcclusionMap) {
         occlusion = mix(1.0, texture(occlusionMap, uv).r, clamp(occlusionStrength, 0.0, 1.0));
     }
 
-    vec3 ambient = ambientStrength * ambientColor * diffuseColor * occlusion;
+    vec3 ambient = ambientStrength * ambientColor * ambientHemisphereTint(norm) * diffuseColor * occlusion;
     vec3 lighting = ambient;
 
     // Both of these depend only on the material's smoothness, so they are loop
@@ -959,6 +1791,15 @@ void main()
             specular *= attenuation;
         }
 
+        if (coatAmount > 0.0 && specularEnabled) {
+            // The coat reflects first; what it reflects never reaches the base.
+            float coatF;
+            float coatSpec = clearcoatLobe(coatN, viewDir, lDirN, coatRough, coatAmount, coatF);
+            diffuse *= 1.0 - coatF;
+            specular = specular * (1.0 - coatF) +
+                       coatSpec * lightColorArr[i] * (intensity * attenuation);
+        }
+
         float shadow = 0.0;
 #ifndef MODU_ES2
         if (lightShadowKindArr[i] != 0) {
@@ -983,7 +1824,55 @@ void main()
     }
 #endif
 
-    if (specularEnabled && hasReflectionCast && reflectionIntensity > 0.0) {
+    // Image-based lighting. Indirect, so the occlusion map applies, and the
+    // diffuse part follows the material's ambient strength the way the flat
+    // ambient term does (0.2, the default, is 1x).
+    bool iblSpecular = false;
+#ifndef MODU_ES2
+    {
+        float NoV = clamp(dot(norm, viewDir), 1e-4, 1.0);
+        vec3 indirect = vec3(0.0);
+        if (hasEnvironmentCube && environmentIntensity > 0.0) {
+            float ambientScale = (ambientStrength <= 0.2) ? ambientStrength * 5.0
+                                                          : 1.0 + (ambientStrength - 0.2) * 1.25;
+            vec3 irradiance = environmentIrradiance(norm);
+            vec3 kD = usePbr ? (vec3(1.0) - envBRDFApprox(F0, roughness, NoV)) : vec3(1.0);
+            indirect += diffuseColor * irradiance * kD *
+                        (occlusion * ambientScale * environmentIntensity);
+        }
+        bool haveEnvironment = (hasEnvironmentCube && skyLightingReflections) || (hasReflectionCast && reflectionIsProbe);
+        if (usePbr && specularEnabled && haveEnvironment) {
+            iblSpecular = true;
+            vec3 R = reflect(-viewDir, norm);
+            // Rough lobes lean toward the normal (Frostbite's dominant direction).
+            float a = roughness * roughness;
+            R = normalize(mix(norm, R, (1.0 - a) * (sqrt(1.0 - a) + a)));
+            // Horizon occlusion: a normal-mapped reflection that dips under the
+            // surface would otherwise fetch the ground half of the sky.
+            float horizon = clamp(1.0 + 1.2 * dot(R, geomN), 0.0, 1.0);
+            float specOcclusion = hasOcclusionMap
+                ? clamp(pow(NoV + occlusion, exp2(-16.0 * roughness - 1.0)) - 1.0 + occlusion, 0.0, 1.0)
+                : 1.0;
+            indirect += sampleEnvironmentSpecular(R, roughness) * envBRDFApprox(F0, roughness, NoV) *
+                        (horizon * horizon * specOcclusion);
+        }
+        if (coatAmount > 0.0 && specularEnabled) {
+            float NoVc = clamp(dot(coatN, viewDir), 1e-4, 1.0);
+            float coatF = envBRDFApprox(vec3(0.04), coatRough, NoVc).x * coatAmount;
+            indirect *= 1.0 - coatF;
+            if (haveEnvironment) {
+                vec3 Rc = reflect(-viewDir, coatN);
+                float horizonC = clamp(1.0 + 1.2 * dot(Rc, geomN), 0.0, 1.0);
+                indirect += sampleEnvironmentSpecular(Rc, coatRough) *
+                            (coatF * horizonC * horizonC * mix(1.0, occlusion, 0.5));
+            }
+        }
+        lighting += indirect;
+    }
+#endif
+
+    // Legacy cubemap blend, for materials the IBL path above does not cover.
+    if (!iblSpecular && specularEnabled && hasReflectionCast && reflectionIntensity > 0.0) {
         vec3 reflectionDir = reflect(-viewDir, norm);
         float distanceFade = smoothstep(reflectionFadeStart, max(reflectionFadeStart + 0.01, reflectionFadeEnd), length(viewPos - FragPos));
         float fresnelBase = 1.0 - clamp(dot(norm, viewDir), 0.0, 1.0);
@@ -1012,3 +1901,4 @@ void main()
     finalColor = applyFog(finalColor);
     FragColor = vec4(finalColor, alpha);
 }
+#endif // grass / water / material main

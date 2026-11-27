@@ -27,12 +27,15 @@ class Engine;
     #define MODULARITY_SCRIPT_EXPORT __attribute__((visibility("default")))
 #endif
 
-#define MODULARITY_NATIVE_SCRIPT_ABI_VERSION 80
+#define MODULARITY_NATIVE_SCRIPT_ABI_VERSION 82
 
 #define MODULARITY_SCRIPT_LAYOUT_SIGNATURE() \
     ((static_cast<unsigned long long>(sizeof(SceneObject)) << 40) ^ \
      (static_cast<unsigned long long>(sizeof(ScriptComponent)) << 20) ^ \
      static_cast<unsigned long long>(sizeof(ScriptContext)))
+
+// Engine-side: clears the cross-script store behind ScriptContext::SetSharedValue.
+namespace ScriptSharedValues { void Clear(); }
 
 struct MODULARITY_SCRIPT_API ScriptContext {
     Engine* engine = nullptr;
@@ -156,6 +159,16 @@ struct MODULARITY_SCRIPT_API ScriptContext {
     bool NetworkJoinRandomRoom();
     bool NetworkLeaveRoom();
 
+    // Lobby / room list. After connecting, call NetworkJoinLobby() then
+    // NetworkRefreshRoomList() to populate the list, then query it with
+    // GetRoomCount()/GetRoomName()/GetRoomPlayerCount()/GetRoomMaxPlayers().
+    bool NetworkJoinLobby();
+    bool NetworkRefreshRoomList();
+    int GetRoomCount() const;
+    std::string GetRoomName(int index) const;
+    int GetRoomPlayerCount(int index) const;
+    int GetRoomMaxPlayers(int index) const;
+
     int GetLocalNetworkPlayerId() const;
     int GetNetworkHostPlayerId() const;
     bool IsNetworkHost() const;
@@ -185,6 +198,34 @@ struct MODULARITY_SCRIPT_API ScriptContext {
     void SetLocalAvatarPose(int slot, const glm::vec3& position, const glm::quat& rotation);
     void ClearLocalAvatarPose(int slot);
     bool GetAvatarPose(int playerId, int slot, glm::vec3& position, glm::quat& rotation) const;
+
+    // HTTP(S). ModuHttpScriptApi.h is the script-facing wrapper. Requests run off the
+    // main thread; onComplete runs later on the main thread (never inside HttpSend),
+    // then onRelease runs. When play mode stops before a request finishes, only
+    // onRelease runs, so the script can free its captured state without reaching a
+    // destroyed instance. `headers` is "Name: value" lines separated by '\n'.
+    // Plain function pointers keep std::function out of the cross-module ABI.
+    // `ctx` is rebuilt for the object/script that sent the request (object is null
+    // when that object no longer exists), valid only for the duration of the call.
+    using HttpCompleteFn = void (*)(void* user, ScriptContext& ctx, int status, const char* body,
+                                    size_t bodyLength, const char* error);
+    using HttpReleaseFn = void (*)(void* user);
+    unsigned int HttpSend(const std::string& method, const std::string& url, const std::string& headers,
+                          const std::string& body, int timeoutSeconds,
+                          HttpCompleteFn onComplete, HttpReleaseFn onRelease, void* user);
+    bool IsHttpAvailable(std::string& reason) const;
+    // Anonymous, stable per-machine id (hashed), like Unity's deviceUniqueIdentifier.
+    std::string GetDeviceUniqueId() const;
+
+    // String store shared by every script module. Each script is its own shared
+    // library loaded RTLD_LOCAL, so a header-level static is per-script; services
+    // (sessions, auth tokens) keep cross-script state here instead. Cleared when
+    // play mode starts and stops. Revision increments on every write to a key.
+    void SetSharedValue(const std::string& key, const std::string& value);
+    std::string GetSharedValue(const std::string& key, const std::string& fallback = std::string()) const;
+    bool HasSharedValue(const std::string& key) const;
+    void EraseSharedValue(const std::string& key);
+    unsigned int GetSharedValueRevision(const std::string& key) const;
 
     // Rotation conversion in the engine's own convention (Rx*Ry*Rz, degrees), which
     // is NOT glm's default quat(vec3) composition - the two agree only while a
@@ -319,6 +360,42 @@ struct MODULARITY_SCRIPT_API ScriptContext {
                                 float* hitDynamicFriction = nullptr) const;
     bool SetRigidbodyRotation(const glm::vec3& rotDeg);
     bool TeleportRigidbody(const glm::vec3& pos, const glm::vec3& rotDeg);
+    // --- Point forces and physics-truth queries (ABI 72) --------------------------------
+    // All points/vectors are world space. Self variants act on this script's object; the
+    // Object* variants take a scene object id. Forces accumulate into the NEXT physics step
+    // and are cleared after it, so call force functions from FixedUpdate for exact per-step
+    // application (impulses change velocity immediately and work from any hook). Bodies are
+    // woken when a force/impulse is applied. All return false when the object has no
+    // simulated dynamic body (kinematic/static bodies reject forces).
+    bool AddRigidbodyForceAtPosition(const glm::vec3& force, const glm::vec3& worldPoint);
+    bool AddObjectRigidbodyForceAtPosition(int objectId, const glm::vec3& force, const glm::vec3& worldPoint);
+    bool AddRigidbodyImpulseAtPosition(const glm::vec3& impulse, const glm::vec3& worldPoint);
+    bool AddObjectRigidbodyImpulseAtPosition(int objectId, const glm::vec3& impulse, const glm::vec3& worldPoint);
+    bool AddObjectRigidbodyForce(int objectId, const glm::vec3& force);
+    bool AddObjectRigidbodyTorque(int objectId, const glm::vec3& torque);
+    // Velocity of a world-space point rigidly attached to the body (linear + angular x r).
+    bool GetRigidbodyPointVelocity(const glm::vec3& worldPoint, glm::vec3& outVelocity) const;
+    bool GetObjectRigidbodyPointVelocity(int objectId, const glm::vec3& worldPoint, glm::vec3& outVelocity) const;
+    // World-space center of mass (honours rbUseCustomCenterOfMass/rbCenterOfMass).
+    bool GetRigidbodyCenterOfMass(glm::vec3& outWorldCenterOfMass) const;
+    bool GetObjectRigidbodyCenterOfMass(int objectId, glm::vec3& outWorldCenterOfMass) const;
+    // World angular velocity in rad/s.
+    bool GetObjectRigidbodyAngularVelocity(int objectId, glm::vec3& outVelocity) const;
+    bool SetObjectRigidbodyAngularVelocity(int objectId, const glm::vec3& velocity);
+    // Live simulated body-origin pose straight from the physics engine (not the interpolated
+    // render pose in obj.position/rotation). Use this for physics math, especially in FixedUpdate.
+    bool GetRigidbodyPhysicsPose(glm::vec3& outPosition, glm::quat& outRotation) const;
+    bool GetObjectRigidbodyPhysicsPose(int objectId, glm::vec3& outPosition, glm::quat& outRotation) const;
+    // Simulated mass in kg (after the project mass unit is applied).
+    bool GetObjectRigidbodyMass(int objectId, float& outMassKg) const;
+    // Closest ray hit ignoring ignoreObjectId (-1 = ignore nothing) and, when skipSensors is
+    // true, every trigger/sensor collider. dir need not be normalized. hitFriction is the hit
+    // body's combined friction (0.9 when nothing was hit). Unused outputs may be nullptr.
+    bool RaycastClosestIgnoring(const glm::vec3& origin, const glm::vec3& dir, float distance,
+                                int ignoreObjectId,
+                                glm::vec3* hitPos = nullptr, glm::vec3* hitNormal = nullptr,
+                                float* hitDistance = nullptr, int* hitObjectId = nullptr,
+                                float* hitFriction = nullptr, bool skipSensors = true) const;
     // Audio helpers
     bool HasAudioSource() const;
     bool PlayAudio();
@@ -329,6 +406,16 @@ struct MODULARITY_SCRIPT_API ScriptContext {
     bool PlayObjectAudioOneShot(int objectId, const std::string& clipPath, float volumeScale = 1.0f);
     bool SetAudioLoop(bool loop);
     bool SetAudioVolume(float volume);
+    // Per-frame runtime audio controls: they do NOT mark the project dirty. Pitch is a
+    // playback-rate multiplier clamped to [0.05, 4] (combined with any AudioFX pitch effect);
+    // volume is clamped to [0, 2].
+    bool SetAudioPitch(float pitch);
+    bool SetObjectAudioPitch(int objectId, float pitch);
+    bool SetObjectAudioVolume(int objectId, float volume);
+    // Last rendered game frame. cpuFrameMs is the unclamped wall-clock frame interval;
+    // gpuFrameMs comes from the profiler GPU timer and is -1 when not available (the timer
+    // only runs while the profiler records). Cheap: reads cached counters.
+    void GetRenderStats(int& drawCalls, int& triangles, float& cpuFrameMs, float& gpuFrameMs) const;
     bool SetAudioClip(const std::string& path);
     bool PlayAudioOneShot(const std::string& clipPath = "", float volumeScale = 1.0f);
     // Animation helpers
@@ -411,6 +498,14 @@ struct MODULARITY_SCRIPT_API ScriptContext {
     bool IsIEnumRunning(void(*fn)(ScriptContext&, float)) const;
     void StopAllIEnums();
     void MarkDirty();
+    // Weather (ABI 73): mode is a WeatherMode value - 0 Clear, 1 Overcast, 2 DarkCloudy,
+    // 3 Rain, 4 Thunderstorm; intensity 0..1 blends from clear toward that mode. Changes
+    // the running scene's weather only: no undo, no dirty flag, not saved with the scene.
+    // SetWeather also enables the scene's weather. Both return false without an engine
+    // (and SetWeather for an out-of-range mode); GetWeather reports mode -1 / 0 when the
+    // scene's weather is disabled.
+    bool SetWeather(int mode, float intensity);
+    bool GetWeather(int& mode, float& intensity) const;
 };
 
 enum class ScriptLoadFailure {
@@ -430,6 +525,7 @@ public:
     using TestEditorFn = void(*)(ScriptContext&, float);
     using UpdateFn = void(*)(ScriptContext&, float);
     using TickUpdateFn = void(*)(ScriptContext&, float);
+    using FixedUpdateFn = void(*)(ScriptContext&, float);
     using InspectorFn = void(*)(ScriptContext&);
     using EditorRenderFn = void(*)(ScriptContext&);
     using EditorExitFn = void(*)(ScriptContext&);
@@ -441,6 +537,9 @@ public:
     InspectorFn getInspector(const fs::path& binaryPath);
     void tickModule(const fs::path& binaryPath, ScriptContext& ctx, float deltaTime,
                     bool runSpec, bool runTest);
+    // Runs Script_FixedUpdate for an already-loaded module (no file stat). Skips objects whose
+    // Begin has not run yet; tickModule loads modules and runs Begin first.
+    void fixedUpdateModule(const fs::path& binaryPath, ScriptContext& ctx, float fixedDeltaTime);
     void dispatchCollision(const fs::path& binaryPath, ScriptContext& ctx,
                            SceneObject* other, PhysicsCollisionPhase phase, float deltaTime);
     void unloadAll();
@@ -466,6 +565,7 @@ private:
         TestEditorFn testEditor = nullptr;
         UpdateFn update = nullptr;
         TickUpdateFn tickUpdate = nullptr;
+        FixedUpdateFn fixedUpdate = nullptr;
         EditorRenderFn editorRender = nullptr;
         EditorExitFn editorExit = nullptr;
         ResetStateFn resetState = nullptr;

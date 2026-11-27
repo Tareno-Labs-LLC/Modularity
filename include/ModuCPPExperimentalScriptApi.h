@@ -224,28 +224,6 @@ inline bool SetObjectsEnabledState(ScriptContext& ctx, const std::vector<std::st
     return changed;
 }
 
-inline glm::vec3 GetObjectReferencePosition(ScriptContext& ctx, const SceneObject& object) {
-    if (HasUIComponent(object) && object.ui.type != UIElementType::None) {
-        glm::vec2 worldUiPos(object.ui.position.x, object.ui.position.y);
-        int parentId = object.parentId;
-        int guard = 0;
-        while (parentId >= 0 && guard < 256) {
-            ++guard;
-            SceneObject* parent = ctx.FindObjectById(parentId);
-            if (!parent) break;
-            if (HasUIComponent(*parent) && parent->ui.type != UIElementType::None) {
-                worldUiPos += parent->ui.position;
-                parentId = parent->parentId;
-                continue;
-            }
-            worldUiPos += glm::vec2(parent->position.x, parent->position.y);
-            break;
-        }
-        return glm::vec3(worldUiPos.x, worldUiPos.y, object.position.z);
-    }
-    return object.position;
-}
-
 inline std::string GetCurrentObjectName(ScriptContext& ctx, const std::string& fallback = "Object") {
     if (ctx.object && !ctx.object->name.empty()) {
         return ctx.object->name;

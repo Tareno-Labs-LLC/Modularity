@@ -21,6 +21,16 @@ That avoids vendoring miniz or wiring up a second zlib.
 The implementation is compiled exactly once, in `src/Textures/ExrLoader.cpp`. Include that
 header rather than `tinyexr.h` — the amalgamation is ~11k lines and pulls in a lot.
 
+## DWAA / DWAB
+
+tinyexr has no DWAA/DWAB (lossy DreamWorks DCT) decoder, and that is the compression Poly Haven
+ships every EXR with. `src/Textures/ExrLoader.cpp` therefore carries its own decoder for
+scanline DWA images: a port of the decode half of OpenEXR's `ImfDwaCompressor.cpp`
+(BSD-3-Clause), reusing tinyexr's Huffman / RLE / FP16 helpers from the same translation unit.
+`LoadExrToRgba8` routes DWA files there and everything else through tinyexr. Output was checked
+against OpenEXR 3.5 itself (within 1/255 after 8-bit quantisation). Tiled, deep and multi-part
+DWA files are rejected with an error.
+
 ## Note on the decoded data
 
 EXR is floating point and usually linear. `LoadExrToRgba8` clamps to [0,1] and scales to

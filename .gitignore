@@ -11,6 +11,8 @@ CrashReports/
 .vscode/
 .idea/
 .claude/
+__pycache__/
+*.pyc
 
 # The vendored Windows FFmpeg ships avfilter-11.dll at 124 MB, over the 100 MB
 # body limit the LFS remote sits behind. Nothing in the engine links or ships

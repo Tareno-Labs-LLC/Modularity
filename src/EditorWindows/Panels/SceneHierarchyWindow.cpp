@@ -730,15 +730,28 @@ void Engine::renderHierarchyPanel() {
     }
     // Refresh once before drawing. Row storage, names and child links remain
     // owned by this snapshot for the complete traversal, even if actions mutate
-    // the scene vector. Reuse capacities on steady-state frames.
+    // the scene vector. Reuse capacities on steady-state frames. Strings are compared before
+    // they are copied: nearly every frame nothing changed, and a compare neither allocates nor
+    // dirties the row.
+    {
+    MODU_PROFILE_SCOPE("Hierarchy::SnapshotRefresh", ProfilerSampleCategory::UI);
     cache.snapshot.refresh(sceneObjects, filter, [&](auto& row, const SceneObject& source) {
         row.enabled = IsObjectEnabledInHierarchy(source);
         row.iconColor = GetHierarchyTypeColor(source);
-        row.editorIconPath = source.editorIconPath;
-        row.componentIconPath = SceneObjectComponentIconPath(source);
+        if (row.editorIconPath != source.editorIconPath) row.editorIconPath = source.editorIconPath;
+        const std::string& componentIcon = SceneObjectComponentIconPath(source);
+        if (row.componentIconSource != &componentIcon) {
+            row.componentIconPath = componentIcon;
+            row.componentIconSource = &componentIcon;
+        }
         row.editorIconTint = source.editorIconTint;
-        row.previewPath = !source.albedoTexturePath.empty() ? source.albedoTexturePath
-            : (source.useOverlay ? source.overlayTexturePath : std::string());
+        const std::string* previewSource = !source.albedoTexturePath.empty() ? &source.albedoTexturePath
+            : (source.useOverlay ? &source.overlayTexturePath : nullptr);
+        if (!previewSource) {
+            row.previewPath.clear();
+        } else if (row.previewPath != *previewSource) {
+            row.previewPath = *previewSource;
+        }
         row.previewFilter = source.material.textureFilter;
         row.hasParallaxLayer2D = source.hasParallaxLayer2D && source.parallaxLayer2D.enabled;
         row.parallaxOrder = source.parallaxLayer2D.order;
@@ -749,6 +762,7 @@ void Engine::renderHierarchyPanel() {
         }
         row.drawnLastFrame = false;
     });
+    }
     cache.revealAncestors.clear();
     if (cache.lastSelectedId != selectedObjectId) {
         cache.lastSelectedId = selectedObjectId;
@@ -930,7 +944,6 @@ void Engine::renderObjectNode(int objectId, const std::string& filter,
     if (depth > 256 || std::find(renderPath.begin(), renderPath.end(), objectId) != renderPath.end()) return;
     renderPath.push_back(objectId);
     const auto& obj = *node;
-    node->drawnLastFrame = true;
 
     hierarchyVisibleOrder.push_back(obj.id);
 
@@ -972,6 +985,20 @@ void Engine::renderObjectNode(int objectId, const std::string& filter,
 
     ImVec2 itemMin = ImGui::GetItemRectMin();
     ImVec2 itemMax = ImGui::GetItemRectMax();
+    // Rows scrolled out of view are still submitted above (same ID and size, so layout, scrolling,
+    // keyboard nav, range-select and open state are untouched) but skip everything that only
+    // draws. The margin covers what a row paints outside its own rect: glow, tree lines, scaled
+    // text. A row outside the clip rect cannot be hovered, so nothing hover-driven is lost.
+    bool rowVisible = false;
+    {
+        const ImGuiWindow* rowWindow = ImGui::GetCurrentWindow();
+        const float rowMargin = (itemMax.y - itemMin.y) + 16.0f;
+        rowVisible = !rowWindow->SkipItems &&
+                     itemMax.y + rowMargin >= rowWindow->ClipRect.Min.y &&
+                     itemMin.y - rowMargin <= rowWindow->ClipRect.Max.y;
+    }
+    // Only rows that are really shown pay for the missing-asset check on the next refresh.
+    node->drawnLastFrame = rowVisible;
     UIAnimationState& animState = editorUiAnimationStates[nodeId];
     bool hovered = ImGui::IsItemHovered() && !gHierarchySuppressMouseHover;
     bool active = ImGui::IsItemActive();
@@ -991,7 +1018,7 @@ void Engine::renderObjectNode(int objectId, const std::string& filter,
     float activeT = std::clamp(animState.active, 0.0f, 1.0f);
     float openT = std::clamp(animState.sliderValue, 0.0f, 1.0f);
     float glow = std::min(1.0f, hoverT * 0.7f + activeT * 1.0f);
-    if (glow > 0.001f) {
+    if (rowVisible && glow > 0.001f) {
         ImVec2 pad(4.0f + 10.0f * hoverT + 14.0f * activeT, 2.0f + 6.0f * hoverT);
         ImVec2 glowMin(itemMin.x - pad.x, itemMin.y - pad.y);
         ImVec2 glowMax(itemMax.x + pad.x, itemMax.y + pad.y);
@@ -999,7 +1026,9 @@ void Engine::renderObjectNode(int objectId, const std::string& filter,
         glowCol.w *= 0.35f * glow;
         ImGui::GetWindowDrawList()->AddRectFilled(glowMin, glowMax, ImGui::GetColorU32(glowCol), 6.0f);
     }
-    DrawHierarchyLines(ImGui::GetWindowDrawList(), itemMin, itemMax, ancestorHasNext, depth, isLast);
+    if (rowVisible) {
+        DrawHierarchyLines(ImGui::GetWindowDrawList(), itemMin, itemMax, ancestorHasNext, depth, isLast);
+    }
 
     float lineHeight = itemMax.y - itemMin.y;
     float iconScale = 1.0f + 0.08f * hoverT + 0.12f * activeT;
@@ -1015,85 +1044,88 @@ void Engine::renderObjectNode(int objectId, const std::string& filter,
         dimmed.z *= rowDim;
         iconColor = ImGui::ColorConvertFloat4ToU32(dimmed);
     }
-    Texture* componentIcon = obj.editorIconPath.empty()
-        ? nullptr
-        : renderer.getTexture(obj.editorIconPath,
-                              MaterialProperties::TextureFilter::Bilinear);
-    if (!componentIcon || !componentIcon->GetID()) {
-        componentIcon = renderer.getTexture(obj.componentIconPath,
-                                            MaterialProperties::TextureFilter::Bilinear);
-    }
-    ImU32 iconTintU32 = ImGui::ColorConvertFloat4ToU32(
-        ImVec4(obj.editorIconTint.r * rowDim,
-               obj.editorIconTint.g * rowDim,
-               obj.editorIconTint.b * rowDim,
-               obj.editorIconTint.a));
-    if (componentIcon && componentIcon->GetID()) {
-        float texIconSize = std::max(8.0f, (lineHeight - 2.0f) * iconScale);
-        ImVec2 texIconPos(labelStart, itemMin.y + (lineHeight - texIconSize) * 0.5f);
-        ImGui::GetWindowDrawList()->AddImage(
-            (ImTextureID)(intptr_t)componentIcon->GetID(),
-            texIconPos, ImVec2(texIconPos.x + texIconSize, texIconPos.y + texIconSize),
-            ImVec2(0, 1), ImVec2(1, 0), iconTintU32);
-    } else {
-        DrawEmptyObjectIcon(ImGui::GetWindowDrawList(), iconPos, iconSize, iconColor);
-    }
-    ImVec4 textCol = ImGui::GetStyleColorVec4(ImGuiCol_Text);
-    textCol.x = std::min(1.0f, textCol.x + 0.15f * hoverT + 0.2f * activeT);
-    textCol.y = std::min(1.0f, textCol.y + 0.15f * hoverT + 0.2f * activeT);
-    textCol.z = std::min(1.0f, textCol.z + 0.15f * hoverT + 0.2f * activeT);
-    textCol.w = std::min(1.0f, textCol.w + 0.2f * hoverT + 0.35f * activeT);
-    const auto& missingAssets = obj;
-    if (!missingAssets.firstMissingAsset.empty()) {
-        textCol.x = std::min(1.0f, 0.95f + 0.05f * hoverT);
-        textCol.y = std::min(1.0f, 0.36f + 0.15f * hoverT);
-        textCol.z = std::min(1.0f, 0.36f + 0.15f * hoverT);
-        if (hovered && ImGui::BeginTooltip()) {
-            const ImVec4 missingTitleColor(0.95f, 0.45f, 0.45f, 1.0f);
-            if (missingAssets.missingAssetCount == 1) {
-                ImGui::TextColored(missingTitleColor, "Missing asset");
-            } else {
-                ImGui::TextColored(missingTitleColor, "Missing assets (%d)", missingAssets.missingAssetCount);
+    if (rowVisible) {
+        Texture* componentIcon = obj.editorIconPath.empty()
+            ? nullptr
+            : renderer.getTexture(obj.editorIconPath,
+                                  MaterialProperties::TextureFilter::Bilinear);
+        if (!componentIcon || !componentIcon->GetID()) {
+            componentIcon = renderer.getTexture(obj.componentIconPath,
+                                                MaterialProperties::TextureFilter::Bilinear);
+        }
+        ImU32 iconTintU32 = ImGui::ColorConvertFloat4ToU32(
+            ImVec4(obj.editorIconTint.r * rowDim,
+                   obj.editorIconTint.g * rowDim,
+                   obj.editorIconTint.b * rowDim,
+                   obj.editorIconTint.a));
+        if (componentIcon && componentIcon->GetID()) {
+            float texIconSize = std::max(8.0f, (lineHeight - 2.0f) * iconScale);
+            ImVec2 texIconPos(labelStart, itemMin.y + (lineHeight - texIconSize) * 0.5f);
+            ImGui::GetWindowDrawList()->AddImage(
+                (ImTextureID)(intptr_t)componentIcon->GetID(),
+                texIconPos, ImVec2(texIconPos.x + texIconSize, texIconPos.y + texIconSize),
+                ImVec2(0, 1), ImVec2(1, 0), iconTintU32);
+        } else {
+            DrawEmptyObjectIcon(ImGui::GetWindowDrawList(), iconPos, iconSize, iconColor);
+        }
+        ImVec4 textCol = ImGui::GetStyleColorVec4(ImGuiCol_Text);
+        textCol.x = std::min(1.0f, textCol.x + 0.15f * hoverT + 0.2f * activeT);
+        textCol.y = std::min(1.0f, textCol.y + 0.15f * hoverT + 0.2f * activeT);
+        textCol.z = std::min(1.0f, textCol.z + 0.15f * hoverT + 0.2f * activeT);
+        textCol.w = std::min(1.0f, textCol.w + 0.2f * hoverT + 0.35f * activeT);
+        const auto& missingAssets = obj;
+        if (!missingAssets.firstMissingAsset.empty()) {
+            textCol.x = std::min(1.0f, 0.95f + 0.05f * hoverT);
+            textCol.y = std::min(1.0f, 0.36f + 0.15f * hoverT);
+            textCol.z = std::min(1.0f, 0.36f + 0.15f * hoverT);
+            if (hovered && ImGui::BeginTooltip()) {
+                const ImVec4 missingTitleColor(0.95f, 0.45f, 0.45f, 1.0f);
+                if (missingAssets.missingAssetCount == 1) {
+                    ImGui::TextColored(missingTitleColor, "Missing asset");
+                } else {
+                    ImGui::TextColored(missingTitleColor, "Missing assets (%d)", missingAssets.missingAssetCount);
+                }
+                ImGui::TextUnformatted(missingAssets.firstMissingAsset.c_str());
+                ImGui::TextDisabled("Export leaves broken references out and reports them.");
+                ImGui::EndTooltip();
             }
-            ImGui::TextUnformatted(missingAssets.firstMissingAsset.c_str());
-            ImGui::TextDisabled("Export leaves broken references out and reports them.");
-            ImGui::EndTooltip();
         }
-    }
-    if (rowDim < 1.0f) {
-        textCol.x *= rowDim;
-        textCol.y *= rowDim;
-        textCol.z *= rowDim;
-        textCol.w *= 0.75f;
-    }
-    float fontSize = ImGui::GetFontSize() * (1.0f + 0.06f * hoverT + 0.1f * activeT);
-    ImVec2 textPos(iconPos.x + iconSize + 6.0f, itemMin.y + (lineHeight - fontSize) * 0.5f);
-    ImGui::GetWindowDrawList()->AddText(ImGui::GetFont(), fontSize, textPos,
-                                        ImGui::GetColorU32(textCol), obj.name.c_str());
+        if (rowDim < 1.0f) {
+            textCol.x *= rowDim;
+            textCol.y *= rowDim;
+            textCol.z *= rowDim;
+            textCol.w *= 0.75f;
+        }
+        float fontSize = ImGui::GetFontSize() * (1.0f + 0.06f * hoverT + 0.1f * activeT);
+        ImVec2 textPos(iconPos.x + iconSize + 6.0f, itemMin.y + (lineHeight - fontSize) * 0.5f);
+        ImGui::GetWindowDrawList()->AddText(ImGui::GetFont(), fontSize, textPos,
+                                            ImGui::GetColorU32(textCol), obj.name.c_str());
 
-    if (obj.hasParallaxLayer2D) {
-        std::string badgeText = "L" + std::to_string(obj.parallaxOrder);
-        ImVec2 badgeTextSize = ImGui::CalcTextSize(badgeText.c_str());
-        ImVec2 labelTextSize = ImGui::CalcTextSize(obj.name.c_str());
-        float badgePadX = 6.0f;
-        float badgePadY = 2.0f;
-        float rightEdge = itemMax.x - 8.0f;
-        if (hierarchyShowTexturePreview) {
-            float previewSize = std::max(12.0f, lineHeight - 4.0f);
-            rightEdge -= (previewSize + 8.0f);
-        }
-        ImVec2 badgeMin(rightEdge - badgeTextSize.x - badgePadX * 2.0f,
-                        itemMin.y + (lineHeight - (badgeTextSize.y + badgePadY * 2.0f)) * 0.5f);
-        ImVec2 badgeMax(rightEdge, badgeMin.y + badgeTextSize.y + badgePadY * 2.0f);
-        float minAllowedX = textPos.x + labelTextSize.x + 8.0f;
-        if (badgeMin.x > minAllowedX) {
-            ImU32 badgeBg = ImGui::GetColorU32(ImVec4(0.20f, 0.40f, 0.62f, 0.78f));
-            ImU32 badgeBorder = ImGui::GetColorU32(ImVec4(0.52f, 0.74f, 0.96f, 0.88f));
-            ImU32 badgeFg = ImGui::GetColorU32(ImVec4(0.92f, 0.96f, 1.0f, 0.96f));
-            ImDrawList* dl = ImGui::GetWindowDrawList();
-            dl->AddRectFilled(badgeMin, badgeMax, badgeBg, 4.0f);
-            dl->AddRect(badgeMin, badgeMax, badgeBorder, 4.0f, 0, 1.0f);
-            dl->AddText(ImVec2(badgeMin.x + badgePadX, badgeMin.y + badgePadY), badgeFg, badgeText.c_str());
+        if (obj.hasParallaxLayer2D) {
+            char badgeText[16];
+            std::snprintf(badgeText, sizeof(badgeText), "L%d", obj.parallaxOrder);
+            ImVec2 badgeTextSize = ImGui::CalcTextSize(badgeText);
+            ImVec2 labelTextSize = ImGui::CalcTextSize(obj.name.c_str());
+            float badgePadX = 6.0f;
+            float badgePadY = 2.0f;
+            float rightEdge = itemMax.x - 8.0f;
+            if (hierarchyShowTexturePreview) {
+                float previewSize = std::max(12.0f, lineHeight - 4.0f);
+                rightEdge -= (previewSize + 8.0f);
+            }
+            ImVec2 badgeMin(rightEdge - badgeTextSize.x - badgePadX * 2.0f,
+                            itemMin.y + (lineHeight - (badgeTextSize.y + badgePadY * 2.0f)) * 0.5f);
+            ImVec2 badgeMax(rightEdge, badgeMin.y + badgeTextSize.y + badgePadY * 2.0f);
+            float minAllowedX = textPos.x + labelTextSize.x + 8.0f;
+            if (badgeMin.x > minAllowedX) {
+                ImU32 badgeBg = ImGui::GetColorU32(ImVec4(0.20f, 0.40f, 0.62f, 0.78f));
+                ImU32 badgeBorder = ImGui::GetColorU32(ImVec4(0.52f, 0.74f, 0.96f, 0.88f));
+                ImU32 badgeFg = ImGui::GetColorU32(ImVec4(0.92f, 0.96f, 1.0f, 0.96f));
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                dl->AddRectFilled(badgeMin, badgeMax, badgeBg, 4.0f);
+                dl->AddRect(badgeMin, badgeMax, badgeBorder, 4.0f, 0, 1.0f);
+                dl->AddText(ImVec2(badgeMin.x + badgePadX, badgeMin.y + badgePadY), badgeFg, badgeText);
+            }
         }
     }
 
@@ -1335,7 +1367,7 @@ void Engine::renderObjectNode(int objectId, const std::string& filter,
         return;
     }
 
-    if (hierarchyShowTexturePreview) {
+    if (rowVisible && hierarchyShowTexturePreview) {
         const std::string* previewPath = obj.previewPath.empty() ? nullptr : &obj.previewPath;
 
         if (previewPath) {
